@@ -12,7 +12,7 @@ import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { createCtoMcpPort, createCtoServer } from "../../src/mcp/cto-server.ts";
 import { formatHostProvisionerReason, hostProvisionerReason, hostReasonKind, hostRefusalText } from "../../src/runtime/host-provisioner-reason.ts";
 import { cleanupTempDirs, commitAll, gitSync, tempDir } from "../helpers/fixtures.ts";
-import { writeFileSync } from "node:fs";
+import { rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { makeHarness } from "../helpers/harness.ts";
 
@@ -121,6 +121,7 @@ const makeWorld = (overrides: Partial<CtoRecord> = {}, env: Record<string, strin
     return allow(ReasonCode.OK, { projectId: P });
   };
   const daemonCache = new Map<string, Decision<unknown>>();
+  const tempRefs = new Set<string>();
   let clock = NOW;
   let uuids = 0;
   const canonicalStatus = (): Record<string, unknown> => ({
@@ -139,16 +140,22 @@ const makeWorld = (overrides: Partial<CtoRecord> = {}, env: Record<string, strin
     if (bin === "git" && args[2] === "log") return answer(0, "");
     if (bin === "git" && args[2] === "config") return answer(0, `${CLONE}\n`);
     // The worker's branches and HEAD, fetched into a namespace of the primary clone and compared with its remotes.
-    if (bin === "git" && args[2] === "fetch") return w.worker.fetchFails ? answer(128, "", "fatal: could not read from the worker\n") : answer(0);
-    if (bin === "git" && args[2] === "for-each-ref") {
-      const workerNamespace = args[4]!.startsWith("refs/acp-cto-retire/repo_") && w.ran.some((l) => l.includes(` fetch --no-tags --quiet ${WORKER} `));
-      return answer(0, workerNamespace ? `${args[4]}HEAD\n${args[4]}heads/main\n` : "");
+    // The primary clone's refs a fetch writes into a namespace, as git keeps them: listed by prefix, deleted on request.
+    if (bin === "git" && args[2] === "fetch") {
+      if (w.worker.fetchFails) return answer(128, "", "fatal: could not read from the worker\n");
+      const spec = args.find((a) => a.startsWith("+refs/*:"));
+      if (spec) for (const ref of ["HEAD", "heads/main"]) tempRefs.add(`${spec.slice("+refs/*:".length, -1)}${ref}`);
+      return answer(0);
     }
+    if (bin === "git" && args[2] === "for-each-ref") return answer(0, [...tempRefs].filter((ref) => ref.startsWith(args[4]!)).map((ref) => `${ref}\n`).join(""));
     if (bin === "git" && args[2] === "rev-list") {
       const unpublished = args.includes("--all") ? w.archiveUnpublished : w.worker.unpublished;
       return answer(0, unpublished ? "deadbeefcafe0123\n" : "");
     }
-    if (bin === "git" && args[2] === "update-ref") return answer(0);
+    if (bin === "git" && args[2] === "update-ref") {
+      for (const line of (options.input ?? "").split("\n")) if (line.startsWith("delete ")) tempRefs.delete(line.slice("delete ".length));
+      return answer(0);
+    }
     if (bin === "gh" && args[0] === "api") return w.repo.exists ? answer(0, `${REPO}\n`) : answer(1, "", "gh: Not Found (HTTP 404)\n");
     if (bin === "gh" && args[0] === "repo" && args[1] === "delete") { w.changes.push(line); w.repo.exists = false; return answer(0); }
     if (bin === MAP_SCRIPT) {
@@ -500,7 +507,7 @@ describe("review r1, item 2: held work, read from real repositories", () => {
   it("finds nothing in a clean, published checkout", () => {
     const { primary, worker } = repos();
     expect(checkoutHeldWork(run, primary)).toBeNull();
-    expect(workerHeldWork(run, primary, worker, "repo_x")).toBeNull();
+    expect(workerHeldWork(run, primary, worker)).toBeNull();
   });
 
   it("finds an unpublished commit on a detached HEAD, in the archived clone and in the worker", () => {
@@ -512,7 +519,7 @@ describe("review r1, item 2: held work, read from real repositories", () => {
     }
     expect(checkoutHeldWork(run, primary)).toMatch(/commit [0-9a-f]{12}/);
     gitSync(primary, ["checkout", "-q", "main"]);
-    expect(workerHeldWork(run, primary, worker, "repo_x")).toMatch(/commit [0-9a-f]{12}/);
+    expect(workerHeldWork(run, primary, worker)).toMatch(/commit [0-9a-f]{12}/);
     expect(gitSync(primary, ["for-each-ref", "refs/acp-cto-retire/"])).toBe("");
   });
 
@@ -521,7 +528,7 @@ describe("review r1, item 2: held work, read from real repositories", () => {
     writeFileSync(join(primary, "notes.txt"), "x\n");
     writeFileSync(join(worker, "notes.txt"), "x\n");
     expect(checkoutHeldWork(run, primary)).toMatch(/uncommitted or untracked/);
-    expect(workerHeldWork(run, primary, worker, "repo_x")).toMatch(/uncommitted or untracked/);
+    expect(workerHeldWork(run, primary, worker)).toMatch(/uncommitted or untracked/);
   });
 });
 
@@ -568,14 +575,58 @@ describe("review r2, item 3: notes on a real bare origin", () => {
     gitSync(worker, ["fetch", "-q", primary, "refs/notes/commitlore:refs/notes/commitlore"]);
 
     expect(checkoutHeldWork(run, primary)).toBeNull();
-    expect(workerHeldWork(run, primary, worker, "repo_x")).toBeNull();
+    expect(workerHeldWork(run, primary, worker)).toBeNull();
     expect(gitSync(primary, ["for-each-ref", "refs/acp-cto-retire/"])).toBe("");
 
     gitSync(primary, ["notes", "--ref=commitlore", "append", "-m", "never pushed", "HEAD"]);
     gitSync(worker, ["notes", "--ref=commitlore", "append", "-m", "worker only", "HEAD"]);
     expect(checkoutHeldWork(run, primary)).toMatch(/commit [0-9a-f]{12}/);
-    expect(workerHeldWork(run, primary, worker, "repo_x")).toMatch(/commit [0-9a-f]{12}/);
+    expect(workerHeldWork(run, primary, worker)).toMatch(/commit [0-9a-f]{12}/);
     expect(gitSync(primary, ["for-each-ref", "refs/acp-cto-retire/"])).toBe("");
+  });
+});
+
+/** The final review's repro, on real repositories: a temporary ref that could not be cleared is never proof of publication. */
+describe("review r3: temporary refs that cannot be cleared", () => {
+  const run: CtoExec = (bin, args, options) => hostRunner({ ...process.env })(bin, args, options);
+  /** A primary clone whose notes are on origin, and a worker clone carrying the same notes, as #1268 copies them. */
+  const notesRepos = (): { primary: string; worker: string } => {
+    const root = tempDir("acp-cto-temp-refs-");
+    gitSync(root, ["init", "-q", "--bare", "origin.git"]);
+    gitSync(root, ["clone", "-q", join(root, "origin.git"), "primary"]);
+    const primary = join(root, "primary");
+    writeFileSync(join(primary, "README.md"), "one\n");
+    commitAll(primary, "one");
+    gitSync(primary, ["push", "-q", "origin", "HEAD:main"]);
+    gitSync(primary, ["fetch", "-q", "origin"]);
+    gitSync(primary, ["notes", "--ref=commitlore", "add", "-m", "a record", "HEAD"]);
+    gitSync(primary, ["push", "-q", "origin", "refs/notes/commitlore"]);
+    gitSync(root, ["clone", "-q", primary, "worker"]);
+    const worker = join(root, "worker");
+    gitSync(worker, ["remote", "remove", "origin"]);
+    gitSync(worker, ["fetch", "-q", primary, "refs/notes/commitlore:refs/notes/commitlore"]);
+    return { primary, worker };
+  };
+
+  it("notes an earlier run fetched into its temp namespace, locked there and since removed upstream, are not taken as published: the worker and the archive are kept", () => {
+    const { primary, worker } = notesRepos();
+    gitSync(primary, ["fetch", "-q", "origin", "+refs/notes/*:refs/acp-cto-retire/origin-notes/*"]);
+    writeFileSync(join(primary, ".git", "refs", "acp-cto-retire", "origin-notes", "commitlore.lock"), "");
+    gitSync(primary, ["push", "-q", "origin", ":refs/notes/commitlore"]);
+    expect(checkoutHeldWork(run, primary)).toMatch(/commit [0-9a-f]{12}/);
+    expect(workerHeldWork(run, primary, worker)).toMatch(/commit [0-9a-f]{12}/);
+  });
+
+  it("a temp ref this check fetched and cannot clear (packed-refs.lock) keeps the checkout: temp refs could not be cleared", () => {
+    const { primary, worker } = notesRepos();
+    const lock = join(primary, ".git", "packed-refs.lock");
+    writeFileSync(lock, "");
+    expect(checkoutHeldWork(run, primary)).toMatch(/temp refs could not be cleared/);
+    expect(workerHeldWork(run, primary, worker)).toMatch(/temp refs could not be cleared/);
+    // Once the lock is gone a new check answers from a namespace of its own, not from the refs the failed ones left.
+    rmSync(lock);
+    expect(checkoutHeldWork(run, primary)).toBeNull();
+    expect(workerHeldWork(run, primary, worker)).toBeNull();
   });
 });
 

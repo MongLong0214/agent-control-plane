@@ -554,34 +554,61 @@ const dirtyTree = (run: CtoExec, path: string): string | null => {
   return status.stdout.trim() ? `${path} has uncommitted or untracked files` : null;
 };
 
-/** origin's notes refs, fetched into this namespace of the repository being checked while a check runs. */
-const ORIGIN_NOTES = `${RETIRE_REFS}origin-notes/`;
-const refsUnder = (run: CtoExec, repo: string, prefix: string): string[] =>
-  run("git", ["-C", repo, "for-each-ref", "--format=%(refname)", prefix], { timeoutMs: 60_000 }).stdout.split("\n").filter((ref) => ref.startsWith(prefix));
-const clearRefs = (run: CtoExec, repo: string, prefix: string): void => {
+/**
+ * A namespace no other check has used, under RETIRE_REFS: one check's refs are never read by another, so refs an
+ * earlier check could not clear are never taken as this one's (they stay under RETIRE_REFS, which no check counts).
+ */
+const freshNamespace = (): string => `${RETIRE_REFS}${randomUUID()}/`;
+/** The refs under `prefix`, or null when git cannot list them. */
+const refsUnder = (run: CtoExec, repo: string, prefix: string): string[] | null => {
+  const listed = run("git", ["-C", repo, "for-each-ref", "--format=%(refname)", prefix], { timeoutMs: 60_000 });
+  return listed.status === 0 ? listed.stdout.split("\n").filter((ref) => ref.startsWith(prefix)) : null;
+};
+/** Deletes every ref under `prefix`; true only when git said so and none is left. */
+const clearRefs = (run: CtoExec, repo: string, prefix: string): boolean => {
   const refs = refsUnder(run, repo, prefix);
-  if (refs.length > 0) run("git", ["-C", repo, "update-ref", "--stdin"], { timeoutMs: 60_000, input: refs.map((ref) => `delete ${ref}\n`).join("") });
+  if (refs === null) return false;
+  if (refs.length > 0) {
+    const deleted = run("git", ["-C", repo, "update-ref", "--stdin"], { timeoutMs: 60_000, input: refs.map((ref) => `delete ${ref}\n`).join("") });
+    if (deleted.status !== 0) return false;
+  }
+  return refsUnder(run, repo, prefix)?.length === 0;
+};
+const uncleared = (repo: string, prefix: string): string => `temp refs could not be cleared from ${repo} (${prefix}); the checkout is kept`;
+
+/**
+ * Runs `check` against a fresh namespace of `repo` and clears that namespace afterwards. The answer stands only if the
+ * namespace was empty when the check began and is empty again when it ends: anything else is held work.
+ */
+const inFreshNamespace = (run: CtoExec, repo: string, check: (namespace: string) => string | null): string | null => {
+  const namespace = freshNamespace();
+  const before = refsUnder(run, repo, namespace);
+  if (before === null || before.length > 0) return `temp refs could not be listed or were not empty in ${repo} (${namespace}); the checkout is kept`;
+  let answer: string | null = null;
+  try {
+    answer = check(namespace);
+  } finally {
+    if (!clearRefs(run, repo, namespace)) answer = uncleared(repo, namespace);
+  }
+  return answer;
 };
 
 /**
  * The first commit reachable from `positives` that `repo`'s remotes do not contain, as held work, or null. A notes ref
  * (CommitLore's records) is never a remote-tracking branch, so when the positives hold notes, origin's own notes refs
- * are fetched into ORIGIN_NOTES and count as published too; notes that cannot be compared with origin's are held work.
+ * are fetched into `namespace` by this check and count as published too; notes that cannot be compared with origin's
+ * are held work. Nothing but what this check fetched is ever read as origin's.
  */
-const unpublishedCommit = (run: CtoExec, repo: string, positives: readonly string[], notes: boolean): string | null => {
-  try {
-    clearRefs(run, repo, ORIGIN_NOTES);
-    if (notes) {
-      const fetched = run("git", ["-C", repo, "fetch", "--no-tags", "--quiet", "origin", `+refs/notes/*:${ORIGIN_NOTES}*`], { timeoutMs: 120_000 });
-      if (fetched.status !== 0) return `its notes could not be compared with origin's: ${firstLine(fetched.stderr)}`;
-    }
-    const ahead = run("git", ["-C", repo, "rev-list", "--max-count=1", ...positives, "--not", "--remotes", `--glob=${ORIGIN_NOTES}*`], { timeoutMs: 120_000 });
-    if (ahead.status !== 0) return `its commits could not be compared with ${repo}'s remotes: ${firstLine(ahead.stderr)}`;
-    const commit = ahead.stdout.trim();
-    return commit ? `commit ${commit.slice(0, 12)} is on no remote-tracking branch or notes ref of ${repo}'s origin` : null;
-  } finally {
-    clearRefs(run, repo, ORIGIN_NOTES);
+const unpublishedCommit = (run: CtoExec, repo: string, positives: readonly string[], notes: boolean, namespace: string): string | null => {
+  const originNotes = `${namespace}origin-notes/`;
+  if (notes) {
+    const fetched = run("git", ["-C", repo, "fetch", "--no-tags", "--quiet", "origin", `+refs/notes/*:${originNotes}*`], { timeoutMs: 120_000 });
+    if (fetched.status !== 0) return `its notes could not be compared with origin's: ${firstLine(fetched.stderr)}`;
   }
+  const ahead = run("git", ["-C", repo, "rev-list", "--max-count=1", ...positives, "--not", "--remotes", ...(notes ? [`--glob=${originNotes}*`] : [])], { timeoutMs: 120_000 });
+  if (ahead.status !== 0) return `its commits could not be compared with ${repo}'s remotes: ${firstLine(ahead.stderr)}`;
+  const commit = ahead.stdout.trim();
+  return commit ? `commit ${commit.slice(0, 12)} is on no remote-tracking branch or notes ref of ${repo}'s origin` : null;
 };
 
 /**
@@ -590,30 +617,32 @@ const unpublishedCommit = (run: CtoExec, repo: string, positives: readonly strin
  * remote-tracking refs, or for its notes in origin's notes refs. Neither the archive nor a worker is removed while
  * this answers, unless the repository goes too.
  */
-export const checkoutHeldWork = (run: CtoExec, path: string): string | null =>
-  dirtyTree(run, path) ?? unpublishedCommit(run, path, [`--exclude=${RETIRE_REFS}*`, "--all"], refsUnder(run, path, "refs/notes/").length > 0);
+export const checkoutHeldWork = (run: CtoExec, path: string): string | null => {
+  const dirty = dirtyTree(run, path);
+  if (dirty) return dirty;
+  const notes = refsUnder(run, path, "refs/notes/");
+  if (notes === null) return `${path}'s notes refs could not be listed`;
+  return inFreshNamespace(run, path, (namespace) => unpublishedCommit(run, path, [`--exclude=${RETIRE_REFS}*`, "--all"], notes.length > 0, namespace));
+};
 
 /**
  * The same question for a worker checkout. A worker clone keeps no remote-tracking refs of its own, so its HEAD and
- * every one of its refs are fetched into a temporary namespace of the project's primary clone and compared there with
- * that clone's remote-tracking refs and origin's notes; the namespace is removed again either way. Anything that
- * cannot be established answers as held work. Refs as last fetched can only make less look published, never more.
+ * every one of its refs are fetched into a fresh namespace of the project's primary clone and compared there with that
+ * clone's remote-tracking refs and origin's notes; the namespace is cleared again either way. Anything that cannot be
+ * established, a fetch or a clear that git refuses included, answers as held work.
  */
-export const workerHeldWork = (run: CtoExec, primary: string | null, worker: string, repositoryId: string): string | null => {
+export const workerHeldWork = (run: CtoExec, primary: string | null, worker: string): string | null => {
   const dirty = dirtyTree(run, worker);
   if (dirty) return dirty;
   if (primary === null) return "there is no primary clone to compare its commits with";
-  const namespace = `${RETIRE_REFS}${repositoryId}/`;
-  try {
-    clearRefs(run, primary, namespace);
-    const fetched = run("git", ["-C", primary, "fetch", "--no-tags", "--quiet", worker, `+refs/*:${namespace}*`, `+HEAD:${namespace}HEAD`], { timeoutMs: 120_000 });
+  return inFreshNamespace(run, primary, (namespace) => {
+    const workerRefs = `${namespace}worker/`;
+    const fetched = run("git", ["-C", primary, "fetch", "--no-tags", "--quiet", worker, `+refs/*:${workerRefs}*`, `+HEAD:${workerRefs}HEAD`], { timeoutMs: 120_000 });
     if (fetched.status !== 0) return `its commits could not be read into ${primary}: ${firstLine(fetched.stderr)}`;
-    const refs = refsUnder(run, primary, namespace);
-    if (refs.length === 0) return `its commits could not be read into ${primary}`;
-    return unpublishedCommit(run, primary, refs, refs.some((ref) => ref.startsWith(`${namespace}notes/`)));
-  } finally {
-    clearRefs(run, primary, namespace);
-  }
+    const refs = refsUnder(run, primary, workerRefs);
+    if (refs === null || refs.length === 0) return `its commits could not be read into ${primary}`;
+    return unpublishedCommit(run, primary, refs, refs.some((ref) => ref.startsWith(`${workerRefs}notes/`)), namespace);
+  });
 };
 
 const retirePlan = (ports: CtoPorts, record: CtoRecord, options: { reason: string; deleteRepo: string | null }): CtoStep[] => {
@@ -690,7 +719,7 @@ const retirePlan = (ports: CtoPorts, record: CtoRecord, options: { reason: strin
         if (madeFrom.status !== 0 || madeFrom.stdout.trim() !== from) return refused(`${path} is not a worker clone made from ${from}; it was left as it is`, { removed, kept });
         const repositoryId = basename(path);
         // The whole repository goes with --delete-repo, so its unpublished work is already given up.
-        const why = options.deleteRepo ? null : workerHeldWork(ports.run, primary, path, repositoryId);
+        const why = options.deleteRepo ? null : workerHeldWork(ports.run, primary, path);
         if (why === null) {
           ports.files.remove(path);
           removed.push(path);
