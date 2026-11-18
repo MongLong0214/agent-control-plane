@@ -3,11 +3,13 @@
  * End-to-end smoke for a CTO session's Buzz channel, against the real Claude Code binary.
  *
  * It starts an INTERACTIVE Claude Code session in a throwaway tmux server (the host the resident CTOs
- * run in), loaded with this repository's `src/cli/buzz-channel.ts` through `--mcp-config` and
- * `--dangerously-load-development-channels server:acp-buzz-channel`, pointed at a local TLS relay this
- * script runs, and proves two things:
+ * run in), launched the way a resident CTO is: the BUILT entry (`dist/cli/buzz-channel.js`, so run `pnpm build`
+ * first) named through a `<state>/current` link to a generation, with the argv and flags `channelLaunchArgs` gives
+ * the resident launcher (`--mcp-config` and `--dangerously-load-development-channels server:acp-buzz-channel`), the
+ * relay found in the state directory's `buzz-nostr-subscriber.json` and the sender declared in `owner-identities`.
+ * The only additions are a trust anchor for the local TLS relay this script runs. It proves two things:
  *
- *   1. a mention signed by the "CEO" key reaches the session as a channel message
+ *   1. a mention signed by a declared sender key reaches the session as a channel message
  *      (the `Channels (experimental)` notice appears and the message is shown as `← acp-buzz-channel: …`), and
  *   2. the session answers it with the `reply` tool, and the relay receives a kind-9 signed by the
  *      CTO key, in the room, threaded under the mention.
@@ -29,13 +31,13 @@
  */
 import { execFileSync, spawnSync } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:https';
 import { homedir, tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { finalizeEvent, generateSecretKey, getPublicKey, verifyEvent } from 'nostr-tools/pure';
-import { classifyScreen, confirmChannelStartup, tmuxChannelDriver } from '../src/runtime/cto-channel-launch.ts';
+import { channelLaunchArgs, classifyScreen, confirmChannelStartup, launchFolderTrust, tmuxChannelDriver } from '../src/runtime/cto-channel-launch.ts';
 
 const NOT_RUN = 77;
 const argv = process.argv.slice(2);
@@ -136,14 +138,35 @@ const relayUrl = `wss://127.0.0.1:${relayServer.address().port}`;
 say(`local relay at ${relayUrl}`);
 
 // ---- the session ---------------------------------------------------------------------------------
-const mcpConfig = JSON.stringify({ mcpServers: { 'acp-buzz-channel': { command: process.execPath, env: { NODE_EXTRA_CA_CERTS: certPem },
-  args: ['--experimental-transform-types', '--disable-warning=ExperimentalWarning', join(root, 'src', 'cli', 'buzz-channel.ts'), '--project-id', 'smoke', '--key-file', keyFile, '--room', ROOM, '--state-dir', state, '--relay-url', relayUrl, '--ceo-pubkey', ceoPub] } } });
+// The runtime is laid out as a deployment lays it out, and the channel is started with the argv the resident launcher
+// gives it: `<state>/current` is a link to a generation, and the entry is named through that link. (A launch through that
+// link once exited at once, having done nothing, and Claude Code saw "Connection closed".) The relay is found where the
+// daemon's subscriber finds it, in the state directory's own configuration, and the sender is declared the way an owner
+// is, in `owner-identities`, so the channel needs nothing beyond what the resident launcher passes it.
+const builtEntry = join(root, 'dist', 'cli', 'buzz-channel.js');
+if (!existsSync(builtEntry)) bail(NOT_RUN, 'not run: dist/cli/buzz-channel.js is not built (run pnpm build): the smoke launches the built entry through a current link');
+const generation = join(state, 'runtime', 'generation-smoke');
+mkdirSync(join(generation, 'dist', 'bin'), { recursive: true });
+symlinkSync(process.execPath, join(generation, 'dist', 'bin', 'node'));
+symlinkSync(join(root, 'dist', 'cli'), join(generation, 'dist', 'cli'));
+symlinkSync(generation, join(state, 'current'));
+writeFileSync(join(state, 'buzz-nostr-subscriber.json'), JSON.stringify({ relayUrl, identities: [{ privateKeyFile: keyFile, encoding: 'hex', rooms: [ROOM] }] }));
+writeFileSync(join(state, 'owner-identities'), `buzz:${ceoPub}\n`);
+const launch = channelLaunchArgs({ runtimeNode: join(state, 'current', 'dist', 'bin', 'node'), runtimeCli: join(state, 'current', 'dist', 'cli', 'agentctl.js'),
+  projectId: 'smoke', keyFile, roomId: ROOM, stateDir: state });
+// Only the trust anchor for this script's own relay is added; the command and its arguments are the launcher's.
+const mcpConfig = JSON.parse(launch[1]);
+mcpConfig.mcpServers['acp-buzz-channel'].env = { NODE_EXTRA_CA_CERTS: certPem };
+launch[1] = JSON.stringify(mcpConfig);
 try { execFileSync(trust, [cwd], { stdio: 'ignore' }); } catch { bail(NOT_RUN, 'not run: the throwaway directory could not be pre-registered as trusted'); }
+// The launchers' own pre-spawn check, against the record the trust script just wrote: it must read as trusted here, where
+// Claude Code then shows no trust dialog, or it is not the record Claude Code reads.
+const folderTrust = launchFolderTrust(cwd, { home: homedir() });
+if (!folderTrust.trusted) bail(NOT_RUN, `not run: the launchers' trust check does not find the throwaway directory trusted (${folderTrust.reason})`);
 // The launch goes through a launcher script, as a resident CTO's does, so the pane's start command is the script.
 const launcher = join(work, 'launcher.sh');
 const quote = (v) => `'${String(v).replaceAll("'", "'\\''")}'`;
-writeFileSync(launcher, `#!/bin/sh\ncd ${quote(cwd)} || exit 1\nexec ${['claude', '--strict-mcp-config', '--mcp-config', mcpConfig, '--dangerously-load-development-channels', 'server:acp-buzz-channel',
-  '--model', model, '--allowedTools', 'mcp__acp-buzz-channel__reply'].map(quote).join(' ')}\n`, { mode: 0o700 });
+writeFileSync(launcher, `#!/bin/sh\ncd ${quote(cwd)} || exit 1\nexec ${['claude', '--model', model, ...launch, '--strict-mcp-config', '--allowedTools', 'mcp__acp-buzz-channel__reply'].map(quote).join(' ')}\n`, { mode: 0o700 });
 const started = tmux('new-session', '-d', '-x', '200', '-y', '50', '-s', 'smoke', launcher);
 if (started.status !== 0) bail(1, `failed: tmux could not start the session: ${started.stderr}`);
 const screen = () => tmux('capture-pane', '-p', '-t', 'smoke').stdout ?? '';

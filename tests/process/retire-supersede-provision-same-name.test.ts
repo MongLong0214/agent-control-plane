@@ -170,6 +170,8 @@ it('#1230: retire, then a bootstrap that supersedes the retired project, provisi
   for (const cmd of ['buzz','claude']) writeFileSync(join(pinned,cmd),fakeHost,{mode:0o700});
   writeFileSync(join(home,'.hermes','bridge','keys','owner.pub'),'c'.repeat(64));
   writeFileSync(join(home,'.claude','scripts','claude-trust-dir.sh'),'#!/bin/sh\nexit 0\n',{mode:0o700});
+  // Claude Code's own store (the file CLAUDE_CONFIG_DIR names below), where each launch's folder must already be trusted; both projects share this clone path.
+  writeFileSync(join(home,'.claude','.claude.json'),JSON.stringify({projects:{[join(home,'projects','fixture')]:{hasTrustDialogAccepted:true}}}));
   // The ACP runtime the resident's MCP entry names; it never runs here.
   writeFileSync(join(root,'current','dist','bin','node'),'#!/bin/sh\nexit 99\n',{mode:0o700});
   writeFileSync(join(root,'current','dist','cli','agentctl.js'),'throw new Error("runtime must not run in tests");');
