@@ -37,7 +37,7 @@ import { homedir, tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { finalizeEvent, generateSecretKey, getPublicKey, verifyEvent } from 'nostr-tools/pure';
-import { channelLaunchArgs, classifyScreen, confirmChannelStartup, tmuxChannelDriver } from '../src/runtime/cto-channel-launch.ts';
+import { channelLaunchArgs, classifyScreen, confirmChannelStartup, launchFolderTrust, tmuxChannelDriver } from '../src/runtime/cto-channel-launch.ts';
 
 const NOT_RUN = 77;
 const argv = process.argv.slice(2);
@@ -159,6 +159,10 @@ const mcpConfig = JSON.parse(launch[1]);
 mcpConfig.mcpServers['acp-buzz-channel'].env = { NODE_EXTRA_CA_CERTS: certPem };
 launch[1] = JSON.stringify(mcpConfig);
 try { execFileSync(trust, [cwd], { stdio: 'ignore' }); } catch { bail(NOT_RUN, 'not run: the throwaway directory could not be pre-registered as trusted'); }
+// The launchers' own pre-spawn check, against the record the trust script just wrote: it must read as trusted here, where
+// Claude Code then shows no trust dialog, or it is not the record Claude Code reads.
+const folderTrust = launchFolderTrust(cwd, { home: homedir() });
+if (!folderTrust.trusted) bail(NOT_RUN, `not run: the launchers' trust check does not find the throwaway directory trusted (${folderTrust.reason})`);
 // The launch goes through a launcher script, as a resident CTO's does, so the pane's start command is the script.
 const launcher = join(work, 'launcher.sh');
 const quote = (v) => `'${String(v).replaceAll("'", "'\\''")}'`;

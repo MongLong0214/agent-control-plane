@@ -1,3 +1,4 @@
+import { readFileSync, realpathSync } from "node:fs";
 import { dirname, join } from "node:path";
 
 /**
@@ -52,6 +53,81 @@ export const channelLaunchArgs = (input: ChannelLaunchInput): string[] => [
   CHANNEL_DEV_FLAG,
   `server:${BUZZ_CHANNEL_SERVER}`,
 ];
+
+// ---- the folder Claude Code will start in is already trusted ------------------------------------
+//
+// The one keystroke below is sent on a screen read a moment earlier, and tmux cannot make reading a pane and pressing a key
+// one step: a pane that is redrawn between them gets the key. So what could be on the other side of that gap is removed
+// before Claude Code starts. Claude Code's startup dialogs run in a fixed order (2.1.323): onboarding; the workspace trust
+// dialog; a project's .mcp.json servers; CLAUDE.md files that import from outside the folder; account and policy notices
+// (code mode, Grove, a Pro trial); an API key that was never approved; the bypass-permissions warning; this channel's
+// development-channels warning; then, only with Claude in Chrome on, its two dialogs. Only the last two can follow the one
+// this module presses; the rest come first, and a dialog the launcher reads that is not that warning is refused unpressed.
+//
+// The trust dialog is the one the launcher can rule out for certain, so it does: the launch folder must already carry the
+// trust record `~/.claude/scripts/claude-trust-dir.sh` writes, `projects[<real path>].hasTrustDialogAccepted`, and a launch
+// without it never starts Claude. Nothing is ever trusted here: this only reads, and the owner records trust. The record
+// must be the folder's own: Claude Code also accepts a trusted folder above it, under rules about git roots that are not
+// modelled here, so a folder trusted only that way is refused, and the owner runs the script on the folder itself.
+//
+// Not excluded, and so a Limit of this launcher: a first run's onboarding screens (`hasCompletedOnboarding`), a project
+// `.mcp.json` server nobody approved, a CLAUDE.md import from outside the folder nobody approved, a pending account or
+// policy notice, an unapproved `ANTHROPIC_API_KEY`, and the bypass-permissions warning when `skipDangerousModePermissionPrompt`
+// is not set (both resident launches pass the bypass flags). Each comes before the warning, so none can follow a screen read
+// as the warning; the launcher only refuses to press them. After the key, a screen that is not the registered line, such as
+// a Claude in Chrome dialog, is recorded as CTO_CHANNEL_STARTUP_REFUSED and no second key is sent.
+
+export type FolderTrustRefusal =
+  | "folder-unresolvable"
+  | "persisted-trust-ignored"
+  | "home-folder"
+  | "store-unreadable"
+  | "no-record";
+
+export type FolderTrust =
+  | { readonly trusted: true; readonly folder: string }
+  | { readonly trusted: false; readonly folder: string | null; readonly reason: FolderTrustRefusal };
+
+/**
+ * Whether Claude Code, started in `cwd`, would find that folder already trusted, by the record the trust script writes.
+ * Reads Claude Code's global config (`$CLAUDE_CONFIG_DIR/.claude.json`, else `<home>/.claude.json`) and writes nothing.
+ * The home folder is never trusted: Claude Code keeps its answer there for one session only. A launch environment that
+ * tells Claude Code to ignore persisted trust is never trusted either.
+ */
+export const launchFolderTrust = (
+  cwd: string,
+  options: { readonly home: string; readonly env?: Readonly<Record<string, string | undefined>> },
+): FolderTrust => {
+  const env = options.env ?? process.env;
+  let folder: string;
+  try {
+    folder = realpathSync(cwd);
+  } catch {
+    return { trusted: false, folder: null, reason: "folder-unresolvable" };
+  }
+  if ((env["CLAUDE_CODE_IGNORE_PERSISTED_TRUST"] ?? "") !== "") return { trusted: false, folder, reason: "persisted-trust-ignored" };
+  let home = options.home;
+  try {
+    home = realpathSync(options.home);
+  } catch {
+    // An unresolvable home cannot be this folder's link target; compare as given.
+  }
+  if (folder === home) return { trusted: false, folder, reason: "home-folder" };
+  let store: unknown;
+  try {
+    const configDir = env["CLAUDE_CONFIG_DIR"] ?? "";
+    store = JSON.parse(readFileSync(join(configDir === "" ? options.home : configDir, ".claude.json"), "utf8"));
+  } catch {
+    return { trusted: false, folder, reason: "store-unreadable" };
+  }
+  if (store === null || typeof store !== "object" || Array.isArray(store)) return { trusted: false, folder, reason: "store-unreadable" };
+  const projects = (store as { projects?: unknown }).projects;
+  const record = projects !== null && typeof projects === "object" && Object.hasOwn(projects, folder)
+    ? (projects as Record<string, unknown>)[folder]
+    : undefined;
+  const accepted = record !== null && typeof record === "object" && (record as { hasTrustDialogAccepted?: unknown }).hasTrustDialogAccepted === true;
+  return accepted ? { trusted: true, folder } : { trusted: false, folder, reason: "no-record" };
+};
 
 // ---- confirming Claude Code's development-channels warning -------------------------------------
 //

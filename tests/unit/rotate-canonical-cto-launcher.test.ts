@@ -1,6 +1,6 @@
 import { type ChildProcess, spawn } from "node:child_process";
 import { once } from "node:events";
-import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -46,7 +46,7 @@ const stub = (path: string, body: string) => {
 const running = (pid: number) => { try { process.kill(pid, 0); return true; } catch { return false; } };
 
 /** `childMs`: how long the old conversation's child (a shell writer of its own) outlives the old process. */
-const fixture = async (initial: Mode, childMs = 1_200) => {
+const fixture = async (initial: Mode, childMs = 1_200, folderTrusted = true) => {
   const dir = tempDir("acp-rotlaunch-");
   const cwd = join(dir, "project");
   const home = join(dir, "home");
@@ -64,7 +64,12 @@ const fixture = async (initial: Mode, childMs = 1_200) => {
   writeFileSync(db, JSON.stringify({ holderSessionUuid: OLD, generation: 1, binding: { generation: 1, sessionId: "ses_old", lifecycle: "READY", liveRuns: [] },
     channel: { actorId: getPublicKey(ctoKey), room: ROOM }, buzz: { verdict: "ADMITTED", sessionId: "ses_old", generation: 1 }, rotations: [] }));
   const previousArgs = ["/rt/agentctl.js", "attach", "canonical-cto", "--claimed-session-id", OLD, "--project-id", PROJECT, "--expected-binding-generation", "1"];
-  writeFileSync(join(home, ".claude.json"), JSON.stringify({ projects: { [cwd]: { mcpServers: { "acp-cto": { type: "stdio", command: "/rt/node", args: previousArgs, env: {} } } } } }));
+  // Claude Code's own store, as `claude-trust-dir.sh` writes it: the folder's real path with the trust flag. A launch whose
+  // folder is not trusted there is refused before anything moves, so the fixture's folder is trusted unless a case says not.
+  const entry = { mcpServers: { "acp-cto": { type: "stdio", command: "/rt/node", args: previousArgs, env: {} } } };
+  const projects: Record<string, Record<string, unknown>> = { [cwd]: entry };
+  if (folderTrusted) projects[realpathSync(cwd)] = { ...projects[realpathSync(cwd)], hasTrustDialogAccepted: true };
+  writeFileSync(join(home, ".claude.json"), JSON.stringify({ projects }));
   const handoff = join(dir, "handoff.json");
   writeFileSync(handoff, JSON.stringify({ projectStatus: "green", activeManifestDigest: null, recentDecisions: [], openBlockers: [], queuedWork: [],
     repositoryFacts: [], knownRisks: [], recommendedNextAction: "continue" }));
@@ -287,6 +292,33 @@ describe("rotate-canonical-cto.mjs: handoff -> rotate -> stop old (confirmed, wi
     const result = await f.launch();
     expect(result.code, result.stderr + result.stdout).toBe(68);
     expect(f.calls().some((call) => call[0] === "agentctl" && call[2] === "rotate")).toBe(false);
+  });
+
+  it("refuses before anything moves when the launch folder is not trusted in Claude Code's store, and trusts nothing itself", async () => {
+    const f = await fixture("claims", 1_200, false);
+    const store = readFileSync(join(f.home, ".claude.json"), "utf8");
+    const result = await f.launch();
+    expect(result.code, result.stderr + result.stdout).toBe(69);
+    expect(f.steps(result.stdout).at(-1)).toMatchObject({
+      step: "workspace-trust", refused: "CTO_CHANNEL_CWD_NOT_TRUSTED", reason: "no-record", folder: realpathSync(f.cwd),
+    });
+    // The old conversation is untouched and no Claude, no tmux session and no switchover was started: the key that would
+    // answer a trust dialog is never given a chance to.
+    const calls = f.calls();
+    expect(calls.some((call) => call[0] === "agentctl" && call[2] === "rotate")).toBe(false);
+    expect(calls.some((call) => call[0] === "claude" || call[0] === "tmux")).toBe(false);
+    expect(running(f.old.pid!)).toBe(true);
+    expect(readFileSync(join(f.home, ".claude.json"), "utf8")).toBe(store);
+  });
+
+  it("starts when the folder is trusted, with no keystroke for anything but the one warning", async () => {
+    const f = await fixture("claims");
+    writeFileSync(join(f.dir, "screen"), WARNING_SCREEN);
+    writeFileSync(join(f.dir, "screen-after"), REGISTERED_SCREEN);
+    const result = await f.launch();
+    expect(result.code, result.stderr + result.stdout).toBe(0);
+    expect(f.steps(result.stdout).some((line) => line.step === "workspace-trust")).toBe(false);
+    expect(f.calls().filter((call) => call[0] === "tmux" && call[1] === "send-keys")).toEqual([["tmux", "send-keys", "-t", "%1", "Enter"]]);
   });
 
   it("does not take a room or key from the command line", async () => {

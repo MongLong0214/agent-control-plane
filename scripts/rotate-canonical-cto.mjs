@@ -25,7 +25,10 @@
 //
 // The new conversation is always started with the project's Buzz channel, with the room and identity its canonical
 // entitlement holds and that identity's key file (`~/.hermes/bridge/keys/cto-<project>.priv`): any of them missing or
-// disagreeing is refused before the old conversation is touched (exit 68), never answered by starting without it. Claude
+// disagreeing is refused before the old conversation is touched (exit 68), never answered by starting without it. The
+// folder it starts in must also already be trusted in Claude Code's own store (`claude-trust-dir.sh` records that): else
+// it is refused the same way (exit 69, CTO_CHANNEL_CWD_NOT_TRUSTED), because a trust dialog must not be able to take the
+// one key sent for the warning, and nothing here ever trusts a folder for the owner. Claude
 // Code's development-channels warning is confirmed (that screen only, on the launch's own pane); a screen the launcher may
 // not press is not a start failure: the new conversation is left running there, the refusal is written to
 // rotations/<project>-<uuid>.channel-refusal.json, nothing is killed, and the switchover stays pending (exit 5).
@@ -34,7 +37,7 @@ import { chmodSync, closeSync, mkdirSync, openSync, readFileSync, renameSync, rm
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { getPublicKey } from 'nostr-tools/pure';
-import { channelLaunchArgs, confirmChannelStartup, tmuxChannelDriver } from '../src/runtime/cto-channel-launch.ts';
+import { channelLaunchArgs, confirmChannelStartup, launchFolderTrust, tmuxChannelDriver } from '../src/runtime/cto-channel-launch.ts';
 
 const usage = 'usage: rotate-canonical-cto.mjs --project <id> --to <uuid> --expected-generation <n> --cwd <dir> --old-pid <pid> --tmux-session <name> --handoff <package.json> [--timeout-ms <ms>] [--poll-ms <ms>] [--stop-timeout-ms <ms>]';
 const flags = {};
@@ -212,6 +215,14 @@ const channel = (() => {
   }
   return refuse(failure);
 })();
+// The new conversation's folder must already be trusted in Claude Code's own store, or nothing is started: the launcher
+// sends one key on a screen read a moment before, and a trust dialog must not be able to take it. Refused here, before the
+// old conversation is touched, and only read: the owner records the trust (`claude-trust-dir.sh <folder>`), never this.
+const folderTrust = launchFolderTrust(flags.cwd, { home: process.env.HOME ?? homedir() });
+if (!folderTrust.trusted) {
+  stop(69, 'workspace-trust', { refused: 'CTO_CHANNEL_CWD_NOT_TRUSTED', reason: folderTrust.reason, folder: folderTrust.folder,
+    note: 'nothing was changed; trust the folder with claude-trust-dir.sh and run this launcher again with the same arguments' });
+}
 const old = before.value.holderSessionUuid;
 const resumed = (before.value.rotations ?? []).find((rotation) => rotation.state === 'PENDING') ?? null;
 if (resumed && (resumed.toSessionUuid !== to || resumed.fromGeneration !== expected || resumed.fromSessionUuid !== old)) {
