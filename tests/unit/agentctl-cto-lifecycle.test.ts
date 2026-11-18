@@ -140,7 +140,10 @@ const makeWorld = (overrides: Partial<CtoRecord> = {}, env: Record<string, strin
     if (bin === "git" && args[2] === "config") return answer(0, `${CLONE}\n`);
     // The worker's branches and HEAD, fetched into a namespace of the primary clone and compared with its remotes.
     if (bin === "git" && args[2] === "fetch") return w.worker.fetchFails ? answer(128, "", "fatal: could not read from the worker\n") : answer(0);
-    if (bin === "git" && args[2] === "for-each-ref") return answer(0, w.ran.some((l) => l.includes(" fetch ")) ? `${args[4]}HEAD\n${args[4]}heads/main\n` : "");
+    if (bin === "git" && args[2] === "for-each-ref") {
+      const workerNamespace = args[4]!.startsWith("refs/acp-cto-retire/repo_") && w.ran.some((l) => l.includes(` fetch --no-tags --quiet ${WORKER} `));
+      return answer(0, workerNamespace ? `${args[4]}HEAD\n${args[4]}heads/main\n` : "");
+    }
     if (bin === "git" && args[2] === "rev-list") {
       const unpublished = args.includes("--all") ? w.archiveUnpublished : w.worker.unpublished;
       return answer(0, unpublished ? "deadbeefcafe0123\n" : "");
@@ -479,7 +482,7 @@ describe("review r1", () => {
 describe("review r1, item 2: held work, read from real repositories", () => {
   // The production runner, resolved inside each test so that one missing export fails only the tests that use it.
   const run: CtoExec = (bin, args, options) => hostRunner({ ...process.env, GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@example.invalid", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@example.invalid" })(bin, args, options);
-  const repos = (): { primary: string; worker: string } => {
+  const repos = (): { primary: string; worker: string; root: string } => {
     const root = tempDir("acp-cto-held-");
     gitSync(root, ["init", "-q", "--bare", "origin.git"]);
     gitSync(root, ["clone", "-q", join(root, "origin.git"), "primary"]);
@@ -491,7 +494,7 @@ describe("review r1, item 2: held work, read from real repositories", () => {
     gitSync(root, ["clone", "-q", primary, "worker"]);
     const worker = join(root, "worker");
     gitSync(worker, ["remote", "remove", "origin"]);
-    return { primary, worker };
+    return { primary, worker, root };
   };
 
   it("finds nothing in a clean, published checkout", () => {
@@ -519,6 +522,60 @@ describe("review r1, item 2: held work, read from real repositories", () => {
     writeFileSync(join(worker, "notes.txt"), "x\n");
     expect(checkoutHeldWork(run, primary)).toMatch(/uncommitted or untracked/);
     expect(workerHeldWork(run, primary, worker, "repo_x")).toMatch(/uncommitted or untracked/);
+  });
+});
+
+describe("review r2", () => {
+  const CLAIMED_BY_HOLDER = { toSessionUuid: CONVERSATION, fromGeneration: 25, claimedGeneration: 26, revoked: false };
+
+  it("1: a saved relaunch target is verified only by its own conversation, not by another one holding the role", async () => {
+    const saved = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+    const w = makeWorld({ kind: "canonical", resident: null, generation: 26, lastRotation: CLAIMED_BY_HOLDER });
+    w.files.set(`${STATE}/cto-relaunch-${P}.json`, JSON.stringify({ to: saved }));
+    expect(await runCtoCommand(["relaunch", P, "--handoff", "/h.json", "--apply"], w.ports)).toBe(0);
+    expect(w.rotateRuns).toEqual([saved]);
+  });
+
+  it("2: a fresh relaunch is not held back by the current holder's broken Buzz reception: it warns and relaunches", async () => {
+    const w = makeWorld({ kind: "canonical", resident: null, generation: 26, lastRotation: CLAIMED_BY_HOLDER });
+    w.buzzVerified = false;
+    expect(await runCtoCommand(["relaunch", P, "--handoff", "/h.json", "--apply"], w.ports)).toBe(0);
+    expect(w.rotateRuns).toHaveLength(1);
+    expect(w.rotateRuns[0]).not.toBe(CONVERSATION);
+    const rotated = w.out.find((l) => l["step"] === "rotate" && l["result"] === "done")!;
+    expect(JSON.stringify(rotated["detail"])).toMatch(/warning.*not verified on Buzz/);
+  });
+});
+
+describe("review r2, item 3: notes on a real bare origin", () => {
+  const run: CtoExec = (bin, args, options) => hostRunner({ ...process.env })(bin, args, options);
+
+  it("does not count notes published to origin as held work, and still counts notes that are not", () => {
+    const root = tempDir("acp-cto-notes-");
+    gitSync(root, ["init", "-q", "--bare", "origin.git"]);
+    gitSync(root, ["clone", "-q", join(root, "origin.git"), "primary"]);
+    const primary = join(root, "primary");
+    writeFileSync(join(primary, "README.md"), "one\n");
+    commitAll(primary, "one");
+    gitSync(primary, ["push", "-q", "origin", "HEAD:main"]);
+    gitSync(primary, ["fetch", "-q", "origin"]);
+    gitSync(primary, ["notes", "--ref=commitlore", "add", "-m", "a record", "HEAD"]);
+    gitSync(primary, ["push", "-q", "origin", "refs/notes/commitlore"]);
+    gitSync(root, ["clone", "-q", primary, "worker"]);
+    const worker = join(root, "worker");
+    gitSync(worker, ["remote", "remove", "origin"]);
+    // A worker clone carries the resident's notes refs (#1268).
+    gitSync(worker, ["fetch", "-q", primary, "refs/notes/commitlore:refs/notes/commitlore"]);
+
+    expect(checkoutHeldWork(run, primary)).toBeNull();
+    expect(workerHeldWork(run, primary, worker, "repo_x")).toBeNull();
+    expect(gitSync(primary, ["for-each-ref", "refs/acp-cto-retire/"])).toBe("");
+
+    gitSync(primary, ["notes", "--ref=commitlore", "append", "-m", "never pushed", "HEAD"]);
+    gitSync(worker, ["notes", "--ref=commitlore", "append", "-m", "worker only", "HEAD"]);
+    expect(checkoutHeldWork(run, primary)).toMatch(/commit [0-9a-f]{12}/);
+    expect(workerHeldWork(run, primary, worker, "repo_x")).toMatch(/commit [0-9a-f]{12}/);
+    expect(gitSync(primary, ["for-each-ref", "refs/acp-cto-retire/"])).toBe("");
   });
 });
 

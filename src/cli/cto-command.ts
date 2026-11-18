@@ -366,7 +366,7 @@ const verifyRotation = async (ports: CtoPorts, projectId: string, to: string, ge
       buzz.reception?.subscriber?.connected === true && buzz.reception.subscriber.liveness === "LIVE" && buzz.reception.subscriber.delivering === true &&
       buzz.reception.ingress?.listening === true) return ok({ verified: to, generation });
     if (ports.now() >= deadline) {
-      return refused(`conversation ${to} holds the role at generation ${generation} and is not verified on Buzz; no other rotation was started`, { buzz: seen?.buzz ?? null });
+      return refused(`conversation ${to} holds the role at generation ${generation} and is not verified on Buzz`, { buzz: seen?.buzz ?? null });
     }
     await ports.sleep(2_000);
   }
@@ -387,15 +387,18 @@ const rotateStep = (ports: CtoPorts, projectId: string, handoff: string | null, 
     if (!record) return refused("the project is not registered");
     const unfinished = readRelaunchMarker(ports, projectId) === to;
     const claimed = claimedByHolder(record);
-    if (claimed && (unfinished || claimed.toSessionUuid === to)) {
-      const verified = await verifyRotation(ports, projectId, claimed.toSessionUuid, claimed.claimedGeneration!, VERIFY_WAIT_MS);
-      if (verified.ok) ports.files.remove(marker);
+    // Only the target itself, once it holds the role, is verified instead of rotated to: never another conversation.
+    if (claimed && claimed.toSessionUuid === to) {
+      const verified = await verifyRotation(ports, projectId, to, claimed.claimedGeneration!, VERIFY_WAIT_MS);
+      if (!verified.ok) return refused(`${verified.reason}; no other rotation was started`, verified.detail);
+      ports.files.remove(marker);
       return verified;
     }
-    // A rotation another run left claimed and unverified is that rotation's to finish, not a reason to start another.
+    // A fresh relaunch is how a holder whose Buzz reception is broken is recovered, so that is reported, never a refusal.
+    let warning: string | null = null;
     if (claimed && !unfinished) {
       const now = await verifyRotation(ports, projectId, claimed.toSessionUuid, claimed.claimedGeneration!, 0);
-      if (!now.ok) return now;
+      if (!now.ok) warning = `${now.reason}; relaunching to recover it`;
     }
     if (!handoff) return refused("--handoff <package.json> is required: rotate-canonical-cto starts the new conversation from that handoff package");
     if (!ports.scripts.rotate) return refused("rotate-canonical-cto.mjs was not found (set ACP_ROTATE_CANONICAL_CTO)");
@@ -413,9 +416,10 @@ const rotateStep = (ports: CtoPorts, projectId: string, handoff: string | null, 
       "--old-pid", String(old[0]?.pid ?? record.session?.pid ?? 0), "--tmux-session", `cto-${projectId}-${to.slice(0, 8)}`, "--handoff", handoff,
     ], { env: scriptEnv(ports), timeoutMs: 600_000 });
     const last = lastJsonLine(answer.stdout) ?? {};
-    if (answer.status !== 0) return refused(`rotate-canonical-cto exited ${answer.status ?? "on timeout"} at its ${String(last["step"] ?? "first")} step; run this again to continue with conversation ${to}`, last);
+    const noted = warning ? { warning } : {};
+    if (answer.status !== 0) return refused(`rotate-canonical-cto exited ${answer.status ?? "on timeout"} at its ${String(last["step"] ?? "first")} step; run this again to continue with conversation ${to}`, { ...last, ...noted });
     ports.files.remove(marker);
-    return ok({ to, ...last });
+    return ok({ to, ...last, ...noted });
   },
 });
 
@@ -550,50 +554,65 @@ const dirtyTree = (run: CtoExec, path: string): string | null => {
   return status.stdout.trim() ? `${path} has uncommitted or untracked files` : null;
 };
 
+/** origin's notes refs, fetched into this namespace of the repository being checked while a check runs. */
+const ORIGIN_NOTES = `${RETIRE_REFS}origin-notes/`;
+const refsUnder = (run: CtoExec, repo: string, prefix: string): string[] =>
+  run("git", ["-C", repo, "for-each-ref", "--format=%(refname)", prefix], { timeoutMs: 60_000 }).stdout.split("\n").filter((ref) => ref.startsWith(prefix));
+const clearRefs = (run: CtoExec, repo: string, prefix: string): void => {
+  const refs = refsUnder(run, repo, prefix);
+  if (refs.length > 0) run("git", ["-C", repo, "update-ref", "--stdin"], { timeoutMs: 60_000, input: refs.map((ref) => `delete ${ref}\n`).join("") });
+};
+
+/**
+ * The first commit reachable from `positives` that `repo`'s remotes do not contain, as held work, or null. A notes ref
+ * (CommitLore's records) is never a remote-tracking branch, so when the positives hold notes, origin's own notes refs
+ * are fetched into ORIGIN_NOTES and count as published too; notes that cannot be compared with origin's are held work.
+ */
+const unpublishedCommit = (run: CtoExec, repo: string, positives: readonly string[], notes: boolean): string | null => {
+  try {
+    clearRefs(run, repo, ORIGIN_NOTES);
+    if (notes) {
+      const fetched = run("git", ["-C", repo, "fetch", "--no-tags", "--quiet", "origin", `+refs/notes/*:${ORIGIN_NOTES}*`], { timeoutMs: 120_000 });
+      if (fetched.status !== 0) return `its notes could not be compared with origin's: ${firstLine(fetched.stderr)}`;
+    }
+    const ahead = run("git", ["-C", repo, "rev-list", "--max-count=1", ...positives, "--not", "--remotes", `--glob=${ORIGIN_NOTES}*`], { timeoutMs: 120_000 });
+    if (ahead.status !== 0) return `its commits could not be compared with ${repo}'s remotes: ${firstLine(ahead.stderr)}`;
+    const commit = ahead.stdout.trim();
+    return commit ? `commit ${commit.slice(0, 12)} is on no remote-tracking branch or notes ref of ${repo}'s origin` : null;
+  } finally {
+    clearRefs(run, repo, ORIGIN_NOTES);
+  }
+};
+
 /**
  * Why a checkout holds work no remote has, or null only on proof that it holds none: its tree is clean, and every
  * commit reachable from HEAD or any of its refs (`--all`, stash and private refs included) is contained in its
- * remote-tracking refs. Neither the archive nor a worker is removed while this answers, unless the repository goes too.
+ * remote-tracking refs, or for its notes in origin's notes refs. Neither the archive nor a worker is removed while
+ * this answers, unless the repository goes too.
  */
-export const checkoutHeldWork = (run: CtoExec, path: string): string | null => {
-  const dirty = dirtyTree(run, path);
-  if (dirty) return dirty;
-  const ahead = run("git", ["-C", path, "rev-list", "--max-count=1", `--exclude=${RETIRE_REFS}*`, "--all", "--not", "--remotes"], { timeoutMs: 120_000 });
-  if (ahead.status !== 0) return `${path}'s commits could not be compared with its remotes: ${firstLine(ahead.stderr)}`;
-  const commit = ahead.stdout.trim();
-  return commit ? `commit ${commit.slice(0, 12)} is on no remote-tracking branch of ${path}` : null;
-};
+export const checkoutHeldWork = (run: CtoExec, path: string): string | null =>
+  dirtyTree(run, path) ?? unpublishedCommit(run, path, [`--exclude=${RETIRE_REFS}*`, "--all"], refsUnder(run, path, "refs/notes/").length > 0);
 
 /**
  * The same question for a worker checkout. A worker clone keeps no remote-tracking refs of its own, so its HEAD and
  * every one of its refs are fetched into a temporary namespace of the project's primary clone and compared there with
- * that clone's remote-tracking refs; the namespace is removed again either way. Anything that cannot be established
- * answers as held work. Remote-tracking refs as last fetched can only make less look published, never more.
+ * that clone's remote-tracking refs and origin's notes; the namespace is removed again either way. Anything that
+ * cannot be established answers as held work. Refs as last fetched can only make less look published, never more.
  */
 export const workerHeldWork = (run: CtoExec, primary: string | null, worker: string, repositoryId: string): string | null => {
   const dirty = dirtyTree(run, worker);
   if (dirty) return dirty;
   if (primary === null) return "there is no primary clone to compare its commits with";
   const namespace = `${RETIRE_REFS}${repositoryId}/`;
-  const git = (args: string[], input?: string): CtoExecResult =>
-    run("git", ["-C", primary, ...args], { timeoutMs: 120_000, ...(input === undefined ? {} : { input }) });
-  const held = (): string[] => git(["for-each-ref", "--format=%(refname)", namespace]).stdout.split("\n").filter((ref) => ref.startsWith(namespace));
-  const clear = (): void => {
-    const refs = held();
-    if (refs.length > 0) git(["update-ref", "--stdin"], refs.map((ref) => `delete ${ref}\n`).join(""));
-  };
   try {
-    clear();
-    const fetched = git(["fetch", "--no-tags", "--quiet", worker, `+refs/*:${namespace}*`, `+HEAD:${namespace}HEAD`]);
+    clearRefs(run, primary, namespace);
+    const fetched = run("git", ["-C", primary, "fetch", "--no-tags", "--quiet", worker, `+refs/*:${namespace}*`, `+HEAD:${namespace}HEAD`], { timeoutMs: 120_000 });
     if (fetched.status !== 0) return `its commits could not be read into ${primary}: ${firstLine(fetched.stderr)}`;
-    const refs = held();
+    const refs = refsUnder(run, primary, namespace);
     if (refs.length === 0) return `its commits could not be read into ${primary}`;
-    const ahead = git(["rev-list", "--max-count=1", ...refs, "--not", "--remotes"]);
-    if (ahead.status !== 0) return `its commits could not be compared with ${primary}'s remotes: ${firstLine(ahead.stderr)}`;
-    const commit = ahead.stdout.trim();
-    return commit ? `commit ${commit.slice(0, 12)} is on no remote-tracking branch of ${primary}` : null;
+    return unpublishedCommit(run, primary, refs, refs.some((ref) => ref.startsWith(`${namespace}notes/`)));
   } finally {
-    clear();
+    clearRefs(run, primary, namespace);
   }
 };
 
