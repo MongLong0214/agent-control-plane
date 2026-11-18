@@ -54,6 +54,8 @@ export async function residentGitHost() {
   for (const cmd of ["gh", "claude", "tmux", "ps", "lsof"]) writeFileSync(join(bin, cmd), fake, { mode: 0o700 });
   mkdirSync(join(home, ".claude", "scripts"), { recursive: true });
   writeFileSync(join(home, ".claude", "scripts", "claude-trust-dir.sh"), "#!/bin/sh\nexit 0\n", { mode: 0o700 });
+  // Claude Code's own store, where a launch's folder must already be trusted (the file CLAUDE_CONFIG_DIR names, below).
+  writeFileSync(join(home, ".claude", ".claude.json"), JSON.stringify({ projects: { [clone]: { hasTrustDialogAccepted: true } } }));
   mkdirSync(join(home, ".hermes", "bridge", "keys"), { recursive: true, mode: 0o700 });
   writeFileSync(join(home, ".hermes", "bridge", "keys", "cto-test.priv"), "11".repeat(32) + "\n", { mode: 0o600 });
   await git(clone, ["init", "-q", "-b", "dev"]);

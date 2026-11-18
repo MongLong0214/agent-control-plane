@@ -9,7 +9,7 @@ import Database from 'better-sqlite3';
 import { currentCanonicalCeoBuzzRoute, daemonBuzzSigner } from '../src/outbox/ceo-buzz-signer.ts';
 import { canonicalJson } from '../src/core/digest.ts';
 import { readProcessStartToken } from '../src/core/process-argv.ts';
-import { channelLaunchArgs, confirmChannelStartup, tmuxChannelDriver } from '../src/runtime/cto-channel-launch.ts';
+import { channelLaunchArgs, confirmChannelStartup, launchFolderTrust, tmuxChannelDriver } from '../src/runtime/cto-channel-launch.ts';
 import { assertNoOtherCtoProcess, ctoRoleScope } from '../src/cto/one-cto-per-project.ts';
 import { formatHostProvisionerReason, hostProvisionerReason, hostReasonKind, hostRefusalText, recordedResidentExitStatus } from '../src/runtime/host-provisioner-reason.ts';
 const home = process.env.HOME;
@@ -655,6 +655,9 @@ try {
         if (priorExit && priorExit.marker.exitReported !== true) {
           throw new RecordedExitRefusal(formatHostProvisionerReason(priorExit.reason));
         }
+        // Claude Code is not started in a folder whose trust it would ask about: the launcher's one keystroke is sent on a
+        // screen read a moment before, and a trust dialog must not be able to take it. Only read here; the owner records trust.
+        if (!launchFolderTrust(a.clonePath,{home}).trusted) throw new ProvisionerRefusal(formatHostProvisionerReason({binary:'claude',operation:'ensure-resident',kind:hostReasonKind.launchFolderNotTrusted}));
         const launch = randomUUID();
         const launcher = join(state,`resident-${a.projectId}.sh`);
         const quote = v => `'${String(v).replaceAll("'", "'\\''")}'`;

@@ -2078,6 +2078,29 @@ export class Doctor {
           "attach to the project's tmux session, look at the screen it is stopped at, and deal with it yourself; ensure-resident refuses to start a second Claude until that session ends",
       });
     }
+    // A CTO launch that never started because the folder Claude Code would start in is not trusted in Claude Code's own
+    // store: the launcher presses one key on one screen, and a trust dialog must not be able to take it. ACP records
+    // nothing on the owner's behalf; the owner trusts the folder and the next attempt starts.
+    const folderNotTrusted = this.db.all<{ project_id: string; last_error: string }>(
+      `SELECT project_id, last_error FROM resident_project_provisioning
+        WHERE status = 'PENDING' AND last_error LIKE '%workspace trust:%' ORDER BY project_id`,
+    );
+    if (folderNotTrusted.length > 0) {
+      findings.push({
+        code: "CTO_CHANNEL_CWD_NOT_TRUSTED",
+        severity: "ERROR",
+        scope: "global",
+        blocking: false,
+        confidence: "HIGH",
+        observedEvidence: {
+          count: folderNotTrusted.length,
+          projects: folderNotTrusted.map((row) => ({ projectId: row.project_id, reason: row.last_error })),
+        },
+        recommendedAction:
+          "no CTO session was started: the folder it would start in has no trust record of its own in Claude Code's store, and ACP never trusts a folder for you. " +
+          "Run ~/.claude/scripts/claude-trust-dir.sh <the project's clone> (the home folder can never be trusted, and an environment that sets CLAUDE_CODE_IGNORE_PERSISTED_TRUST makes every record not count), then ensure-resident starts it",
+      });
+    }
     // acp-daemon-notice/v1: a refusal notice the daemon could not deliver to the CEO, terminally —
     // Hermes refused it, a 200 did not match, or the pinned CEO moved since its bytes were fixed. It
     // is never retried under a new id, so this is where it becomes visible.

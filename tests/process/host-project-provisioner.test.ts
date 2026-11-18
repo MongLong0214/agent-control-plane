@@ -45,7 +45,7 @@ const RULE = '─'.repeat(100);
 const REGISTERED_SCREEN = ' ▐▛███▛█   Claude Code v2.1.323\n\n  Channels (experimental) messages from server:acp-buzz-channel inject directly in this session · restart without --dangerously-load-development-channels to stop\n'+RULE+'\n❯ \n'+RULE+'\n';
 const WARNING_SCREEN = '\n'+RULE+'\n  WARNING: Loading development channels\n\n  --dangerously-load-development-channels is for local channel development only. Do not use this option to run channels you have downloaded off the internet.\n\n  Please use --channels to run a list of approved channels.\n\n  Channels: server:acp-buzz-channel\n\n  ❯ 1. I am using this for local development\n    2. Exit\n\n  Enter to confirm · Esc to cancel\n';
 const TRUST_SCREEN = RULE+'\n Quick safety check: Is this a project you created or one you trust?\n\n ❯ 1. Yes, I trust this folder\n   2. No, exit\n\n Enter to confirm · Esc to cancel\n';
-const fixture = (profileReadback:Record<string,unknown> = {name:'cto-test'}) => {
+const fixture = (profileReadback:Record<string,unknown> = {name:'cto-test'},folderTrusted = true) => {
   const home = realpathSync(tempDir('resident-host-home-'));const state = join(home,'acp');const bin = join(home,'bin');mkdirSync(bin);const resolvedBin = join(home,'resolved');mkdirSync(resolvedBin);
   const runtimeNode = join(state,'current','dist','bin','node');const runtimeCli = join(state,'current','dist','cli','agentctl.js');
   const generation = join(state,'generations','fixture');
@@ -58,6 +58,8 @@ const fixture = (profileReadback:Record<string,unknown> = {name:'cto-test'}) => 
   writeFileSync(join(home,'.hermes','bridge','keys','owner.pub'),'c'.repeat(64));
   const database = join(home,'state.sqlite');writeCeoDatabase(database,'d'.repeat(64));
   mkdirSync(join(home,'.claude','scripts'),{recursive:true});writeFileSync(join(home,'.claude','scripts','claude-trust-dir.sh'),'#!/bin/sh\nexit 0\n',{mode:0o700});
+  // Claude Code's own store, where the launch's folder must already be trusted (the file CLAUDE_CONFIG_DIR names, as the real one does).
+  writeFileSync(join(home,'.claude','.claude.json'),JSON.stringify({projects:folderTrusted ? {[a.clonePath]:{hasTrustDialogAccepted:true}} : {[a.clonePath]:{mcpServers:{}}}}));
   const fake = `#!${process.execPath}
 const fs = require('node:fs'), path = require('node:path');
 const root = process.env.HOME, cmd = path.basename(process.argv[1]), args = process.argv.slice(2), stateFile = path.join(root,'fake.json');
@@ -320,6 +322,31 @@ it('confirms the development-channels warning once, on the resident it just laun
   expect(saved.captureTargets.length).toBeGreaterThan(0);
   expect([...new Set(saved.captureTargets)]).toEqual(['%1']);
   expect(saved.launches).toBe(1);
+});
+
+it('refuses a launch whose folder is not trusted in Claude Code\'s store before any session exists, and a later trusted store launches',async () => {
+  const f = fixture(undefined,false);
+  await f.invoke('ensure-checkout');await f.invoke('ensure-buzz');
+  const store = join(f.home,'.claude','.claude.json');const before = readFileSync(store,'utf8');
+  await expect(f.invoke('ensure-resident')).rejects.toThrow('claude in ensure-resident: workspace trust: launch folder is not trusted');
+  const saved = JSON.parse(readFileSync(join(f.home,'fake.json'),'utf8'));
+  // No launcher, no session, no keystroke: a dialog that could take the one Enter has nothing to appear in.
+  expect(saved.launches ?? 0).toBe(0);expect(saved.keys ?? []).toEqual([]);expect(saved.kills ?? 0).toBe(0);
+  expect(existsSync(join(f.state,'resident-test.sh'))).toBe(false);
+  // The host trusts nothing for the owner.
+  expect(readFileSync(store,'utf8')).toBe(before);
+  // The owner's own trust (as claude-trust-dir.sh records it) is all the next attempt needs.
+  writeFileSync(store,JSON.stringify({projects:{[f.a.clonePath]:{hasTrustDialogAccepted:true}}}));
+  await f.invoke('ensure-resident');
+  expect(JSON.parse(readFileSync(join(f.home,'fake.json'),'utf8')).launches).toBe(1);
+});
+
+it('launches when the folder is trusted: the check reads the store and nothing is pressed for it',async () => {
+  const f = fixture();
+  await f.invoke('ensure-checkout');await f.invoke('ensure-buzz');
+  await f.invoke('ensure-resident');
+  const saved = JSON.parse(readFileSync(join(f.home,'fake.json'),'utf8'));
+  expect(saved.launches).toBe(1);expect(saved.keys ?? []).toEqual([]);
 });
 
 it('presses nothing when the session is already registered',async () => {

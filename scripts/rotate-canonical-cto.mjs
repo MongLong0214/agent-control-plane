@@ -29,7 +29,10 @@
 //
 // The new conversation is always started with the project's Buzz channel, with the room and identity its canonical
 // entitlement holds and that identity's key file (`~/.hermes/bridge/keys/cto-<project>.priv`): any of them missing or
-// disagreeing is refused before the old conversation is touched (exit 68), never answered by starting without it. Claude
+// disagreeing is refused before the old conversation is touched (exit 68), never answered by starting without it. The
+// folder it starts in must also already be trusted in Claude Code's own store (`claude-trust-dir.sh` records that): else
+// it is refused the same way (exit 69, CTO_CHANNEL_CWD_NOT_TRUSTED), because a trust dialog must not be able to take the
+// one key sent for the warning, and nothing here ever trusts a folder for the owner. Claude
 // Code's development-channels warning is confirmed (that screen only, on the launch's own pane); a screen the launcher may
 // not press is not a start failure: the new conversation is left running there, the refusal is written to
 // rotations/<project>-<uuid>.channel-refusal.json, nothing is killed, and the switchover stays pending (exit 5).
@@ -38,7 +41,7 @@ import { chmodSync, closeSync, mkdirSync, openSync, readFileSync, renameSync, rm
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { getPublicKey } from 'nostr-tools/pure';
-import { channelLaunchArgs, confirmChannelStartup, tmuxChannelDriver } from '../src/runtime/cto-channel-launch.ts';
+import { channelLaunchArgs, confirmChannelStartup, launchFolderTrust, tmuxChannelDriver } from '../src/runtime/cto-channel-launch.ts';
 import { assertNoOtherCtoProcess, ctoRoleScope } from '../src/cto/one-cto-per-project.ts';
 
 const usage = 'usage: rotate-canonical-cto.mjs --project <id> --to <uuid> --expected-generation <n> --cwd <dir> --old-pid <pid> --tmux-session <name> --handoff <package.json> [--timeout-ms <ms>] [--poll-ms <ms>] [--stop-timeout-ms <ms>]';
@@ -185,13 +188,46 @@ const channel = (() => {
   if (!held || typeof held.room !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(held.room) || !/^[0-9a-f]{64}$/.test(held.actorId ?? '')) {
     return refuse('the project has no canonical Buzz identity and room to start a channel with');
   }
-  const keyFile = join(process.env.HOME ?? homedir(), '.hermes', 'bridge', 'keys', `cto-${project}.priv`);
-  let secret;
-  try { secret = readFileSync(keyFile, 'utf8').trim(); } catch { return refuse('the project\'s CTO key file cannot be read'); }
-  if (!/^[0-9a-f]{64}$/.test(secret)) return refuse('the project\'s CTO key file is not 32 hex-encoded bytes');
-  if (getPublicKey(Uint8Array.from(Buffer.from(secret, 'hex'))) !== held.actorId) return refuse('the project\'s CTO key is not the Buzz identity its canonical entitlement names');
-  return { room: held.room, keyFile };
+  // The key is the one the daemon's own Buzz subscriber is declared to use for this room (its configuration names a key
+  // file per identity and room), else the resident naming `cto-<project>.priv`. A canonical CTO that was not provisioned
+  // as a resident keeps the key file it was created with, so the room, not the project's name, is what finds it. A
+  // candidate counts only if it is hex and derives exactly the identity the entitlement names.
+  const candidates = [];
+  try {
+    const subscriber = JSON.parse(readFileSync(join(state, 'buzz-nostr-subscriber.json'), 'utf8'));
+    for (const identity of Array.isArray(subscriber.identities) ? subscriber.identities : []) {
+      if (identity?.encoding === 'hex' && typeof identity.privateKeyFile === 'string' && Array.isArray(identity.rooms) && identity.rooms.includes(held.room)) candidates.push(identity.privateKeyFile);
+    }
+  } catch { /* no subscriber configuration: the naming below is all there is */ }
+  candidates.push(join(process.env.HOME ?? homedir(), '.hermes', 'bridge', 'keys', `cto-${project}.priv`));
+  let failure = 'the project\'s CTO key file cannot be read';
+  const skipped = [];
+  for (const keyFile of candidates) {
+    let secret;
+    try { secret = readFileSync(keyFile, 'utf8').trim(); } catch { continue; }
+    if (!/^[0-9a-f]{64}$/.test(secret)) { failure = 'the project\'s CTO key file is not 32 hex-encoded bytes'; skipped.push({ keyFile, reason: failure }); continue; }
+    // 64 hex digits are not always a secret key (all zeros is not one): a candidate that cannot be derived from is skipped,
+    // named and not quoted, and the next one is tried, so one bad file never ends the search.
+    let derived;
+    try { derived = getPublicKey(Uint8Array.from(Buffer.from(secret, 'hex'))); } catch {
+      failure = 'the project\'s CTO key file is not a valid secret key';
+      skipped.push({ keyFile, reason: failure });
+      continue;
+    }
+    if (derived !== held.actorId) { failure = 'the project\'s CTO key is not the Buzz identity its canonical entitlement names'; skipped.push({ keyFile, reason: failure }); continue; }
+    if (skipped.length > 0) report('channel-key', { skipped });
+    return { room: held.room, keyFile };
+  }
+  return refuse(failure);
 })();
+// The new conversation's folder must already be trusted in Claude Code's own store, or nothing is started: the launcher
+// sends one key on a screen read a moment before, and a trust dialog must not be able to take it. Refused here, before the
+// old conversation is touched, and only read: the owner records the trust (`claude-trust-dir.sh <folder>`), never this.
+const folderTrust = launchFolderTrust(flags.cwd, { home: process.env.HOME ?? homedir() });
+if (!folderTrust.trusted) {
+  stop(69, 'workspace-trust', { refused: 'CTO_CHANNEL_CWD_NOT_TRUSTED', reason: folderTrust.reason, folder: folderTrust.folder,
+    note: 'nothing was changed; trust the folder with claude-trust-dir.sh and run this launcher again with the same arguments' });
+}
 const old = before.value.holderSessionUuid;
 const resumed = (before.value.rotations ?? []).find((rotation) => rotation.state === 'PENDING') ?? null;
 if (resumed && (resumed.toSessionUuid !== to || resumed.fromGeneration !== expected || resumed.fromSessionUuid !== old)) {

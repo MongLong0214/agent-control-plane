@@ -1,3 +1,4 @@
+import { readFileSync, realpathSync } from "node:fs";
 import { dirname, join } from "node:path";
 
 /**
@@ -52,6 +53,81 @@ export const channelLaunchArgs = (input: ChannelLaunchInput): string[] => [
   CHANNEL_DEV_FLAG,
   `server:${BUZZ_CHANNEL_SERVER}`,
 ];
+
+// ---- the folder Claude Code will start in is already trusted ------------------------------------
+//
+// The one keystroke below is sent on a screen read a moment earlier, and tmux cannot make reading a pane and pressing a key
+// one step: a pane that is redrawn between them gets the key. So what could be on the other side of that gap is removed
+// before Claude Code starts. Claude Code's startup dialogs run in a fixed order (2.1.323): onboarding; the workspace trust
+// dialog; a project's .mcp.json servers; CLAUDE.md files that import from outside the folder; account and policy notices
+// (code mode, Grove, a Pro trial); an API key that was never approved; the bypass-permissions warning; this channel's
+// development-channels warning; then, only with Claude in Chrome on, its two dialogs. Only the last two can follow the one
+// this module presses; the rest come first, and a dialog the launcher reads that is not that warning is refused unpressed.
+//
+// The trust dialog is the one the launcher can rule out for certain, so it does: the launch folder must already carry the
+// trust record `~/.claude/scripts/claude-trust-dir.sh` writes, `projects[<real path>].hasTrustDialogAccepted`, and a launch
+// without it never starts Claude. Nothing is ever trusted here: this only reads, and the owner records trust. The record
+// must be the folder's own: Claude Code also accepts a trusted folder above it, under rules about git roots that are not
+// modelled here, so a folder trusted only that way is refused, and the owner runs the script on the folder itself.
+//
+// Not excluded, and so a Limit of this launcher: a first run's onboarding screens (`hasCompletedOnboarding`), a project
+// `.mcp.json` server nobody approved, a CLAUDE.md import from outside the folder nobody approved, a pending account or
+// policy notice, an unapproved `ANTHROPIC_API_KEY`, and the bypass-permissions warning when `skipDangerousModePermissionPrompt`
+// is not set (both resident launches pass the bypass flags). Each comes before the warning, so none can follow a screen read
+// as the warning; the launcher only refuses to press them. After the key, a screen that is not the registered line, such as
+// a Claude in Chrome dialog, is recorded as CTO_CHANNEL_STARTUP_REFUSED and no second key is sent.
+
+export type FolderTrustRefusal =
+  | "folder-unresolvable"
+  | "persisted-trust-ignored"
+  | "home-folder"
+  | "store-unreadable"
+  | "no-record";
+
+export type FolderTrust =
+  | { readonly trusted: true; readonly folder: string }
+  | { readonly trusted: false; readonly folder: string | null; readonly reason: FolderTrustRefusal };
+
+/**
+ * Whether Claude Code, started in `cwd`, would find that folder already trusted, by the record the trust script writes.
+ * Reads Claude Code's global config (`$CLAUDE_CONFIG_DIR/.claude.json`, else `<home>/.claude.json`) and writes nothing.
+ * The home folder is never trusted: Claude Code keeps its answer there for one session only. A launch environment that
+ * tells Claude Code to ignore persisted trust is never trusted either.
+ */
+export const launchFolderTrust = (
+  cwd: string,
+  options: { readonly home: string; readonly env?: Readonly<Record<string, string | undefined>> },
+): FolderTrust => {
+  const env = options.env ?? process.env;
+  let folder: string;
+  try {
+    folder = realpathSync(cwd);
+  } catch {
+    return { trusted: false, folder: null, reason: "folder-unresolvable" };
+  }
+  if ((env["CLAUDE_CODE_IGNORE_PERSISTED_TRUST"] ?? "") !== "") return { trusted: false, folder, reason: "persisted-trust-ignored" };
+  let home = options.home;
+  try {
+    home = realpathSync(options.home);
+  } catch {
+    // An unresolvable home cannot be this folder's link target; compare as given.
+  }
+  if (folder === home) return { trusted: false, folder, reason: "home-folder" };
+  let store: unknown;
+  try {
+    const configDir = env["CLAUDE_CONFIG_DIR"] ?? "";
+    store = JSON.parse(readFileSync(join(configDir === "" ? options.home : configDir, ".claude.json"), "utf8"));
+  } catch {
+    return { trusted: false, folder, reason: "store-unreadable" };
+  }
+  if (store === null || typeof store !== "object" || Array.isArray(store)) return { trusted: false, folder, reason: "store-unreadable" };
+  const projects = (store as { projects?: unknown }).projects;
+  const record = projects !== null && typeof projects === "object" && Object.hasOwn(projects, folder)
+    ? (projects as Record<string, unknown>)[folder]
+    : undefined;
+  const accepted = record !== null && typeof record === "object" && (record as { hasTrustDialogAccepted?: unknown }).hasTrustDialogAccepted === true;
+  return accepted ? { trusted: true, folder } : { trusted: false, folder, reason: "no-record" };
+};
 
 // ---- confirming Claude Code's development-channels warning -------------------------------------
 //
@@ -144,35 +220,68 @@ export const confirmChannelStartup = async (
   driver: ChannelScreenDriver,
   bounds: ChannelStartupBounds = DEFAULT_CHANNEL_STARTUP_BOUNDS,
 ): Promise<ChannelStartupResult> => {
-  const look = async (): Promise<ScreenVerdict> => {
+  // A screen is read in the middle of being drawn as often as not: a warning cut off after its second sentence is a
+  // warning still arriving, not one that differs. So a screen that would end the launch (an altered warning, another
+  // channel list, a dialog that is not the warning) ends it only when the next read, a poll later, is the same screen.
+  let lastRefusable: string | null = null;
+  const look = async (): Promise<{ verdict: ScreenVerdict; settled: boolean; raw: string | null }> => {
+    let text: string;
     try {
-      return classifyScreen(await driver.capture());
+      text = await driver.capture();
     } catch {
-      return "OTHER_DIALOG";
+      // A terminal that is not the launch's reads as an unknown dialog, the same way twice.
+      const settled = lastRefusable === "\u0000unreadable";
+      lastRefusable = "\u0000unreadable";
+      return { verdict: "OTHER_DIALOG", settled, raw: null };
     }
+    const verdict = classifyScreen(text);
+    const refusable = verdict === "WARNING_OTHER_CHANNELS" || verdict === "WARNING_ALTERED" || verdict === "OTHER_DIALOG";
+    const normalized = normalizeScreen(text);
+    const settled = refusable && lastRefusable === normalized;
+    lastRefusable = refusable ? normalized : null;
+    return { verdict, settled, raw: text };
   };
   let verdict: ScreenVerdict = "OTHER";
+  // The one keystroke is authorized by agreement, never by one snapshot: two reads of the same pane in a row, byte for
+  // byte the same, each exactly the warning. A screen is redrawn between any two reads, so a single exact read can be
+  // followed by something else before the key lands; this narrows that to the one read taken immediately before it.
+  let exactBefore: string | null = null;
   const first = driver.now();
   while (true) {
-    verdict = await look();
+    const read = await look();
+    verdict = read.verdict;
     if (verdict === "REGISTERED") return { ok: true, confirmed: false };
-    if (verdict === "EXACT_WARNING") break;
-    if (verdict === "WARNING_OTHER_CHANNELS" || verdict === "WARNING_ALTERED") {
-      return { ok: false, failure: "WARNING_DIFFERS", screen: verdict, confirmed: false };
+    if (verdict === "EXACT_WARNING") {
+      if (exactBefore !== null && exactBefore === read.raw) break;
+      exactBefore = read.raw;
+    } else {
+      exactBefore = null;
+      if (read.settled && (verdict === "WARNING_OTHER_CHANNELS" || verdict === "WARNING_ALTERED")) {
+        return { ok: false, failure: "WARNING_DIFFERS", screen: verdict, confirmed: false };
+      }
+      if (read.settled && verdict === "OTHER_DIALOG") return { ok: false, failure: "UNRECOGNIZED_SCREEN", screen: verdict, confirmed: false };
     }
-    if (verdict === "OTHER_DIALOG") return { ok: false, failure: "UNRECOGNIZED_SCREEN", screen: verdict, confirmed: false };
     if (driver.now() - first >= bounds.screenWaitMs) return { ok: false, failure: "UNRECOGNIZED_SCREEN", screen: verdict, confirmed: false };
     await driver.sleep(bounds.pollMs);
   }
+  // Immediately before the key: read once more. Anything but the very same bytes aborts, and nothing is pressed.
+  const last = await look();
+  if (last.verdict === "REGISTERED") return { ok: true, confirmed: false };
+  if (last.raw === null) return { ok: false, failure: "UNRECOGNIZED_SCREEN", screen: last.verdict, confirmed: false };
+  if (last.raw !== exactBefore) {
+    return { ok: false, failure: last.verdict === "OTHER_DIALOG" ? "UNRECOGNIZED_SCREEN" : "WARNING_DIFFERS", screen: last.verdict, confirmed: false };
+  }
   await driver.press();
+  lastRefusable = null;
   const pressed = driver.now();
   while (true) {
     await driver.sleep(bounds.pollMs);
-    verdict = await look();
+    const read = await look();
+    verdict = read.verdict;
     if (verdict === "REGISTERED") return { ok: true, confirmed: true };
     if (driver.now() - pressed >= bounds.registerWaitMs) break;
     // The warning may take a moment to be redrawn away, so it is waited out; a different dialog is not.
-    if (verdict === "OTHER_DIALOG" || verdict === "WARNING_ALTERED" || verdict === "WARNING_OTHER_CHANNELS") break;
+    if (read.settled && (verdict === "OTHER_DIALOG" || verdict === "WARNING_ALTERED" || verdict === "WARNING_OTHER_CHANNELS")) break;
   }
   return { ok: false, failure: "NOT_REGISTERED", screen: verdict, confirmed: true };
 };

@@ -771,6 +771,13 @@ export const ReasonCode = {
    * the warning was confirmed and the channel did not register. The session may still be running.
    */
   CTO_CHANNEL_STARTUP_REFUSED: "CTO_CHANNEL_STARTUP_REFUSED",
+  /**
+   * A CTO session ACP would launch with its Buzz channel was not started: the folder Claude Code would start in has no trust
+   * record of its own in Claude Code's store. The launcher presses one key on a screen it read a moment before, and a trust
+   * dialog is the screen that must not be able to take it, so the launch is refused before Claude exists. ACP never trusts a
+   * folder for the owner; the owner records it (`~/.claude/scripts/claude-trust-dir.sh <folder>`) and the next attempt starts.
+   */
+  CTO_CHANNEL_CWD_NOT_TRUSTED: "CTO_CHANNEL_CWD_NOT_TRUSTED",
 
   // --- canonical turns -----------------------------------------------------
   /**
