@@ -22,6 +22,9 @@ export const hostReasonKind = {
   channelScreenUnrecognized: 'channel startup: unrecognized screen',
   channelWarningDiffers: 'channel startup: development-channels warning differs from the expected one',
   channelNotRegistered: 'channel startup: channel not registered',
+  // The launch never started: the folder Claude Code would start in has no trust record of its own, so a trust dialog could
+  // take the one confirming key (`launchFolderTrust`). Its own prefix keeps it apart from a channel that did not come up.
+  launchFolderNotTrusted: 'workspace trust: launch folder is not trusted',
 } as const;
 /** The kinds above that say the launch's channel did not come up. */
 export const channelStartupReasonKinds: readonly string[] = [

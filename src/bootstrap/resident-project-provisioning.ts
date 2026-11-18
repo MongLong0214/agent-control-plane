@@ -8,7 +8,7 @@ import type { Db } from '../db/database.ts';
 import type { Clock } from '../core/clock.ts';
 import { CanonicalSessionRegistry } from '../registry/canonical-session-registry.ts';
 import { HostOperationFailure, HostRetirementRefusal, type HostProjectProvisioner, type ProjectAllocation, type HostObservation, type HostOperation } from '../runtime/host-project-provisioner.ts';
-import { channelStartupReasonKinds, formatHostProvisionerReason } from '../runtime/host-provisioner-reason.ts';
+import { channelStartupReasonKinds, formatHostProvisionerReason, hostReasonKind } from '../runtime/host-provisioner-reason.ts';
 import { ReasonCode } from '../core/reason-codes.ts';
 import type { AuditLog } from '../db/audit.ts';
 import type { BootstrapConfirmation } from './repo-factory-bootstrap-run.ts';
@@ -125,6 +125,10 @@ export class ResidentProjectProvisioning {
       // did not come up is on the audit log, and the doctor names the provisioning row that carries it.
       if (reason?.binary === 'claude' && reason.operation === 'ensure-resident' && channelStartupReasonKinds.includes(reason.kind)) {
         if (this.audit) this.audit.record({kind:'CTO_CHANNEL_STARTUP_REFUSED',reasonCode:ReasonCode.CTO_CHANNEL_STARTUP_REFUSED,runId:input.runId,projectId:input.projectId,evidence:{reason:reason.kind}});
+      }
+      // A launch that never started because the folder is not trusted is its own refusal: nothing was launched or pressed.
+      if (reason?.binary === 'claude' && reason.operation === 'ensure-resident' && reason.kind === hostReasonKind.launchFolderNotTrusted) {
+        if (this.audit) this.audit.record({kind:'CTO_CHANNEL_CWD_NOT_TRUSTED',reasonCode:ReasonCode.CTO_CHANNEL_CWD_NOT_TRUSTED,runId:input.runId,projectId:input.projectId,evidence:{reason:reason.kind}});
       }
       this.db.run(`UPDATE resident_project_provisioning SET last_error = ?, updated_at = ? WHERE run_id = ?`,[`provisioning readback pending or refused${detail}`,this.clock.nowIso(),input.runId]);
       // The ledger commit is the durable consumer acknowledgement. If the host response is lost before

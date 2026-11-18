@@ -328,6 +328,30 @@ describe('durable resident provisioning and retirement',() => {
     expect(finding).toMatchObject({severity:'ERROR',blocking:false,observedEvidence:{count:1,projects:[{projectId:'resident',reason:expect.stringContaining(kind)}]}});
     h.cp.close();
   });
+  it('audits a launch refused because its folder is not trusted as CTO_CHANNEL_CWD_NOT_TRUSTED, apart from a channel that did not come up, and the doctor names it',async () => {
+    const kind = 'workspace trust: launch folder is not trusted';
+    const h = makeHarness();const host = new FakeHost();const invoke = host.invoke.bind(host);
+    host.invoke = async (op,a,packet) => {
+      if (op === 'ensure-resident') throw new HostOperationFailure(op,`host project provisioner refused operation: claude in ensure-resident: ${kind}\n`);
+      return invoke(op,a,packet);
+    };
+    const run = h.cp.runs.create({kind:RunKind.PROJECT_BOOTSTRAP,executionMode:'STANDARD',contract});if (!run.allowed) throw new Error(run.message);
+    h.cp.projects.register({projectId:'resident',name:'resident'});
+    const service = new ResidentProjectProvisioning(h.cp.db,h.clock,host,join(h.root,'home'),h.root,h.cp.audit);service.attachSubscriber(async () => false);
+    service.remember({runId:run.value.runId,candidateSnapshotDigest:'candidate',ceoSessionId:'ceo'},'resident',{});
+    const input = {runId:run.value.runId,projectId:'resident',repositoryIdentity:'github:acme/fixture',repositoryNodeId:'R_node',head:'f'.repeat(40),packet:{}};
+    await expect(service.ensure(input)).rejects.toMatchObject({reason:{binary:'claude',operation:'ensure-resident',kind}});
+    expect(service.row(input.runId)).toMatchObject({status:'PENDING',last_error:`provisioning readback pending or refused: claude in ensure-resident: ${kind}`});
+    expect(h.cp.db.all<{reason_code:string;project_id:string;evidence_json:string}>(`SELECT reason_code, project_id, evidence_json FROM audit_events WHERE kind = 'CTO_CHANNEL_CWD_NOT_TRUSTED'`,[]))
+      .toEqual([{reason_code:'CTO_CHANNEL_CWD_NOT_TRUSTED',project_id:'resident',evidence_json:JSON.stringify({reason:kind})}]);
+    // It is not a channel that failed to come up: nothing was launched, so that audit event and finding stay silent.
+    expect(h.cp.db.all(`SELECT 1 FROM audit_events WHERE kind = 'CTO_CHANNEL_STARTUP_REFUSED'`,[])).toEqual([]);
+    const findings = (await h.cp.doctor.run('system')).findings;
+    expect(findings.find(f => f.code === 'CTO_CHANNEL_STARTUP_REFUSED')).toBeUndefined();
+    const finding = findings.find(f => f.code === 'CTO_CHANNEL_CWD_NOT_TRUSTED');
+    expect(finding).toMatchObject({severity:'ERROR',blocking:false,observedEvidence:{count:1,projects:[{projectId:'resident',reason:expect.stringContaining(kind)}]},recommendedAction:expect.stringContaining('claude-trust-dir.sh')});
+    h.cp.close();
+  });
   it.each(['cwd','uuid','rc','ancestry','missing'] as const)('refuses a stale or missing %s readback even when the process was launched',async wrong => {
     const h = makeHarness();const host = new FakeHost();const invoke = host.invoke.bind(host);
     host.invoke = async (op,a) => {

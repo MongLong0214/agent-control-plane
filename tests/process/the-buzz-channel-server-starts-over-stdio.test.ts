@@ -1,6 +1,6 @@
 import { spawnSync } from "node:child_process";
-import { chmodSync, mkdirSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { chmodSync, mkdirSync, readdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -59,6 +59,38 @@ describe("the channel server over stdio", () => {
       await client.close();
     }
   }, 30_000);
+
+  it("answers initialize when it is started through a symlinked path, as a runtime's current link starts it", async () => {
+    // The resident launcher names the entry as `<state>/current/dist/cli/buzz-channel.js`, and `current` is a link to the
+    // generation in use. `import.meta.url` is the realpath and `process.argv[1]` is the link, so an entry that compares
+    // the two literally never starts: the process exits 0 having done nothing and Claude Code sees the server close.
+    const f = files();
+    const root = tempDir("acp-channel-link-");
+    symlinkSync(dirname(ENTRY), join(root, "current"));
+    const linked = join(root, "current", "buzz-channel.ts");
+    const client = new Client({ name: "claude-code-stand-in", version: "0" }, { capabilities: {} });
+    const transport = new StdioClientTransport({
+      command: process.execPath,
+      args: [...SOURCE_NODE, linked, ...args(f, ["--ceo-pubkey", getPublicKey(generateSecretKey())]).slice(SOURCE_NODE.length + 1)],
+      env: { PATH: process.env["PATH"] ?? "", HOME: process.env["HOME"] ?? "" },
+      stderr: "pipe",
+    });
+    await client.connect(transport);
+    try {
+      expect(client.getServerCapabilities()?.experimental).toEqual({ "claude/channel": {} });
+      expect((await client.listTools()).tools.map((t) => t.name)).toEqual(["reply"]);
+    } finally {
+      await client.close();
+    }
+  }, 30_000);
+
+  it("has no entry anywhere in src that decides it is the program by comparing import.meta.url to argv[1] literally", () => {
+    const root = fileURLToPath(new URL("../../src/", import.meta.url));
+    const literal = /import\.meta\.url\s*===?\s*[`'"]file:\/\/|[`'"]file:\/\/\$\{\s*process\.argv\[1\]/u;
+    const offenders = readdirSync(root, { recursive: true, encoding: "utf8" })
+      .filter((path) => path.endsWith(".ts") && literal.test(readFileSync(join(root, path), "utf8")));
+    expect(offenders).toEqual([]);
+  });
 
   it("refuses to start with a key that is also the CEO's, and says only a closed reason", () => {
     const f = files();

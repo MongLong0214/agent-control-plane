@@ -170,6 +170,12 @@ export type ChannelVerdict =
   | { readonly deliver: true; readonly role: ChannelSenderRole; readonly room: string; readonly replyTo: string }
   | { readonly deliver: false; readonly reason: ChannelSkipReason };
 
+/** One Buzz message the daemon's queue holds for this role, with the signed event it was admitted from. */
+export interface QueuedBuzzMessage {
+  readonly eventId: string;
+  readonly event: SignedEvent;
+}
+
 export interface BuzzChannelOptions {
   readonly relayUrl: string;
   readonly projectId: string;
@@ -187,6 +193,13 @@ export interface BuzzChannelOptions {
   readonly openSocket?: BuzzRelaySocketFactory;
   readonly scheduler?: ChannelScheduler;
   readonly store?: ChannelStateStore;
+  /**
+   * What the daemon's queue still holds for this role, oldest first. Asked once, when the relay first accepts the
+   * channel and before the subscription is requested: each is delivered the way a relay event is, once, and the relay's
+   * replay of the same event is then a repeat. A message its own rules refuse is skipped, never delivered on the
+   * queue's say-so alone.
+   */
+  readonly backlog?: () => readonly QueuedBuzzMessage[];
 }
 
 /**
@@ -295,6 +308,7 @@ export class BuzzChannelRelay {
   #probeId: string | null = null;
   #probeTimer: unknown = null;
   #chain: Promise<void> = Promise.resolve();
+  #backlogDone = false;
   readonly #pending = new Map<string, { generation: number; settle: (ack: ReplyAckResult) => void; timer: unknown }>();
 
   constructor(options: BuzzChannelOptions) {
@@ -367,11 +381,7 @@ export class BuzzChannelRelay {
     const rooms = tagValues(event, "h");
     const room = rooms.length === 1 ? rooms[0]! : "";
     if (room === "" || !this.#o.rooms.includes(room)) return { deliver: false, reason: "other-room" };
-    const role: ChannelSenderRole | null = this.#o.ownerPubkeys.includes(event.pubkey)
-      ? "owner"
-      : this.#o.ceoPubkeys().includes(event.pubkey)
-        ? "ceo"
-        : null;
+    const role = this.#roleOf(event.pubkey);
     if (role === null) return { deliver: false, reason: "unbound-actor" };
     const recipients = tagValues(event, "p");
     const replyTo = replyToOf(event);
@@ -389,6 +399,11 @@ export class BuzzChannelRelay {
     if (!mentionsMe && !inThread && !ownerOpen) return { deliver: false, reason: "not-addressed" };
     if (this.#events.get(event.id)?.delivered === true) return { deliver: false, reason: "duplicate" };
     return { deliver: true, role, room, replyTo };
+  }
+
+  /** Who an author is to this channel: a declared owner, the bound CEO, or nobody. The author decides, never the text. */
+  #roleOf(pubkey: string): ChannelSenderRole | null {
+    return this.#o.ownerPubkeys.includes(pubkey) ? "owner" : this.#o.ceoPubkeys().includes(pubkey) ? "ceo" : null;
   }
 
   /** Signs with this CTO's key, threads under `eventId` in `room`, and waits for the relay's verdict. */
@@ -563,7 +578,7 @@ export class BuzzChannelRelay {
     }
   }
 
-  #ok(frame: readonly unknown[], generation: number): void {
+  async #ok(frame: readonly unknown[], generation: number): Promise<void> {
     if (frame.length !== 4 || typeof frame[1] !== "string" || typeof frame[2] !== "boolean" || typeof frame[3] !== "string") {
       return this.#lost();
     }
@@ -571,6 +586,9 @@ export class BuzzChannelRelay {
     if (id === this.#authId) {
       if (frame[2] !== true) return this.#lost();
       this.#subscribed = true;
+      // The queue first, oldest first, then the relay: what the relay replays after this is a repeat of what was shown.
+      await this.#deliverBacklog();
+      if (generation !== this.#generation || this.#socket === null) return;
       const filters = this.#filters();
       this.#activeSince = (filters[0] as { since: number }).since;
       this.#socket?.send(JSON.stringify(["REQ", this.#subId, ...filters]));
@@ -594,52 +612,92 @@ export class BuzzChannelRelay {
     const event = plainEventOf(frame[2]);
     if (event === null || !validateEvent(event) || !verifyEvent(event)) return;
     const verdict = this.classify(event);
-    if (verdict.deliver) {
-      const notification: ChannelNotification = {
-        content: neutralizeChannelText(event.content),
-        meta: {
-          sender_role: verdict.role,
-          sender_pubkey: event.pubkey,
-          room: verdict.room,
-          event_id: event.id,
-          reply_to_event_id: verdict.replyTo,
-          project: this.#o.projectId,
-          trust: "untrusted_peer_message",
-        },
-      };
-      const claimed = Math.min(event.created_at, this.#sched.nowSeconds());
-      try {
-        await this.#o.onNotification(notification);
-      } catch {
-        // Not marked seen, and the resume point stays at or before it however many later events are
-        // delivered: the next connection asks for it again.
-        this.#retry.set(event.id, claimed);
-        this.#o.onDiagnostic?.("channel notification was not written to the session");
-        this.#persist();
-        return;
-      }
-      this.#retry.delete(event.id);
-      const parent = verdict.replyTo === "" ? undefined : this.#events.get(verdict.replyTo);
-      this.#events.set(event.id, {
-        at: event.created_at,
-        author: event.pubkey,
-        room: verdict.room,
-        root: parent !== undefined && parent.room === verdict.room ? parent.root : event.id,
-        delivered: true,
-      });
-      this.#touchThread(this.#events.get(event.id)!.root, verdict.room, claimed);
-      this.#delivered += 1;
-      this.#o.onReceipt?.({
-        type: "emitted",
-        eventId: event.id,
-        room: verdict.room,
-        senderPubkey: event.pubkey,
-        emittedAt: this.#sched.nowSeconds(),
-      });
-    }
+    if (verdict.deliver && !(await this.#emit(event, verdict, true))) return;
     // A handled event, delivered or not, is behind the cursor; one whose notification failed is not.
     const claimed = Math.min(event.created_at, this.#sched.nowSeconds());
     this.#cursor = Math.max(this.#cursor ?? 0, claimed);
+    this.#persist();
+  }
+
+  /**
+   * Hands one delivered-to-this-CTO event to the session and remembers it: its notification, the one receipt that moves
+   * the daemon's queue, and its place in a thread. `false` means the session did not take it; the event is then not marked
+   * shown, and when it came from the relay its place in line is kept so a resume asks for it again.
+   */
+  async #emit(
+    event: RelayEvent,
+    verdict: { readonly role: ChannelSenderRole; readonly room: string; readonly replyTo: string },
+    fromRelay: boolean,
+  ): Promise<boolean> {
+    const notification: ChannelNotification = {
+      content: neutralizeChannelText(event.content),
+      meta: {
+        sender_role: verdict.role,
+        sender_pubkey: event.pubkey,
+        room: verdict.room,
+        event_id: event.id,
+        reply_to_event_id: verdict.replyTo,
+        project: this.#o.projectId,
+        trust: "untrusted_peer_message",
+      },
+    };
+    const claimed = Math.min(event.created_at, this.#sched.nowSeconds());
+    try {
+      await this.#o.onNotification(notification);
+    } catch {
+      this.#o.onDiagnostic?.("channel notification was not written to the session");
+      if (fromRelay) {
+        // Not marked seen, and the resume point stays at or before it however many later events are delivered.
+        this.#retry.set(event.id, claimed);
+        this.#persist();
+      }
+      return false;
+    }
+    this.#retry.delete(event.id);
+    const parent = verdict.replyTo === "" ? undefined : this.#events.get(verdict.replyTo);
+    this.#events.set(event.id, {
+      at: event.created_at,
+      author: event.pubkey,
+      room: verdict.room,
+      root: parent !== undefined && parent.room === verdict.room ? parent.root : event.id,
+      delivered: true,
+    });
+    this.#touchThread(this.#events.get(event.id)!.root, verdict.room, claimed);
+    this.#delivered += 1;
+    this.#o.onReceipt?.({
+      type: "emitted",
+      eventId: event.id,
+      room: verdict.room,
+      senderPubkey: event.pubkey,
+      emittedAt: this.#sched.nowSeconds(),
+    });
+    return true;
+  }
+
+  /** The queue's pending messages for this role, once per process. See `BuzzChannelOptions.backlog`. */
+  async #deliverBacklog(): Promise<void> {
+    if (this.#backlogDone || this.#o.backlog === undefined) return;
+    this.#backlogDone = true;
+    let queued: readonly QueuedBuzzMessage[];
+    try {
+      queued = this.#o.backlog();
+    } catch {
+      this.#o.onDiagnostic?.("the daemon's queue could not be read; its messages stay pending");
+      return;
+    }
+    for (const item of queued) {
+      if (this.#events.get(item.eventId)?.delivered === true) continue;
+      const event = plainEventOf(item.event);
+      // The queue names the event; the event must be that one, validly signed, and one this channel would hear.
+      if (event === null || event.id !== item.eventId || !validateEvent(event) || !verifyEvent(event)) continue;
+      if (event.kind !== BUZZ_MENTION_KIND || event.pubkey === this.pubkey) continue;
+      const rooms = tagValues(event, "h");
+      const room = rooms.length === 1 ? rooms[0]! : "";
+      if (room === "" || !this.#o.rooms.includes(room)) continue;
+      const role = this.#roleOf(event.pubkey);
+      if (role === null) continue;
+      await this.#emit(event, { role, room, replyTo: replyToOf(event) }, false);
+    }
     this.#persist();
   }
 
