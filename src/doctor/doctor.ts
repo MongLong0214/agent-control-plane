@@ -24,6 +24,7 @@ import { strandedBootstrapApplications } from "../bootstrap/bootstrap-applicatio
 import { contractChangeRunsWithoutGrant } from "../registry/manifest-activation-grants.ts";
 import { inspectDatabaseStatePaths, inspectPrivatePath } from "../db/state-preflight.ts";
 import { probeSessionLiveness } from "../daemon/dead-binding-recovery.ts";
+import { type CtoProcessReader, ctoProcessesFor, ctoRoleScope, snapshotCtoProcesses, systemCtoProcessReader } from "../cto/one-cto-per-project.ts";
 import { Role, RunState, SessionLifecycle, roleKeyFor } from "../domain/types.ts";
 import type { GitHubKernel } from "../github/github-kernel.ts";
 import { git, isClean, tryRevParse } from "../git/git.ts";
@@ -481,6 +482,9 @@ export class Doctor {
    */
   #supplementalFindings: ((scope: DoctorScope) => readonly Finding[]) | null = null;
 
+  /** Where the one-CTO check reads the host's processes: ps and lsof, unless a test says otherwise. */
+  #ctoProcessReader: CtoProcessReader = systemCtoProcessReader();
+
   /**
    * O4 (D1) — the newest audit event when this process's control plane opened the database, which it
    * does before its daemon starts or dispatches anything: every event at or below it was written by an
@@ -543,6 +547,11 @@ export class Doctor {
     if (this.#supplementalFindings === supplier) this.#supplementalFindings = null;
   }
 
+  /** Replaces the host process reader the one-CTO finding uses. Reads nothing itself. */
+  useCtoProcessReader(reader: CtoProcessReader): void {
+    this.#ctoProcessReader = reader;
+  }
+
   async run(
     scope: DoctorScope = "system",
     target?: string,
@@ -561,6 +570,7 @@ export class Doctor {
 
     if (scope === "system" || scope === "cto" || scope === "project") {
       findings.push(...this.checkBindings(target ?? null, scope));
+      findings.push(...(await this.checkOneCtoPerProject(target ?? null)));
     }
     if (scope === "system" || scope === "run") {
       findings.push(...this.checkRuns(target ?? null));
@@ -708,6 +718,47 @@ export class Doctor {
   }
 
   /** The projects a "project" or "cto" report covers: the target alone, or every project without one. */
+  /**
+   * One project, one CTO process. Looks for what the launch doors cannot refuse because they never ran: two or
+   * more live claude processes that resume a project's CTO conversation, sit in its checkout, or are its bound
+   * session. Never blocking: a project's CTO is an availability fact, and the system report is the daemon's
+   * startup gate. A process table that cannot be read is UNKNOWN, not clean and not a duplicate.
+   */
+  private async checkOneCtoPerProject(projectId: string | null): Promise<Finding[]> {
+    const projects = this.projectsCovered(projectId).filter((project) => project.retiredAt === null);
+    const scopes = projects
+      .filter((project) => this.db.get(`SELECT 1 FROM assignments WHERE role = 'PRIMARY_CTO' AND project_id = ?`, [project.projectId]) !== undefined)
+      .map((project) => ctoRoleScope((sql, params) => this.db.all(sql, [...params]), project.projectId));
+    if (scopes.length === 0) return [];
+    const read = await snapshotCtoProcesses(this.#ctoProcessReader);
+    if (!read.ok) {
+      return [{
+        code: "CTO_PROCESSES_UNKNOWN",
+        severity: "INFO",
+        scope: projectId ? `project:${projectId}` : "host",
+        blocking: false,
+        confidence: "LOW",
+        observedEvidence: { detail: read.detail },
+        recommendedAction: "nothing is requested of anyone: the host's process table could not be read, so whether a project has more than one CTO process is unknown",
+      }];
+    }
+    const findings: Finding[] = [];
+    for (const scope of scopes) {
+      const processes = ctoProcessesFor(scope, read.snapshot);
+      if (processes.length < 2) continue;
+      findings.push({
+        code: "CTO_PROCESSES_DUPLICATED",
+        severity: "ERROR",
+        scope: `project:${scope.projectId}`,
+        blocking: false,
+        confidence: "HIGH",
+        observedEvidence: { processes },
+        recommendedAction: "nothing is requested of anyone: more than one live claude process resumes this project's CTO conversation, sits in its checkout or is its bound session; which one stays is an open decision",
+      });
+    }
+    return findings;
+  }
+
   private projectsCovered(projectId: string | null) {
     return projectId ? [this.projects.get(projectId)].filter((project) => project !== null) : this.projects.list();
   }

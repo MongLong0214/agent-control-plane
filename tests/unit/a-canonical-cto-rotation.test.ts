@@ -40,6 +40,7 @@ import {
 import { CanonicalSessionRegistry } from "../../src/registry/canonical-session-registry.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 import { bootstrapCtoProvider, makeHarness, registerFixtureProject } from "../helpers/harness.ts";
+import { noOtherCtoProcesses } from "../helpers/cto-process-table.ts";
 
 afterAll(cleanupTempDirs);
 
@@ -162,6 +163,7 @@ const world = async () => {
         expectedPeerIdentity: `uid:${PEER_UID}`, peerProtocolVersion: PEER_PROTOCOL, buzzPurpose: "continuity:PRIMARY_CTO",
       },
       claimDeps: {
+        ctoProcessReader: noOtherCtoProcesses,
         processInspector: { snapshot: (p) => chain.find((entry) => entry.pid === p) ?? null },
         imageInspector: { resolve: () => ({ imagePath: "/fake/claude", version: "0.0.0-test", sha256: `sha256:${"0".repeat(64)}` }) },
         transcriptReader: { locate: (u) => ({ path: `/fake/transcripts/${u}.jsonl`, sizeBytes: 42 }) },

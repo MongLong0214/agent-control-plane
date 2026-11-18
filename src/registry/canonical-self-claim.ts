@@ -3,6 +3,7 @@ import { closeSync, constants, existsSync, fstatSync, openSync, readFileSync, re
 import { homedir, platform } from "node:os";
 import { dirname, join } from "node:path";
 
+import { CTO_ALREADY_RUNNING, CTO_PROCESS_TABLE_UNREADABLE, assertNoOtherCtoProcess, ctoRoleScope, systemCtoProcessReader, type CtoProcessReader } from "../cto/one-cto-per-project.ts";
 import { systemClock, type Clock } from "../core/clock.ts";
 import { digestOf, sha256 } from "../core/digest.ts";
 import { type Decision, type Evidence, allow, deny } from "../core/errors.ts";
@@ -97,6 +98,10 @@ export const SelfClaimRefusal = {
   CLAIMED_SESSION_MISMATCH: "CLAIMED_SESSION_MISMATCH",
   CLAIMED_PID_MISMATCH: "CLAIMED_PID_MISMATCH",
   SESSION_NOT_ENTITLED: "SESSION_NOT_ENTITLED",
+  /** Another live process already is this project's CTO (one CTO per project); the claimant itself is never one. */
+  CTO_ALREADY_RUNNING: CTO_ALREADY_RUNNING,
+  /** The process table could not be read, so no claim is admitted on it: a launch-side read fails closed. */
+  CTO_PROCESS_TABLE_UNREADABLE: CTO_PROCESS_TABLE_UNREADABLE,
   ANCESTOR_START_UNKNOWN: "ANCESTOR_START_UNKNOWN",
   ANCESTOR_NOT_INTERACTIVE: "ANCESTOR_NOT_INTERACTIVE",
   ANCESTOR_CWD_UNREADABLE: "ANCESTOR_CWD_UNREADABLE",
@@ -1673,6 +1678,8 @@ export interface CanonicalSelfClaimDeps {
    * identity does not listen in is refused before the room is opened (`unsubscribedRoomRefusal`).
    */
   subscribedBuzzRooms?: SubscribedBuzzRooms;
+  /** The host's process-table reader for the one-CTO check, defaulting to ps and lsof. Injectable for the same reason `processInspector` is. */
+  ctoProcessReader?: CtoProcessReader;
 }
 
 /** Read-only evidence only: no owner authority, session creation or binding writes.
@@ -1952,6 +1959,15 @@ interface ClaimAsked {
  * never text from a path, a key or the request. A generation mismatch adds the two integers it
  * compared, so the row says which generation was asked for and which one was next.
  */
+/** The other CTO processes a refusal names, each field only in the shape it can have: a pid, a start time, a UUID, a tmux session name. */
+const runningProcessesEvidence = (value: unknown): Array<Record<string, unknown>> =>
+  (Array.isArray(value) ? value : []).slice(0, 8).map((one: Record<string, unknown>) => ({
+    pid: Number.isSafeInteger(one["pid"]) ? one["pid"] : null,
+    startedAt: typeof one["startedAt"] === "string" && one["startedAt"].length <= 40 ? one["startedAt"] : null,
+    conversationId: typeof one["conversationId"] === "string" && UUID_PATTERN.test(one["conversationId"]) ? one["conversationId"] : null,
+    tmuxSession: typeof one["tmuxSession"] === "string" && /^[A-Za-z0-9._-]{1,64}$/.test(one["tmuxSession"]) ? one["tmuxSession"] : null,
+  }));
+
 const claimDecisionAuditRecord = (
   asked: ClaimAsked,
   decision: Decision<CanonicalSelfClaimReceipt>,
@@ -1982,7 +1998,8 @@ const claimDecisionAuditRecord = (
     kind: "CANONICAL_SELF_CLAIM_REFUSED",
     reasonCode: decision.reasonCode,
     projectId: isRegisteredProject(asked.projectId) ? asked.projectId : null,
-    evidence: { identity: UUID_PATTERN.test(asked.claimedSessionUuid) ? asked.claimedSessionUuid : null, reason, ...compared },
+    evidence: { identity: UUID_PATTERN.test(asked.claimedSessionUuid) ? asked.claimedSessionUuid : null, reason, ...compared,
+      ...(reason === SelfClaimRefusal.CTO_ALREADY_RUNNING ? { processes: runningProcessesEvidence(decision.evidence["processes"]) } : {}) },
   };
 };
 
@@ -2037,6 +2054,7 @@ export class CanonicalSelfClaim {
   readonly #maxAncestryHops: number;
   readonly #canonicalBuzzChannelId: string;
   readonly #subscribedBuzzRooms: SubscribedBuzzRooms | null;
+  readonly #ctoProcessReader: CtoProcessReader;
   readonly #canonicalSessions: readonly CanonicalAdoptableSession[];
 
   constructor(
@@ -2085,6 +2103,7 @@ export class CanonicalSelfClaim {
     this.#maxAncestryHops = deps.maxAncestryHops ?? MAX_ANCESTRY_HOPS;
     this.#canonicalBuzzChannelId = config.canonicalBuzzChannelId;
     this.#subscribedBuzzRooms = deps.subscribedBuzzRooms ?? null;
+    this.#ctoProcessReader = deps.ctoProcessReader ?? systemCtoProcessReader();
     // Frozen at construction, like every other deployment fact here: a later mutation of the array
     // the composition root passed must not change which sessions this instance will adopt.
     this.#canonicalSessions = validatedSessions.map((entry) => Object.freeze({ ...entry }));
@@ -2207,6 +2226,20 @@ export class CanonicalSelfClaim {
         "this session is not the canonical CTO for the requested project",
         { observed: request.projectId, entitled: entry.projectId },
       );
+    }
+    // One CTO per project: a second distinct live process for this role is refused, whatever started it and
+    // even when it names the same conversation. The claimant itself (this pid, re-attaching) is the one
+    // process excluded. Before the room is opened and before anything is written; a process table that
+    // cannot be read refuses too, since a claim admitted on a read that failed would admit a second CTO.
+    const running = await assertNoOtherCtoProcess(
+      ctoRoleScope((sql, params) => this.db.all(sql, [...params]), entry.projectId, { conversationIds: [identity.sessionUuid] }),
+      this.#ctoProcessReader,
+      [identity.pid],
+    );
+    if (!running.ok) {
+      return running.reasonCode === CTO_ALREADY_RUNNING
+        ? refuse(SelfClaimRefusal.CTO_ALREADY_RUNNING, ReasonCode.CONFLICT, running.message, { processes: running.processes })
+        : refuse(SelfClaimRefusal.CTO_PROCESS_TABLE_UNREADABLE, ReasonCode.PROBE_FAILED, running.message, {});
     }
     // The Buzz routing address is resolved here, before the synchronous transaction opens, never
     // awaited inside it. `sessions.create` accepts `buzzAddress` directly, so the resolved value

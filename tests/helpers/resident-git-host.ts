@@ -33,8 +33,8 @@ else if (cmd === 'tmux') {
   // The resident's terminal: a session whose Buzz channel is registered, so the launcher has nothing to confirm.
   else if (args[0] === 'capture-pane') out('Channels (experimental) messages from server:acp-buzz-channel inject directly in this session');
 }
-else if (cmd === 'ps') { if (s.launched) { if (args.includes('command=')) out('claude --session-id '+a.sessionUuid); else out(process.env.TEST_CLAUDE_PID+' 999999 Thu Oct 22 01:00:00 2026 claude --session-id '+a.sessionUuid+'\\n999999 1 Thu Oct 22 01:00:00 2026 tmux'); } }
-else if (cmd === 'lsof') out('n'+a.clonePath+'\\n');
+else if (cmd === 'ps') { if (args[0] === '-axww') { const row = (pid,ppid,command) => pid+' '+ppid+' '+process.getuid()+' S Thu Oct 22 01:00:00 2026 '+command+'\\n'; out(row(process.ppid,1,'node host-project-provisioner')+(s.launched ? row(process.env.TEST_CLAUDE_PID,999999,'claude --session-id '+a.sessionUuid) : '')); } else if (s.launched) { if (args.includes('command=')) out('claude --session-id '+a.sessionUuid); else out(process.env.TEST_CLAUDE_PID+' 999999 Thu Oct 22 01:00:00 2026 claude --session-id '+a.sessionUuid+'\\n999999 1 Thu Oct 22 01:00:00 2026 tmux'); } }
+else if (cmd === 'lsof') out(args.includes('-Fpn') ? args[args.indexOf('-p')+1].split(',').map(p => 'p'+p+'\\nn'+a.clonePath+'\\n').join('') : 'n'+a.clonePath+'\\n');
 else process.exit(2);
 fs.writeFileSync(stateFile,JSON.stringify(s));
 `;

@@ -15,6 +15,10 @@
 //   verify   -> the new session holds n + 1, and the daemon's own Buzz subscriber connection for its identity is
 //               live and delivering to it and the ingress is listening (registry eligibility alone proves nothing)
 //
+// One CTO per project (exit 69): the target conversation, or any other process of the project's CTO but the old one, already
+// running refuses the rotation (CTO_ALREADY_RUNNING), before the old holder is fenced and again before the new one starts; a
+// process table that cannot be read refuses too (CTO_PROCESS_TABLE_UNREADABLE). The shared check is src/cto/one-cto-per-project.ts.
+//
 // Owned work at the boundary, or an old process tree whose exit is not confirmed in time: the new conversation is
 // never started (exit 4). Nothing ever goes back to the old conversation or its generation: a new conversation that
 // never claims by the deadline is fenced (its tmux session, which this run started, is killed and the exit of its
@@ -35,6 +39,7 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { getPublicKey } from 'nostr-tools/pure';
 import { channelLaunchArgs, confirmChannelStartup, tmuxChannelDriver } from '../src/runtime/cto-channel-launch.ts';
+import { assertNoOtherCtoProcess, ctoRoleScope } from '../src/cto/one-cto-per-project.ts';
 
 const usage = 'usage: rotate-canonical-cto.mjs --project <id> --to <uuid> --expected-generation <n> --cwd <dir> --old-pid <pid> --tmux-session <name> --handoff <package.json> [--timeout-ms <ms>] [--poll-ms <ms>] [--stop-timeout-ms <ms>]';
 const flags = {};
@@ -205,6 +210,14 @@ for (let row = table.find((entry) => entry.pid === process.pid), hops = 0; oldRo
 if (oldRow && selfRow && (oldRow.pgid === selfRow.pgid || (oldRow.sess > 0 && oldRow.sess === selfRow.sess))) {
   stop(66, 'status', { refused: 'the launcher shares the old conversation\'s process group or session, so it cannot tell that tree\'s exit from its own; run it in its own session (e.g. in its own tmux session)' });
 }
+// One CTO per project: the target conversation, and nothing else of the project's CTO, may be running besides the old
+// process this run replaces (its pid is the one exclusion). Asked before the old holder is fenced, and again just before the
+// start (exit 69); a process table that cannot be read refuses the same way.
+const oneCto = async (step) => {
+  const verdict = await assertNoOtherCtoProcess(ctoRoleScope(() => [], project, { conversationIds: [to, old], checkouts: [flags.cwd] }), undefined, [oldPid]);
+  if (!verdict.ok) stop(69, step, { refused: verdict.reasonCode, message: verdict.message, ...(verdict.processes ? { processes: verdict.processes } : {}), note: step === 'target' ? 'nothing was changed' : 'the old conversation is stopped and fenced and the switchover stays pending; run this launcher again with the same arguments once the other process is gone' });
+};
+await oneCto('target');
 report('handoff', { project, from: old, to, generation: expected, ...(resumed ? { resumed: resumed.transferId } : {}) });
 
 // rotate — the old holder is fenced at ACP before its process is touched.
@@ -284,6 +297,7 @@ const relayArgs = (() => {
   set('--expected-binding-generation', 'auto');
   return args;
 })();
+await oneCto('start');
 let started = false;
 /** The new conversation did not claim: fence it (this run's tmux session and its process tree) and say so. */
 const fenceNew = async (why) => {

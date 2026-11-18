@@ -77,12 +77,16 @@ if (cmd === 'gh') {
   else if (args[0] === 'kill-session') delete s.residents[name];
   else process.exit(2);
 } else if (cmd === 'ps') {
-  if (args[1] === 'pid=,ppid=,lstart=,command=') out(residents().map(r => r.pid + ' ' + r.pane + ' ' + lstart + ' claude --session-id ' + r.sessionUuid + '\\n' + r.pane + ' 1 ' + lstart + ' tmux').join('\\n'));
+  if (args[0] === '-axww') out([process.ppid + ' 1 ' + process.getuid() + ' S ' + lstart + ' node host-project-provisioner'].concat(residents().map(r => r.pid + ' ' + r.pane + ' ' + process.getuid() + ' S ' + lstart + ' claude --session-id ' + r.sessionUuid)).join('\\n') + '\\n');
+  else if (args[1] === 'pid=,ppid=,lstart=,command=') out(residents().map(r => r.pid + ' ' + r.pane + ' ' + lstart + ' claude --session-id ' + r.sessionUuid + '\\n' + r.pane + ' 1 ' + lstart + ' tmux').join('\\n'));
   else if (args[0] === '-axo') out(residents().map(r => 'claude --session-id ' + r.sessionUuid).join('\\n'));
   else if (args[0] === '-p') { const r = residents().find(r => r.pid === Number(args[1])); out(r ? 'claude --session-id ' + r.sessionUuid : ''); }
 } else if (cmd === 'lsof') {
+  if (args.includes('-Fpn')) out(flag('-p').split(',').map(p => { const r = residents().find(r => r.pid === Number(p)); return r ? 'p' + p + '\\nn' + r.cwd + '\\n' : ''; }).join(''));
+  else {
   const r = residents().find(r => r.pid === Number(flag('-p')));
   out(r ? 'n' + r.cwd + '\\n' : '');
+  }
 } else if (cmd === 'buzz') {
   // The relay knows its caller by the key it signs with.
   const key = process.env.BUZZ_PRIVATE_KEY || '';

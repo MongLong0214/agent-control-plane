@@ -21,6 +21,7 @@ import { callCtoTool } from "../helpers/cto-tool.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 import { GenesisGitHub, genesisPlanFixture } from "../helpers/genesis-github.ts";
 import { bindCeo, bootstrapCtoProvider, decideThroughHermes, makeHarness, type Harness } from "../helpers/harness.ts";
+import { noOtherCtoProcesses } from "../helpers/cto-process-table.ts";
 
 afterAll(cleanupTempDirs);
 
@@ -92,6 +93,7 @@ const adoptedBootstrap = async (h: Harness, projectId: string, options: { transf
         expectedPeerIdentity: `uid:${UID}`, peerProtocolVersion: "test", buzzPurpose: "test",
       },
       claimDeps: {
+        ctoProcessReader: noOtherCtoProcesses,
         processInspector: { snapshot: (asked) => chain.find((entry) => entry.pid === asked) ?? null },
         imageInspector: { resolve: () => null },
         transcriptReader: { locate: () => ({ path: "/test/transcript", sizeBytes: 10 }) },

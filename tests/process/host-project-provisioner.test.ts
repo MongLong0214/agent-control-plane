@@ -1,4 +1,4 @@
-import { afterAll, afterEach, expect, it, vi } from 'vitest';
+import { afterAll, afterEach, describe, expect, it, vi } from 'vitest';
 import { mkdirSync, readFileSync, rmSync, writeFileSync, realpathSync, statSync, symlinkSync, chmodSync, existsSync, readdirSync, renameSync } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -82,10 +82,11 @@ else if(cmd === 'tmux') {
  }
  else if(args[0] === 'capture-pane') {s.captureTargets=(s.captureTargets||[]).concat([args[args.indexOf('-t')+1]]);const f=path.join(root,'screen');out(fs.existsSync(f) ? fs.readFileSync(f,'utf8') : ${JSON.stringify(REGISTERED_SCREEN)});}
  else if(args[0] === 'send-keys') {s.keys=(s.keys||[]).concat([args.slice(args.indexOf('-t')+1)]);const next=path.join(root,'screen-after');if(fs.existsSync(next)) fs.copyFileSync(next,path.join(root,'screen'));}
+ else if(args[0] === 'list-panes') out((s.panes||[]).map(p => p.pid+' '+p.name).join('\\n'));
  else if(args[0] === 'kill-session') {s.pane=false;s.paneDead=false;s.kills=(s.kills||0)+1;} else process.exit(2);
 }
-else if(cmd === 'ps') {if(args[0] === '-p') out(s.pinCommand || '');else if(args[0] === '-o' && args[1] === 'lstart=') out(s.lstart || '');else if(s.launched) {if(args.includes('command=')) out('claude --session-id '+a.sessionUuid);else out(process.env.TEST_CLAUDE_PID+' 999999 Thu Oct 22 01:00:00 2026 claude --session-id '+a.sessionUuid+'\\n999999 1 Thu Oct 22 01:00:00 2026 tmux');}}
-else if(cmd === 'lsof') out('n'+(s.cwd || a.clonePath)+'\\n');
+else if(cmd === 'ps') {if(args[0] === '-axww') {if(s.psFail) process.exit(2);const uid=process.getuid(),row=(pid,ppid,command)=>pid+' '+ppid+' '+uid+' S Thu Oct 22 01:00:00 2026 '+command+'\\n';out(row(process.ppid,1,'node host-project-provisioner')+(s.launched ? row(process.env.TEST_CLAUDE_PID,999999,'claude --session-id '+a.sessionUuid) : '')+(s.others||[]).map(o => row(o.pid,o.ppid||1,o.command)).join(''));} else if(args[0] === '-p') out(s.pinCommand || '');else if(args[0] === '-o' && args[1] === 'lstart=') out(s.lstart || '');else if(s.launched) {if(args.includes('command=')) out('claude --session-id '+a.sessionUuid);else out(process.env.TEST_CLAUDE_PID+' 999999 Thu Oct 22 01:00:00 2026 claude --session-id '+a.sessionUuid+'\\n999999 1 Thu Oct 22 01:00:00 2026 tmux');}}
+else if(cmd === 'lsof') {if(args.includes('-Fpn')) {if(s.lsofFail) process.exit(2);out(args[args.indexOf('-p')+1].split(',').map(p => {const o=(s.others||[]).find(x => String(x.pid) === p);return 'p'+p+'\\nn'+(o ? (o.cwd||'/nowhere') : (s.cwd||a.clonePath))+'\\n';}).join(''));} else out('n'+(s.cwd || a.clonePath)+'\\n');}
 else if(cmd === 'buzz') {
  // Buzz knows its caller by the key it signs with, which need not be the one at the identity's path.
  const key = process.env.BUZZ_PRIVATE_KEY || '', ecdh = require('node:crypto').createECDH('secp256k1');
@@ -341,6 +342,69 @@ it.each([
   expect(saved.keys ?? []).toEqual([]);
   // The session is left as it is: nothing killed, nothing pressed.
   expect(saved.kills ?? 0).toBe(0);
+});
+
+describe('one CTO per project at the resident launch door',() => {
+  const CONVERSATION = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+  /** The live incident: an older plain-path process on the same conversation, in a tmux session of its own name. */
+  const oldPlainPath = {pid:37663,ppid:3327,command:`claude --resume ${CONVERSATION} --messaging-socket-path /state/cc-session-acp-test.sock --remote-control test CTO --permission-mode bypassPermissions --dangerously-skip-permissions`};
+  const ready = async () => {const f = fixture();await f.invoke('ensure-checkout');await f.invoke('ensure-buzz');return f;};
+
+  it('refuses to start a second CTO on the conversation an older plain-path process already holds, before any tmux session exists',async () => {
+    const f = await ready();
+    patchFake(f,{others:[oldPlainPath],panes:[{pid:3327,name:'acp-test'}]});
+    await expect(f.invoke('ensure-resident')).rejects.toThrow(new RegExp(`CTO_ALREADY_RUNNING: project test already has a CTO process: pid=37663 started="Thu Oct 22 01:00:00 2026" conversation=${CONVERSATION} tmux=acp-test by=conversation`));
+    expect(fakeState(f)).toMatchObject({launches:0});
+    expect(fakeState(f).launched).toBeUndefined();
+    expect(existsSync(join(f.state,'resident-test.launch.json'))).toBe(false);
+  });
+
+  it('refuses a process that sits in the project checkout though its argv names no conversation (a title-rewritten claude)',async () => {
+    const f = await ready();
+    patchFake(f,{others:[{pid:4242,command:'claude',cwd:f.a.clonePath}]});
+    await expect(f.invoke('ensure-resident')).rejects.toThrow(/CTO_ALREADY_RUNNING: .*pid=4242 .*conversation=none .*by=cwd/);
+    expect(fakeState(f)).toMatchObject({launches:0});
+  });
+
+  it('fails closed, with a reason of its own, when the process table cannot be read',async () => {
+    const f = await ready();
+    patchFake(f,{psFail:true});
+    await expect(f.invoke('ensure-resident')).rejects.toThrow(/CTO_PROCESS_TABLE_UNREADABLE: project test: process table: read failed/);
+    expect(fakeState(f)).toMatchObject({launches:0});
+    patchFake(f,{psFail:false,lsofFail:true,others:[{pid:4343,command:'claude --resume 99999999-9999-4999-8999-999999999999',cwd:'/elsewhere'}]});
+    await expect(f.invoke('ensure-resident')).rejects.toThrow(/CTO_PROCESS_TABLE_UNREADABLE: project test: working directories: read failed/);
+    expect(fakeState(f)).toMatchObject({launches:0});
+  });
+
+  it('starts the CTO when the only other claude processes belong to other projects',async () => {
+    const f = await ready();
+    patchFake(f,{others:[{pid:4444,command:'claude --resume 99999999-9999-4999-8999-999999999999',cwd:'/Users/other/projects/Other'},{pid:4445,command:'claude mcp get acp-cto',cwd:f.a.clonePath}]});
+    await f.invoke('ensure-resident');
+    expect(fakeState(f)).toMatchObject({launches:1});
+  });
+
+  it('carries the refusal to the daemon as the host\'s own one line, and no other free text of its stderr',async () => {
+    const f = await ready();
+    patchFake(f,{others:[oldPlainPath]});
+    const failure = await refusal(daemon(f).invoke('ensure-resident',f.a));
+    expect(failure.message).toMatch(/^host provisioner ensure-resident failed: CTO_ALREADY_RUNNING: project test already has a CTO process: pid=37663 started="[^"]+" conversation=aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa tmux=none by=conversation$/);
+    expect(failure.reason).toBeNull();
+    expect(fakeState(f)).toMatchObject({launches:0});
+  });
+
+  it('names the refusal for the fleet watcher in the host\'s one line, and the daemon-side failure carries it',async () => {
+    const f = await ready();
+    patchFake(f,{others:[oldPlainPath]});
+    const recoveryScript = fileURLToPath(new URL('../../dist/host/resident-fleet-up.mjs',import.meta.url));
+    mkdirSync(join(f.home,'.claude','watchers','fleet'),{recursive:true});
+    const request = {allocation:f.a,packet:{productIntent:'bytes'}};
+    writeFileSync(join(f.home,'.claude','watchers','fleet','acp-test.resident.json'),JSON.stringify(request));
+    const result = await new Promise<{code:number|null;stderr:string}>(resolve => {execFile(process.execPath,[recoveryScript],{env:{...f.env,ACP_HOST_PROJECT_PROVISIONER:f.script},timeout:30_000},(error,_out,stderr) => resolve({code:error ? (error as {code?:number}).code ?? 1 : 0,stderr}));});
+    expect(result.code).toBe(1);
+    expect(result.stderr).toMatch(/resident not started: acp-test\.resident\.json: CTO_ALREADY_RUNNING: project test already has a CTO process: pid=37663 /);
+    expect(result.stderr).toContain('resident recovery pending: acp-test.resident.json');
+    expect(fakeState(f)).toMatchObject({launches:0});
+  });
 });
 
 it('counts a channel that does not register after the confirmation as a failure, with one key pressed',async () => {

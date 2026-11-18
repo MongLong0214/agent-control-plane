@@ -1,6 +1,7 @@
 import { type ChildProcess, spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { once } from "node:events";
-import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -13,7 +14,12 @@ afterAll(cleanupTempDirs);
 const stragglers: number[] = [];
 const children: ChildProcess[] = [];
 const groups: number[] = [];
+const targetPidFiles: string[] = [];
 afterEach(() => {
+  // A process the agentctl stub started on the launcher's behalf: killed here whatever the test saw.
+  for (const file of targetPidFiles.splice(0)) {
+    try { const pid = Number(readFileSync(file, "utf8")); if (Number.isSafeInteger(pid) && pid > 1) process.kill(pid, "SIGKILL"); } catch { /* not started, or already gone */ }
+  }
   for (const child of children.splice(0)) if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
   // Never 0 or 1: kill(0) and kill(-0) would signal this runner's own process group.
   for (const pid of stragglers.splice(0)) if (pid > 1) try { process.kill(pid, "SIGKILL"); } catch { /* already gone */ }
@@ -27,8 +33,10 @@ afterEach(() => {
  * itself is `a-canonical-cto-rotation`'s.
  */
 const LAUNCHER = fileURLToPath(new URL("../../scripts/rotate-canonical-cto.mjs", import.meta.url));
-const OLD = "58cac5c6-0000-4000-8000-0000000000c1";
-const NEW = "36276d16-0000-4000-8000-0000000000c2";
+// Fresh per run: a claude-shaped process another run of this file (another lane, another checkout) has up, naming its
+// conversation, is a second CTO to the one-CTO check, so two runs must never name the same conversation.
+const OLD = randomUUID();
+const NEW = randomUUID();
 const PROJECT = "launch-project";
 const ROOM = "11111111-1111-4111-8111-111111111111";
 
@@ -46,7 +54,12 @@ const stub = (path: string, body: string) => {
 const running = (pid: number) => { try { process.kill(pid, 0); return true; } catch { return false; } };
 
 /** `childMs`: how long the old conversation's child (a shell writer of its own) outlives the old process. */
-const fixture = async (initial: Mode, childMs = 1_200) => {
+/**
+ * `oldAsClaude`: the old conversation's process has the shape of a real one (a binary named claude, its conversation
+ * in `--resume`), so the one-CTO check has to exclude exactly its pid. `claudeBin`: a claude-shaped binary a test
+ * starts other processes with.
+ */
+const fixture = async (initial: Mode, childMs = 1_200, options: { oldAsClaude?: boolean } = {}) => {
   const dir = tempDir("acp-rotlaunch-");
   const cwd = join(dir, "project");
   const home = join(dir, "home");
@@ -70,6 +83,9 @@ const fixture = async (initial: Mode, childMs = 1_200) => {
     repositoryFacts: [], knownRisks: [], recommendedNextAction: "continue" }));
   const record = `fs.appendFileSync(${JSON.stringify(log)}, JSON.stringify([require("node:path").basename(process.argv[1]), ...process.argv.slice(2)]) + "\\n");`;
   const mode = `fs.readFileSync(${JSON.stringify(modeFile)}, "utf8")`;
+  mkdirSync(join(dir, "bin"));
+  const claudeBin = join(dir, "bin", "claude");
+  symlinkSync(process.execPath, claudeBin);
   stub(join(dir, "agentctl"), `${record}
 const db = ${JSON.stringify(db)}; const s = JSON.parse(fs.readFileSync(db, "utf8")); const a = process.argv.slice(2);
 const flag = (n) => a[a.indexOf(n) + 1];
@@ -77,6 +93,10 @@ if (a[1] === "status") { process.stdout.write(JSON.stringify(s)); process.exit(0
 if (flag("--to") === ${JSON.stringify(NEW)} && a.includes("--handoff") && !s.rotations.some((r) => r.state === "PENDING") && s.generation === 1) {
   s.rotations = [{ transferId: "t1", state: "PENDING", fromSessionUuid: ${JSON.stringify(OLD)}, toSessionUuid: ${JSON.stringify(NEW)}, fromGeneration: 1, toGeneration: 2 }];
   s.binding.lifecycle = "DRAINING"; if (${mode} === "owned-work") s.binding.liveRuns = ["run_raced"];
+  // A test that wants a second CTO process to appear while the old one is being replaced: it starts when the switchover is recorded.
+  if (fs.existsSync(${JSON.stringify(join(dir, "spawn-target"))})) {
+    const t = require("node:child_process").spawn(${JSON.stringify(claudeBin)}, ["-e", "setInterval(() => {}, 1e6)", "--", "--resume", ${JSON.stringify(NEW)}], { detached: true, stdio: "ignore", env: {} });
+    fs.writeFileSync(${JSON.stringify(join(dir, "target.pid"))}, String(t.pid)); t.unref(); }
   fs.writeFileSync(db, JSON.stringify(s));
   process.stdout.write(JSON.stringify({ outcome: "SWITCHOVER_PENDING", transferId: "t1", toGeneration: 2 })); process.exit(0); }
 process.stdout.write(JSON.stringify({ ok: false, reasonCode: "CONFLICT" })); process.exit(1);`);
@@ -116,8 +136,11 @@ if (process.argv[2] === "new-session") {
   require("node:fs").writeFileSync(${JSON.stringify(grandchildPidFile)}, String(g.pid)); process.exit(0);
 });
 setTimeout(() => {}, ${childMs});\n`);
-  const old = spawn(process.execPath, ["-e", `const c = require("node:child_process").spawn(process.execPath, [${JSON.stringify(childScript)}], { stdio: "ignore", env: {} });
-require("node:fs").writeFileSync(${JSON.stringify(childPidFile)}, String(c.pid)); setInterval(() => {}, 1e6);`, OLD], { stdio: "ignore", env: {}, detached: true });
+  const oldScript = `const c = require("node:child_process").spawn(process.execPath, [${JSON.stringify(childScript)}], { stdio: "ignore", env: {} });
+require("node:fs").writeFileSync(${JSON.stringify(childPidFile)}, String(c.pid)); setInterval(() => {}, 1e6);`;
+  const old = options.oldAsClaude
+    ? spawn(claudeBin, ["-e", oldScript, "--", "--resume", OLD], { stdio: "ignore", env: {}, detached: true })
+    : spawn(process.execPath, ["-e", oldScript, OLD], { stdio: "ignore", env: {}, detached: true });
   children.push(old);
   groups.push(old.pid!);
   await once(old, "spawn");
@@ -132,11 +155,11 @@ require("node:fs").writeFileSync(${JSON.stringify(childPidFile)}, String(c.pid))
   };
   const childPid = await pidIn(childPidFile);
   stragglers.push(childPid);
-  const launch = (stopTimeoutMs = 10_000, extra: string[] = []) => bounded([LAUNCHER, "--project", PROJECT, "--to", NEW, "--expected-generation", "1", "--cwd", cwd,
+  const launch = (stopTimeoutMs = 10_000, extra: string[] = [], env: NodeJS.ProcessEnv = {}) => bounded([LAUNCHER, "--project", PROJECT, "--to", NEW, "--expected-generation", "1", "--cwd", cwd,
     "--old-pid", String(old.pid), "--tmux-session", "acp-rot-test", "--handoff", handoff, "--timeout-ms", "600", "--poll-ms", "50",
     "--stop-timeout-ms", String(stopTimeoutMs), ...extra], {
     PATH: process.env["PATH"] ?? "", HOME: home, ACP_STATE_DIR: join(dir, "state"), ACP_AGENTCTL: join(dir, "agentctl"),
-    CLAUDE_BIN: join(dir, "claude"), TMUX_BIN: join(dir, "tmux"), ACP_OPERATOR_TOKEN: "operator-token-for-test", TEST_OLD_PID: String(old.pid),
+    CLAUDE_BIN: join(dir, "claude"), TMUX_BIN: join(dir, "tmux"), ACP_OPERATOR_TOKEN: "operator-token-for-test", TEST_OLD_PID: String(old.pid), ...env,
   });
   const calls = () => readFileSync(log, "utf8").trim().split("\n").map((line) => JSON.parse(line) as unknown[]);
   const steps = (stdout: string) => stdout.trim().split("\n").map((line) => JSON.parse(line) as { step: string } & Record<string, unknown>);
@@ -149,7 +172,16 @@ require("node:fs").writeFileSync(${JSON.stringify(childPidFile)}, String(c.pid))
     for (let i = 0; i < 200 && running(childPid); i++) await new Promise((resolve) => setTimeout(resolve, 20));
     return grandchild;
   };
-  return { dir, home, keyFile, db, cwd, old, childPid, launch, calls, steps, previousArgs, setMode, handOffToGrandchild };
+  /** A claude-shaped process of its own, started in `where`, naming `args` (a conversation, or nothing). Killed with the test. */
+  const startClaude = async (where: string, args: string[] = []) => {
+    const other = spawn(claudeBin, ["-e", "setInterval(() => {}, 1e6)", "--", ...args], { stdio: "ignore", env: {}, detached: true, cwd: where });
+    children.push(other);
+    await once(other, "spawn");
+    return other;
+  };
+  targetPidFiles.push(join(dir, "target.pid"));
+  const targetStartedByRotate = async () => { const pid = await pidIn(join(dir, "target.pid")); stragglers.push(pid); return pid; };
+  return { dir, home, keyFile, db, cwd, old, childPid, launch, calls, steps, previousArgs, setMode, handOffToGrandchild, startClaude, targetStartedByRotate };
 };
 
 /** The launcher as a child of its own, killed at 30 s so a wedge names itself. */
@@ -359,5 +391,62 @@ describe("rotate-canonical-cto.mjs: handoff -> rotate -> stop old (confirmed, wi
     expect(f.calls().some((call) => call[0] === "agentctl" && call.includes(OLD))).toBe(false);
     expect(f.calls().some((call) => call[0] === "tmux" && call[1] === "kill-session")).toBe(false);
     expect(existsSync(join(f.dir, "state", "rotations"))).toBe(true);
+  });
+});
+
+describe("one CTO per project at the rotation door", () => {
+  it("refuses, before the old holder is fenced or stopped, when the target conversation is already running", async () => {
+    const f = await fixture("claims");
+    const target = await f.startClaude(f.dir, ["--resume", NEW]);
+    const result = await f.launch();
+    expect(result.code, result.stderr + result.stdout).toBe(69);
+    const refusal = f.steps(result.stdout).at(-1)!;
+    expect(refusal).toMatchObject({ step: "target", refused: "CTO_ALREADY_RUNNING" });
+    expect(refusal["processes"]).toEqual([expect.objectContaining({ pid: target.pid, conversationId: NEW, matchedBy: ["conversation"] })]);
+    // Nothing moved: no switchover recorded, no tmux session, and the old conversation still runs.
+    expect(rotatesTo(f.calls(), NEW)).toEqual([]);
+    expect(f.calls().some((call) => call[0] === "tmux" && call[1] === "new-session")).toBe(false);
+    expect(running(f.old.pid!)).toBe(true);
+  });
+
+  it("refuses another claude process in the project's checkout whose argv names no conversation", async () => {
+    const f = await fixture("claims");
+    const other = await f.startClaude(f.cwd);
+    const result = await f.launch();
+    expect(result.code, result.stderr + result.stdout).toBe(69);
+    expect(f.steps(result.stdout).at(-1)).toMatchObject({ step: "target", refused: "CTO_ALREADY_RUNNING",
+      processes: [expect.objectContaining({ pid: other.pid, conversationId: null, matchedBy: ["cwd"] })] });
+    expect(rotatesTo(f.calls(), NEW)).toEqual([]);
+  });
+
+  it("refuses at the start, with the old holder stopped and the switchover still pending, when a second CTO process appeared meanwhile", async () => {
+    const f = await fixture("claims");
+    writeFileSync(join(f.dir, "spawn-target"), "");
+    const result = await f.launch();
+    expect(result.code, result.stderr + result.stdout).toBe(69);
+    await f.targetStartedByRotate();
+    expect(f.steps(result.stdout).map((line) => line.step)).toEqual(["handoff", "rotate", "stop", "start"]);
+    expect(f.steps(result.stdout).at(-1)).toMatchObject({ step: "start", refused: "CTO_ALREADY_RUNNING" });
+    expect(f.calls().some((call) => call[0] === "tmux" && call[1] === "new-session")).toBe(false);
+    expect(running(f.old.pid!)).toBe(false);
+  });
+
+  it("excludes exactly the old conversation's process: a real-shaped old claude does not refuse its own replacement", async () => {
+    const f = await fixture("claims", 1_200, { oldAsClaude: true });
+    const result = await f.launch();
+    expect(result.code, result.stderr + result.stdout).toBe(0);
+    expect(f.steps(result.stdout).map((line) => line.step)).toEqual(["handoff", "rotate", "stop", "start", "channel", "verify"]);
+  });
+
+  it("fails closed when the working directories of the host's claude processes cannot be read", async () => {
+    const f = await fixture("claims");
+    await f.startClaude(f.dir, ["--resume", "99999999-9999-4999-8999-999999999999"]);
+    const failing = join(f.dir, "failing-bin");
+    mkdirSync(failing);
+    stub(join(failing, "lsof"), "process.exit(2);");
+    const result = await f.launch(10_000, [], { PATH: `${failing}:${process.env["PATH"] ?? ""}` });
+    expect(result.code, result.stderr + result.stdout).toBe(69);
+    expect(f.steps(result.stdout).at(-1)).toMatchObject({ step: "target", refused: "CTO_PROCESS_TABLE_UNREADABLE" });
+    expect(rotatesTo(f.calls(), NEW)).toEqual([]);
   });
 });
