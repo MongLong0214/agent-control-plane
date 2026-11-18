@@ -86,5 +86,7 @@ describe("packet listings share the reviewer budget", () => {
       expect(evidence.tasks[0]).toMatchObject({ taskId: task.taskId, state: "SUCCEEDED", workerBindingCount: 1 });
       expect(prompts[0]!.prompt).toMatch(/"truncated": true/);
     } finally { harness.cp.close(); }
-  }, 120_000);
+    // Building 140 repositories and 650 tasks took 70.8s, 98.6s and 116.3s on three green CI shards and 126.0s on a
+    // red one (PR #1435 run 44099206899), against about 44s locally: the old 120s bound was inside CI's spread.
+  }, 300_000);
 });
