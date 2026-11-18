@@ -340,13 +340,14 @@ const baseRequest = (
  * The host's process table as a test states it. By default it holds only this test process, so a claim is judged on
  * the synthetic ancestry it was given and never on whatever claude sessions the machine running the tests has.
  */
-const hostProcesses = (others: readonly (Omit<CtoProcess, "uid"> & { cwd?: string })[] = [], fails: "table" | "cwd" | null = null): CtoProcessReader => {
+const hostProcesses = (others: readonly (Omit<CtoProcess, "uid" | "command"> & { argv: readonly string[]; cwd?: string })[] = [], fails: "table" | "cwd" | null = null): CtoProcessReader => {
   const rows: CtoProcess[] = [
     { pid: process.pid, ppid: 1, uid: process.getuid?.() ?? 0, startedAt: "Fri Jan  1 00:00:00 2027", command: "node vitest" },
-    ...others.map(({ cwd: _cwd, ...row }) => ({ ...row, uid: process.getuid?.() ?? 0 })),
+    ...others.map(({ cwd: _cwd, argv, ...row }) => ({ ...row, command: argv.join(" "), uid: process.getuid?.() ?? 0 })),
   ];
   return {
     table: async () => { if (fails === "table") throw Object.assign(new Error("ps failed"), { code: "ETIMEDOUT" }); return rows; },
+    argv: (pid) => others.find((row) => row.pid === pid)?.argv ?? ["node", "vitest"],
     cwds: async (pids) => {
       if (fails === "cwd") throw Object.assign(new Error("lsof failed"), { code: "ETIMEDOUT" });
       return new Map(others.filter((row) => pids.includes(row.pid) && row.cwd !== undefined).map((row) => [row.pid, row.cwd!]));
@@ -471,7 +472,7 @@ describe("one CTO per project at the claim door", () => {
   const STARTED = "Tue Nov 14 12:10:15 2026";
   /** The shape the live incident had: an older plain-path process on the same conversation, in a tmux of its own. */
   const oldPlainPath = { pid: 4242, ppid: 1, startedAt: STARTED,
-    command: `claude --resume ${CANON} --messaging-socket-path /state/cc-session-acp-p.sock --remote-control p CTO --permission-mode bypassPermissions`, cwd: "/work/where-it-was-started" };
+    argv: ["claude", "--resume", CANON, "--messaging-socket-path", "/state/cc-session-acp-p.sock", "--remote-control", "p CTO", "--permission-mode", "bypassPermissions"], cwd: "/work/where-it-was-started" };
 
   it("refuses a second distinct live process for the role's conversation, even with the same conversation id, and writes nothing", async () => {
     const core = makeCore();
@@ -490,14 +491,28 @@ describe("one CTO per project at the claim door", () => {
     expect(JSON.parse(row!.evidence)).toMatchObject({ reason: "CTO_ALREADY_RUNNING", processes: [{ pid: 4242, startedAt: STARTED, conversationId: CANON, tmuxSession: null }] });
   });
 
-  it("admits the same process re-attaching: the claimant's own pid is the one process excluded", async () => {
+  it("admits the same process re-attaching: the claimant's own pid and start are the one process excluded", async () => {
     const core = makeCore();
     const projectId = "prj_one_cto_same";
     insertProject(core, projectId);
-    const claimant = { pid: 10, ppid: 1, startedAt: STARTED, command: `/opt/claude/claude --session-id ${CANON}`, cwd: CWD };
+    // The default claude ancestor of these tests: pid 10, started "Fri Jan  1 00:00:00 2027".
+    const claimant = { pid: 10, ppid: 1, startedAt: "Fri Jan  1 00:00:00 2027", argv: ["/opt/claude/claude", "--session-id", CANON], cwd: CWD };
     const subject = makeSubject(core, projectId, { ctoProcessReader: hostProcesses([claimant]) });
     const admitted = await subject.claim(baseRequest(core, projectId));
     expect(admitted.allowed, JSON.stringify(admitted)).toBe(true);
+  });
+
+  it("does not excuse a pid that now belongs to another process: the same pid with another start is a second CTO", async () => {
+    const core = makeCore();
+    const projectId = "prj_one_cto_reused";
+    insertProject(core, projectId);
+    const reused = { pid: 10, ppid: 1, startedAt: "Mon Nov  9 09:00:00 2026", argv: ["/opt/claude/claude", "--resume", CANON], cwd: "/work/elsewhere" };
+    const subject = makeSubject(core, projectId, { ctoProcessReader: hostProcesses([reused]) });
+    const refused = await subject.claim(baseRequest(core, projectId));
+    expect(refused.allowed).toBe(false);
+    if (refused.allowed) throw new Error("admitted a second CTO");
+    expect(refused.evidence["reason"]).toBe("CTO_ALREADY_RUNNING");
+    expect(refused.evidence["processes"]).toEqual([expect.objectContaining({ pid: 10, matchedBy: ["conversation"] })]);
   });
 
   it("refuses a second process that is in the project's checkout though its argv names no conversation", async () => {
@@ -506,7 +521,7 @@ describe("one CTO per project at the claim door", () => {
     insertProject(core, projectId);
     core.db.run(`INSERT INTO repositories (repository_id, identity, checkout_path, project_id, repository_role, created_at) VALUES (?, ?, ?, ?, 'primary', ?)`,
       ["repo_one_cto", "github:acme/one-cto", "/work/one-cto-checkout", projectId, core.clock.nowIso()]);
-    const silent = { pid: 4343, ppid: 1, startedAt: STARTED, command: "claude", cwd: "/work/one-cto-checkout" };
+    const silent = { pid: 4343, ppid: 1, startedAt: STARTED, argv: ["claude"], cwd: "/work/one-cto-checkout" };
     const subject = makeSubject(core, projectId, { ctoProcessReader: hostProcesses([silent]) });
     const refused = await subject.claim(baseRequest(core, projectId));
     expect(refused.allowed).toBe(false);
@@ -515,12 +530,32 @@ describe("one CTO per project at the claim door", () => {
     expect(refused.evidence["processes"]).toEqual([expect.objectContaining({ pid: 4343, matchedBy: ["cwd"] })]);
   });
 
+  it("reads real argv: a prompt that only quotes --resume <uuid> is no second CTO, and a prompt that mentions -p does not hide a claude in the checkout", async () => {
+    const core = makeCore();
+    const projectId = "prj_one_cto_argv";
+    insertProject(core, projectId);
+    core.db.run(`INSERT INTO repositories (repository_id, identity, checkout_path, project_id, repository_role, created_at) VALUES (?, ?, ?, ?, 'primary', ?)`,
+      ["repo_one_cto_argv", "github:acme/one-cto-argv", "/work/one-cto-argv", projectId, core.clock.nowIso()]);
+    const quoting = { pid: 4545, ppid: 1, startedAt: STARTED, argv: ["claude", `please run claude --resume ${CANON} for me`], cwd: "/elsewhere" };
+    const admitted = await makeSubject(core, projectId, { ctoProcessReader: hostProcesses([quoting]) }).claim(baseRequest(core, projectId));
+    expect(admitted.allowed, JSON.stringify(admitted)).toBe(true);
+    const mentioning = { pid: 4546, ppid: 1, startedAt: STARTED, argv: ["claude", "Explain how -p works"], cwd: "/work/one-cto-argv" };
+    const core2 = makeCore();
+    insertProject(core2, projectId);
+    core2.db.run(`INSERT INTO repositories (repository_id, identity, checkout_path, project_id, repository_role, created_at) VALUES (?, ?, ?, ?, 'primary', ?)`,
+      ["repo_one_cto_argv", "github:acme/one-cto-argv", "/work/one-cto-argv", projectId, core2.clock.nowIso()]);
+    const refused = await makeSubject(core2, projectId, { ctoProcessReader: hostProcesses([mentioning]) }).claim(baseRequest(core2, projectId));
+    expect(refused.allowed).toBe(false);
+    if (refused.allowed) throw new Error("admitted a second CTO");
+    expect(refused.evidence["processes"]).toEqual([expect.objectContaining({ pid: 4546, matchedBy: ["cwd"] })]);
+  });
+
   it.each([["the process table", "table"], ["the working directories", "cwd"]] as const)(
     "fails closed when %s cannot be read: the claim is refused with its own reason, not admitted on a read that failed", async (_what, fails) => {
       const core = makeCore();
       const projectId = `prj_one_cto_read_${fails}`;
       insertProject(core, projectId);
-      const bystander = { pid: 4444, ppid: 1, startedAt: STARTED, command: "claude --resume 33333333-3333-4333-8333-333333333333", cwd: "/elsewhere" };
+      const bystander = { pid: 4444, ppid: 1, startedAt: STARTED, argv: ["claude", "--resume", "33333333-3333-4333-8333-333333333333"], cwd: "/elsewhere" };
       const subject = makeSubject(core, projectId, { ctoProcessReader: hostProcesses([bystander], fails) });
       const before = rowCounts(core);
       const refused = await subject.claim(baseRequest(core, projectId));

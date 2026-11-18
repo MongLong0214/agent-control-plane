@@ -2228,13 +2228,13 @@ export class CanonicalSelfClaim {
       );
     }
     // One CTO per project: a second distinct live process for this role is refused, whatever started it and
-    // even when it names the same conversation. The claimant itself (this pid, re-attaching) is the one
-    // process excluded. Before the room is opened and before anything is written; a process table that
+    // even when it names the same conversation. The claimant itself (this pid with this start, re-attaching) is
+    // the one process excluded, so a pid since reused by another process is counted. Before the room is opened and before anything is written; a process table that
     // cannot be read refuses too, since a claim admitted on a read that failed would admit a second CTO.
     const running = await assertNoOtherCtoProcess(
       ctoRoleScope((sql, params) => this.db.all(sql, [...params]), entry.projectId, { conversationIds: [identity.sessionUuid] }),
       this.#ctoProcessReader,
-      [identity.pid],
+      identity.startedAt === null ? [] : [{ pid: identity.pid, startedAt: identity.startedAt }],
     );
     if (!running.ok) {
       return running.reasonCode === CTO_ALREADY_RUNNING

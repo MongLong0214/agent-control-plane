@@ -5,6 +5,7 @@ import { chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, rmSync, s
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import Database from "better-sqlite3";
 import { afterAll, afterEach, describe, expect, it } from "vitest";
 import { generateSecretKey, getPublicKey } from "nostr-tools/pure";
 
@@ -91,6 +92,18 @@ const fixture = async (initial: Mode, childMs = 1_200, folderTrusted = true, opt
   mkdirSync(join(dir, "bin"));
   const claudeBin = join(dir, "bin", "claude");
   symlinkSync(process.execPath, claudeBin);
+  // What a claude-shaped process runs: the script, then the flags a real claude would have, as separate argv elements.
+  const idleScript = join(dir, "bin", "idle.js");
+  writeFileSync(idleScript, "setInterval(() => {}, 1e6);\n");
+  // The daemon's database as the one-CTO check reads it: the tables the role's scope is read from, empty until a test fills them.
+  const stateDb = join(dir, "state", "state.sqlite");
+  const sqlite = new Database(stateDb);
+  sqlite.exec(`CREATE TABLE assignments (assignment_id TEXT, role_key TEXT, role TEXT, project_id TEXT, actor_id TEXT, session_id TEXT, status TEXT);
+    CREATE TABLE actor_target_bindings (target_binding_id TEXT, target_actor_id TEXT, executor_kind TEXT, target_locator TEXT, target_locator_digest TEXT);
+    CREATE TABLE repositories (repository_id TEXT, checkout_path TEXT, project_id TEXT, retired_at TEXT);`);
+  sqlite.close();
+  /** Fills the database the scope is read from. */
+  const seed = (fill: (db: InstanceType<typeof Database>) => void) => { const open = new Database(stateDb); try { fill(open); } finally { open.close(); } };
   stub(join(dir, "agentctl"), `${record}
 const db = ${JSON.stringify(db)}; const s = JSON.parse(fs.readFileSync(db, "utf8")); const a = process.argv.slice(2);
 const flag = (n) => a[a.indexOf(n) + 1];
@@ -100,7 +113,7 @@ if (flag("--to") === ${JSON.stringify(NEW)} && a.includes("--handoff") && !s.rot
   s.binding.lifecycle = "DRAINING"; if (${mode} === "owned-work") s.binding.liveRuns = ["run_raced"];
   // A test that wants a second CTO process to appear while the old one is being replaced: it starts when the switchover is recorded.
   if (fs.existsSync(${JSON.stringify(join(dir, "spawn-target"))})) {
-    const t = require("node:child_process").spawn(${JSON.stringify(claudeBin)}, ["-e", "setInterval(() => {}, 1e6)", "--", "--resume", ${JSON.stringify(NEW)}], { detached: true, stdio: "ignore", env: {} });
+    const t = require("node:child_process").spawn(${JSON.stringify(claudeBin)}, [${JSON.stringify(idleScript)}, "--resume", ${JSON.stringify(NEW)}], { detached: true, stdio: "ignore", env: {} });
     fs.writeFileSync(${JSON.stringify(join(dir, "target.pid"))}, String(t.pid)); t.unref(); }
   fs.writeFileSync(db, JSON.stringify(s));
   process.stdout.write(JSON.stringify({ outcome: "SWITCHOVER_PENDING", transferId: "t1", toGeneration: 2 })); process.exit(0); }
@@ -143,8 +156,10 @@ if (process.argv[2] === "new-session") {
 setTimeout(() => {}, ${childMs});\n`);
   const oldScript = `const c = require("node:child_process").spawn(process.execPath, [${JSON.stringify(childScript)}], { stdio: "ignore", env: {} });
 require("node:fs").writeFileSync(${JSON.stringify(childPidFile)}, String(c.pid)); setInterval(() => {}, 1e6);`;
+  const oldScriptFile = join(dir, "bin", "old.js");
+  writeFileSync(oldScriptFile, oldScript);
   const old = options.oldAsClaude
-    ? spawn(claudeBin, ["-e", oldScript, "--", "--resume", OLD], { stdio: "ignore", env: {}, detached: true })
+    ? spawn(claudeBin, [oldScriptFile, "--resume", OLD], { stdio: "ignore", env: {}, detached: true })
     : spawn(process.execPath, ["-e", oldScript, OLD], { stdio: "ignore", env: {}, detached: true });
   children.push(old);
   groups.push(old.pid!);
@@ -179,14 +194,14 @@ require("node:fs").writeFileSync(${JSON.stringify(childPidFile)}, String(c.pid))
   };
   /** A claude-shaped process of its own, started in `where`, naming `args` (a conversation, or nothing). Killed with the test. */
   const startClaude = async (where: string, args: string[] = []) => {
-    const other = spawn(claudeBin, ["-e", "setInterval(() => {}, 1e6)", "--", ...args], { stdio: "ignore", env: {}, detached: true, cwd: where });
+    const other = spawn(claudeBin, [idleScript, ...args], { stdio: "ignore", env: {}, detached: true, cwd: where });
     children.push(other);
     await once(other, "spawn");
     return other;
   };
   targetPidFiles.push(join(dir, "target.pid"));
   const targetStartedByRotate = async () => { const pid = await pidIn(join(dir, "target.pid")); stragglers.push(pid); return pid; };
-  return { dir, home, keyFile, db, cwd, old, childPid, launch, calls, steps, previousArgs, setMode, handOffToGrandchild, startClaude, targetStartedByRotate };
+  return { dir, home, keyFile, db, cwd, old, childPid, launch, calls, steps, previousArgs, setMode, handOffToGrandchild, startClaude, targetStartedByRotate, seed, stateDb };
 };
 
 /** The launcher as a child of its own, killed at 30 s so a wedge names itself. */
@@ -494,7 +509,7 @@ describe("one CTO per project at the rotation door", () => {
     const f = await fixture("claims");
     const target = await f.startClaude(f.dir, ["--resume", NEW]);
     const result = await f.launch();
-    expect(result.code, result.stderr + result.stdout).toBe(69);
+    expect(result.code, result.stderr + result.stdout).toBe(70);
     const refusal = f.steps(result.stdout).at(-1)!;
     expect(refusal).toMatchObject({ step: "target", refused: "CTO_ALREADY_RUNNING" });
     expect(refusal["processes"]).toEqual([expect.objectContaining({ pid: target.pid, conversationId: NEW, matchedBy: ["conversation"] })]);
@@ -508,7 +523,7 @@ describe("one CTO per project at the rotation door", () => {
     const f = await fixture("claims");
     const other = await f.startClaude(f.cwd);
     const result = await f.launch();
-    expect(result.code, result.stderr + result.stdout).toBe(69);
+    expect(result.code, result.stderr + result.stdout).toBe(70);
     expect(f.steps(result.stdout).at(-1)).toMatchObject({ step: "target", refused: "CTO_ALREADY_RUNNING",
       processes: [expect.objectContaining({ pid: other.pid, conversationId: null, matchedBy: ["cwd"] })] });
     expect(rotatesTo(f.calls(), NEW)).toEqual([]);
@@ -518,7 +533,7 @@ describe("one CTO per project at the rotation door", () => {
     const f = await fixture("claims");
     writeFileSync(join(f.dir, "spawn-target"), "");
     const result = await f.launch();
-    expect(result.code, result.stderr + result.stdout).toBe(69);
+    expect(result.code, result.stderr + result.stdout).toBe(70);
     await f.targetStartedByRotate();
     expect(f.steps(result.stdout).map((line) => line.step)).toEqual(["handoff", "rotate", "stop", "start"]);
     expect(f.steps(result.stdout).at(-1)).toMatchObject({ step: "start", refused: "CTO_ALREADY_RUNNING" });
@@ -540,8 +555,64 @@ describe("one CTO per project at the rotation door", () => {
     mkdirSync(failing);
     stub(join(failing, "lsof"), "process.exit(2);");
     const result = await f.launch(10_000, [], { PATH: `${failing}:${process.env["PATH"] ?? ""}` });
-    expect(result.code, result.stderr + result.stdout).toBe(69);
+    expect(result.code, result.stderr + result.stdout).toBe(70);
     expect(f.steps(result.stdout).at(-1)).toMatchObject({ step: "target", refused: "CTO_PROCESS_TABLE_UNREADABLE" });
     expect(rotatesTo(f.calls(), NEW)).toEqual([]);
+  });
+
+  it("excuses the old pid only for the very process it validated: a pid that belongs to another CTO is counted, not excluded", async () => {
+    const f = await fixture("claims", 60_000);
+    // The first run fences the old holder and stops it; its child outlives it, so the switchover stays pending (exit 4).
+    expect((await f.launch(800)).code).toBe(4);
+    expect(running(f.old.pid!)).toBe(false);
+    // The resumed run is handed a pid that now belongs to another claude process naming the target conversation.
+    const impostor = await f.startClaude(f.dir, ["--resume", NEW]);
+    const result = await f.launch(800, ["--old-pid", String(impostor.pid)]);
+    expect(result.code, result.stderr + result.stdout).toBe(70);
+    expect(f.steps(result.stdout).at(-1)).toMatchObject({ step: "target", refused: "CTO_ALREADY_RUNNING",
+      processes: [expect.objectContaining({ pid: impostor.pid, conversationId: NEW, matchedBy: ["conversation"] })] });
+    expect(f.calls().some((call) => call[0] === "tmux")).toBe(false);
+  });
+
+  it("checks the role's whole scope from the database: a conversation the role held before, and every registered checkout", async () => {
+    const f = await fixture("claims");
+    const held = randomUUID();
+    const second = join(f.dir, "second-checkout");
+    mkdirSync(second);
+    f.seed((db) => {
+      db.prepare("INSERT INTO assignments (assignment_id, role_key, role, project_id, actor_id, session_id, status) VALUES ('a1', ?, 'PRIMARY_CTO', ?, 'actor-1', 's1', 'REVOKED')").run(`PRIMARY_CTO:${PROJECT}`, PROJECT);
+      db.prepare("INSERT INTO actor_target_bindings (target_binding_id, target_actor_id, executor_kind, target_locator, target_locator_digest) VALUES ('b1', 'actor-1', 'claude-cli', ?, 'digest')").run(held);
+      db.prepare("INSERT INTO repositories (repository_id, checkout_path, project_id, retired_at) VALUES ('r1', ?, ?, NULL)").run(second, PROJECT);
+    });
+    // A conversation the project's CTO held earlier is running again.
+    const earlier = await f.startClaude(f.dir, ["--resume", held]);
+    const first = await f.launch();
+    expect(first.code, first.stderr + first.stdout).toBe(70);
+    expect(f.steps(first.stdout).at(-1)).toMatchObject({ step: "target", refused: "CTO_ALREADY_RUNNING",
+      processes: [expect.objectContaining({ pid: earlier.pid, conversationId: held, matchedBy: ["conversation"] })] });
+    earlier.kill("SIGKILL");
+    for (let i = 0; i < 100 && running(earlier.pid!); i++) await new Promise((resolve) => setTimeout(resolve, 20));
+    // A claude sits in another registered checkout of the project, not the one named on the command line.
+    const elsewhere = await f.startClaude(second);
+    const next = await f.launch();
+    expect(next.code, next.stderr + next.stdout).toBe(70);
+    expect(f.steps(next.stdout).at(-1)).toMatchObject({ step: "target", refused: "CTO_ALREADY_RUNNING",
+      processes: [expect.objectContaining({ pid: elsewhere.pid, matchedBy: ["cwd"] })] });
+    expect(rotatesTo(f.calls(), NEW)).toEqual([]);
+    // With both gone the same command rotates: the wider scope refuses only what is there.
+    elsewhere.kill("SIGKILL");
+    for (let i = 0; i < 100 && running(elsewhere.pid!); i++) await new Promise((resolve) => setTimeout(resolve, 20));
+    const done = await f.launch();
+    expect(done.code, done.stderr + done.stdout).toBe(0);
+  });
+
+  it("fails closed when the database the role's scope is read from cannot be opened", async () => {
+    const f = await fixture("claims");
+    rmSync(f.stateDb);
+    const result = await f.launch();
+    expect(result.code, result.stderr + result.stdout).toBe(70);
+    expect(f.steps(result.stdout).at(-1)).toMatchObject({ step: "target", refused: "CTO_PROCESS_TABLE_UNREADABLE" });
+    expect(rotatesTo(f.calls(), NEW)).toEqual([]);
+    expect(running(f.old.pid!)).toBe(true);
   });
 });

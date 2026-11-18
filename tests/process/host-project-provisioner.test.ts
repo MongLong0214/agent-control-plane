@@ -373,14 +373,37 @@ it.each([
 
 describe('one CTO per project at the resident launch door',() => {
   const CONVERSATION = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+  const spawned:ChildProcess[] = [];
+  afterEach(() => {for (const child of spawned.splice(0)) if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');});
+  /**
+   * A real process with the shape of a claude session: an executable named claude (a link to node) running an idle script,
+   * with `args` after it. Its argv is the kernel's, so the check reads it exactly as it reads the real thing.
+   */
+  const claudeStandIn = async (f:ReturnType<typeof fixture>, args:string[], cwd?:string) => {
+    const dir = join(f.home,'claude-bin');mkdirSync(dir,{recursive:true});
+    const link = join(dir,'claude');if (!existsSync(link)) symlinkSync(process.execPath,link);
+    const script = join(dir,'idle.js');writeFileSync(script,'setInterval(() => {}, 1e6);');
+    const child = spawn(link,[script,...args],{stdio:'ignore',env:{},...(cwd ? {cwd} : {})});
+    spawned.push(child);await new Promise(resolve => child.once('spawn',resolve));
+    return {pid:child.pid!,command:[link,script,...args].join(' ')};
+  };
+  /** A headless query's shape: node's own `-p` evaluates the idle expression, so `-p` is a real argv element. */
+  const headlessStandIn = async (f:ReturnType<typeof fixture>) => {
+    const dir = join(f.home,'claude-bin');mkdirSync(dir,{recursive:true});
+    const link = join(dir,'claude');if (!existsSync(link)) symlinkSync(process.execPath,link);
+    const child = spawn(link,['-p','setInterval(() => {}, 1e6)'],{stdio:'ignore',env:{}});
+    spawned.push(child);await new Promise(resolve => child.once('spawn',resolve));
+    return {pid:child.pid!,command:`${link} -p setInterval(() => {}, 1e6)`};
+  };
   /** The live incident: an older plain-path process on the same conversation, in a tmux session of its own name. */
-  const oldPlainPath = {pid:37663,ppid:3327,command:`claude --resume ${CONVERSATION} --messaging-socket-path /state/cc-session-acp-test.sock --remote-control test CTO --permission-mode bypassPermissions --dangerously-skip-permissions`};
+  const oldPlainPath = (f:ReturnType<typeof fixture>) => claudeStandIn(f,['--resume',CONVERSATION,'--messaging-socket-path','/state/cc-session-acp-test.sock','--remote-control','test CTO','--permission-mode','bypassPermissions','--dangerously-skip-permissions']);
   const ready = async () => {const f = fixture();await f.invoke('ensure-checkout');await f.invoke('ensure-buzz');return f;};
 
   it('refuses to start a second CTO on the conversation an older plain-path process already holds, before any tmux session exists',async () => {
     const f = await ready();
-    patchFake(f,{others:[oldPlainPath],panes:[{pid:3327,name:'acp-test'}]});
-    await expect(f.invoke('ensure-resident')).rejects.toThrow(new RegExp(`CTO_ALREADY_RUNNING: project test already has a CTO process: pid=37663 started="Thu Oct 22 01:00:00 2026" conversation=${CONVERSATION} tmux=acp-test by=conversation`));
+    const old = await oldPlainPath(f);
+    patchFake(f,{others:[{...old,ppid:3327,cwd:'/elsewhere'}],panes:[{pid:3327,name:'acp-test'}]});
+    await expect(f.invoke('ensure-resident')).rejects.toThrow(new RegExp(`CTO_ALREADY_RUNNING: project test already has a CTO process: pid=${old.pid} started="Thu Oct 22 01:00:00 2026" conversation=${CONVERSATION} tmux=acp-test by=conversation`));
     expect(fakeState(f)).toMatchObject({launches:0});
     expect(fakeState(f).launched).toBeUndefined();
     expect(existsSync(join(f.state,'resident-test.launch.json'))).toBe(false);
@@ -388,47 +411,66 @@ describe('one CTO per project at the resident launch door',() => {
 
   it('refuses a process that sits in the project checkout though its argv names no conversation (a title-rewritten claude)',async () => {
     const f = await ready();
-    patchFake(f,{others:[{pid:4242,command:'claude',cwd:f.a.clonePath}]});
-    await expect(f.invoke('ensure-resident')).rejects.toThrow(/CTO_ALREADY_RUNNING: .*pid=4242 .*conversation=none .*by=cwd/);
+    const silent = await claudeStandIn(f,[]);
+    patchFake(f,{others:[{...silent,cwd:f.a.clonePath}]});
+    await expect(f.invoke('ensure-resident')).rejects.toThrow(new RegExp(`CTO_ALREADY_RUNNING: .*pid=${silent.pid} .*conversation=none .*by=cwd`));
     expect(fakeState(f)).toMatchObject({launches:0});
   });
 
-  it('fails closed, with a reason of its own, when the process table cannot be read',async () => {
+  it('reads real argv elements: a prompt that quotes --resume <uuid> is no second CTO, and a prompt that mentions -p does not hide a claude in the checkout',async () => {
+    const f = await ready();
+    const quoting = await claudeStandIn(f,[`please run claude --resume ${CONVERSATION} for me`]);
+    patchFake(f,{others:[{...quoting,cwd:'/elsewhere'}]});
+    await f.invoke('ensure-resident');
+    expect(fakeState(f)).toMatchObject({launches:1});
+    const g = await ready();
+    const mentioning = await claudeStandIn(g,['Explain how -p works']);
+    patchFake(g,{others:[{...mentioning,cwd:g.a.clonePath}]});
+    await expect(g.invoke('ensure-resident')).rejects.toThrow(new RegExp(`CTO_ALREADY_RUNNING: .*pid=${mentioning.pid} .*by=cwd`));
+    expect(fakeState(g)).toMatchObject({launches:0});
+  });
+
+  it('fails closed, with a reason of its own, when the process table or a claude\'s working directory cannot be read',async () => {
     const f = await ready();
     patchFake(f,{psFail:true});
     await expect(f.invoke('ensure-resident')).rejects.toThrow(/CTO_PROCESS_TABLE_UNREADABLE: project test: process table: read failed/);
     expect(fakeState(f)).toMatchObject({launches:0});
-    patchFake(f,{psFail:false,lsofFail:true,others:[{pid:4343,command:'claude --resume 99999999-9999-4999-8999-999999999999',cwd:'/elsewhere'}]});
+    const bystander = await claudeStandIn(f,['--resume','99999999-9999-4999-8999-999999999999']);
+    patchFake(f,{psFail:false,lsofFail:true,others:[{...bystander,cwd:'/elsewhere'}]});
     await expect(f.invoke('ensure-resident')).rejects.toThrow(/CTO_PROCESS_TABLE_UNREADABLE: project test: working directories: read failed/);
     expect(fakeState(f)).toMatchObject({launches:0});
   });
 
-  it('starts the CTO when the only other claude processes belong to other projects',async () => {
+  it('starts the CTO when the only other claude processes belong to other projects, or are not sessions',async () => {
     const f = await ready();
-    patchFake(f,{others:[{pid:4444,command:'claude --resume 99999999-9999-4999-8999-999999999999',cwd:'/Users/other/projects/Other'},{pid:4445,command:'claude mcp get acp-cto',cwd:f.a.clonePath}]});
+    const other = await claudeStandIn(f,['--resume','99999999-9999-4999-8999-999999999999']);
+    const subcommand = await headlessStandIn(f);
+    patchFake(f,{others:[{...other,cwd:'/Users/other/projects/Other'},{...subcommand,cwd:f.a.clonePath}]});
     await f.invoke('ensure-resident');
     expect(fakeState(f)).toMatchObject({launches:1});
   });
 
   it('carries the refusal to the daemon as the host\'s own one line, and no other free text of its stderr',async () => {
     const f = await ready();
-    patchFake(f,{others:[oldPlainPath]});
+    const old = await oldPlainPath(f);
+    patchFake(f,{others:[{...old,cwd:'/elsewhere'}]});
     const failure = await refusal(daemon(f).invoke('ensure-resident',f.a));
-    expect(failure.message).toMatch(/^host provisioner ensure-resident failed: CTO_ALREADY_RUNNING: project test already has a CTO process: pid=37663 started="[^"]+" conversation=aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa tmux=none by=conversation$/);
+    expect(failure.message).toMatch(new RegExp(`^host provisioner ensure-resident failed: CTO_ALREADY_RUNNING: project test already has a CTO process: pid=${old.pid} started="[^"]+" conversation=${CONVERSATION} tmux=none by=conversation$`));
     expect(failure.reason).toBeNull();
     expect(fakeState(f)).toMatchObject({launches:0});
   });
 
   it('names the refusal for the fleet watcher in the host\'s one line, and the daemon-side failure carries it',async () => {
     const f = await ready();
-    patchFake(f,{others:[oldPlainPath]});
+    const old = await oldPlainPath(f);
+    patchFake(f,{others:[{...old,cwd:'/elsewhere'}]});
     const recoveryScript = fileURLToPath(new URL('../../dist/host/resident-fleet-up.mjs',import.meta.url));
     mkdirSync(join(f.home,'.claude','watchers','fleet'),{recursive:true});
     const request = {allocation:f.a,packet:{productIntent:'bytes'}};
     writeFileSync(join(f.home,'.claude','watchers','fleet','acp-test.resident.json'),JSON.stringify(request));
     const result = await new Promise<{code:number|null;stderr:string}>(resolve => {execFile(process.execPath,[recoveryScript],{env:{...f.env,ACP_HOST_PROJECT_PROVISIONER:f.script},timeout:30_000},(error,_out,stderr) => resolve({code:error ? (error as {code?:number}).code ?? 1 : 0,stderr}));});
     expect(result.code).toBe(1);
-    expect(result.stderr).toMatch(/resident not started: acp-test\.resident\.json: CTO_ALREADY_RUNNING: project test already has a CTO process: pid=37663 /);
+    expect(result.stderr).toContain(`resident not started: acp-test.resident.json: CTO_ALREADY_RUNNING: project test already has a CTO process: pid=${old.pid} `);
     expect(result.stderr).toContain('resident recovery pending: acp-test.resident.json');
     expect(fakeState(f)).toMatchObject({launches:0});
   });

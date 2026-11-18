@@ -717,7 +717,6 @@ export class Doctor {
     }];
   }
 
-  /** The projects a "project" or "cto" report covers: the target alone, or every project without one. */
   /**
    * One project, one CTO process. Looks for what the launch doors cannot refuse because they never ran: two or
    * more live claude processes that resume a project's CTO conversation, sit in its checkout, or are its bound
@@ -725,9 +724,10 @@ export class Doctor {
    * startup gate. A process table that cannot be read is UNKNOWN, not clean and not a duplicate.
    */
   private async checkOneCtoPerProject(projectId: string | null): Promise<Finding[]> {
-    const projects = this.projectsCovered(projectId).filter((project) => project.retiredAt === null);
-    const scopes = projects
-      .filter((project) => this.db.get(`SELECT 1 FROM assignments WHERE role = 'PRIMARY_CTO' AND project_id = ?`, [project.projectId]) !== undefined)
+    // Every registered, unretired project, whether or not a CTO was ever bound: a second claude in a checkout before the
+    // first attach is the same two CTOs, and no assignment exists yet to say whose they are.
+    const scopes = this.projectsCovered(projectId)
+      .filter((project) => project.retiredAt === null)
       .map((project) => ctoRoleScope((sql, params) => this.db.all(sql, [...params]), project.projectId));
     if (scopes.length === 0) return [];
     const read = await snapshotCtoProcesses(this.#ctoProcessReader);
@@ -759,6 +759,7 @@ export class Doctor {
     return findings;
   }
 
+  /** The projects a "project" or "cto" report covers: the target alone, or every project without one. */
   private projectsCovered(projectId: string | null) {
     return projectId ? [this.projects.get(projectId)].filter((project) => project !== null) : this.projects.list();
   }

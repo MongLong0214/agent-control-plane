@@ -8,6 +8,7 @@ import type { CtoProcessReader } from "../../src/cto/one-cto-per-project.ts";
  */
 export const noOtherCtoProcesses: CtoProcessReader = {
   table: async () => [{ pid: process.pid, ppid: 1, uid: process.getuid?.() ?? 0, startedAt: "Fri Jan  1 00:00:00 2027", command: "node vitest" }],
+  argv: () => null,
   cwds: async () => new Map(),
   tmuxPanes: async () => new Map(),
   alive: () => false,

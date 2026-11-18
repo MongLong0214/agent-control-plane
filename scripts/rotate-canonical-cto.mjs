@@ -15,7 +15,7 @@
 //   verify   -> the new session holds n + 1, and the daemon's own Buzz subscriber connection for its identity is
 //               live and delivering to it and the ingress is listening (registry eligibility alone proves nothing)
 //
-// One CTO per project (exit 69): the target conversation, or any other process of the project's CTO but the old one, already
+// One CTO per project (exit 70): the target conversation, or any other process of the project's CTO but the old one, already
 // running refuses the rotation (CTO_ALREADY_RUNNING), before the old holder is fenced and again before the new one starts; a
 // process table that cannot be read refuses too (CTO_PROCESS_TABLE_UNREADABLE). The shared check is src/cto/one-cto-per-project.ts.
 //
@@ -40,6 +40,7 @@ import { execFileSync } from 'node:child_process';
 import { chmodSync, closeSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
+import Database from 'better-sqlite3';
 import { getPublicKey } from 'nostr-tools/pure';
 import { channelLaunchArgs, confirmChannelStartup, launchFolderTrust, tmuxChannelDriver } from '../src/runtime/cto-channel-launch.ts';
 import { assertNoOtherCtoProcess, ctoRoleScope } from '../src/cto/one-cto-per-project.ts';
@@ -247,11 +248,20 @@ if (oldRow && selfRow && (oldRow.pgid === selfRow.pgid || (oldRow.sess > 0 && ol
   stop(66, 'status', { refused: 'the launcher shares the old conversation\'s process group or session, so it cannot tell that tree\'s exit from its own; run it in its own session (e.g. in its own tmux session)' });
 }
 // One CTO per project: the target conversation, and nothing else of the project's CTO, may be running besides the old
-// process this run replaces (its pid is the one exclusion). Asked before the old holder is fenced, and again just before the
-// start (exit 69); a process table that cannot be read refuses the same way.
+// process this run replaces. The role's scope is the one every other door uses, read from the daemon's database: every
+// conversation that held or was entitled to the role, and every registered checkout of the project (the ones named on this
+// command line are added). The old process is expected only while it is still the very process this run validated, by pid
+// and start time: once it has exited, or its pid belongs to another process, nothing is excluded. Asked before the old holder
+// is fenced, and again just before the start (exit 70); a process table or a database that cannot be read refuses the same way.
+const roleScope = () => {
+  const database = new Database(process.env.ACP_HOST_DATABASE_PATH || join(state, 'state.sqlite'), { readonly: true, fileMustExist: true });
+  try { return ctoRoleScope((sql, params) => database.prepare(sql).all(...params), project, { conversationIds: [to, old], checkouts: [flags.cwd] }); } finally { database.close(); }
+};
 const oneCto = async (step) => {
-  const verdict = await assertNoOtherCtoProcess(ctoRoleScope(() => [], project, { conversationIds: [to, old], checkouts: [flags.cwd] }), undefined, [oldPid]);
-  if (!verdict.ok) stop(69, step, { refused: verdict.reasonCode, message: verdict.message, ...(verdict.processes ? { processes: verdict.processes } : {}), note: step === 'target' ? 'nothing was changed' : 'the old conversation is stopped and fenced and the switchover stays pending; run this launcher again with the same arguments once the other process is gone' });
+  let scope;
+  try { scope = roleScope(); } catch { stop(70, step, { refused: 'CTO_PROCESS_TABLE_UNREADABLE', message: `CTO_PROCESS_TABLE_UNREADABLE: project ${project}: the role's conversations and checkouts could not be read from the database`, note: 'nothing was changed' }); }
+  const verdict = await assertNoOtherCtoProcess(scope, undefined, oldRow ? [{ pid: oldRow.pid, startedAt: oldRow.start }] : []);
+  if (!verdict.ok) stop(70, step, { refused: verdict.reasonCode, message: verdict.message, ...(verdict.processes ? { processes: verdict.processes } : {}), note: step === 'target' ? 'nothing was changed' : 'the old conversation is stopped and fenced and the switchover stays pending; run this launcher again with the same arguments once the other process is gone' });
 };
 await oneCto('target');
 report('handoff', { project, from: old, to, generation: expected, ...(resumed ? { resumed: resumed.transferId } : {}) });
