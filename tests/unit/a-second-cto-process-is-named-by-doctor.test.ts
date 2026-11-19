@@ -1,6 +1,6 @@
 import { realpathSync } from "node:fs";
 
-import { afterAll, describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it, vi } from "vitest";
 
 import type { CtoProcess, CtoProcessReader } from "../../src/cto/one-cto-per-project.ts";
 import { Role, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
@@ -106,5 +106,20 @@ describe("doctor names a project that has two CTO processes", () => {
     // One claude in the checkout is not two.
     harness.cp.doctor.useCtoProcessReader(reader([{ pid: 90_010, argv: ["claude"], cwd: checkout }]));
     expect(await findings(harness)).toEqual([]);
+  });
+
+  it("reports UNKNOWN when the role's scope cannot be read, never a project with nothing to look at", async () => {
+    const { harness, checkout } = await projectWithCto();
+    harness.cp.doctor.useCtoProcessReader(reader([
+      { pid: BOUND_PID, argv: ["claude"], cwd: checkout },
+      { pid: 90_020, argv: ["claude"], cwd: checkout },
+    ]));
+    const all = harness.cp.db.all.bind(harness.cp.db);
+    vi.spyOn(harness.cp.db, "all").mockImplementation(((sql: string, params?: unknown[]) => {
+      if (/SELECT checkout_path AS path FROM repositories/.test(sql)) throw Object.assign(new Error("database is locked"), { code: "SQLITE_BUSY" });
+      return all(sql, params);
+    }) as typeof harness.cp.db.all);
+    const named = await findings(harness);
+    expect(named).toEqual([expect.objectContaining({ code: "CTO_PROCESSES_UNKNOWN", severity: "INFO", blocking: false, observedEvidence: { detail: "role scope: read failed (SQLITE_BUSY)" } })]);
   });
 });

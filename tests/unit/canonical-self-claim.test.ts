@@ -550,6 +550,29 @@ describe("one CTO per project at the claim door", () => {
     expect(refused.evidence["processes"]).toEqual([expect.objectContaining({ pid: 4546, matchedBy: ["cwd"] })]);
   });
 
+  it("refuses when the role's scope cannot be read: a registered checkout the read dropped would have let a second CTO pass", async () => {
+    const core = makeCore();
+    const projectId = "prj_one_cto_scope";
+    insertProject(core, projectId);
+    core.db.run(`INSERT INTO repositories (repository_id, identity, checkout_path, project_id, repository_role, created_at) VALUES (?, ?, ?, ?, 'primary', ?)`,
+      ["repo_one_cto_scope", "github:acme/one-cto-scope", "/work/one-cto-scope", projectId, core.clock.nowIso()]);
+    const silent = { pid: 4747, ppid: 1, startedAt: STARTED, argv: ["claude"], cwd: "/work/one-cto-scope" };
+    // The database is locked for the one read that names the project's checkouts (SQLITE_BUSY), as another writer can leave it.
+    const all = core.db.all.bind(core.db);
+    vi.spyOn(core.db, "all").mockImplementation(((sql: string, params?: unknown[]) => {
+      if (/SELECT checkout_path AS path FROM repositories/.test(sql)) throw Object.assign(new Error("database is locked"), { code: "SQLITE_BUSY" });
+      return all(sql, params);
+    }) as typeof core.db.all);
+    const subject = makeSubject(core, projectId, { ctoProcessReader: hostProcesses([silent]) });
+    const before = rowCounts(core);
+    const refused = await subject.claim(baseRequest(core, projectId));
+    expect(refused).toMatchObject({ allowed: false, reasonCode: ReasonCode.PROBE_FAILED });
+    if (refused.allowed) throw new Error("admitted on a scope that could not be read");
+    expect(refused.evidence["reason"]).toBe("CTO_PROCESS_TABLE_UNREADABLE");
+    expect(refused.message).toContain("role scope: read failed (SQLITE_BUSY)");
+    expectRolledBack(core, before, refused);
+  });
+
   it.each([["the process table", "table"], ["the working directories", "cwd"]] as const)(
     "fails closed when %s cannot be read: the claim is refused with its own reason, not admitted on a read that failed", async (_what, fails) => {
       const core = makeCore();

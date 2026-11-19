@@ -5,6 +5,8 @@ import { chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, rmSync, s
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { readProcessStartToken } from "../../src/core/process-argv.ts";
+
 import Database from "better-sqlite3";
 import { afterAll, afterEach, describe, expect, it } from "vitest";
 import { generateSecretKey, getPublicKey } from "nostr-tools/pure";
@@ -100,7 +102,9 @@ const fixture = async (initial: Mode, childMs = 1_200, folderTrusted = true, opt
   const sqlite = new Database(stateDb);
   sqlite.exec(`CREATE TABLE assignments (assignment_id TEXT, role_key TEXT, role TEXT, project_id TEXT, actor_id TEXT, session_id TEXT, status TEXT);
     CREATE TABLE actor_target_bindings (target_binding_id TEXT, target_actor_id TEXT, executor_kind TEXT, target_locator TEXT, target_locator_digest TEXT);
-    CREATE TABLE repositories (repository_id TEXT, checkout_path TEXT, project_id TEXT, retired_at TEXT);`);
+    CREATE TABLE repositories (repository_id TEXT, checkout_path TEXT, project_id TEXT, retired_at TEXT);
+    CREATE TABLE conversational_actors (actor_id TEXT, current_session_id TEXT);
+    CREATE TABLE sessions (session_id TEXT, os_pid INTEGER, os_process_started_at TEXT);`);
   sqlite.close();
   /** Fills the database the scope is read from. */
   const seed = (fill: (db: InstanceType<typeof Database>) => void) => { const open = new Database(stateDb); try { fill(open); } finally { open.close(); } };
@@ -175,6 +179,13 @@ require("node:fs").writeFileSync(${JSON.stringify(childPidFile)}, String(c.pid))
   };
   const childPid = await pidIn(childPidFile);
   stragglers.push(childPid);
+  // The old holder's runtime row, as the canonical claim records it: its pid and its native start token. The launcher knows the old
+  // holder by this and by nothing a command line says.
+  seed((db) => {
+    db.prepare("INSERT INTO actor_target_bindings (target_binding_id, target_actor_id, executor_kind, target_locator, target_locator_digest) VALUES ('b-old', 'actor-old', 'claude-cli', ?, 'digest')").run(OLD);
+    db.prepare("INSERT INTO conversational_actors (actor_id, current_session_id) VALUES ('actor-old', 'ses_old')").run();
+    db.prepare("INSERT INTO sessions (session_id, os_pid, os_process_started_at) VALUES ('ses_old', ?, ?)").run(old.pid, readProcessStartToken(old.pid!));
+  });
   const launch = (stopTimeoutMs = 10_000, extra: string[] = [], env: NodeJS.ProcessEnv = {}) => bounded([LAUNCHER, "--project", PROJECT, "--to", NEW, "--expected-generation", "1", "--cwd", cwd,
     "--old-pid", String(old.pid), "--tmux-session", "acp-rot-test", "--handoff", handoff, "--timeout-ms", "600", "--poll-ms", "50",
     "--stop-timeout-ms", String(stopTimeoutMs), ...extra], {
@@ -611,7 +622,70 @@ describe("one CTO per project at the rotation door", () => {
     rmSync(f.stateDb);
     const result = await f.launch();
     expect(result.code, result.stderr + result.stdout).toBe(70);
-    expect(f.steps(result.stdout).at(-1)).toMatchObject({ step: "target", refused: "CTO_PROCESS_TABLE_UNREADABLE" });
+    expect(f.steps(result.stdout).at(-1)).toMatchObject({ refused: "CTO_PROCESS_TABLE_UNREADABLE" });
+    expect(rotatesTo(f.calls(), NEW)).toEqual([]);
+    expect(running(f.old.pid!)).toBe(true);
+  });
+
+  it("knows the old holder only by the process its session row recorded: a target whose prompt names the old conversation is neither excluded nor signalled", async () => {
+    const f = await fixture("claims", 60_000);
+    // The first run stops the old holder (its child outlives it, so the switchover stays pending, exit 4).
+    expect((await f.launch(800)).code).toBe(4);
+    expect(running(f.old.pid!)).toBe(false);
+    // The target is up, and its prompt says it continues from the old conversation. Handed its pid as --old-pid, a launcher that searched
+    // command lines for the old uuid would take it for the old holder, leave it out of the check and send it SIGTERM.
+    const target = await f.startClaude(f.dir, ["--resume", NEW, `You are ${PROJECT}'s canonical CTO, continuing from conversation ${OLD} at generation 2.`]);
+    const result = await f.launch(800, ["--old-pid", String(target.pid)]);
+    expect(result.code, result.stderr + result.stdout).toBe(70);
+    expect(f.steps(result.stdout).at(-1)).toMatchObject({ step: "target", refused: "CTO_ALREADY_RUNNING",
+      processes: [expect.objectContaining({ pid: target.pid, conversationId: NEW, matchedBy: ["conversation"] })] });
+    expect(running(target.pid!)).toBe(true);
+  });
+
+  it("excludes and signals nothing when the recorded identity no longer matches the process at that pid", async () => {
+    const f = await fixture("claims");
+    // The row's start token is another process's: the process now at its pid is not the one that was recorded, however it looks.
+    f.seed((db) => { db.prepare("UPDATE sessions SET os_process_started_at = 'darwin-tv:1.000001' WHERE session_id = 'ses_old'").run(); });
+    const result = await f.launch();
+    expect(result.code, result.stderr + result.stdout).toBe(66);
+    expect(f.steps(result.stdout).at(-1)).toMatchObject({ step: "status", refused: "old-pid is not the old conversation's claude process" });
+    expect(running(f.old.pid!)).toBe(true);
+    expect(rotatesTo(f.calls(), NEW)).toEqual([]);
+  });
+
+  it("refuses an --old-pid that is not the process the old holder's row recorded", async () => {
+    const f = await fixture("claims");
+    const other = await f.startClaude(f.dir, ["--resume", randomUUID()]);
+    const result = await f.launch(10_000, ["--old-pid", String(other.pid)]);
+    expect(result.code, result.stderr + result.stdout).toBe(66);
+    expect(f.steps(result.stdout).at(-1)).toMatchObject({ step: "status", refused: "old-pid is not the old holder's recorded process" });
+    expect(running(f.old.pid!)).toBe(true);
+    expect(running(other.pid!)).toBe(true);
+  });
+
+  it("refuses, with a real exclusive lock on the database, rather than going on without the role's scope", async () => {
+    const f = await fixture("claims");
+    const holder = new Database(f.stateDb);
+    holder.exec("BEGIN EXCLUSIVE");
+    try {
+      const result = await f.launch();
+      expect(result.code, result.stderr + result.stdout).toBe(70);
+      expect(f.steps(result.stdout).at(-1)).toMatchObject({ refused: "CTO_PROCESS_TABLE_UNREADABLE" });
+      expect(rotatesTo(f.calls(), NEW)).toEqual([]);
+      expect(running(f.old.pid!)).toBe(true);
+    } finally {
+      holder.exec("ROLLBACK");
+      holder.close();
+    }
+  });
+
+  it("refuses when a table of the role's scope cannot be read, where it once passed on an empty scope", async () => {
+    const f = await fixture("claims");
+    // A repositories table this reader cannot query (no retired_at): a read failure, not a table that is absent.
+    f.seed((db) => { db.exec("DROP TABLE repositories; CREATE TABLE repositories (repository_id TEXT, checkout_path TEXT, project_id TEXT);"); });
+    const result = await f.launch();
+    expect(result.code, result.stderr + result.stdout).toBe(70);
+    expect(f.steps(result.stdout).at(-1)).toMatchObject({ step: "target", refused: "CTO_PROCESS_TABLE_UNREADABLE", message: expect.stringContaining("role scope: read failed (SQLITE_ERROR)") });
     expect(rotatesTo(f.calls(), NEW)).toEqual([]);
     expect(running(f.old.pid!)).toBe(true);
   });

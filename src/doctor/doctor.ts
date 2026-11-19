@@ -24,7 +24,7 @@ import { strandedBootstrapApplications } from "../bootstrap/bootstrap-applicatio
 import { contractChangeRunsWithoutGrant } from "../registry/manifest-activation-grants.ts";
 import { inspectDatabaseStatePaths, inspectPrivatePath } from "../db/state-preflight.ts";
 import { probeSessionLiveness } from "../daemon/dead-binding-recovery.ts";
-import { type CtoProcessReader, ctoProcessesFor, ctoRoleScope, snapshotCtoProcesses, systemCtoProcessReader } from "../cto/one-cto-per-project.ts";
+import { RoleScopeUnreadable, type CtoProcessReader, ctoProcessesFor, ctoRoleScope, snapshotCtoProcesses, systemCtoProcessReader } from "../cto/one-cto-per-project.ts";
 import { Role, RunState, SessionLifecycle, roleKeyFor } from "../domain/types.ts";
 import type { GitHubKernel } from "../github/github-kernel.ts";
 import { git, isClean, tryRevParse } from "../git/git.ts";
@@ -726,22 +726,19 @@ export class Doctor {
   private async checkOneCtoPerProject(projectId: string | null): Promise<Finding[]> {
     // Every registered, unretired project, whether or not a CTO was ever bound: a second claude in a checkout before the
     // first attach is the same two CTOs, and no assignment exists yet to say whose they are.
-    const scopes = this.projectsCovered(projectId)
-      .filter((project) => project.retiredAt === null)
-      .map((project) => ctoRoleScope((sql, params) => this.db.all(sql, [...params]), project.projectId));
+    let scopes: ReturnType<typeof ctoRoleScope>[];
+    try {
+      scopes = this.projectsCovered(projectId)
+        .filter((project) => project.retiredAt === null)
+        .map((project) => ctoRoleScope((sql, params) => this.db.all(sql, [...params]), project.projectId));
+    } catch (error) {
+      // A scope that could not be read is UNKNOWN, never a project with nothing to look at.
+      if (!(error instanceof RoleScopeUnreadable)) throw error;
+      return [this.ctoProcessesUnknown(projectId, error.detail)];
+    }
     if (scopes.length === 0) return [];
     const read = await snapshotCtoProcesses(this.#ctoProcessReader);
-    if (!read.ok) {
-      return [{
-        code: "CTO_PROCESSES_UNKNOWN",
-        severity: "INFO",
-        scope: projectId ? `project:${projectId}` : "host",
-        blocking: false,
-        confidence: "LOW",
-        observedEvidence: { detail: read.detail },
-        recommendedAction: "nothing is requested of anyone: the host's process table could not be read, so whether a project has more than one CTO process is unknown",
-      }];
-    }
+    if (!read.ok) return [this.ctoProcessesUnknown(projectId, read.detail)];
     const findings: Finding[] = [];
     for (const scope of scopes) {
       const processes = ctoProcessesFor(scope, read.snapshot);
@@ -757,6 +754,18 @@ export class Doctor {
       });
     }
     return findings;
+  }
+
+  private ctoProcessesUnknown(projectId: string | null, detail: string): Finding {
+    return {
+      code: "CTO_PROCESSES_UNKNOWN",
+      severity: "INFO",
+      scope: projectId ? `project:${projectId}` : "host",
+      blocking: false,
+      confidence: "LOW",
+      observedEvidence: { detail },
+      recommendedAction: "nothing is requested of anyone: the host's process table or the role's scope could not be read, so whether a project has more than one CTO process is unknown",
+    };
   }
 
   /** The projects a "project" or "cto" report covers: the target alone, or every project without one. */

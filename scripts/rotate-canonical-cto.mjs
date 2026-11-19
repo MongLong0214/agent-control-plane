@@ -17,7 +17,10 @@
 //
 // One CTO per project (exit 70): the target conversation, or any other process of the project's CTO but the old one, already
 // running refuses the rotation (CTO_ALREADY_RUNNING), before the old holder is fenced and again before the new one starts; a
-// process table that cannot be read refuses too (CTO_PROCESS_TABLE_UNREADABLE). The shared check is src/cto/one-cto-per-project.ts.
+// process table or a role scope that cannot be read refuses too (CTO_PROCESS_TABLE_UNREADABLE). The shared check is
+// src/cto/one-cto-per-project.ts. The old holder is the process its session row recorded, pid and native start token, and
+// nothing a command line says: that exact process is the one excluded from the check and the one signalled, and a pid that no
+// longer has that start is another process, so nothing is excluded or signalled for it.
 //
 // Owned work at the boundary, or an old process tree whose exit is not confirmed in time: the new conversation is
 // never started (exit 4). Nothing ever goes back to the old conversation or its generation: a new conversation that
@@ -43,7 +46,8 @@ import { join } from 'node:path';
 import Database from 'better-sqlite3';
 import { getPublicKey } from 'nostr-tools/pure';
 import { channelLaunchArgs, confirmChannelStartup, launchFolderTrust, tmuxChannelDriver } from '../src/runtime/cto-channel-launch.ts';
-import { assertNoOtherCtoProcess, ctoRoleScope } from '../src/cto/one-cto-per-project.ts';
+import { assertNoOtherCtoProcess, ctoRoleScope, unreadableScopeVerdict } from '../src/cto/one-cto-per-project.ts';
+import { readProcessStartToken } from '../src/core/process-argv.ts';
 
 const usage = 'usage: rotate-canonical-cto.mjs --project <id> --to <uuid> --expected-generation <n> --cwd <dir> --old-pid <pid> --tmux-session <name> --handoff <package.json> [--timeout-ms <ms>] [--poll-ms <ms>] [--stop-timeout-ms <ms>]';
 const flags = {};
@@ -236,7 +240,28 @@ if (resumed && (resumed.toSessionUuid !== to || resumed.fromGeneration !== expec
 }
 if (before.value.generation !== expected) stop(66, 'status', { refused: 'expected-generation is not the role\'s current generation', generation: before.value.generation });
 const table = processTable();
-const oldRow = old ? table.find((row) => row.pid === oldPid && row.command.includes(old)) ?? null : null;
+// The daemon's database, read-only and bounded: the one place the role's scope and the old holder's process are read from.
+const readDatabase = (use) => {
+  const database = new Database(process.env.ACP_HOST_DATABASE_PATH || join(state, 'state.sqlite'), { readonly: true, fileMustExist: true, timeout: 3000 });
+  try { return use(database); } finally { database.close(); }
+};
+const unreadable = (step, detail) => stop(70, step, { refused: 'CTO_PROCESS_TABLE_UNREADABLE', message: `CTO_PROCESS_TABLE_UNREADABLE: project ${project}: ${detail}`, note: 'nothing was changed' });
+// The old holder is the process its session row recorded, pid and native start token, rather than one found by searching
+// command lines for its conversation id (a new conversation's prompt may name the old one). What is excluded from the one-CTO
+// check, and what is signalled, is that exact process or nothing: a pid that no longer has that start is another process.
+const recordedOld = (() => {
+  if (!old) return null;
+  try {
+    return readDatabase((database) => database.prepare(
+      `SELECT s.os_pid AS pid, s.os_process_started_at AS start FROM actor_target_bindings tb
+         JOIN conversational_actors c ON c.actor_id = tb.target_actor_id JOIN sessions s ON s.session_id = c.current_session_id
+        WHERE tb.executor_kind = 'claude-cli' AND tb.target_locator = ?`).get(old)) ?? null;
+  } catch { return unreadable('status', 'the old holder\'s recorded process could not be read from the database'); }
+})();
+const isRecordedOld = (row) => row !== undefined && recordedOld !== null && Number.isSafeInteger(recordedOld.pid) && typeof recordedOld.start === 'string' &&
+  row.pid === recordedOld.pid && readProcessStartToken(row.pid) === recordedOld.start;
+const oldRow = (() => { const row = table.find((entry) => recordedOld !== null && entry.pid === recordedOld.pid); return isRecordedOld(row) ? row : null; })();
+if (oldRow && oldRow.pid !== oldPid) stop(66, 'status', { refused: 'old-pid is not the old holder\'s recorded process', oldPid, recorded: oldRow.pid });
 if (!old || (!oldRow && !resumed)) stop(66, 'status', { refused: 'old-pid is not the old conversation\'s claude process' });
 // The launcher must not be part of what it stops: it would wait for itself, or die with it.
 for (let row = table.find((entry) => entry.pid === process.pid), hops = 0; oldRow && row && hops < 64; hops++) {
@@ -253,14 +278,14 @@ if (oldRow && selfRow && (oldRow.pgid === selfRow.pgid || (oldRow.sess > 0 && ol
 // command line are added). The old process is expected only while it is still the very process this run validated, by pid
 // and start time: once it has exited, or its pid belongs to another process, nothing is excluded. Asked before the old holder
 // is fenced, and again just before the start (exit 70); a process table or a database that cannot be read refuses the same way.
-const roleScope = () => {
-  const database = new Database(process.env.ACP_HOST_DATABASE_PATH || join(state, 'state.sqlite'), { readonly: true, fileMustExist: true });
-  try { return ctoRoleScope((sql, params) => database.prepare(sql).all(...params), project, { conversationIds: [to, old], checkouts: [flags.cwd] }); } finally { database.close(); }
-};
+const roleScope = () => readDatabase((database) => ctoRoleScope((sql, params) => database.prepare(sql).all(...params), project, { conversationIds: [to, old], checkouts: [flags.cwd] }));
 const oneCto = async (step) => {
   let scope;
-  try { scope = roleScope(); } catch { stop(70, step, { refused: 'CTO_PROCESS_TABLE_UNREADABLE', message: `CTO_PROCESS_TABLE_UNREADABLE: project ${project}: the role's conversations and checkouts could not be read from the database`, note: 'nothing was changed' }); }
-  const verdict = await assertNoOtherCtoProcess(scope, undefined, oldRow ? [{ pid: oldRow.pid, startedAt: oldRow.start }] : []);
+  try { scope = roleScope(); } catch (error) {
+    const verdict = unreadableScopeVerdict(project, error);
+    stop(70, step, { refused: verdict.reasonCode, message: verdict.message, note: 'nothing was changed' });
+  }
+  const verdict = await assertNoOtherCtoProcess(scope, undefined, oldRow ? [{ pid: oldRow.pid, startedAt: recordedOld.start }] : []);
   if (!verdict.ok) stop(70, step, { refused: verdict.reasonCode, message: verdict.message, ...(verdict.processes ? { processes: verdict.processes } : {}), note: step === 'target' ? 'nothing was changed' : 'the old conversation is stopped and fenced and the switchover stays pending; run this launcher again with the same arguments once the other process is gone' });
 };
 await oneCto('target');
@@ -316,7 +341,8 @@ const keep = () => {
 };
 refresh();
 keep();
-if (oldRow) {
+// Signalled only while it is still the recorded process: one that has exited, and whose pid another process took, is left alone.
+if (oldRow && isRecordedOld(oldRow)) {
   try { process.kill(oldRow.pid, 'SIGTERM'); } catch (error) { if (error.code !== 'ESRCH') stop(4, 'stop', { refused: 'the old claude process could not be signalled', oldPid }); }
 }
 const left = await exitOf(refresh, stopTimeoutMs, keep);

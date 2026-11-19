@@ -3,7 +3,7 @@ import { closeSync, constants, existsSync, fstatSync, openSync, readFileSync, re
 import { homedir, platform } from "node:os";
 import { dirname, join } from "node:path";
 
-import { CTO_ALREADY_RUNNING, CTO_PROCESS_TABLE_UNREADABLE, assertNoOtherCtoProcess, ctoRoleScope, systemCtoProcessReader, type CtoProcessReader } from "../cto/one-cto-per-project.ts";
+import { CTO_ALREADY_RUNNING, CTO_PROCESS_TABLE_UNREADABLE, RoleScopeUnreadable, assertNoOtherCtoProcess, ctoRoleScope, systemCtoProcessReader, unreadableScopeVerdict, type CtoProcessReader, type OneCtoVerdict } from "../cto/one-cto-per-project.ts";
 import { systemClock, type Clock } from "../core/clock.ts";
 import { digestOf, sha256 } from "../core/digest.ts";
 import { type Decision, type Evidence, allow, deny } from "../core/errors.ts";
@@ -2231,11 +2231,18 @@ export class CanonicalSelfClaim {
     // even when it names the same conversation. The claimant itself (this pid with this start, re-attaching) is
     // the one process excluded, so a pid since reused by another process is counted. Before the room is opened and before anything is written; a process table that
     // cannot be read refuses too, since a claim admitted on a read that failed would admit a second CTO.
-    const running = await assertNoOtherCtoProcess(
-      ctoRoleScope((sql, params) => this.db.all(sql, [...params]), entry.projectId, { conversationIds: [identity.sessionUuid] }),
-      this.#ctoProcessReader,
-      identity.startedAt === null ? [] : [{ pid: identity.pid, startedAt: identity.startedAt }],
-    );
+    // A scope that could not be read is a refusal, never an empty scope: a registered checkout it missed would let a second CTO pass.
+    let running: OneCtoVerdict;
+    try {
+      running = await assertNoOtherCtoProcess(
+        ctoRoleScope((sql, params) => this.db.all(sql, [...params]), entry.projectId, { conversationIds: [identity.sessionUuid] }),
+        this.#ctoProcessReader,
+        identity.startedAt === null ? [] : [{ pid: identity.pid, startedAt: identity.startedAt }],
+      );
+    } catch (error) {
+      if (!(error instanceof RoleScopeUnreadable)) throw error;
+      running = unreadableScopeVerdict(entry.projectId, error);
+    }
     if (!running.ok) {
       return running.reasonCode === CTO_ALREADY_RUNNING
         ? refuse(SelfClaimRefusal.CTO_ALREADY_RUNNING, ReasonCode.CONFLICT, running.message, { processes: running.processes })

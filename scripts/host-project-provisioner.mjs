@@ -10,7 +10,7 @@ import { currentCanonicalCeoBuzzRoute, daemonBuzzSigner } from '../src/outbox/ce
 import { canonicalJson } from '../src/core/digest.ts';
 import { readProcessStartToken } from '../src/core/process-argv.ts';
 import { channelLaunchArgs, confirmChannelStartup, launchFolderTrust, tmuxChannelDriver } from '../src/runtime/cto-channel-launch.ts';
-import { assertNoOtherCtoProcess, ctoRoleScope } from '../src/cto/one-cto-per-project.ts';
+import { assertNoOtherCtoProcess, ctoRoleScope, unreadableScopeVerdict } from '../src/cto/one-cto-per-project.ts';
 import { formatHostProvisionerReason, hostProvisionerReason, hostReasonKind, hostRefusalText, recordedResidentExitStatus } from '../src/runtime/host-provisioner-reason.ts';
 const home = process.env.HOME;
 const state = process.env.ACP_STATE_DIR;
@@ -124,8 +124,13 @@ try {
         switchoverPending = db.prepare(from('t.claimed_at IS NULL AND t.revoked_at IS NULL')).get(a.projectId,current) ?? null;
         if (current !== a.sessionUuid) a = {...a,sessionUuid:current};
       }
-      // The role's conversations, checkouts and bound process, for the one-CTO check at launch.
-      oneCtoScope = ctoRoleScope((sql,params) => db.prepare(sql).all(...params),a.projectId,{conversationIds:[a.sessionUuid,...switchedFrom],checkouts:[a.clonePath]});
+      // The role's conversations, checkouts and bound process, for the one-CTO check at launch: only ensure-resident launches.
+      if (req.operation === 'ensure-resident') oneCtoScope = ctoRoleScope((sql,params) => db.prepare(sql).all(...params),a.projectId,{conversationIds:[a.sessionUuid,...switchedFrom],checkouts:[a.clonePath]});
+    } catch (error) {
+      // A launch never goes on a read that failed (a lock, an I/O error): refused here, before anything on the host is written, and
+      // never answered with an empty scope. Any other operation keeps its own failure.
+      if (req.operation === 'ensure-resident' && !(error instanceof ProvisionerRefusal)) throw new ProvisionerRefusal(unreadableScopeVerdict(a.projectId,error).message);
+      throw error;
     } finally {db.close();}
   }
   mkdirSync(state,{recursive:true,mode:0o700});

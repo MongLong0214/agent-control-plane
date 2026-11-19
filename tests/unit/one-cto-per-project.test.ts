@@ -1,22 +1,32 @@
-import { realpathSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { mkdirSync, readFileSync, realpathSync } from "node:fs";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
+
+import Database from "better-sqlite3";
 
 import { afterAll, describe, expect, it } from "vitest";
 
 import {
   CTO_ALREADY_RUNNING,
+  CLAUDE_OPTIONS,
+  CLAUDE_SUBCOMMANDS,
   CTO_PROCESS_TABLE_UNREADABLE,
+  RoleScopeUnreadable,
   assertNoOtherCtoProcess,
   ctoRefusalOfStderr,
   ctoRoleScope,
   parseClaudeArgv,
   parseLsofCwds,
   parseProcessTable,
+  unreadableScopeVerdict,
+  type ClaudeOptionKind,
   type CtoProcess,
   type CtoProcessReader,
   type CtoRoleScope,
 } from "../../src/cto/one-cto-per-project.ts";
 import { Role, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
-import { cleanupTempDirs } from "../helpers/fixtures.ts";
+import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 import { bindCeo, makeHarness, registerFixtureProject } from "../helpers/harness.ts";
 
 afterAll(cleanupTempDirs);
@@ -154,13 +164,128 @@ describe("parseClaudeArgv: what a claude process is, from its argv elements", ()
     expect(parseClaudeArgv(["claude", "--", "--resume", CONVERSATION])?.conversationIds).toEqual([]);
   });
 
-  it("is interactive unless it is a subcommand or has a real -p/--print before its prompt, past options and their values", () => {
+  it("is interactive unless it is a subcommand or has a real -p/--print, past options and their values", () => {
     expect(parseClaudeArgv(["claude", "--resume", CONVERSATION, "--remote-control", "p CTO"])?.interactive).toBe(true);
     expect(parseClaudeArgv(["claude", "plugin", "list"])?.interactive).toBe(false);
     expect(parseClaudeArgv(["claude", "-p", "hi"])?.interactive).toBe(false);
     expect(parseClaudeArgv(["claude", "--mcp-config", "{}", "--dangerously-load-development-channels", "server:acp-buzz-channel", "-p", "hi"])?.interactive).toBe(false);
     expect(parseClaudeArgv(["claude", "Explain how -p works"])?.interactive).toBe(true);
-    expect(parseClaudeArgv(["claude", "--model", "opus", "do the thing", "-p"])?.interactive).toBe(true);
+    // With the whole option table the walk is exact, so a real flag after the prompt is a real flag.
+    expect(parseClaudeArgv(["claude", "--model", "opus", "do the thing", "-p"])?.interactive).toBe(false);
+    // A subcommand's own options belong to it, and are not unknown options of claude's.
+    expect(parseClaudeArgv(["claude", "mcp", "add", "--scope", "local", "acp-cto", "--", "node", "agentctl.js"])?.interactive).toBe(false);
+    expect(parseClaudeArgv(["claude", "--model", "opus", "mcp", "get", "acp-cto"])?.interactive).toBe(false);
+  });
+
+  it("consumes the next element as the value of every option that takes one, whatever it looks like", () => {
+    // The reviewer's shape: `-p` here is the value of --system-prompt, so this is a conversation and its cwd counts.
+    expect(parseClaudeArgv(["claude", "--system-prompt", "-p", "Hello"])?.interactive).toBe(true);
+    expect(parseClaudeArgv(["claude", "--model", "--print", "hello"])?.interactive).toBe(true);
+    expect(parseClaudeArgv(["claude", "--name", "-p", "--resume", CONVERSATION])?.conversationIds).toEqual([CONVERSATION]);
+    // A value that is the word --resume is a value, and the uuid after it is the prompt.
+    expect(parseClaudeArgv(["claude", "--system-prompt", "--resume", CONVERSATION])?.conversationIds).toEqual([]);
+    // A list takes its first element whatever it looks like, then up to the next option; an optional value only when it is not an option.
+    expect(parseClaudeArgv(["claude", "--add-dir", "-p", "/a", "/b"])?.interactive).toBe(true);
+    expect(parseClaudeArgv(["claude", "--mcp-config", "{}", "a", "b", "-p"])?.interactive).toBe(false);
+    expect(parseClaudeArgv(["claude", "--resume", "-p", "hi"])?.interactive).toBe(false);
+    expect(parseClaudeArgv(["claude", "--remote-control", "p CTO", "--debug", "-p"])?.interactive).toBe(false);
+    expect(parseClaudeArgv(["claude", "--model=opus", "-p", "x"])?.interactive).toBe(false);
+    expect(parseClaudeArgv(["claude", "--system-prompt=-p", "x"])?.interactive).toBe(true);
+  });
+
+  it("reads an option it does not know as ambiguous: interactive, so it is counted, with every flagged conversation named", () => {
+    const unknown = parseClaudeArgv(["claude", "--frobnicate", "-p", "--resume", CONVERSATION]);
+    expect(unknown).toMatchObject({ interactive: true, conversationIds: [CONVERSATION] });
+    // What came before an unknown option is exact: a real -p ahead of it stands, and the usage probe's own argv is headless.
+    expect(parseClaudeArgv(["claude", "-p", "--frobnicate"])).toMatchObject({ interactive: false });
+    expect(parseClaudeArgv(["claude", "--frobnicate", "mcp", "list"])).toMatchObject({ interactive: true });
+    // A bundled short option is not in the table either.
+    expect(parseClaudeArgv(["claude", "-pc", "x"])?.interactive).toBe(true);
+  });
+
+  it("reads ACP's own launch argv exactly: interactive, naming its conversation, with no option unknown", () => {
+    const launch = ["/Users/isaac/.local/bin/claude", "--model", "opus", "--mcp-config", `{"mcpServers":{"acp-buzz-channel":{"command":"node"}}}`,
+      "--dangerously-load-development-channels", "server:acp-buzz-channel", "--resume", CONVERSATION, "--name", "p CTO", "--remote-control", "p CTO",
+      "--messaging-socket-path", "/state/cc-session-p.sock", "--permission-mode", "bypassPermissions", "--dangerously-skip-permissions",
+      "You are p CTO. Connect to acp-cto and read -p role_dispatch_pending."];
+    expect(parseClaudeArgv(launch)).toMatchObject({ interactive: true, conversationIds: [CONVERSATION] });
+    // Not ambiguous: a real -p appended after the prompt is seen as the flag it is.
+    expect(parseClaudeArgv([...launch, "-p"])?.interactive).toBe(false);
+  });
+});
+
+describe("the option table is Claude Code 2.1.323's own, as `claude --help` prints it", () => {
+  const FIXTURE = fileURLToPath(new URL("../fixtures/claude-2.1.323-help.txt", import.meta.url));
+  /** What `--help` says each option takes: `<x>` a value, `[x]` an optional one, `<x...>` a list, nothing a flag; and its subcommands. */
+  const readHelp = (help: string) => {
+    const options = new Map<string, ClaudeOptionKind>();
+    const commands = new Set<string>();
+    let section = "";
+    for (const line of help.split("\n")) {
+      if (/^(Options|Commands|Arguments):$/.test(line)) { section = line.slice(0, -1); continue; }
+      if (section === "Options") {
+        const spec = /^ {2}(-\S.*?)(?: {2,}|$)/.exec(line)?.[1];
+        if (spec === undefined) continue;
+        const argument = /\s(<[^>]+>|\[[^\]]+\])$/.exec(spec)?.[1] ?? null;
+        const kind: ClaudeOptionKind = argument === null ? "flag" : argument.endsWith("...>") ? "list" : argument.startsWith("<") ? "value" : "optional";
+        for (const name of spec.replace(/\s(<[^>]+>|\[[^\]]+\])$/, "").split(", ")) options.set(name.trim(), kind);
+      } else if (section === "Commands") {
+        const name = /^ {2}([a-z][a-z-]*(?:\|[a-z][a-z-]*)*)(?: |$)/.exec(line)?.[1];
+        if (name !== undefined) for (const alias of name.split("|")) commands.add(alias);
+      }
+    }
+    return { options, commands };
+  };
+  /** The options ACP's own launches pass that `--help` does not list. */
+  const HIDDEN = new Map<string, ClaudeOptionKind>([["--messaging-socket-path", "value"], ["--dangerously-load-development-channels", "list"], ["--max-turns", "value"]]);
+
+  it("holds exactly the options and subcommands of the pinned --help, and the two hidden options ACP launches with", () => {
+    const { options, commands } = readHelp(readFileSync(FIXTURE, "utf8"));
+    expect(options.size).toBeGreaterThan(60);
+    expect(commands.size).toBe(21);
+    expect(new Map([...CLAUDE_OPTIONS].filter(([name]) => !HIDDEN.has(name)))).toEqual(options);
+    for (const [name, kind] of HIDDEN) expect(CLAUDE_OPTIONS.get(name)).toBe(kind);
+    expect(CLAUDE_OPTIONS.size).toBe(options.size + HIDDEN.size);
+    expect(CLAUDE_SUBCOMMANDS).toEqual(commands);
+  });
+
+  it("is still what the installed claude prints, when that claude is 2.1.323", () => {
+    let version = "";
+    try { version = execFileSync("claude", ["--version"], { encoding: "utf8", timeout: 20_000 }); } catch { return; }
+    if (!version.startsWith("2.1.323 ")) return;
+    const live = readHelp(execFileSync("claude", ["--help"], { encoding: "utf8", timeout: 20_000 }));
+    expect(live).toEqual(readHelp(readFileSync(FIXTURE, "utf8")));
+  });
+});
+
+describe("a role scope that could not be read is never an empty scope", () => {
+  it("a table the database does not have names nothing; any other failure throws", () => {
+    const missing = () => { throw Object.assign(new Error("no such table: repositories"), { code: "SQLITE_ERROR" }); };
+    expect(ctoRoleScope(missing, "p", { checkouts: ["/c"] })).toEqual({ projectId: "p", conversationIds: [], checkouts: ["/c"], bound: [] });
+    const busy = () => { throw Object.assign(new Error("database is locked"), { code: "SQLITE_BUSY" }); };
+    expect(() => ctoRoleScope(busy, "p")).toThrow(RoleScopeUnreadable);
+    expect(() => ctoRoleScope(busy, "p")).toThrow("role scope: read failed (SQLITE_BUSY)");
+    expect(unreadableScopeVerdict("p", new RoleScopeUnreadable({ code: "SQLITE_BUSY" }))).toMatchObject({ ok: false, reasonCode: CTO_PROCESS_TABLE_UNREADABLE, detail: "role scope: read failed (SQLITE_BUSY)" });
+  });
+
+  it("with a real exclusive lock on the database, the read throws and a registered checkout is not silently dropped", () => {
+    const dir = tempDir("one-cto-lock-");
+    mkdirSync(dir, { recursive: true });
+    const file = join(dir, "state.sqlite");
+    const writer = new Database(file);
+    writer.exec("CREATE TABLE repositories (repository_id TEXT, checkout_path TEXT, project_id TEXT, retired_at TEXT); INSERT INTO repositories VALUES ('r1', '/registered/checkout', 'p', NULL);");
+    const reader = new Database(file, { readonly: true, fileMustExist: true, timeout: 200 });
+    try {
+      const query = <T>(sql: string, params: readonly unknown[]): T[] => reader.prepare(sql).all(...params) as T[];
+      expect(ctoRoleScope(query, "p").checkouts).toEqual(["/registered/checkout"]);
+      writer.exec("BEGIN EXCLUSIVE");
+      expect(() => ctoRoleScope(query, "p")).toThrow(/role scope: read failed \(SQLITE_BUSY\)/);
+      writer.exec("ROLLBACK");
+      expect(ctoRoleScope(query, "p").checkouts).toEqual(["/registered/checkout"]);
+    } finally {
+      reader.close();
+      writer.close();
+    }
   });
 });
 

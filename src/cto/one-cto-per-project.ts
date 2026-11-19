@@ -105,20 +105,51 @@ export type CtoSnapshotResult =
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const NATIVE_VERSIONED_CLAUDE = /^.+\/claude\/versions\/\d+\.\d+\.\d+$/;
-/** `claude <subcommand>` runs a short command, not a conversation: it is never a CTO. */
-const CLAUDE_SUBCOMMANDS: ReadonlySet<string> = new Set([
-  "mcp", "config", "doctor", "update", "upgrade", "install", "migrate-installer", "setup-token", "plugin", "plugins", "agents", "auth",
-]);
-/** Options that take every following non-option element as values: a prompt after one is read as one of them, so the launch's own prompt follows another option. */
-const LIST_FLAGS: ReadonlySet<string> = new Set([
-  "--mcp-config", "--dangerously-load-development-channels", "--channels", "--add-dir", "--allowed-tools", "--allowedTools",
-  "--disallowed-tools", "--disallowedTools", "--plugin-dir", "--betas", "--tools",
-]);
-/** Options whose next element is their value, never a flag and never the prompt. */
-const VALUE_FLAGS: ReadonlySet<string> = new Set([
-  "--model", "--name", "-n", "--messaging-socket-path", "--remote-control", "--permission-mode", "--effort", "--input-format",
-  "--system-prompt", "--append-system-prompt", "--settings", "--setting-sources", "--max-turns", "--agents", "--fallback-model",
-  "--session-id", "--resume", "-r", "--output-format", "--mcp-debug-file", "--debug-file",
+/**
+ * How an option consumes the elements after it, as commander (Claude Code's own parser) does:
+ *   flag      takes nothing;
+ *   value     `<x>`: the next element is its value, whatever it looks like, so `--system-prompt -p` has the value `-p`;
+ *   optional  `[x]`: the next element is its value unless it starts with `-`;
+ *   list      `<x...>`: the next element, whatever it looks like, then every following element up to the next that starts with `-`.
+ * An option is also given as `--name=value`, which is self-contained.
+ */
+export type ClaudeOptionKind = "flag" | "value" | "optional" | "list";
+
+const optionTable = (kinds: Record<ClaudeOptionKind, readonly string[]>): ReadonlyMap<string, ClaudeOptionKind> =>
+  new Map((Object.entries(kinds) as Array<[ClaudeOptionKind, readonly string[]]>).flatMap(([kind, names]) => names.map((name): [string, ClaudeOptionKind] => [name, kind])));
+
+/**
+ * Claude Code 2.1.323's options, read off its own `claude --help` (pinned in `tests/unit/one-cto-per-project.test.ts` against
+ * `tests/fixtures/claude-2.1.323-help.txt`), every spelling of each. Three are not in `--help` and are what ACP's own launches pass:
+ * `--messaging-socket-path <path>`, `--dangerously-load-development-channels <servers...>` (the CTO launches) and `--max-turns <n>`
+ * (the capacity usage probe).
+ * An option not in this table leaves the number of elements it takes unknown, so what follows cannot be told from its value.
+ */
+export const CLAUDE_OPTIONS: ReadonlyMap<string, ClaudeOptionKind> = optionTable({
+  flag: [
+    "--allow-dangerously-skip-permissions", "--ax-screen-reader", "--bg", "--background", "--bare", "--brief", "--chrome", "-c", "--continue",
+    "--dangerously-skip-permissions", "--desktop", "--disable-slash-commands", "--exclude-dynamic-system-prompt-sections", "--fork-session",
+    "--forward-subagent-text", "-h", "--help", "--ide", "--include-hook-events", "--include-partial-messages", "--no-chrome",
+    "--no-session-persistence", "-p", "--print", "--replay-user-messages", "--restricted", "--safe-mode", "--strict-mcp-config", "--tmux",
+    "--verbose", "-v", "--version",
+  ],
+  value: [
+    "--agent", "--agents", "--append-system-prompt", "--autocompact", "--debug-file", "--effort", "--environment", "--fallback-model",
+    "--input-format", "--json-schema", "--max-budget-usd", "--model", "-n", "--name", "--output-format", "--permission-mode",
+    "--permission-prompts", "--plugin-dir", "--plugin-url", "--remote-control-session-name-prefix", "--session-id", "--setting-sources",
+    "--settings", "--system-prompt", "--system-prompt-snapshot", "--messaging-socket-path", "--max-turns",
+  ],
+  optional: ["--cloud", "-d", "--debug", "--from-pr", "--prompt-suggestions", "--remote-control", "-r", "--resume", "--teleport", "-w", "--worktree"],
+  list: [
+    "--add-dir", "--allowedTools", "--allowed-tools", "--betas", "--disallowedTools", "--disallowed-tools", "--file", "--mcp-config", "--tools",
+    "--dangerously-load-development-channels",
+  ],
+});
+
+/** `claude <subcommand>` runs a short command, not a conversation: it is never a CTO. From the same `--help`, with the aliases. */
+export const CLAUDE_SUBCOMMANDS: ReadonlySet<string> = new Set([
+  "agents", "attach", "auth", "auto-mode", "doctor", "gateway", "import", "install", "logs", "mcp", "plugin", "plugins", "purge", "respawn",
+  "rm", "setup-token", "stop", "kill", "ultrareview", "update", "upgrade",
 ]);
 
 /** The argv from the claude executable on (past a leading `env VAR=value`), or null when the process is not claude. */
@@ -134,12 +165,17 @@ const claudeArgv = (argv: readonly string[]): readonly string[] | null => {
 };
 
 /**
- * What a process is from its real argv, or null when it is not claude. Decided on whole elements only:
- * `-p` and `--print` make it headless when they are elements of their own before the prompt, the first
- * element that is neither an option nor an option's value (a prompt that merely contains "-p" is one
- * element, and is not one); `--resume`, `-r` and `--session-id` name a conversation when an element is
- * exactly that flag and the next is exactly a UUID, or one element is `--resume=<uuid>`. Nothing after a
- * bare `--` is an option.
+ * What a process is from its real argv, or null when it is not claude. Decided on whole elements, walking
+ * the argv the way Claude Code's own parser does, with its option table (`CLAUDE_OPTIONS`):
+ *   - an option that takes a value consumes the next element as that value, so `--system-prompt -p` is not headless
+ *     and a prompt that merely contains "-p" or "--resume <uuid>" is one element and no flag;
+ *   - `-p` and `--print` make it headless; the first positional element that is a subcommand name (`mcp`, `doctor`, ...)
+ *     makes it a command, and what follows belongs to that command;
+ *   - `--resume`, `-r` and `--session-id` name a conversation when their value is exactly a UUID;
+ *   - nothing after a bare `--` is an option.
+ * An option the table does not know leaves the count of elements it takes unknown, so what follows it cannot be
+ * told from its value: unless a `-p` or a subcommand came before it, the process is then read as interactive (it is
+ * counted), and every `--resume <uuid>` element is taken to name a conversation. Fail closed.
  */
 export const parseClaudeArgv = (argv: readonly string[]): ClaudeProcess | null => {
   const claude = claudeArgv(argv);
@@ -147,29 +183,46 @@ export const parseClaudeArgv = (argv: readonly string[]): ClaudeProcess | null =
   const boundary = claude.indexOf("--");
   const end = boundary === -1 ? claude.length : boundary;
   const conversationIds: string[] = [];
-  for (let at = 1; at < end; at += 1) {
+  const names = (name: string): boolean => name === "--resume" || name === "-r" || name === "--session-id";
+  const note = (value: string | null | undefined): void => { if (value !== null && value !== undefined && UUID.test(value)) conversationIds.push(value.toLowerCase()); };
+  let headless = false;
+  let subcommand = false;
+  let ambiguous = false;
+  let positional = false;
+  for (let at = 1; at < end && !subcommand; at += 1) {
     const element = claude[at]!;
-    const attached = /^(?:--resume|--session-id)=(.*)$/.exec(element);
-    if (attached !== null) { if (UUID.test(attached[1]!)) conversationIds.push(attached[1]!.toLowerCase()); continue; }
-    if ((element === "--resume" || element === "-r" || element === "--session-id") && claude[at + 1] !== undefined && UUID.test(claude[at + 1]!)) {
-      conversationIds.push(claude[at + 1]!.toLowerCase());
-      at += 1;
+    if (!element.startsWith("-") || element === "-") {
+      if (!positional) {
+        positional = true;
+        subcommand = CLAUDE_SUBCOMMANDS.has(element);
+      }
+      continue;
+    }
+    const equals = element.indexOf("=");
+    const name = equals === -1 ? element : element.slice(0, equals);
+    const kind = CLAUDE_OPTIONS.get(name);
+    if (kind === undefined) { ambiguous = true; break; }
+    if (name === "-p" || name === "--print") headless = true;
+    let value: string | null = equals === -1 ? null : element.slice(equals + 1);
+    if (equals === -1) {
+      if ((kind === "value" || kind === "list") && at + 1 < end) { value = claude[at + 1]!; at += 1; }
+      else if (kind === "optional" && at + 1 < end && !claude[at + 1]!.startsWith("-")) { value = claude[at + 1]!; at += 1; }
+      if (kind === "list") while (at + 1 < end && !claude[at + 1]!.startsWith("-")) at += 1;
+    }
+    if (names(name)) note(value);
+  }
+  if (ambiguous) {
+    // Not told apart from a value: every element that is exactly a conversation flag followed by exactly a UUID counts.
+    for (let at = 1; at < end; at += 1) {
+      const element = claude[at]!;
+      const attached = /^(?:--resume|--session-id)=(.*)$/.exec(element);
+      if (attached !== null) note(attached[1]);
+      else if (names(element)) note(claude[at + 1]);
     }
   }
-  const second = claude[1];
-  let interactive = !(second !== undefined && !second.startsWith("-") && CLAUDE_SUBCOMMANDS.has(second));
-  for (let at = 1; interactive && at < end; at += 1) {
-    const element = claude[at]!;
-    if (element === "-p" || element === "--print" || element.startsWith("--print=")) { interactive = false; break; }
-    if (!element.startsWith("-")) break;
-    if (element.includes("=")) continue;
-    if (LIST_FLAGS.has(element)) {
-      while (at + 1 < end && !claude[at + 1]!.startsWith("-")) at += 1;
-    } else if (VALUE_FLAGS.has(element) && at + 1 < end && !claude[at + 1]!.startsWith("-")) {
-      at += 1;
-    }
-  }
-  return { argv: claude, interactive, conversationIds };
+  // What was seen before an unknown option is exact, so a `-p` or a subcommand ahead of it stands; what follows it cannot be told from its
+  // value, so an unknown option that comes first leaves the process counted.
+  return { argv: claude, interactive: !(headless || subcommand), conversationIds: [...new Set(conversationIds)] };
 };
 
 const sameDirectory = (observed: string, checkout: string): boolean => {
@@ -405,13 +458,35 @@ export const systemCtoProcessReader = (): CtoProcessReader => ({
 // The role's scope, from the daemon's database.
 // ---------------------------------------------------------------------------
 
+const scopeDetail = (cause: unknown): string => {
+  if (cause instanceof RoleScopeUnreadable) return cause.detail;
+  const code = (cause as { code?: unknown } | null)?.code;
+  return `role scope: ${typeof code === "string" || typeof code === "number" ? `read failed (${code})` : "read failed"}`;
+};
+
+/** The role's scope could not be read from the database. Never an empty scope. */
+export class RoleScopeUnreadable extends Error {
+  readonly detail: string;
+  constructor(cause: unknown) {
+    const detail = scopeDetail(cause);
+    super(detail);
+    this.detail = detail;
+  }
+}
+
+/** The launch refusal for a scope that could not be read (whatever the failure): the reason code of a process table that could not be read. */
+export const unreadableScopeVerdict = (projectId: string, error: unknown): OneCtoVerdict => {
+  const detail = scopeDetail(error);
+  return { ok: false, reasonCode: CTO_PROCESS_TABLE_UNREADABLE, projectId, detail, message: `${CTO_PROCESS_TABLE_UNREADABLE}: project ${projectId}: ${detail}` };
+};
+
 export type RoleScopeQuery = <T>(sql: string, params: readonly unknown[]) => T[];
 
 /**
  * What names a project's CTO in the database: every conversation that held or was entitled to the role
  * (a conversation switched over from still counts, because it must not be running either), the
  * project's registered checkouts and the bound session's process. A table this database does not have
- * names nothing. `extra` adds what a door already knows: the conversation it is about to start, its cwd.
+ * names nothing; any other failure to read throws `RoleScopeUnreadable`. `extra` adds what a door already knows: the conversation it is about to start, its cwd.
  */
 export const ctoRoleScope = (
   query: RoleScopeQuery,
@@ -419,7 +494,12 @@ export const ctoRoleScope = (
   extra: { conversationIds?: readonly string[]; checkouts?: readonly string[] } = {},
 ): CtoRoleScope => {
   const rows = <T>(sql: string): T[] => {
-    try { return query<T>(sql, [projectId]); } catch { return []; }
+    try { return query<T>(sql, [projectId]); } catch (error) {
+      // A table this database does not have names nothing. Any other failure (a lock, an I/O error, a corrupt page) is not an empty
+      // answer: a scope built without a checkout or a conversation lets the check pass on what it could not see.
+      if (/no such table/i.test(String((error as { message?: unknown } | null)?.message ?? ""))) return [];
+      throw new RoleScopeUnreadable(error);
+    }
   };
   const conversationIds = new Set<string>((extra.conversationIds ?? []).map((id) => id.toLowerCase()));
   for (const row of rows<{ id: string }>(

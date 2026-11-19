@@ -20,16 +20,17 @@ import { cleanupTempDirs, tempDir } from '../helpers/fixtures.ts';
 // Only the tables and columns currentCanonicalCeoBuzzRoute reads, with one current canonical CEO.
 const writeCeoDatabase = (path:string, recipient:string) => {
   const db = new Database(path);
-  db.exec(`CREATE TABLE assignments(assignment_id,binding_generation,actor_id,role_key,role,status);
+  // The columns the one-CTO check reads from a daemon database too (a database it cannot read is a refusal, not an empty scope).
+  db.exec(`CREATE TABLE assignments(assignment_id,binding_generation,actor_id,role_key,role,status,project_id,session_id);
     CREATE TABLE conversational_actors(actor_id,current_session_id,current_session_incarnation);
-    CREATE TABLE sessions(session_id,incarnation,buzz_address,buzz_actor_id,lifecycle);
-    CREATE TABLE actor_target_bindings(target_binding_id,target_actor_id,executor_kind);
+    CREATE TABLE sessions(session_id,incarnation,buzz_address,buzz_actor_id,lifecycle,os_pid,os_process_started_at);
+    CREATE TABLE actor_target_bindings(target_binding_id,target_actor_id,executor_kind,target_locator);
     CREATE TABLE actor_target_attestations(target_binding_id,assignment_id,binding_generation,executor_session_id,executor_session_incarnation,target_bind_receipt_json,target_bind_executor_runtime_identity);
-    INSERT INTO assignments VALUES('asg_ceo',1,'act_ceo','CEO','CEO','ACTIVE');
+    INSERT INTO assignments(assignment_id,binding_generation,actor_id,role_key,role,status) VALUES('asg_ceo',1,'act_ceo','CEO','CEO','ACTIVE');
     INSERT INTO conversational_actors VALUES('act_ceo','ses_ceo','inc_ceo');
-    INSERT INTO actor_target_bindings VALUES('tb_ceo','act_ceo','hermes');
+    INSERT INTO actor_target_bindings(target_binding_id,target_actor_id,executor_kind) VALUES('tb_ceo','act_ceo','hermes');
     INSERT INTO actor_target_attestations VALUES('tb_ceo','asg_ceo',1,'ses_ceo','inc_ceo','{}','runtime');`);
-  db.prepare(`INSERT INTO sessions VALUES('ses_ceo','inc_ceo','ffffffff-ffff-4fff-8fff-ffffffffffff',?,'READY')`).run(recipient);
+  db.prepare(`INSERT INTO sessions(session_id,incarnation,buzz_address,buzz_actor_id,lifecycle) VALUES('ses_ceo','inc_ceo','ffffffff-ffff-4fff-8fff-ffffffffffff',?,'READY')`).run(recipient);
   db.close();
 };
 const setCeoRecipient = (path:string, recipient:string|null) => {
@@ -428,6 +429,19 @@ describe('one CTO per project at the resident launch door',() => {
     patchFake(g,{others:[{...mentioning,cwd:g.a.clonePath}]});
     await expect(g.invoke('ensure-resident')).rejects.toThrow(new RegExp(`CTO_ALREADY_RUNNING: .*pid=${mentioning.pid} .*by=cwd`));
     expect(fakeState(g)).toMatchObject({launches:0});
+  });
+
+  it('refuses, with a real exclusive lock on the database, rather than launching on a scope it could not read',async () => {
+    const f = await ready();
+    const holder = new Database(f.database);
+    holder.exec('BEGIN EXCLUSIVE');
+    try {
+      await expect(f.invoke('ensure-resident')).rejects.toThrow(/CTO_PROCESS_TABLE_UNREADABLE: project test: role scope: read failed \(SQLITE_BUSY\)/);
+      expect(fakeState(f)).toMatchObject({launches:0});
+      expect(existsSync(join(f.state,'resident-test.launch.json'))).toBe(false);
+    } finally {holder.exec('ROLLBACK');holder.close();}
+    await f.invoke('ensure-resident');
+    expect(fakeState(f)).toMatchObject({launches:1});
   });
 
   it('fails closed, with a reason of its own, when the process table or a claude\'s working directory cannot be read',async () => {
