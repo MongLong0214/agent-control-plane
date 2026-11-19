@@ -8,7 +8,7 @@ import type { Decision } from "../core/errors.ts";
 import { readProcessArgv, readProcessStartToken } from "../core/process-argv.ts";
 import { residentWorkerCheckoutPath } from "../core/resident-allocation-paths.ts";
 import { daemonBuzzSigner } from "../outbox/ceo-buzz-signer.ts";
-import { BUZZ_CHANNEL_SERVER, CHANNEL_DEV_FLAG, channelLaunchArgs, confirmChannelStartup, launchFolderTrust, tmuxChannelDriver } from "../runtime/cto-channel-launch.ts";
+import { BUZZ_CHANNEL_SERVER, CHANNEL_DEV_FLAG, channelEmittedSince, channelLaunchArgs, confirmChannelStartup, launchFolderTrust, tmuxChannelDriver } from "../runtime/cto-channel-launch.ts";
 import { readHostProvisionerReason, recordedResidentExitStatus } from "../runtime/host-provisioner-reason.ts";
 
 /**
@@ -190,7 +190,8 @@ const conversationProcesses = (ports: CtoPorts, uuid: string | null): CtoProcess
   return ports.processes().filter((p) => names.test(p.command));
 };
 const carriesChannel = (command: string): boolean => command.includes(`${CHANNEL_DEV_FLAG} server:${BUZZ_CHANNEL_SERVER}`);
-const alive = (ports: CtoPorts, pid: number | null | undefined): boolean => Boolean(pid) && ports.processes().some((p) => p.pid === pid);
+/** Alive by the kernel's own start token, never by whether `ps` happened to list it. */
+const alive = (ports: CtoPorts, pid: number | null | undefined): boolean => Boolean(pid) && ports.startToken(pid!) !== null;
 
 /** The tmux session one of whose panes is `pid` or an ancestor of it. */
 const tmuxOf = (ports: CtoPorts, pid: number): string | null => {
@@ -265,7 +266,7 @@ const idleStep = (ports: CtoPorts, projectId: string): CtoStep => ({
     const record = fresh(ports, projectId);
     const uuid = record?.conversation ?? null;
     const live = conversationProcesses(ports, uuid);
-    if (!record || live.length === 0) return ok({ running: false });
+    if (!record || (live.length === 0 && boundPid(ports, record) === null)) return ok({ running: false });
     const cwd = record.session?.workdir ?? cloneOf(record);
     const mtime = cwd ? ports.files.mtimeMs(transcriptOf(ports, cwd, uuid!)) : null;
     if (mtime === null) return refused(`conversation ${uuid} is running and its transcript cannot be found, so whether it is mid-turn is unknown`);
@@ -275,11 +276,26 @@ const idleStep = (ports: CtoPorts, projectId: string): CtoStep => ({
   },
 });
 
-/** Whether `pid` is the incarnation ACP recorded: the native start token, or `ps`'s lstart text for a row written that way. */
-const sameIncarnation = (ports: CtoPorts, pid: number, startedAt: string): boolean => {
+/**
+ * Whether `pid` is the incarnation ACP recorded: the native start token, or `ps`'s lstart text for a row written that
+ * way. Null when that cannot be told (an lstart row and a `ps` that does not answer), which callers treat as the same.
+ */
+const sameIncarnation = (ports: CtoPorts, pid: number, startedAt: string): boolean | null => {
   if (ports.startToken(pid) === startedAt) return true;
   if (!/^[A-Z][a-z]{2} [A-Z][a-z]{2} +\d{1,2} \d{2}:\d{2}:\d{2} \d{4}$/.test(startedAt)) return false;
-  return ports.run("ps", ["-o", "lstart=", "-p", String(pid)], { env: { ...ports.env, LC_ALL: "C" }, timeoutMs: 5_000 }).stdout.trim() === startedAt;
+  const lstart = ports.run(PS, ["-o", "lstart=", "-p", String(pid)], { env: { ...ports.env, LC_ALL: "C" }, timeoutMs: 5_000 });
+  return lstart.status === 0 ? lstart.stdout.trim() === startedAt : null;
+};
+
+/**
+ * The bound session's own process, when the kernel says it is alive and it is (or may be) the incarnation ACP recorded:
+ * fail closed, whatever an argv match says. A recorded pid that now belongs to another process is not it.
+ */
+const boundPid = (ports: CtoPorts, record: CtoRecord | null): number | null => {
+  const pid = record?.session?.pid ?? null;
+  if (!pid || !alive(ports, pid)) return null;
+  const startedAt = record?.session?.startedAt ?? null;
+  return startedAt === null || sameIncarnation(ports, pid, startedAt) !== false ? pid : null;
 };
 
 /**
@@ -293,24 +309,31 @@ const stopStep = (ports: CtoPorts, projectId: string, id = "stop", keepChanneled
   plan: keepChanneled
     ? "unless the CTO's conversation already runs with the acp-buzz-channel, send SIGTERM to the one claude process running it (its exact pid and start time), nothing else, and wait for it to exit"
     : "send SIGTERM to the one claude process running the CTO's conversation (its exact pid and start time), nothing else, and wait for it to exit",
+  // Not done while the bound session's process is alive, even when no argv the process table lists names it.
   done: () => {
-    const live = conversationProcesses(ports, fresh(ports, projectId)?.conversation ?? null);
+    const record = fresh(ports, projectId);
+    const live = conversationProcesses(ports, record?.conversation ?? null);
+    const bound = boundPid(ports, record);
+    if (bound !== null && !live.some((p) => p.pid === bound)) return false;
     return live.length === 0 || (keepChanneled && live.every((p) => carriesChannel(p.command)));
   },
   run: async () => {
     const record = fresh(ports, projectId);
     const uuid = record?.conversation ?? null;
     const live = conversationProcesses(ports, uuid);
-    if (live.length === 0) return ok({ running: false });
     if (live.length > 1) return refused(`${live.length} processes run conversation ${uuid} (${live.map((p) => p.pid).join(", ")}); nothing was signalled`);
-    const target = live[0]!;
-    const recorded = record?.session?.pid ?? null;
-    if (recorded && recorded !== target.pid && alive(ports, recorded)) {
-      return refused(`ACP records pid ${recorded} for this CTO, which is alive, but pid ${target.pid} runs its conversation; nothing was signalled`);
+    const bound = boundPid(ports, record);
+    // The bound session's process is the one to stop when the process table does not show it by its argv.
+    const target = live[0] ?? (bound !== null ? { pid: bound } : null);
+    if (target === null) return ok({ running: false });
+    if (bound !== null && bound !== target.pid) {
+      return refused(`ACP records pid ${bound} for this CTO, which is alive, but pid ${target.pid} runs its conversation; nothing was signalled`);
     }
+    const recorded = record?.session?.pid ?? null;
     const recordedStart = record?.session?.startedAt ?? null;
-    if (recorded === target.pid && recordedStart && !sameIncarnation(ports, target.pid, recordedStart)) {
-      return refused(`pid ${target.pid} is not the incarnation ACP recorded for this CTO (its start time differs); nothing was signalled`);
+    const incarnation = recorded === target.pid && recordedStart ? sameIncarnation(ports, target.pid, recordedStart) : true;
+    if (incarnation !== true) {
+      return refused(`pid ${target.pid} ${incarnation === false ? "is not the incarnation ACP recorded for this CTO (its start time differs)" : "cannot be told from the incarnation ACP recorded (ps did not answer)"}; nothing was signalled`);
     }
     const start = ports.startToken(target.pid);
     if (start === null) return refused(`pid ${target.pid}'s start time cannot be read, so its exit could not be confirmed; nothing was signalled`);
@@ -507,6 +530,7 @@ const canonicalResumeSteps = (ports: CtoPorts, projectId: string, restart: boole
       const planned = readCanonicalLauncher(ports, projectId);
       if (!planned) return refused(`${launcher} is missing or unreadable; run this again to write it`);
       const tmuxRun = (args: string[]): CtoExecResult => ports.run("tmux", args, { timeoutMs: 10_000 });
+      const launchedAt = Math.floor(ports.now() / 1000);
       const started = tmuxExists(ports, planned.tmux)
         ? tmuxRun(["new-window", "-d", "-P", "-F", "#{pane_id}", "-t", `=${planned.tmux}:`, launcher])
         : tmuxRun(["new-session", "-d", "-s", planned.tmux, "-P", "-F", "#{pane_id}", launcher]);
@@ -517,7 +541,9 @@ const canonicalResumeSteps = (ports: CtoPorts, projectId: string, restart: boole
         if (answer.status !== 0) throw new Error(firstLine(answer.stderr) || `${bin} exited ${answer.status ?? "on timeout"}`);
         return answer.stdout;
       };
-      const startup = await confirmChannelStartup(tmuxChannelDriver({ tmux: "tmux", target: pane, startCommand: launcher, run }));
+      // A backlog flood can scroll the registered line away; the channel's own receipt after this launch proves it too.
+      const registered = channelEmittedSince(ports.stateDir, projectId, launchedAt, (path) => ports.files.read(path));
+      const startup = await confirmChannelStartup(tmuxChannelDriver({ tmux: "tmux", target: pane, startCommand: launcher, run, registered }));
       if (!startup.ok) {
         return refused(`the resumed conversation was started in tmux ${planned.tmux} (${pane}) and its channel did not come up (${startup.failure}, screen ${startup.screen}); it was left running there`, { tmux: planned.tmux, pane });
       }
@@ -1074,6 +1100,23 @@ export const openCtoState = async (databasePath: string): Promise<CtoStateReader
   };
 };
 
+/** `ps` by its absolute path: a PATH without it must not read as a host with no processes. */
+const PS = "/bin/ps";
+
+/**
+ * The process table, or an error. A `ps` that cannot run (missing, refused by a sandbox, timed out) or lists nothing
+ * is never an empty table: an empty table would read as "no CTO is running" and let a stop be skipped.
+ */
+export const processTableOf = (run: CtoExec): CtoProcess[] => {
+  const listed = run(PS, ["-axww", "-o", "pid=,ppid=,command="], { env: { ...process.env, LC_ALL: "C" }, timeoutMs: 10_000 });
+  const rows = listed.status === 0 ? listed.stdout.split("\n").flatMap((line) => {
+    const match = /^\s*(\d+)\s+(\d+)\s(.*)$/.exec(line);
+    return match ? [{ pid: Number(match[1]), ppid: Number(match[2]), command: match[3]!.trim() }] : [];
+  }) : [];
+  if (rows.length === 0) throw new Error(`the process table could not be read (${PS} ${listed.status === null ? "did not run" : `exited ${listed.status}`}${listed.stderr ? `: ${firstLine(listed.stderr)}` : ""}); nothing was assumed about what runs`);
+  return rows;
+};
+
 /** Subprocesses as the command runs them on the host: bounded, no shell, stdout and stderr captured. */
 export const hostRunner = (env: Readonly<Record<string, string | undefined>>): CtoExec => (bin, args, options = {}) => {
   const result = spawnSync(bin, [...args], {
@@ -1093,10 +1136,7 @@ export const createCtoPorts = async (input: {
   return {
     home, stateDir, databasePath: input.databasePath, env, operator: input.operator, run: runner,
     state: await openCtoState(input.databasePath),
-    processes: () => runner("ps", ["-axww", "-o", "pid=,ppid=,command="], { env: { ...env, LC_ALL: "C" }, timeoutMs: 10_000 }).stdout.split("\n").flatMap((line) => {
-      const match = /^\s*(\d+)\s+(\d+)\s(.*)$/.exec(line);
-      return match ? [{ pid: Number(match[1]), ppid: Number(match[2]), command: match[3]!.trim() }] : [];
-    }),
+    processes: () => processTableOf(runner),
     startToken: readProcessStartToken,
     argv: readProcessArgv,
     signal: (pid, signal) => { process.kill(pid, signal); },

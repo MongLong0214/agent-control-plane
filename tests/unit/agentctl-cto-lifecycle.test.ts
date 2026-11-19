@@ -4,13 +4,13 @@ import { afterAll, describe, expect, it, vi } from "vitest";
 
 import { main } from "../../src/cli/agentctl.ts";
 import {
-  CTO_SUBCOMMANDS, IDLE_SECONDS, checkoutHeldWork, hostRunner, runCtoCommand, workerHeldWork,
+  CTO_SUBCOMMANDS, IDLE_SECONDS, checkoutHeldWork, hostRunner, processTableOf, runCtoCommand, workerHeldWork,
   type CtoExec, type CtoExecOptions, type CtoExecResult, type CtoPorts, type CtoProcess, type CtoRecord,
 } from "../../src/cli/cto-command.ts";
 import { allow, deny, type Decision } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { createCtoMcpPort, createCtoServer } from "../../src/mcp/cto-server.ts";
-import { CHANNEL_REGISTERED_LINE } from "../../src/runtime/cto-channel-launch.ts";
+import { CHANNEL_REGISTERED_LINE, DEV_CHANNELS_WARNING } from "../../src/runtime/cto-channel-launch.ts";
 import { formatHostProvisionerReason, hostProvisionerReason, hostReasonKind, hostRefusalText } from "../../src/runtime/host-provisioner-reason.ts";
 import { cleanupTempDirs, commitAll, gitSync, tempDir } from "../helpers/fixtures.ts";
 import { realpathSync, rmSync, writeFileSync } from "node:fs";
@@ -81,6 +81,10 @@ interface World {
   panes: Map<number, string>;
   /** The launcher tmux last started, and whether the conversation it resumes claims the role. */
   launched: { command: string | null; claims: boolean };
+  /** The launch's pane: the registered line, or the warning and then a backlog flood that scrolls that line away. */
+  pane: "registered" | "flood";
+  /** Pids alive in the kernel that `ps` does not list (a process table that could not be read whole). */
+  hiddenFromPs: Set<number>;
 }
 
 const results = (w: World): Array<[string, string]> => w.out.filter((l) => typeof l["result"] === "string" && typeof l["step"] === "string").map((l) => [l["step"] as string, l["result"] as string]);
@@ -97,7 +101,7 @@ const makeWorld = (overrides: Partial<CtoRecord> = {}, env: Record<string, strin
   const w = {
     out: [], changes: [], ran: [], files, mtimes, tmux: new Set([TMUX]), repo: { exists: true }, worker: { unpublished: false, fetchFails: false }, operatorAnswers: [], provisionerAnswers: [],
     dirty: new Set<string>(), archiveUnpublished: false, daemonRejects: false, retireExecutions: 0, rotateRuns: [],
-    argv: new Map<number, string[]>(), panes: new Map([[100, TMUX]]), launched: { command: null, claims: true },
+    argv: new Map<number, string[]>(), panes: new Map([[100, TMUX]]), launched: { command: null, claims: true }, pane: "registered", hiddenFromPs: new Set<number>(),
     procs: [
       { pid: 100, ppid: 1, command: "/bin/sh /state/resident-e2e-sort-fixture.sh" },
       { pid: CLAUDE, ppid: 100, command: `/bin/claude --model opus ${CHANNEL} --resume ${CONVERSATION} --name e2e CTO` },
@@ -146,7 +150,16 @@ const makeWorld = (overrides: Partial<CtoRecord> = {}, env: Record<string, strin
       return answer(0, "%9\n");
     }
     if (bin === "tmux" && args[0] === "display-message") return answer(0, args[4] === "#{pane_id}" ? "%9\n" : `${w.launched.command}\n`);
-    if (bin === "tmux" && args[0] === "capture-pane") return answer(0, `${CHANNEL_REGISTERED_LINE}\n`);
+    if (bin === "tmux" && args[0] === "capture-pane") {
+      if (w.pane === "registered") return answer(0, `${CHANNEL_REGISTERED_LINE}\n`);
+      return answer(0, w.changes.includes("tmux send-keys -t %9 Enter") ? `${Array.from({ length: 40 }, (_, i) => `← acp-buzz-channel: backlog ${i}`).join("\n")}\n` : `${DEV_CHANNELS_WARNING}\n`);
+    }
+    if (bin === "tmux" && args[0] === "send-keys") {
+      w.changes.push(line);
+      // The channel delivers its backlog into the session and appends its emitted receipts.
+      files.set(`${STATE}/buzz-channel/${P}.receipts.jsonl`, `${JSON.stringify({ type: "emitted", eventId: "e1", room: ROOM, senderPubkey: "p", emittedAt: Math.floor(Date.now() / 1000) + 1 })}\n`);
+      return answer(0);
+    }
     if (bin === LOCAL_CLAUDE && args[0] === "mcp") { w.changes.push(line); return answer(args[1] === "remove" ? 1 : 0); }
     if (bin === "tmux" && args[0] === "has-session") return answer(w.tmux.has(args[2]!.slice(1)) ? 0 : 1);
     if (bin === "tmux" && args[0] === "kill-session") { w.changes.push(line); w.tmux.delete(args[2]!.slice(1)); return answer(0); }
@@ -215,7 +228,7 @@ const makeWorld = (overrides: Partial<CtoRecord> = {}, env: Record<string, strin
     },
     state: { projects: () => (w.record.retiredAt ? [] : [structuredClone(w.record)]), project: (id: string) => (id === P ? structuredClone(w.record) : null) },
     run: subprocess,
-    processes: () => w.procs.slice(),
+    processes: () => w.procs.filter((p) => !w.hiddenFromPs.has(p.pid)),
     startToken: (pid: number) => (w.procs.some((p) => p.pid === pid) ? `start-${pid}` : null),
     signal: (pid: number) => {
       w.changes.push(`SIGTERM ${pid}`);
@@ -657,6 +670,58 @@ describe("a canonical relaunch resumes the role's bound conversation", () => {
     const { w } = canonicalWorld();
     expect(await runCtoCommand(["relaunch", P, "--handoff", "/h.json", "--apply"], w.ports)).toBe(2);
     expect(w.changes).toEqual([]);
+  });
+});
+
+/** deploy135, live: two relaunches the channel served were reported as failed, and a stop read as already done while its CTO ran. */
+describe("deploy135 live defects", () => {
+  it("1: a relaunch whose backlog flood scrolls the registered line away counts as registered by the channel's emitted receipt", async () => {
+    const w = makeWorld({ kind: "canonical", resident: null, generation: null, session: null });
+    const cwd = realpathSync(tempDir("acp-cto-flood-"));
+    const config = tempDir("acp-cto-flood-config-");
+    writeFileSync(join(config, ".claude.json"), JSON.stringify({ projects: { [cwd]: { hasTrustDialogAccepted: true } } }));
+    w.record = { ...w.record, repositories: [{ repositoryId: "repo_1", identity: `github:${REPO}`, checkoutPath: cwd }] };
+    w.ports = { ...w.ports, env: { ...w.ports.env, CLAUDE_CONFIG_DIR: config } };
+    w.procs = [{ pid: CLAUDE, ppid: 1, command: `${LOCAL_CLAUDE} --resume ${CONVERSATION}` }];
+    w.argv.set(CLAUDE, [LOCAL_CLAUDE, "--resume", CONVERSATION]);
+    const transcript = `${HOME}/.claude/projects/${cwd.replace(/[^A-Za-z0-9]/g, "-")}/${CONVERSATION}.jsonl`;
+    w.files.set(transcript, "{}");
+    w.mtimes.set(transcript, NOW - (IDLE_SECONDS + 60) * 1000);
+    w.pane = "flood";
+    expect(await runCtoCommand(["relaunch", P, "--apply"], w.ports)).toBe(0);
+    expect(results(w).find(([s]) => s === "launch")).toEqual(["launch", "done"]);
+    expect(w.changes.filter((c) => c.startsWith("tmux send-keys"))).toEqual(["tmux send-keys -t %9 Enter"]);
+  });
+
+  // myeotnyeon: pid 84604, `claude --resume 36276d16-…` (a bare argv[0]), binding ACTIVE gen 4 with os_pid 84604.
+  const MYEOTNYEON = "36276d16-29e8-4946-bb88-3e5c1895e0d7";
+  const myeotnyeon = (): World => {
+    const w = makeWorld({ conversation: MYEOTNYEON, generation: 4, session: { pid: 84604, startedAt: "start-84604", workdir: CLONE } });
+    w.procs = [{ pid: 84604, ppid: 3327, command: `claude --resume ${MYEOTNYEON} --messaging-socket-path ${STATE}/cc-session-acp-myeotnyeon.sock --remote-control myeotnyeon CTO --permission-mode bypassPermissions --dangerously-skip-permissions` }];
+    w.files.set(TRANSCRIPT.replace(CONVERSATION, MYEOTNYEON), "{}");
+    w.mtimes.set(TRANSCRIPT.replace(CONVERSATION, MYEOTNYEON), NOW - (IDLE_SECONDS + 60) * 1000);
+    return w;
+  };
+
+  it("2: a stop is not already done while the bound session's os_pid is alive, even when the process table does not show it", async () => {
+    const w = myeotnyeon();
+    w.hiddenFromPs.add(84604);
+    expect(await runCtoCommand(["relaunch", P], w.ports)).toBe(0);
+    expect(w.out.find((l) => l["step"] === "stop")).toMatchObject({ already: false });
+    expect(await runCtoCommand(["relaunch", P, "--apply"], w.ports)).toBe(0);
+    expect(w.changes[0]).toBe("SIGTERM 84604");
+  });
+
+  it("2: with that exact argv and binding, the stop is planned and stops pid 84604", async () => {
+    const w = myeotnyeon();
+    expect(await runCtoCommand(["relaunch", P], w.ports)).toBe(0);
+    expect(w.out.find((l) => l["step"] === "stop")).toMatchObject({ already: false });
+  });
+
+  it("2: a process table that cannot be read is an error, never an empty table", () => {
+    expect(() => processTableOf((): CtoExecResult => ({ status: 1, stdout: "", stderr: "ps: operation not permitted" }))).toThrow(/process table could not be read/);
+    expect(() => processTableOf((): CtoExecResult => ({ status: null, stdout: "", stderr: "" }))).toThrow(/process table could not be read/);
+    expect(processTableOf((): CtoExecResult => ({ status: 0, stdout: "  84604  3327 claude --resume x\n", stderr: "" }))).toEqual([{ pid: 84604, ppid: 3327, command: "claude --resume x" }]);
   });
 });
 
