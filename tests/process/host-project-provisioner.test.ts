@@ -1,4 +1,4 @@
-import { afterAll, afterEach, expect, it, vi } from 'vitest';
+import { afterAll, afterEach, describe, expect, it, vi } from 'vitest';
 import { mkdirSync, readFileSync, rmSync, writeFileSync, realpathSync, statSync, symlinkSync, chmodSync, existsSync, readdirSync, renameSync } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -20,16 +20,17 @@ import { cleanupTempDirs, tempDir } from '../helpers/fixtures.ts';
 // Only the tables and columns currentCanonicalCeoBuzzRoute reads, with one current canonical CEO.
 const writeCeoDatabase = (path:string, recipient:string) => {
   const db = new Database(path);
-  db.exec(`CREATE TABLE assignments(assignment_id,binding_generation,actor_id,role_key,role,status);
+  // The columns the one-CTO check reads from a daemon database too (a database it cannot read is a refusal, not an empty scope).
+  db.exec(`CREATE TABLE assignments(assignment_id,binding_generation,actor_id,role_key,role,status,project_id,session_id);
     CREATE TABLE conversational_actors(actor_id,current_session_id,current_session_incarnation);
-    CREATE TABLE sessions(session_id,incarnation,buzz_address,buzz_actor_id,lifecycle);
-    CREATE TABLE actor_target_bindings(target_binding_id,target_actor_id,executor_kind);
+    CREATE TABLE sessions(session_id,incarnation,buzz_address,buzz_actor_id,lifecycle,os_pid,os_process_started_at);
+    CREATE TABLE actor_target_bindings(target_binding_id,target_actor_id,executor_kind,target_locator);
     CREATE TABLE actor_target_attestations(target_binding_id,assignment_id,binding_generation,executor_session_id,executor_session_incarnation,target_bind_receipt_json,target_bind_executor_runtime_identity);
-    INSERT INTO assignments VALUES('asg_ceo',1,'act_ceo','CEO','CEO','ACTIVE');
+    INSERT INTO assignments(assignment_id,binding_generation,actor_id,role_key,role,status) VALUES('asg_ceo',1,'act_ceo','CEO','CEO','ACTIVE');
     INSERT INTO conversational_actors VALUES('act_ceo','ses_ceo','inc_ceo');
-    INSERT INTO actor_target_bindings VALUES('tb_ceo','act_ceo','hermes');
+    INSERT INTO actor_target_bindings(target_binding_id,target_actor_id,executor_kind) VALUES('tb_ceo','act_ceo','hermes');
     INSERT INTO actor_target_attestations VALUES('tb_ceo','asg_ceo',1,'ses_ceo','inc_ceo','{}','runtime');`);
-  db.prepare(`INSERT INTO sessions VALUES('ses_ceo','inc_ceo','ffffffff-ffff-4fff-8fff-ffffffffffff',?,'READY')`).run(recipient);
+  db.prepare(`INSERT INTO sessions(session_id,incarnation,buzz_address,buzz_actor_id,lifecycle) VALUES('ses_ceo','inc_ceo','ffffffff-ffff-4fff-8fff-ffffffffffff',?,'READY')`).run(recipient);
   db.close();
 };
 const setCeoRecipient = (path:string, recipient:string|null) => {
@@ -84,10 +85,11 @@ else if(cmd === 'tmux') {
  }
  else if(args[0] === 'capture-pane') {s.captureTargets=(s.captureTargets||[]).concat([args[args.indexOf('-t')+1]]);const f=path.join(root,'screen');out(fs.existsSync(f) ? fs.readFileSync(f,'utf8') : ${JSON.stringify(REGISTERED_SCREEN)});}
  else if(args[0] === 'send-keys') {s.keys=(s.keys||[]).concat([args.slice(args.indexOf('-t')+1)]);const next=path.join(root,'screen-after');if(fs.existsSync(next)) fs.copyFileSync(next,path.join(root,'screen'));}
+ else if(args[0] === 'list-panes') out((s.panes||[]).map(p => p.pid+' '+p.name).join('\\n'));
  else if(args[0] === 'kill-session') {s.pane=false;s.paneDead=false;s.kills=(s.kills||0)+1;} else process.exit(2);
 }
-else if(cmd === 'ps') {if(args[0] === '-p') out(s.pinCommand || '');else if(args[0] === '-o' && args[1] === 'lstart=') out(s.lstart || '');else if(s.launched) {if(args.includes('command=')) out('claude --session-id '+a.sessionUuid);else out(process.env.TEST_CLAUDE_PID+' 999999 Thu Oct 22 01:00:00 2026 claude --session-id '+a.sessionUuid+'\\n999999 1 Thu Oct 22 01:00:00 2026 tmux');}}
-else if(cmd === 'lsof') out('n'+(s.cwd || a.clonePath)+'\\n');
+else if(cmd === 'ps') {if(args[0] === '-axww') {if(s.psFail) process.exit(2);const uid=process.getuid(),row=(pid,ppid,command)=>pid+' '+ppid+' '+uid+' S Thu Oct 22 01:00:00 2026 '+command+'\\n';out(row(process.ppid,1,'node host-project-provisioner')+(s.launched ? row(process.env.TEST_CLAUDE_PID,999999,'claude --session-id '+a.sessionUuid) : '')+(s.others||[]).map(o => row(o.pid,o.ppid||1,o.command)).join(''));} else if(args[0] === '-p') out(s.pinCommand || '');else if(args[0] === '-o' && args[1] === 'lstart=') out(s.lstart || '');else if(s.launched) {if(args.includes('command=')) out('claude --session-id '+a.sessionUuid);else out(process.env.TEST_CLAUDE_PID+' 999999 Thu Oct 22 01:00:00 2026 claude --session-id '+a.sessionUuid+'\\n999999 1 Thu Oct 22 01:00:00 2026 tmux');}}
+else if(cmd === 'lsof') {if(args.includes('-Fpn')) {if(s.lsofFail) process.exit(2);out(args[args.indexOf('-p')+1].split(',').map(p => {const o=(s.others||[]).find(x => String(x.pid) === p);return 'p'+p+'\\nn'+(o ? (o.cwd||'/nowhere') : (s.cwd||a.clonePath))+'\\n';}).join(''));} else out('n'+(s.cwd || a.clonePath)+'\\n');}
 else if(cmd === 'buzz') {
  // Buzz knows its caller by the key it signs with, which need not be the one at the identity's path.
  const key = process.env.BUZZ_PRIVATE_KEY || '', ecdh = require('node:crypto').createECDH('secp256k1');
@@ -368,6 +370,124 @@ it.each([
   expect(saved.keys ?? []).toEqual([]);
   // The session is left as it is: nothing killed, nothing pressed.
   expect(saved.kills ?? 0).toBe(0);
+});
+
+describe('one CTO per project at the resident launch door',() => {
+  const CONVERSATION = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+  const spawned:ChildProcess[] = [];
+  afterEach(() => {for (const child of spawned.splice(0)) if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');});
+  /**
+   * A real process with the shape of a claude session: an executable named claude (a link to node) running an idle script,
+   * with `args` after it. Its argv is the kernel's, so the check reads it exactly as it reads the real thing.
+   */
+  const claudeStandIn = async (f:ReturnType<typeof fixture>, args:string[], cwd?:string) => {
+    const dir = join(f.home,'claude-bin');mkdirSync(dir,{recursive:true});
+    const link = join(dir,'claude');if (!existsSync(link)) symlinkSync(process.execPath,link);
+    const script = join(dir,'idle.js');writeFileSync(script,'setInterval(() => {}, 1e6);');
+    const child = spawn(link,[script,...args],{stdio:'ignore',env:{},...(cwd ? {cwd} : {})});
+    spawned.push(child);await new Promise(resolve => child.once('spawn',resolve));
+    return {pid:child.pid!,command:[link,script,...args].join(' ')};
+  };
+  /** A headless query's shape: node's own `-p` evaluates the idle expression, so `-p` is a real argv element. */
+  const headlessStandIn = async (f:ReturnType<typeof fixture>) => {
+    const dir = join(f.home,'claude-bin');mkdirSync(dir,{recursive:true});
+    const link = join(dir,'claude');if (!existsSync(link)) symlinkSync(process.execPath,link);
+    const child = spawn(link,['-p','setInterval(() => {}, 1e6)'],{stdio:'ignore',env:{}});
+    spawned.push(child);await new Promise(resolve => child.once('spawn',resolve));
+    return {pid:child.pid!,command:`${link} -p setInterval(() => {}, 1e6)`};
+  };
+  /** The live incident: an older plain-path process on the same conversation, in a tmux session of its own name. */
+  const oldPlainPath = (f:ReturnType<typeof fixture>) => claudeStandIn(f,['--resume',CONVERSATION,'--messaging-socket-path','/state/cc-session-acp-test.sock','--remote-control','test CTO','--permission-mode','bypassPermissions','--dangerously-skip-permissions']);
+  const ready = async () => {const f = fixture();await f.invoke('ensure-checkout');await f.invoke('ensure-buzz');return f;};
+
+  it('refuses to start a second CTO on the conversation an older plain-path process already holds, before any tmux session exists',async () => {
+    const f = await ready();
+    const old = await oldPlainPath(f);
+    patchFake(f,{others:[{...old,ppid:3327,cwd:'/elsewhere'}],panes:[{pid:3327,name:'acp-test'}]});
+    await expect(f.invoke('ensure-resident')).rejects.toThrow(new RegExp(`CTO_ALREADY_RUNNING: project test already has a CTO process: pid=${old.pid} started="Thu Oct 22 01:00:00 2026" conversation=${CONVERSATION} tmux=acp-test by=conversation`));
+    expect(fakeState(f)).toMatchObject({launches:0});
+    expect(fakeState(f).launched).toBeUndefined();
+    expect(existsSync(join(f.state,'resident-test.launch.json'))).toBe(false);
+  });
+
+  it('refuses a process that sits in the project checkout though its argv names no conversation (a title-rewritten claude)',async () => {
+    const f = await ready();
+    const silent = await claudeStandIn(f,[]);
+    patchFake(f,{others:[{...silent,cwd:f.a.clonePath}]});
+    await expect(f.invoke('ensure-resident')).rejects.toThrow(new RegExp(`CTO_ALREADY_RUNNING: .*pid=${silent.pid} .*conversation=none .*by=cwd`));
+    expect(fakeState(f)).toMatchObject({launches:0});
+  });
+
+  it('reads real argv elements: a prompt that quotes --resume <uuid> is no second CTO, and a prompt that mentions -p does not hide a claude in the checkout',async () => {
+    const f = await ready();
+    const quoting = await claudeStandIn(f,[`please run claude --resume ${CONVERSATION} for me`]);
+    patchFake(f,{others:[{...quoting,cwd:'/elsewhere'}]});
+    await f.invoke('ensure-resident');
+    expect(fakeState(f)).toMatchObject({launches:1});
+    const g = await ready();
+    const mentioning = await claudeStandIn(g,['Explain how -p works']);
+    patchFake(g,{others:[{...mentioning,cwd:g.a.clonePath}]});
+    await expect(g.invoke('ensure-resident')).rejects.toThrow(new RegExp(`CTO_ALREADY_RUNNING: .*pid=${mentioning.pid} .*by=cwd`));
+    expect(fakeState(g)).toMatchObject({launches:0});
+  });
+
+  it('refuses, with a real exclusive lock on the database, rather than launching on a scope it could not read',async () => {
+    const f = await ready();
+    const holder = new Database(f.database);
+    holder.exec('BEGIN EXCLUSIVE');
+    try {
+      await expect(f.invoke('ensure-resident')).rejects.toThrow(/CTO_PROCESS_TABLE_UNREADABLE: project test: role scope: read failed \(SQLITE_BUSY\)/);
+      expect(fakeState(f)).toMatchObject({launches:0});
+      expect(existsSync(join(f.state,'resident-test.launch.json'))).toBe(false);
+    } finally {holder.exec('ROLLBACK');holder.close();}
+    await f.invoke('ensure-resident');
+    expect(fakeState(f)).toMatchObject({launches:1});
+  });
+
+  it('fails closed, with a reason of its own, when the process table or a claude\'s working directory cannot be read',async () => {
+    const f = await ready();
+    patchFake(f,{psFail:true});
+    await expect(f.invoke('ensure-resident')).rejects.toThrow(/CTO_PROCESS_TABLE_UNREADABLE: project test: process table: read failed/);
+    expect(fakeState(f)).toMatchObject({launches:0});
+    const bystander = await claudeStandIn(f,['--resume','99999999-9999-4999-8999-999999999999']);
+    patchFake(f,{psFail:false,lsofFail:true,others:[{...bystander,cwd:'/elsewhere'}]});
+    await expect(f.invoke('ensure-resident')).rejects.toThrow(/CTO_PROCESS_TABLE_UNREADABLE: project test: working directories: read failed/);
+    expect(fakeState(f)).toMatchObject({launches:0});
+  });
+
+  it('starts the CTO when the only other claude processes belong to other projects, or are not sessions',async () => {
+    const f = await ready();
+    const other = await claudeStandIn(f,['--resume','99999999-9999-4999-8999-999999999999']);
+    const subcommand = await headlessStandIn(f);
+    patchFake(f,{others:[{...other,cwd:'/Users/other/projects/Other'},{...subcommand,cwd:f.a.clonePath}]});
+    await f.invoke('ensure-resident');
+    expect(fakeState(f)).toMatchObject({launches:1});
+  });
+
+  it('carries the refusal to the daemon as the host\'s own one line, and no other free text of its stderr',async () => {
+    const f = await ready();
+    const old = await oldPlainPath(f);
+    patchFake(f,{others:[{...old,cwd:'/elsewhere'}]});
+    const failure = await refusal(daemon(f).invoke('ensure-resident',f.a));
+    expect(failure.message).toMatch(new RegExp(`^host provisioner ensure-resident failed: CTO_ALREADY_RUNNING: project test already has a CTO process: pid=${old.pid} started="[^"]+" conversation=${CONVERSATION} tmux=none by=conversation$`));
+    expect(failure.reason).toBeNull();
+    expect(fakeState(f)).toMatchObject({launches:0});
+  });
+
+  it('names the refusal for the fleet watcher in the host\'s one line, and the daemon-side failure carries it',async () => {
+    const f = await ready();
+    const old = await oldPlainPath(f);
+    patchFake(f,{others:[{...old,cwd:'/elsewhere'}]});
+    const recoveryScript = fileURLToPath(new URL('../../dist/host/resident-fleet-up.mjs',import.meta.url));
+    mkdirSync(join(f.home,'.claude','watchers','fleet'),{recursive:true});
+    const request = {allocation:f.a,packet:{productIntent:'bytes'}};
+    writeFileSync(join(f.home,'.claude','watchers','fleet','acp-test.resident.json'),JSON.stringify(request));
+    const result = await new Promise<{code:number|null;stderr:string}>(resolve => {execFile(process.execPath,[recoveryScript],{env:{...f.env,ACP_HOST_PROJECT_PROVISIONER:f.script},timeout:30_000},(error,_out,stderr) => resolve({code:error ? (error as {code?:number}).code ?? 1 : 0,stderr}));});
+    expect(result.code).toBe(1);
+    expect(result.stderr).toContain(`resident not started: acp-test.resident.json: CTO_ALREADY_RUNNING: project test already has a CTO process: pid=${old.pid} `);
+    expect(result.stderr).toContain('resident recovery pending: acp-test.resident.json');
+    expect(fakeState(f)).toMatchObject({launches:0});
+  });
 });
 
 it('counts a channel that does not register after the confirmation as a failure, with one key pressed',async () => {

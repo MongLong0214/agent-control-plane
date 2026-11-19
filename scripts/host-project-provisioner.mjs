@@ -10,6 +10,7 @@ import { currentCanonicalCeoBuzzRoute, daemonBuzzSigner } from '../src/outbox/ce
 import { canonicalJson } from '../src/core/digest.ts';
 import { readProcessStartToken } from '../src/core/process-argv.ts';
 import { channelLaunchArgs, confirmChannelStartup, launchFolderTrust, tmuxChannelDriver } from '../src/runtime/cto-channel-launch.ts';
+import { assertNoOtherCtoProcess, ctoRoleScope, unreadableScopeVerdict } from '../src/cto/one-cto-per-project.ts';
 import { formatHostProvisionerReason, hostProvisionerReason, hostReasonKind, hostRefusalText, recordedResidentExitStatus } from '../src/runtime/host-provisioner-reason.ts';
 const home = process.env.HOME;
 const state = process.env.ACP_STATE_DIR;
@@ -107,6 +108,7 @@ try {
   // again, neither in acp-cto nor in a launch.
   const switchedFrom = new Set();
   let switchoverPending = null;
+  let oneCtoScope = null;
   const rotationDb = ceoSigner ? null : process.env.ACP_HOST_DATABASE_PATH || join(state,'state.sqlite');
   if (rotationDb && existsSync(rotationDb)) {
     const db = new Database(rotationDb,{readonly:true,fileMustExist:true});
@@ -122,6 +124,13 @@ try {
         switchoverPending = db.prepare(from('t.claimed_at IS NULL AND t.revoked_at IS NULL')).get(a.projectId,current) ?? null;
         if (current !== a.sessionUuid) a = {...a,sessionUuid:current};
       }
+      // The role's conversations, checkouts and bound process, for the one-CTO check at launch: only ensure-resident launches.
+      if (req.operation === 'ensure-resident') oneCtoScope = ctoRoleScope((sql,params) => db.prepare(sql).all(...params),a.projectId,{conversationIds:[a.sessionUuid,...switchedFrom],checkouts:[a.clonePath]});
+    } catch (error) {
+      // A launch never goes on a read that failed (a lock, an I/O error): refused here, before anything on the host is written, and
+      // never answered with an empty scope. Any other operation keeps its own failure.
+      if (req.operation === 'ensure-resident' && !(error instanceof ProvisionerRefusal)) throw new ProvisionerRefusal(unreadableScopeVerdict(a.projectId,error).message);
+      throw error;
     } finally {db.close();}
   }
   mkdirSync(state,{recursive:true,mode:0o700});
@@ -661,8 +670,11 @@ try {
         atomic(launcher,`#!/bin/sh\nunset ACP_OPERATOR_TOKEN ACP_MCP_TOKEN ACP_BUZZ_INGRESS_SECRET GH_TOKEN GITHUB_TOKEN\nexport ACP_STATE_DIR=${quote(state)}\nBUZZ_PRIVATE_KEY=$(cat ${quote(a.privateKeyFile)}) || exit 1\nexport BUZZ_PRIVATE_KEY\ncd ${quote(a.clonePath)} || exit 1\nexport PATH="$PATH":${quote(join(home,'.local','bin'))}\n${args.map(quote).join(' ')}\n`+
           // Claude's exit status alone, bound to this launch and renamed into place whole; never its output or environment.
           `status=$?\numask 077\nrecord=$(mktemp ${quote(`${exitRecord}.XXXXXX`)}) && printf '{"launch":"%s","exitCode":%d}\\n' ${quote(launch)} "$status" > "$record" && mv -f "$record" ${quote(exitRecord)}\nexit "$status"\n`,0o700);
-        // Refuse a duplicate Claude even when RC is still registering. Never kill an unverified pane.
-        const ps = run('ps',['-axo','command=']); check(!ps.split('\n').some(l => namesSession(l)),'resident awaits RC');
+        // One CTO per project, whoever started the other: refuse before any tmux session exists, even when RC is still
+        // registering. A process table that cannot be read refuses too. Never kill an unverified pane. This replaces the
+        // provisioner's own ps scan for the session id rather than running beside it, so a launch door has one definition of running.
+        const one = await assertNoOtherCtoProcess(oneCtoScope ?? ctoRoleScope(() => [],a.projectId,{conversationIds:[a.sessionUuid,...switchedFrom],checkouts:[a.clonePath]}));
+        check(one.ok,one.message);
         let hasPane = false;try {run('tmux',['has-session','-t',a.tmuxName]);hasPane = true;} catch(e) {if (!e.status) throw e;}
         if (hasPane) {
           // One free-text field per read: for a client without a UTF-8 locale tmux prints a tab separator as '_'.

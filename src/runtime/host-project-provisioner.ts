@@ -2,6 +2,7 @@ import { execFile } from 'node:child_process';
 import { z } from 'zod';
 import { join } from 'node:path';
 import type { CanonicalCeoBuzzRoute } from '../outbox/ceo-buzz-signer.ts';
+import { ctoRefusalOfStderr } from '../cto/one-cto-per-project.ts';
 import { formatHostProvisionerReason, readHostProvisionerReason, type HostProvisionerReason } from './host-provisioner-reason.ts';
 
 export const hostOperations = ['ensure-checkout', 'ensure-buzz', 'ensure-routing', 'ensure-resident', 'acknowledge-resident-exit', 'observe', 'verify-retire', 'retire'] as const;
@@ -74,7 +75,9 @@ export class HostOperationFailure extends Error {
   readonly reason: HostProvisionerReason | null;
   constructor(readonly operation: HostOperation, stderr: string) {
     const reason = readHostProvisionerReason(stderr, operation);
-    super(`host provisioner ${operation} failed${reason ? `: ${formatHostProvisionerReason(reason)}` : ''}`);
+    // The one-CTO refusal is the host's own line in one strict shape (`ctoRefusalOfStderr`); no other free text crosses.
+    const ctoRefusal = reason ? null : ctoRefusalOfStderr(stderr);
+    super(`host provisioner ${operation} failed${reason ? `: ${formatHostProvisionerReason(reason)}` : ctoRefusal ? `: ${ctoRefusal}` : ''}`);
     this.reason = reason;
   }
 }
