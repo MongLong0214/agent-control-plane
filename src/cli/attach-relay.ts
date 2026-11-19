@@ -187,6 +187,9 @@ export const DEFAULT_CLAIM_RETRY_POLICY: ClaimRetryPolicy = {
 const RETRIED_REFUSALS: ReadonlySet<string> = new Set([
   "PREDECESSOR_RUNTIME_ALIVE",
   "PREDECESSOR_STILL_SETTLING",
+  // Another process of the project's CTO may be one that is still exiting; a duplicate that stays is refused after the same wait.
+  "CTO_ALREADY_RUNNING",
+  "CTO_PROCESS_TABLE_UNREADABLE",
   "DEAD_PREDECESSOR_UNRELEASED",
   "ENTITLEMENT_CHANGED",
   "BUZZ_ROOM_UNRESOLVED",

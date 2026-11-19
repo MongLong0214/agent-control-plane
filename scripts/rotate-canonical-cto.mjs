@@ -15,6 +15,13 @@
 //   verify   -> the new session holds n + 1, and the daemon's own Buzz subscriber connection for its identity is
 //               live and delivering to it and the ingress is listening (registry eligibility alone proves nothing)
 //
+// One CTO per project (exit 70): the target conversation, or any other process of the project's CTO but the old one, already
+// running refuses the rotation (CTO_ALREADY_RUNNING), before the old holder is fenced and again before the new one starts; a
+// process table or a role scope that cannot be read refuses too (CTO_PROCESS_TABLE_UNREADABLE). The shared check is
+// src/cto/one-cto-per-project.ts. The old holder is the process its session row recorded, pid and native start token, and
+// nothing a command line says: that exact process is the one excluded from the check and the one signalled, and a pid that no
+// longer has that start is another process, so nothing is excluded or signalled for it.
+//
 // Owned work at the boundary, or an old process tree whose exit is not confirmed in time: the new conversation is
 // never started (exit 4). Nothing ever goes back to the old conversation or its generation: a new conversation that
 // never claims by the deadline is fenced (its tmux session, which this run started, is killed and the exit of its
@@ -36,8 +43,11 @@ import { execFileSync } from 'node:child_process';
 import { chmodSync, closeSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
+import Database from 'better-sqlite3';
 import { getPublicKey } from 'nostr-tools/pure';
 import { channelLaunchArgs, confirmChannelStartup, launchFolderTrust, tmuxChannelDriver } from '../src/runtime/cto-channel-launch.ts';
+import { assertNoOtherCtoProcess, ctoRoleScope, unreadableScopeVerdict } from '../src/cto/one-cto-per-project.ts';
+import { readProcessStartToken } from '../src/core/process-argv.ts';
 
 const usage = 'usage: rotate-canonical-cto.mjs --project <id> --to <uuid> --expected-generation <n> --cwd <dir> --old-pid <pid> --tmux-session <name> --handoff <package.json> [--timeout-ms <ms>] [--poll-ms <ms>] [--stop-timeout-ms <ms>]';
 const flags = {};
@@ -230,7 +240,28 @@ if (resumed && (resumed.toSessionUuid !== to || resumed.fromGeneration !== expec
 }
 if (before.value.generation !== expected) stop(66, 'status', { refused: 'expected-generation is not the role\'s current generation', generation: before.value.generation });
 const table = processTable();
-const oldRow = old ? table.find((row) => row.pid === oldPid && row.command.includes(old)) ?? null : null;
+// The daemon's database, read-only and bounded: the one place the role's scope and the old holder's process are read from.
+const readDatabase = (use) => {
+  const database = new Database(process.env.ACP_HOST_DATABASE_PATH || join(state, 'state.sqlite'), { readonly: true, fileMustExist: true, timeout: 3000 });
+  try { return use(database); } finally { database.close(); }
+};
+const unreadable = (step, detail) => stop(70, step, { refused: 'CTO_PROCESS_TABLE_UNREADABLE', message: `CTO_PROCESS_TABLE_UNREADABLE: project ${project}: ${detail}`, note: 'nothing was changed' });
+// The old holder is the process its session row recorded, pid and native start token, rather than one found by searching
+// command lines for its conversation id (a new conversation's prompt may name the old one). What is excluded from the one-CTO
+// check, and what is signalled, is that exact process or nothing: a pid that no longer has that start is another process.
+const recordedOld = (() => {
+  if (!old) return null;
+  try {
+    return readDatabase((database) => database.prepare(
+      `SELECT s.os_pid AS pid, s.os_process_started_at AS start FROM actor_target_bindings tb
+         JOIN conversational_actors c ON c.actor_id = tb.target_actor_id JOIN sessions s ON s.session_id = c.current_session_id
+        WHERE tb.executor_kind = 'claude-cli' AND tb.target_locator = ?`).get(old)) ?? null;
+  } catch { return unreadable('status', 'the old holder\'s recorded process could not be read from the database'); }
+})();
+const isRecordedOld = (row) => row !== undefined && recordedOld !== null && Number.isSafeInteger(recordedOld.pid) && typeof recordedOld.start === 'string' &&
+  row.pid === recordedOld.pid && readProcessStartToken(row.pid) === recordedOld.start;
+const oldRow = (() => { const row = table.find((entry) => recordedOld !== null && entry.pid === recordedOld.pid); return isRecordedOld(row) ? row : null; })();
+if (oldRow && oldRow.pid !== oldPid) stop(66, 'status', { refused: 'old-pid is not the old holder\'s recorded process', oldPid, recorded: oldRow.pid });
 if (!old || (!oldRow && !resumed)) stop(66, 'status', { refused: 'old-pid is not the old conversation\'s claude process' });
 // The launcher must not be part of what it stops: it would wait for itself, or die with it.
 for (let row = table.find((entry) => entry.pid === process.pid), hops = 0; oldRow && row && hops < 64; hops++) {
@@ -241,6 +272,23 @@ for (let row = table.find((entry) => entry.pid === process.pid), hops = 0; oldRo
 if (oldRow && selfRow && (oldRow.pgid === selfRow.pgid || (oldRow.sess > 0 && oldRow.sess === selfRow.sess))) {
   stop(66, 'status', { refused: 'the launcher shares the old conversation\'s process group or session, so it cannot tell that tree\'s exit from its own; run it in its own session (e.g. in its own tmux session)' });
 }
+// One CTO per project: the target conversation, and nothing else of the project's CTO, may be running besides the old
+// process this run replaces. The role's scope is the one every other door uses, read from the daemon's database: every
+// conversation that held or was entitled to the role, and every registered checkout of the project (the ones named on this
+// command line are added). The old process is expected only while it is still the very process this run validated, by pid
+// and start time: once it has exited, or its pid belongs to another process, nothing is excluded. Asked before the old holder
+// is fenced, and again just before the start (exit 70); a process table or a database that cannot be read refuses the same way.
+const roleScope = () => readDatabase((database) => ctoRoleScope((sql, params) => database.prepare(sql).all(...params), project, { conversationIds: [to, old], checkouts: [flags.cwd] }));
+const oneCto = async (step) => {
+  let scope;
+  try { scope = roleScope(); } catch (error) {
+    const verdict = unreadableScopeVerdict(project, error);
+    stop(70, step, { refused: verdict.reasonCode, message: verdict.message, note: 'nothing was changed' });
+  }
+  const verdict = await assertNoOtherCtoProcess(scope, undefined, oldRow ? [{ pid: oldRow.pid, startedAt: recordedOld.start }] : []);
+  if (!verdict.ok) stop(70, step, { refused: verdict.reasonCode, message: verdict.message, ...(verdict.processes ? { processes: verdict.processes } : {}), note: step === 'target' ? 'nothing was changed' : 'the old conversation is stopped and fenced and the switchover stays pending; run this launcher again with the same arguments once the other process is gone' });
+};
+await oneCto('target');
 report('handoff', { project, from: old, to, generation: expected, ...(resumed ? { resumed: resumed.transferId } : {}) });
 
 // rotate — the old holder is fenced at ACP before its process is touched.
@@ -293,7 +341,8 @@ const keep = () => {
 };
 refresh();
 keep();
-if (oldRow) {
+// Signalled only while it is still the recorded process: one that has exited, and whose pid another process took, is left alone.
+if (oldRow && isRecordedOld(oldRow)) {
   try { process.kill(oldRow.pid, 'SIGTERM'); } catch (error) { if (error.code !== 'ESRCH') stop(4, 'stop', { refused: 'the old claude process could not be signalled', oldPid }); }
 }
 const left = await exitOf(refresh, stopTimeoutMs, keep);
@@ -320,6 +369,7 @@ const relayArgs = (() => {
   set('--expected-binding-generation', 'auto');
   return args;
 })();
+await oneCto('start');
 let started = false;
 /** The new conversation did not claim: fence it (this run's tmux session and its process tree) and say so. */
 const fenceNew = async (why) => {

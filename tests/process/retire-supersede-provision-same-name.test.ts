@@ -77,12 +77,16 @@ if (cmd === 'gh') {
   else if (args[0] === 'kill-session') delete s.residents[name];
   else process.exit(2);
 } else if (cmd === 'ps') {
-  if (args[1] === 'pid=,ppid=,lstart=,command=') out(residents().map(r => r.pid + ' ' + r.pane + ' ' + lstart + ' claude --session-id ' + r.sessionUuid + '\\n' + r.pane + ' 1 ' + lstart + ' tmux').join('\\n'));
+  if (args[0] === '-axww') out([process.ppid + ' 1 ' + process.getuid() + ' S ' + lstart + ' node host-project-provisioner'].concat(residents().map(r => r.pid + ' ' + r.pane + ' ' + process.getuid() + ' S ' + lstart + ' claude --session-id ' + r.sessionUuid)).join('\\n') + '\\n');
+  else if (args[1] === 'pid=,ppid=,lstart=,command=') out(residents().map(r => r.pid + ' ' + r.pane + ' ' + lstart + ' claude --session-id ' + r.sessionUuid + '\\n' + r.pane + ' 1 ' + lstart + ' tmux').join('\\n'));
   else if (args[0] === '-axo') out(residents().map(r => 'claude --session-id ' + r.sessionUuid).join('\\n'));
   else if (args[0] === '-p') { const r = residents().find(r => r.pid === Number(args[1])); out(r ? 'claude --session-id ' + r.sessionUuid : ''); }
 } else if (cmd === 'lsof') {
+  if (args.includes('-Fpn')) out(flag('-p').split(',').map(p => { const r = residents().find(r => r.pid === Number(p)); return r ? 'p' + p + '\\nn' + r.cwd + '\\n' : ''; }).join(''));
+  else {
   const r = residents().find(r => r.pid === Number(flag('-p')));
   out(r ? 'n' + r.cwd + '\\n' : '');
+  }
 } else if (cmd === 'buzz') {
   // The relay knows its caller by the key it signs with.
   const key = process.env.BUZZ_PRIVATE_KEY || '';
@@ -120,16 +124,17 @@ fs.writeFileSync(stateFile, JSON.stringify(s));
 // The tables and columns the host reads the current canonical CEO from, holding one CEO whose Buzz key is 'd'*64.
 const writeCeoDatabase = (path:string) => {
   const db = new Database(path);
-  db.exec(`CREATE TABLE assignments(assignment_id,binding_generation,actor_id,role_key,role,status);
+  // With the columns the one-CTO check reads from a daemon database too: a database it cannot read is a refusal, not an empty scope.
+  db.exec(`CREATE TABLE assignments(assignment_id,binding_generation,actor_id,role_key,role,status,project_id,session_id);
     CREATE TABLE conversational_actors(actor_id,current_session_id,current_session_incarnation);
-    CREATE TABLE sessions(session_id,incarnation,buzz_address,buzz_actor_id,lifecycle);
-    CREATE TABLE actor_target_bindings(target_binding_id,target_actor_id,executor_kind);
+    CREATE TABLE sessions(session_id,incarnation,buzz_address,buzz_actor_id,lifecycle,os_pid,os_process_started_at);
+    CREATE TABLE actor_target_bindings(target_binding_id,target_actor_id,executor_kind,target_locator);
     CREATE TABLE actor_target_attestations(target_binding_id,assignment_id,binding_generation,executor_session_id,executor_session_incarnation,target_bind_receipt_json,target_bind_executor_runtime_identity);
-    INSERT INTO assignments VALUES('asg_ceo',1,'act_ceo','CEO','CEO','ACTIVE');
+    INSERT INTO assignments(assignment_id,binding_generation,actor_id,role_key,role,status) VALUES('asg_ceo',1,'act_ceo','CEO','CEO','ACTIVE');
     INSERT INTO conversational_actors VALUES('act_ceo','ses_ceo','inc_ceo');
-    INSERT INTO actor_target_bindings VALUES('tb_ceo','act_ceo','hermes');
+    INSERT INTO actor_target_bindings(target_binding_id,target_actor_id,executor_kind) VALUES('tb_ceo','act_ceo','hermes');
     INSERT INTO actor_target_attestations VALUES('tb_ceo','asg_ceo',1,'ses_ceo','inc_ceo','{}','runtime');
-    INSERT INTO sessions VALUES('ses_ceo','inc_ceo','ffffffff-ffff-4fff-8fff-ffffffffffff','${'d'.repeat(64)}','READY');`);
+    INSERT INTO sessions(session_id,incarnation,buzz_address,buzz_actor_id,lifecycle) VALUES('ses_ceo','inc_ceo','ffffffff-ffff-4fff-8fff-ffffffffffff','${'d'.repeat(64)}','READY');`);
   db.close();
 };
 

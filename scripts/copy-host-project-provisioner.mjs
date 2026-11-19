@@ -8,5 +8,6 @@ const packaged = name => readFileSync(new URL(`./${name}`,import.meta.url),'utf8
   .replaceAll('../src/core/process-argv.ts','../core/process-argv.js')
   .replaceAll('../src/runtime/host-provisioner-reason.ts','../runtime/host-provisioner-reason.js')
   .replaceAll('../src/runtime/cto-channel-launch.ts','../runtime/cto-channel-launch.js')
+  .replaceAll('../src/cto/one-cto-per-project.ts','../cto/one-cto-per-project.js')
   .replaceAll('../src/outbox/ceo-buzz-signer.ts','../outbox/ceo-buzz-signer.js');
 for (const name of ['host-project-provisioner.mjs','resident-fleet-up.mjs']) writeFileSync(new URL(name,output),packaged(name),{mode:0o700});

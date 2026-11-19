@@ -4,6 +4,7 @@ import { execFileSync } from 'node:child_process';
 import { readdirSync, readFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { formatHostProvisionerReason, readHostProvisionerReason, recordedResidentExitStatus } from '../src/runtime/host-provisioner-reason.ts';
+import { ctoRefusalOfStderr } from '../src/cto/one-cto-per-project.ts';
 const home = process.env.HOME;
 const script = process.env.ACP_HOST_PROJECT_PROVISIONER;
 if (!home || !script || !process.env.ACP_STATE_DIR) throw new Error('resident fleet recovery requires HOME, ACP_STATE_DIR and ACP_HOST_PROJECT_PROVISIONER');
@@ -23,6 +24,11 @@ for (const name of readdirSync(dir).filter(n => n.endsWith('.resident.json'))) {
       process.stderr.write(`resident exited: ${name}: ${formatHostProvisionerReason(reason)}\n`);
       try {host(request,'acknowledge-resident-exit',{residentExitReason:reason});host(request,'ensure-resident');recovered = true;} catch { /* Reported as pending below. */ }
     } else if (reason) process.stderr.write(`resident provisioning failed: ${name}: ${formatHostProvisionerReason(reason)}\n`);
+    else {
+      // Another CTO process of the project is running (or the process table could not be read): the host's own line, in its one shape.
+      const refusal = ctoRefusalOfStderr(String(error.stderr ?? ''));
+      if (refusal) process.stderr.write(`resident not started: ${name}: ${refusal}\n`);
+    }
     if (!recovered) {process.stderr.write(`resident recovery pending: ${name}\n`);process.exitCode = 1;}
   }
 }

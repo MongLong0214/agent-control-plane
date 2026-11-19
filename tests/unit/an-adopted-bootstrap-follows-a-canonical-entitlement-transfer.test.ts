@@ -21,6 +21,8 @@ import { callCtoTool } from "../helpers/cto-tool.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 import { GenesisGitHub, genesisPlanFixture } from "../helpers/genesis-github.ts";
 import { bindCeo, bootstrapCtoProvider, decideThroughHermes, makeHarness, type Harness } from "../helpers/harness.ts";
+import { systemCtoProcessReader, type CtoProcessReader } from "../../src/cto/one-cto-per-project.ts";
+import { noOtherCtoProcesses } from "../helpers/cto-process-table.ts";
 
 afterAll(cleanupTempDirs);
 
@@ -77,7 +79,9 @@ const adoptedBootstrap = async (h: Harness, projectId: string, options: { transf
   const configured = [{ sessionUuid: oldUuid, projectId, buzzActorId, buzzAddress: roomId }];
   registry.grant(configured[0]!, null);
   const roleKey = roleKeyFor(Role.PRIMARY_CTO, { projectId });
-  const claimAs = (uuid: string, generation: number, claude: { pid: number; startedAt: string }): Promise<Decision<CanonicalSelfClaimReceipt>> => {
+  // `reader`: the host's process table the claim's one-CTO check reads. By default this suite's own stand-ins are not in it (they
+  // are doubles of processes); a case that wants them to count passes the host's real reader.
+  const claimAs = (uuid: string, generation: number, claude: { pid: number; startedAt: string }, reader: CtoProcessReader = noOtherCtoProcesses): Promise<Decision<CanonicalSelfClaimReceipt>> => {
     const chain: ProcessSnapshot[] = [
       { pid: 100, ppid: 50, argv: ["node", "mcp"], command: "node mcp", cwd, cwdProbeFailure: null, startedAt: "peer" },
       { pid: 50, ppid: claude.pid, argv: ["/bin/zsh", "-c", "relay"], command: "relay", cwd, cwdProbeFailure: null, startedAt: "relay" },
@@ -92,6 +96,7 @@ const adoptedBootstrap = async (h: Harness, projectId: string, options: { transf
         expectedPeerIdentity: `uid:${UID}`, peerProtocolVersion: "test", buzzPurpose: "test",
       },
       claimDeps: {
+        ctoProcessReader: reader,
         processInspector: { snapshot: (asked) => chain.find((entry) => entry.pid === asked) ?? null },
         imageInspector: { resolve: () => null },
         transcriptReader: { locate: () => ({ path: "/test/transcript", sizeBytes: 10 }) },
@@ -157,6 +162,27 @@ describe("an adopted bootstrap and a canonical entitlement transfer", () => {
     if (!claimed.allowed) throw new Error("unreachable");
     const created = h.cp.runs.create({ kind: RunKind.PROJECT_BOOTSTRAP, executionMode: "STANDARD", contract, adoptCanonicalCto: { projectId: a.projectId, sessionId: claimed.value.sessionId, bindingGeneration: 2 } });
     expect(created).toMatchObject({ allowed: false, evidence: { refusal: "ADOPTION_ENTITLEMENT_TRANSFERRED" } });
+  });
+
+  it("with the host's real process table, a predecessor that is still running refuses the transfer's claim, and only its exit lets the new conversation in", async () => {
+    const h = harness();
+    const f = genesisPlanFixture();
+    const a = await adoptedBootstrap(h, f.manifest.projectId, { noBootstrap: true });
+    expect(a.transfer().allowed).toBe(true);
+    // The old holder's runtime is a real process (the stand-in) recorded on its session row, not a double in a table.
+    const predecessor = h.cp.sessions.require(a.oldSessionId).osPid!;
+    expect(() => process.kill(predecessor, 0)).not.toThrow();
+    const claimant = { pid: process.pid, startedAt: readProcessStartToken(process.pid)! };
+    const refused = await a.claimAs(a.newUuid, 2, claimant, systemCtoProcessReader());
+    expect(refused).toMatchObject({ allowed: false, reasonCode: ReasonCode.CONFLICT, evidence: { reason: "CTO_ALREADY_RUNNING" } });
+    if (refused.allowed) throw new Error("admitted a second CTO");
+    expect(refused.evidence["processes"]).toEqual([expect.objectContaining({ pid: predecessor, matchedBy: ["bound-pid"] })]);
+    expect(new CanonicalSessionRegistry(h.cp.db).holder(a.projectId)?.sessionUuid).toBe(a.oldUuid);
+    // The predecessor exits: nothing else of the role is running, so the same claim is admitted.
+    process.kill(predecessor, "SIGKILL");
+    for (let i = 0; i < 200; i++) { try { process.kill(predecessor, 0); } catch { break; } await new Promise((resolve) => setTimeout(resolve, 20)); }
+    const admitted = await a.claimAs(a.newUuid, 2, claimant, systemCtoProcessReader());
+    expect(admitted.allowed, JSON.stringify(admitted)).toBe(true);
   });
 
   it("P1-b: a RUNNING pipeline attempt of an adopted bootstrap run (no project_id) blocks the transfer", async () => {
