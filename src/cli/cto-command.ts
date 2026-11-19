@@ -5,10 +5,10 @@ import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import type { Decision } from "../core/errors.ts";
-import { readProcessStartToken } from "../core/process-argv.ts";
+import { readProcessArgv, readProcessStartToken } from "../core/process-argv.ts";
 import { residentWorkerCheckoutPath } from "../core/resident-allocation-paths.ts";
 import { daemonBuzzSigner } from "../outbox/ceo-buzz-signer.ts";
-import { BUZZ_CHANNEL_SERVER, CHANNEL_DEV_FLAG } from "../runtime/cto-channel-launch.ts";
+import { BUZZ_CHANNEL_SERVER, CHANNEL_DEV_FLAG, channelLaunchArgs, confirmChannelStartup, launchFolderTrust, tmuxChannelDriver } from "../runtime/cto-channel-launch.ts";
 import { readHostProvisionerReason, recordedResidentExitStatus } from "../runtime/host-provisioner-reason.ts";
 
 /**
@@ -18,7 +18,8 @@ import { readHostProvisionerReason, recordedResidentExitStatus } from "../runtim
  *   - ACP's own operator methods (`project.register`, `project.retire`) over the authenticated operator socket;
  *   - the host project provisioner (`ensure-routing`, `ensure-resident`, `acknowledge-resident-exit`), the launcher a
  *     resident CTO and the fleet watcher already use, which carries the acp-buzz-channel and resumes the conversation;
- *   - `scripts/rotate-canonical-cto.mjs`, the canonical CTO's launcher;
+ *   - `src/runtime/cto-channel-launch.ts` (channel argv, folder trust, the one development-channels confirmation), with
+ *     which a canonical CTO's one long-lived conversation is resumed in tmux rather than rotated to a new one (#1437 R1);
  *   - Hermes's `buzz-identity-map.sh`, which rebuilds channel-cto.map from the roster;
  *   - `tmux`, `git` and `gh` for the session, the checkouts and the repository.
  *
@@ -39,17 +40,20 @@ export const CTO_USAGE = `agentctl cto — a project CTO's lifecycle on this hos
   agentctl cto list
       every CTO: project, binding generation, live session (pid, tmux), whether the session carries
       the acp-buzz-channel, its room, whether the roster routes that room, and its last Buzz activity
-  agentctl cto add <project> [--repo <owner/name>] [--canonical] [--handoff <package.json>] [--apply]
+  agentctl cto add <project> [--repo <owner/name>] [--canonical] [--apply]
       register the project if missing (cloning --repo into ~/projects), check its Buzz identity and
       room, bind the roster, rebuild channel-cto.map, and start the CTO with the channel: a resident
       through ensure-resident (which writes the resident request and the fleet entry), a canonical
-      CTO (--canonical) through rotate-canonical-cto, which needs --handoff
-  agentctl cto relaunch <project> [--handoff <package.json>] [--apply]
-      wait for an idle CTO, then restart it with the channel: a resident is stopped (its exact pid)
-      and started again by ensure-resident with --resume, the same conversation; a canonical CTO
-      goes through rotate-canonical-cto, which moves it to a new conversation and needs --handoff;
-      until that conversation is verified on Buzz, a rerun resumes or verifies it and never starts
-      another rotation
+      CTO (--canonical) by resuming its existing conversation as relaunch does; a canonical CTO
+      with no conversation yet is refused
+  agentctl cto relaunch <project> [--apply]
+      wait for an idle CTO, then restart it with the channel, in the same conversation:
+      a canonical CTO's folder must already be trusted; its exact claude process (pid and start
+      time) is stopped and claude --resume <the role's bound conversation> is started with the
+      channel in its tmux session (or a new detached one), its acp-cto entry claiming with
+      --expected-binding-generation auto, so its queued messages are kept. No new conversation and
+      no handoff package. A resident is stopped and started again by ensure-resident with --resume
+      (this resident path overlaps #1447, which replaces it)
   agentctl cto retire <project> --reason <text> [--delete-repo --yes-delete-repo <owner/name>] [--apply]
       wait for an idle CTO, then agentctl project retire (stops the session, releases the binding,
       archives its room, retires its roster route, takes it off the fleet), confirm the session,
@@ -73,8 +77,8 @@ export interface CtoProcess { pid: number; ppid: number; command: string }
 export interface CtoFiles {
   exists(path: string): boolean;
   read(path: string): string;
-  /** Replaces the file whole (written beside it, then renamed into place). */
-  replace(path: string, body: string): void;
+  /** Replaces the file whole (written beside it, then renamed into place), 0600 unless `mode` says otherwise. */
+  replace(path: string, body: string, mode?: number): void;
   /** Renames a file or a directory tree to a path that does not exist yet, creating its parent. */
   move(from: string, to: string): void;
   /** Removes a file or a directory tree. */
@@ -105,8 +109,6 @@ export interface CtoRecord {
   actorId: string | null;
   /** A resident's provisioning: its status and its allocation (with the room the daemon bound). */
   resident: { status: string; allocation: Record<string, unknown> | null } | null;
-  /** The project's latest canonical rotation: pending while `claimedGeneration` is null and it is not revoked. */
-  lastRotation: { toSessionUuid: string; fromGeneration: number; claimedGeneration: number | null; revoked: boolean } | null;
   lastBuzzAt: string | null;
 }
 export interface CtoStateReader {
@@ -125,6 +127,8 @@ export interface CtoPorts {
   run: CtoExec;
   processes(): CtoProcess[];
   startToken(pid: number): string | null;
+  /** A process's exact argv as the kernel holds it, or null; never `ps`'s space-joined text. */
+  argv(pid: number): readonly string[] | null;
   signal(pid: number, signal: "SIGTERM"): void;
   files: CtoFiles;
   /** The Buzz public key of a key file, never its contents; null when it cannot be read. */
@@ -134,7 +138,7 @@ export interface CtoPorts {
   newUuid(): string;
   write(line: Record<string, unknown>): void;
   node: string;
-  scripts: { provisioner: string | null; rotate: string | null };
+  scripts: { provisioner: string | null };
 }
 
 type Outcome = { ok: true; detail?: Record<string, unknown> } | { ok: false; reason: string; detail?: Record<string, unknown> };
@@ -155,6 +159,8 @@ const REPO = /^[A-Za-z0-9-]+\/[A-Za-z0-9._-]+$/;
 /** How long a conversation's transcript must be unchanged before it is treated as between turns. */
 export const IDLE_SECONDS = 60;
 const STOP_TIMEOUT_MS = 30_000;
+/** How long a resumed canonical CTO has to claim its role from inside its own process. */
+const CLAIM_WAIT_MS = 120_000;
 const POLL_MS = 250;
 
 const githubRepoOf = (identity: string): string | null => {
@@ -177,7 +183,7 @@ const allocationString = (record: CtoRecord, field: string): string | null => {
 const cloneOf = (record: CtoRecord): string | null =>
   allocationString(record, "clonePath") ?? record.repositories.find((r) => !r.checkoutPath.includes("/.acp-worker-checkouts/"))?.checkoutPath ?? null;
 
-/** Processes whose argv runs `uuid` as a Claude conversation, the rule the provisioner and the rotation launcher use. */
+/** Processes whose argv runs `uuid` as a Claude conversation, the rule the host provisioner uses. */
 const conversationProcesses = (ports: CtoPorts, uuid: string | null): CtoProcess[] => {
   if (!uuid || !UUID.test(uuid)) return [];
   const names = new RegExp(`(?:^|\\s)--(?:session-id|resume)\\s+${uuid}(?:\\s|$)`);
@@ -269,14 +275,28 @@ const idleStep = (ports: CtoPorts, projectId: string): CtoStep => ({
   },
 });
 
+/** Whether `pid` is the incarnation ACP recorded: the native start token, or `ps`'s lstart text for a row written that way. */
+const sameIncarnation = (ports: CtoPorts, pid: number, startedAt: string): boolean => {
+  if (ports.startToken(pid) === startedAt) return true;
+  if (!/^[A-Z][a-z]{2} [A-Z][a-z]{2} +\d{1,2} \d{2}:\d{2}:\d{2} \d{4}$/.test(startedAt)) return false;
+  return ports.run("ps", ["-o", "lstart=", "-p", String(pid)], { env: { ...ports.env, LC_ALL: "C" }, timeoutMs: 5_000 }).stdout.trim() === startedAt;
+};
+
 /**
  * SIGTERM to exactly the one process running the conversation, never to anything else, then its exit confirmed by its
- * start token changing. ACP's recorded pid, when that process is alive, must be the same process.
+ * start token changing. ACP's recorded pid, when that process is alive, must be the same process, and when it is that
+ * pid it must be the incarnation ACP recorded (pid and start time). `keepChanneled` leaves a process that already
+ * carries the channel running (cto add brings a CTO up; it does not restart one that is up).
  */
-const stopStep = (ports: CtoPorts, projectId: string, id = "stop"): CtoStep => ({
+const stopStep = (ports: CtoPorts, projectId: string, id = "stop", keepChanneled = false): CtoStep => ({
   id,
-  plan: "send SIGTERM to the one claude process running the CTO's conversation, nothing else, and wait for it to exit",
-  done: () => conversationProcesses(ports, fresh(ports, projectId)?.conversation ?? null).length === 0,
+  plan: keepChanneled
+    ? "unless the CTO's conversation already runs with the acp-buzz-channel, send SIGTERM to the one claude process running it (its exact pid and start time), nothing else, and wait for it to exit"
+    : "send SIGTERM to the one claude process running the CTO's conversation (its exact pid and start time), nothing else, and wait for it to exit",
+  done: () => {
+    const live = conversationProcesses(ports, fresh(ports, projectId)?.conversation ?? null);
+    return live.length === 0 || (keepChanneled && live.every((p) => carriesChannel(p.command)));
+  },
   run: async () => {
     const record = fresh(ports, projectId);
     const uuid = record?.conversation ?? null;
@@ -287,6 +307,10 @@ const stopStep = (ports: CtoPorts, projectId: string, id = "stop"): CtoStep => (
     const recorded = record?.session?.pid ?? null;
     if (recorded && recorded !== target.pid && alive(ports, recorded)) {
       return refused(`ACP records pid ${recorded} for this CTO, which is alive, but pid ${target.pid} runs its conversation; nothing was signalled`);
+    }
+    const recordedStart = record?.session?.startedAt ?? null;
+    if (recorded === target.pid && recordedStart && !sameIncarnation(ports, target.pid, recordedStart)) {
+      return refused(`pid ${target.pid} is not the incarnation ACP recorded for this CTO (its start time differs); nothing was signalled`);
     }
     const start = ports.startToken(target.pid);
     if (start === null) return refused(`pid ${target.pid}'s start time cannot be read, so its exit could not be confirmed; nothing was signalled`);
@@ -330,98 +354,189 @@ const residentLaunchStep = (ports: CtoPorts, projectId: string): CtoStep => ({
   },
 });
 
-/** An unfinished canonical relaunch: the conversation it rotates to, kept until that conversation is verified on Buzz. */
-const relaunchMarkerOf = (ports: CtoPorts, projectId: string): string => join(ports.stateDir, `cto-relaunch-${projectId}.json`);
-const readRelaunchMarker = (ports: CtoPorts, projectId: string): string | null => {
-  const file = relaunchMarkerOf(ports, projectId);
-  if (!ports.files.exists(file)) return null;
-  const to = (JSON.parse(ports.files.read(file)) as { to?: unknown }).to;
-  if (typeof to !== "string" || !UUID.test(to)) throw new Error(`${file} does not name a conversation`);
-  return to;
-};
-const pendingRotationOf = (record: CtoRecord | null): CtoRecord["lastRotation"] =>
-  record?.lastRotation && record.lastRotation.claimedGeneration === null && !record.lastRotation.revoked ? record.lastRotation : null;
-/** A rotation whose conversation holds the role now. */
-const claimedByHolder = (record: CtoRecord | null): CtoRecord["lastRotation"] =>
-  record?.lastRotation && record.lastRotation.claimedGeneration !== null && !record.lastRotation.revoked && record.lastRotation.toSessionUuid === record.conversation
-    ? record.lastRotation : null;
+// ---- a canonical CTO: its one long-lived conversation, resumed (#1437 R1) ------------------------------------------
 
-/** The conversation a canonical relaunch rotates to: an unfinished relaunch's, a pending switchover's, else a new one. */
-const canonicalTarget = (ports: CtoPorts, record: CtoRecord | null, projectId: string): string =>
-  readRelaunchMarker(ports, projectId) ?? pendingRotationOf(record)?.toSessionUuid ?? ports.newUuid();
-
-/**
- * rotate-canonical-cto's own verification, read again: `to` holds the role at the claimed generation, and the daemon's
- * Buzz subscriber for it is connected, live and delivering to it, with the ingress listening.
- */
-const VERIFY_WAIT_MS = 120_000;
-const verifyRotation = async (ports: CtoPorts, projectId: string, to: string, generation: number, waitMs: number): Promise<Outcome> => {
-  interface Status { holderSessionUuid?: string; binding?: { generation?: number; sessionId?: string }; buzz?: { verdict?: string; sessionId?: string; reception?: { subscriber?: { connected?: boolean; liveness?: string; delivering?: boolean }; ingress?: { listening?: boolean } } } }
-  let seen: Status | null = null;
-  for (const deadline = ports.now() + waitMs; ;) {
-    const answer = await ports.operator.request("canonicalCto.status", { projectId });
-    seen = answer.allowed ? answer.value as Status : seen;
-    const buzz = seen?.buzz;
-    if (seen?.holderSessionUuid === to && seen.binding?.generation === generation && buzz?.verdict === "ADMITTED" && buzz.sessionId === seen.binding.sessionId &&
-      buzz.reception?.subscriber?.connected === true && buzz.reception.subscriber.liveness === "LIVE" && buzz.reception.subscriber.delivering === true &&
-      buzz.reception.ingress?.listening === true) return ok({ verified: to, generation });
-    if (ports.now() >= deadline) {
-      return refused(`conversation ${to} holds the role at generation ${generation} and is not verified on Buzz`, { buzz: seen?.buzz ?? null });
-    }
-    await ports.sleep(2_000);
+/** The launcher a canonical resume writes and tmux starts; it is also the record of the tmux session it belongs in. */
+const canonicalLauncherOf = (ports: CtoPorts, projectId: string): string => join(ports.stateDir, `cto-launch-${projectId}.sh`);
+const runtimeNodeOf = (ports: CtoPorts): string => join(ports.stateDir, "current", "dist", "bin", "node");
+const runtimeCliOf = (ports: CtoPorts): string => join(ports.stateDir, "current", "dist", "cli", "agentctl.js");
+/** The acp-cto entry a canonical CTO's claude starts: the same claim, at the role's next generation, from inside it. */
+const acpCtoEntryArgs = (ports: CtoPorts, projectId: string, uuid: string): string[] =>
+  [runtimeCliOf(ports), "attach", "canonical-cto", "--claimed-session-id", uuid, "--project-id", projectId, "--expected-binding-generation", "auto"];
+const cwdOf = (record: CtoRecord): string | null => record.session?.workdir ?? cloneOf(record);
+/** The options a running session was started with that its resume keeps: each takes one value. */
+const CARRIED_OPTIONS = new Set(["--model", "--effort", "--name", "--remote-control", "--messaging-socket-path", "--permission-mode"]);
+const carriedOptions = (argv: readonly string[]): string[] => {
+  const kept: string[] = [];
+  for (let i = 1; i < argv.length - 1; i++) {
+    if (CARRIED_OPTIONS.has(argv[i]!) && !argv[i + 1]!.startsWith("--")) { kept.push(argv[i]!, argv[i + 1]!); i++; }
   }
+  return kept;
+};
+const claudeBinaryOf = (ports: CtoPorts, argv: readonly string[] | null): string | null => {
+  const pinned = ports.env["ACP_CLAUDE_BINARY"] || ports.env["ACP_RESOLVED_CLAUDE_BINARY"];
+  if (pinned) return pinned;
+  return argv?.[0] && argv[0].startsWith("/") && basename(argv[0]) === "claude" ? argv[0] : null;
 };
 
 /**
- * The canonical CTO's launcher, called as it is. It refuses before touching anything when the project's room, Buzz
- * identity or key disagree, stops the old conversation only at a safe boundary, and starts the new one with the
- * channel. A relaunch is one rotation to one conversation: its target is kept until that conversation is verified, so
- * a rerun resumes a pending switchover or verifies a claimed one, and never starts a second rotation.
+ * The key file of the Buzz identity ACP holds for the project, never a new one: the project's own `cto-<project>.priv`,
+ * or the local alias Hermes's channel-cto.map gives its room, whichever is that identity. Paths only; no key is read out.
  */
-const rotateStep = (ports: CtoPorts, projectId: string, handoff: string | null, to: string): CtoStep => ({
-  id: "rotate",
-  plan: `move the canonical CTO to conversation ${to}: an unfinished relaunch or a pending switchover to it is resumed, and once ${to} has claimed the role it is only verified on Buzz, never rotated again; otherwise rotate-canonical-cto fences and stops the old conversation at a safe boundary, starts ${to} in tmux session cto-${projectId}-${to.slice(0, 8)} with the acp-buzz-channel, and verifies its claim and Buzz delivery`,
-  run: async () => {
-    const marker = relaunchMarkerOf(ports, projectId);
+const channelOf = (ports: CtoPorts, record: CtoRecord): { keyFile: string; roomId: string } | string => {
+  const room = record.room;
+  if (!room || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(room) || !/^[0-9a-f]{64}$/.test(record.actorId ?? "")) {
+    return "ACP holds no Buzz identity and room for this CTO to start its channel with";
+  }
+  const map = bridgeFile(ports, "channel-cto.map");
+  const alias = ports.files.exists(map) ? ports.files.read(map).split("\n").map((line) => line.split(" ")).find(([r]) => r === room)?.[1] : undefined;
+  const candidates = [keyFileOf(ports, record.projectId), ...(alias && /^[A-Za-z0-9._-]+$/.test(alias) ? [join(ports.home, ".hermes", "bridge", "keys", `${alias}.priv`)] : [])];
+  const keyFile = candidates.find((file) => ports.publicKeyOf(file) === record.actorId);
+  return keyFile ? { keyFile, roomId: room } : `no key file here is the Buzz identity ACP holds for this CTO (${record.actorId}): looked at ${candidates.join(", ")}`;
+};
+
+interface CanonicalLauncher { tmux: string; argv: string[] }
+const readCanonicalLauncher = (ports: CtoPorts, projectId: string): CanonicalLauncher | null => {
+  const file = canonicalLauncherOf(ports, projectId);
+  if (!ports.files.exists(file)) return null;
+  const line = ports.files.read(file).split("\n").find((l) => l.startsWith("# cto-launch: "));
+  try { return line ? JSON.parse(line.slice("# cto-launch: ".length)) as CanonicalLauncher : null; } catch { return null; }
+};
+
+/**
+ * A canonical CTO restarted in the same conversation: its folder already trusted, its channel's identity and room
+ * resolved, its exact claude process stopped, and `claude --resume <the role's bound conversation>` started with the
+ * channel in the tmux session the old one ran in (or a new detached one), confirming only the development-channels
+ * warning. Its acp-cto entry claims with `--expected-binding-generation auto`, so the conversation re-attaches as the
+ * same actor and the daemon keeps its queued messages for the channel to deliver. Nothing here starts a new
+ * conversation, writes a handoff package or runs a rotation. Everything that can refuse is checked before the stop.
+ */
+const canonicalResumeSteps = (ports: CtoPorts, projectId: string, restart: boolean): CtoStep[] => {
+  const planned = fresh(ports, projectId);
+  const uuid = planned?.conversation ?? null;
+  const cwd = planned ? cwdOf(planned) : null;
+  const launcher = canonicalLauncherOf(ports, projectId);
+  const bound = (): { record: CtoRecord; uuid: string; cwd: string } | string => {
     const record = fresh(ports, projectId);
-    if (!record) return refused("the project is not registered");
-    const unfinished = readRelaunchMarker(ports, projectId) === to;
-    const claimed = claimedByHolder(record);
-    // Only the target itself, once it holds the role, is verified instead of rotated to: never another conversation.
-    if (claimed && claimed.toSessionUuid === to) {
-      const verified = await verifyRotation(ports, projectId, to, claimed.claimedGeneration!, VERIFY_WAIT_MS);
-      if (!verified.ok) return refused(`${verified.reason}; no other rotation was started`, verified.detail);
-      ports.files.remove(marker);
-      return verified;
-    }
-    // A fresh relaunch is how a holder whose Buzz reception is broken is recovered, so that is reported, never a refusal.
-    let warning: string | null = null;
-    if (claimed && !unfinished) {
-      const now = await verifyRotation(ports, projectId, claimed.toSessionUuid, claimed.claimedGeneration!, 0);
-      if (!now.ok) warning = `${now.reason}; relaunching to recover it`;
-    }
-    if (!handoff) return refused("--handoff <package.json> is required: rotate-canonical-cto starts the new conversation from that handoff package");
-    if (!ports.scripts.rotate) return refused("rotate-canonical-cto.mjs was not found (set ACP_ROTATE_CANONICAL_CTO)");
-    if (record.generation === null) return refused("the project's PRIMARY_CTO role is unbound: rotate-canonical-cto moves a CTO that holds it");
-    const old = conversationProcesses(ports, record.conversation);
-    if (old.length > 1) return refused(`${old.length} processes run conversation ${record.conversation}; nothing was started`);
-    const cwd = record.session?.workdir ?? cloneOf(record);
-    if (!cwd) return refused("the CTO's working directory is not recorded");
-    const pending = pendingRotationOf(record);
-    const expected = pending?.toSessionUuid === to ? pending.fromGeneration : record.generation;
-    // Recorded before the launcher runs, so whatever it leaves behind is resumed with this same conversation.
-    if (!unfinished) ports.files.replace(marker, `${JSON.stringify({ to })}\n`);
-    const answer = ports.run(ports.node, [ports.scripts.rotate,
-      "--project", projectId, "--to", to, "--expected-generation", String(expected), "--cwd", cwd,
-      "--old-pid", String(old[0]?.pid ?? record.session?.pid ?? 0), "--tmux-session", `cto-${projectId}-${to.slice(0, 8)}`, "--handoff", handoff,
-    ], { env: scriptEnv(ports), timeoutMs: 600_000 });
-    const last = lastJsonLine(answer.stdout) ?? {};
-    const noted = warning ? { warning } : {};
-    if (answer.status !== 0) return refused(`rotate-canonical-cto exited ${answer.status ?? "on timeout"} at its ${String(last["step"] ?? "first")} step; run this again to continue with conversation ${to}`, { ...last, ...noted });
-    ports.files.remove(marker);
-    return ok({ to, ...last, ...noted });
-  },
-});
+    if (!record?.conversation || !UUID.test(record.conversation)) return "the role has no bound conversation to resume";
+    const folder = cwdOf(record);
+    return folder ? { record, uuid: record.conversation, cwd: folder } : "the CTO's working directory is not recorded";
+  };
+  const resumed = (record: CtoRecord | null): boolean => {
+    const live = conversationProcesses(ports, record?.conversation ?? null);
+    return live.some((p) => carriesChannel(p.command) && p.pid === record?.session?.pid);
+  };
+  return [idleStep(ports, projectId), {
+    id: "trust",
+    plan: `check Claude Code would find ${cwd ?? "the CTO's folder"} already trusted (launchFolderTrust); nothing is ever trusted here`,
+    run: () => {
+      const at = bound();
+      if (typeof at === "string") return refused(at);
+      const trust = launchFolderTrust(at.cwd, { home: ports.home, env: ports.env });
+      return trust.trusted ? ok({ folder: trust.folder })
+        : refused(`Claude Code would not find ${at.cwd} trusted (${trust.reason}); run ~/.claude/scripts/claude-trust-dir.sh ${at.cwd}, then run this again; nothing was stopped`);
+    },
+  }, {
+    id: "channel",
+    plan: "resolve the Buzz identity's key file and the room ACP holds for this CTO, for its channel",
+    run: () => {
+      const at = bound();
+      if (typeof at === "string") return refused(at);
+      const channel = channelOf(ports, at.record);
+      return typeof channel === "string" ? refused(`${channel}; nothing was stopped`) : ok(channel);
+    },
+  }, {
+    id: "launcher",
+    plan: `write ${launcher}: claude --resume ${uuid ?? "<the bound conversation>"} with the channel, keeping the running session's model, effort, name, remote-control name, messaging socket and permission mode, to be started in its tmux session`,
+    // A launcher an earlier run wrote is kept once nothing runs the conversation: it holds what the stopped session carried.
+    done: () => {
+      const record = fresh(ports, projectId);
+      return conversationProcesses(ports, record?.conversation ?? null).length === 0 && readCanonicalLauncher(ports, projectId)?.argv.includes(record?.conversation ?? "\0") === true;
+    },
+    run: () => {
+      const at = bound();
+      if (typeof at === "string") return refused(at);
+      const channel = channelOf(ports, at.record);
+      if (typeof channel === "string") return refused(channel);
+      const live = conversationProcesses(ports, at.uuid);
+      if (live.length > 1) return refused(`${live.length} processes run conversation ${at.uuid}; nothing was written`);
+      const running = live[0] ?? null;
+      const argv = running ? ports.argv(running.pid) : null;
+      if (running && argv === null) return refused(`pid ${running.pid}'s argv cannot be read, so what its session was started with is unknown; nothing was written`);
+      const claude = claudeBinaryOf(ports, argv);
+      if (!claude) return refused("the claude binary is not known: set ACP_CLAUDE_BINARY (agentcpd's launcher pins ACP_RESOLVED_CLAUDE_BINARY)");
+      const earlier = readCanonicalLauncher(ports, projectId);
+      const kept = argv ? carriedOptions(argv) : earlier ? carriedOptions(earlier.argv) : [];
+      const resume = [claude,
+        ...channelLaunchArgs({ runtimeNode: runtimeNodeOf(ports), runtimeCli: runtimeCliOf(ports), projectId, keyFile: channel.keyFile, roomId: channel.roomId, stateDir: ports.stateDir }),
+        "--resume", at.uuid, ...kept, ...(kept.includes("--permission-mode") ? [] : ["--permission-mode", "bypassPermissions"])];
+      const tmux = (running ? tmuxOf(ports, running.pid) : null) ?? earlier?.tmux ?? `cto-${projectId}`;
+      const quote = (v: string): string => `'${v.replaceAll("'", "'\\''")}'`;
+      ports.files.replace(launcher, `#!/bin/sh\n# cto-launch: ${JSON.stringify({ tmux, argv: resume })}\n` +
+        "unset ACP_OPERATOR_TOKEN ACP_MCP_TOKEN ACP_BUZZ_INGRESS_SECRET GH_TOKEN GITHUB_TOKEN\n" +
+        `cd ${quote(at.cwd)} || exit 1\nexec ${resume.map(quote).join(" ")}\n`, 0o700);
+      return ok({ launcher, tmux });
+    },
+  }, {
+    id: "mcp",
+    plan: `point the project's local acp-cto entry at conversation ${uuid ?? "<the bound conversation>"} with --expected-binding-generation auto, so the resumed claude makes the claim itself`,
+    done: () => {
+      const at = bound();
+      if (typeof at === "string") return false;
+      const config = join(ports.home, ".claude.json");
+      if (!ports.files.exists(config)) return false;
+      const entry = (JSON.parse(ports.files.read(config)) as { projects?: Record<string, { mcpServers?: Record<string, { command?: string; args?: string[] }> }> })
+        .projects?.[at.cwd]?.mcpServers?.["acp-cto"];
+      return entry?.command === runtimeNodeOf(ports) && JSON.stringify(entry.args ?? []) === JSON.stringify(acpCtoEntryArgs(ports, projectId, at.uuid));
+    },
+    run: () => {
+      const at = bound();
+      if (typeof at === "string") return refused(at);
+      const claude = claudeBinaryOf(ports, readCanonicalLauncher(ports, projectId)?.argv ?? null);
+      if (!claude) return refused("the claude binary is not known: set ACP_CLAUDE_BINARY");
+      // Absent is fine; the add below is what has to succeed.
+      ports.run(claude, ["mcp", "remove", "--scope", "local", "acp-cto"], { cwd: at.cwd, timeoutMs: 30_000 });
+      const added = ports.run(claude, ["mcp", "add", "--scope", "local", "acp-cto", "--", runtimeNodeOf(ports), ...acpCtoEntryArgs(ports, projectId, at.uuid)], { cwd: at.cwd, timeoutMs: 30_000 });
+      return added.status === 0 ? ok() : refused(`claude mcp add acp-cto failed: ${firstLine(added.stderr)}`);
+    },
+  }, stopStep(ports, projectId, "stop", !restart), {
+    id: "launch",
+    plan: `start ${launcher} in tmux and confirm the acp-buzz-channel came up, pressing nothing but its development-channels warning`,
+    done: () => conversationProcesses(ports, fresh(ports, projectId)?.conversation ?? null).some((p) => carriesChannel(p.command)),
+    run: async () => {
+      const planned = readCanonicalLauncher(ports, projectId);
+      if (!planned) return refused(`${launcher} is missing or unreadable; run this again to write it`);
+      const tmuxRun = (args: string[]): CtoExecResult => ports.run("tmux", args, { timeoutMs: 10_000 });
+      const started = tmuxExists(ports, planned.tmux)
+        ? tmuxRun(["new-window", "-d", "-P", "-F", "#{pane_id}", "-t", `=${planned.tmux}:`, launcher])
+        : tmuxRun(["new-session", "-d", "-s", planned.tmux, "-P", "-F", "#{pane_id}", launcher]);
+      const pane = started.stdout.trim();
+      if (started.status !== 0 || !/^%\d+$/.test(pane)) return refused(`tmux could not start ${launcher} in ${planned.tmux}: ${firstLine(started.stderr)}`);
+      const run = (bin: string, args: string[]): string => {
+        const answer = ports.run(bin, args, { timeoutMs: 10_000 });
+        if (answer.status !== 0) throw new Error(firstLine(answer.stderr) || `${bin} exited ${answer.status ?? "on timeout"}`);
+        return answer.stdout;
+      };
+      const startup = await confirmChannelStartup(tmuxChannelDriver({ tmux: "tmux", target: pane, startCommand: launcher, run }));
+      if (!startup.ok) {
+        return refused(`the resumed conversation was started in tmux ${planned.tmux} (${pane}) and its channel did not come up (${startup.failure}, screen ${startup.screen}); it was left running there`, { tmux: planned.tmux, pane });
+      }
+      return ok({ argv: planned.argv, tmux: planned.tmux, pane, confirmed: startup.confirmed });
+    },
+  }, {
+    id: "claimed",
+    plan: `wait for the resumed claude to claim the PRIMARY_CTO role as conversation ${uuid ?? "<the bound conversation>"} (generation auto)`,
+    done: () => resumed(fresh(ports, projectId)),
+    run: async () => {
+      for (const deadline = ports.now() + CLAIM_WAIT_MS; ;) {
+        const record = fresh(ports, projectId);
+        if (resumed(record)) return ok({ conversation: record!.conversation, generation: record!.generation, pid: record!.session!.pid });
+        if (ports.now() >= deadline) return refused(`the resumed conversation runs with its channel and has not claimed the role within ${CLAIM_WAIT_MS / 1000}s; it was left running`);
+        await ports.sleep(2_000);
+      }
+    },
+  }];
+};
 
 /** The roster routes the project's room to this project and Buzz identity, and is active. */
 const rosterStep = (ports: CtoPorts, projectId: string): CtoStep => ({
@@ -483,7 +598,7 @@ const listCtos = (ports: CtoPorts): number => {
   return 0;
 };
 
-const addPlan = (ports: CtoPorts, projectId: string, options: { repo: string | null; canonical: boolean; handoff: string | null }): CtoStep[] => {
+const addPlan = (ports: CtoPorts, projectId: string, options: { repo: string | null; canonical: boolean }): CtoStep[] => {
   const steps: CtoStep[] = [{
     id: "project",
     plan: options.repo
@@ -511,9 +626,15 @@ const addPlan = (ports: CtoPorts, projectId: string, options: { repo: string | n
       const record = fresh(ports, projectId);
       return Boolean(record && record.actorId && record.room && record.conversation && (options.canonical ? record.kind !== "none" : record.kind === "resident"));
     },
-    run: () => refused(options.canonical
-      ? "ACP holds no canonical entitlement for this project: a canonical CTO's conversation, Buzz identity and room are granted from ACP_CANONICAL_SESSIONS_JSON at daemon start"
-      : "ACP holds no resident allocation for this project: a resident CTO's conversation, Buzz identity and room are allocated by its repo-factory bootstrap; pass --canonical for a canonical CTO"),
+    run: () => {
+      const record = fresh(ports, projectId);
+      if (options.canonical && record && record.kind !== "none" && !record.conversation) {
+        return refused("this canonical CTO has no conversation yet: cto add only resumes an existing conversation, and starting a first one is out of scope here");
+      }
+      return refused(options.canonical
+        ? "ACP holds no canonical entitlement for this project: a canonical CTO's conversation, Buzz identity and room are granted from ACP_CANONICAL_SESSIONS_JSON at daemon start"
+        : "ACP holds no resident allocation for this project: a resident CTO's conversation, Buzz identity and room are allocated by its repo-factory bootstrap; pass --canonical for a canonical CTO");
+    },
   }, {
     id: "buzz-key",
     plan: `confirm ~/.hermes/bridge/keys/cto-${projectId}.priv is the Buzz identity ACP holds for the project`,
@@ -529,19 +650,16 @@ const addPlan = (ports: CtoPorts, projectId: string, options: { repo: string | n
         : `the CTO key ${keyFileOf(ports, projectId)} is identity ${key}, not ${record?.actorId ?? "none"}, which ACP holds for the project`);
     },
   }, rosterStep(ports, projectId), channelMapStep(ports, projectId, true)];
-  if (options.canonical) {
-    const record = fresh(ports, projectId);
-    steps.push(rotateStep(ports, projectId, options.handoff, canonicalTarget(ports, record, projectId)));
-  } else {
-    steps.push(residentLaunchStep(ports, projectId));
-  }
+  if (options.canonical) steps.push(...canonicalResumeSteps(ports, projectId, false));
+  else steps.push(residentLaunchStep(ports, projectId));
   return steps;
 };
 
-const relaunchPlan = (ports: CtoPorts, record: CtoRecord, handoff: string | null): CtoStep[] => {
+const relaunchPlan = (ports: CtoPorts, record: CtoRecord): CtoStep[] => {
   const projectId = record.projectId;
+  // The resident path stays as it is until #1447 replaces it.
   if (record.kind === "resident") return [idleStep(ports, projectId), stopStep(ports, projectId), residentLaunchStep(ports, projectId)];
-  return [idleStep(ports, projectId), rotateStep(ports, projectId, handoff, canonicalTarget(ports, record, projectId))];
+  return canonicalResumeSteps(ports, projectId, true);
 };
 
 /** The temporary namespace a worker's refs are fetched into, in the project's primary clone. Never counted as work. */
@@ -802,10 +920,10 @@ export const executeCtoPlan = async (ports: CtoPorts, header: Record<string, unk
 };
 
 const BOOLEAN_FLAGS = new Set(["--apply", "--canonical", "--delete-repo"]);
-const VALUE_FLAGS = new Set(["--reason", "--repo", "--handoff", "--yes-delete-repo"]);
+const VALUE_FLAGS = new Set(["--reason", "--repo", "--yes-delete-repo"]);
 const ALLOWED: Record<string, readonly string[]> = {
-  add: ["--apply", "--repo", "--canonical", "--handoff"],
-  relaunch: ["--apply", "--handoff"],
+  add: ["--apply", "--repo", "--canonical"],
+  relaunch: ["--apply"],
   retire: ["--apply", "--reason", "--delete-repo", "--yes-delete-repo"],
 };
 
@@ -852,13 +970,13 @@ export const runCtoCommand = async (args: readonly string[], ports: CtoPorts): P
     const repo = value("--repo");
     if (repo !== null && !REPO.test(repo)) return refuse(ports, "--repo must be <owner/name>");
     if (record?.retiredAt) return refuse(ports, `project ${projectId} is retired; a retired project is not added back`);
-    return executeCtoPlan(ports, { command: "add", project: projectId }, addPlan(ports, projectId, { repo, canonical: flags.has("--canonical"), handoff: value("--handoff") }), apply, rerun);
+    return executeCtoPlan(ports, { command: "add", project: projectId }, addPlan(ports, projectId, { repo, canonical: flags.has("--canonical") }), apply, rerun);
   }
   if (!record) return refuse(ports, `unknown project: ${projectId}`);
   if (sub === "relaunch") {
     if (record.retiredAt) return refuse(ports, `project ${projectId} is retired`);
     if (record.kind === "none") return refuse(ports, `project ${projectId} has no CTO allocation or entitlement to relaunch`);
-    return executeCtoPlan(ports, { command: "relaunch", project: projectId, kind: record.kind }, relaunchPlan(ports, record, value("--handoff")), apply, rerun);
+    return executeCtoPlan(ports, { command: "relaunch", project: projectId, kind: record.kind }, relaunchPlan(ports, record), apply, rerun);
   }
   // retire
   const reason = value("--reason");
@@ -918,11 +1036,6 @@ export const openCtoState = async (databasePath: string): Promise<CtoStateReader
     const claimed = get<{ sessionUuid: string; actorId: string; room: string }>(
       `SELECT to_session_uuid AS sessionUuid, buzz_actor_id AS actorId, buzz_address AS room FROM canonical_entitlement_transfers
         WHERE project_id = ? AND claimed_at IS NOT NULL ORDER BY claimed_binding_generation DESC, claimed_at DESC, transfer_id DESC LIMIT 1`, id);
-    const rotation = get<{ toSessionUuid: string; fromGeneration: number; claimedGeneration: number | null; revoked: number }>(
-      `SELECT t.to_session_uuid AS toSessionUuid, r.from_generation AS fromGeneration, t.claimed_binding_generation AS claimedGeneration,
-              t.revoked_at IS NOT NULL AS revoked
-         FROM canonical_entitlement_transfers t JOIN canonical_cto_rotations r ON r.transfer_id = t.transfer_id
-        WHERE t.project_id = ? ORDER BY t.created_at DESC, t.transfer_id DESC LIMIT 1`, id);
     const provisioning = get<{ status: string; allocation: string; steps: string }>(
       `SELECT status, allocation_json AS allocation, steps_json AS steps FROM resident_project_provisioning
         WHERE project_id = ? ORDER BY status = 'RETIRED', updated_at DESC, run_id DESC LIMIT 1`, id);
@@ -949,7 +1062,6 @@ export const openCtoState = async (databasePath: string): Promise<CtoStateReader
       room,
       actorId: claimed?.actorId ?? entitlement?.actorId ?? null,
       resident: provisioning ? { status: provisioning.status, allocation } : null,
-      lastRotation: rotation ? { ...rotation, revoked: rotation.revoked === 1 } : null,
       lastBuzzAt: typeof last?.at === "number" ? new Date(last.at * 1000).toISOString() : null,
     };
   };
@@ -986,11 +1098,12 @@ export const createCtoPorts = async (input: {
       return match ? [{ pid: Number(match[1]), ppid: Number(match[2]), command: match[3]!.trim() }] : [];
     }),
     startToken: readProcessStartToken,
+    argv: readProcessArgv,
     signal: (pid, signal) => { process.kill(pid, signal); },
     files: {
       exists: existsSync,
       read: (path) => readFileSync(path, "utf8"),
-      replace: (path, body) => { const tmp = `${path}.${process.pid}.${randomUUID()}.tmp`; writeFileSync(tmp, body, { mode: 0o600 }); renameSync(tmp, path); },
+      replace: (path, body, mode = 0o600) => { const tmp = `${path}.${process.pid}.${randomUUID()}.tmp`; writeFileSync(tmp, body, { mode }); renameSync(tmp, path); },
       move: (from, to) => { mkdirSync(dirname(to), { recursive: true, mode: 0o700 }); renameSync(from, to); },
       remove: (path) => rmSync(path, { recursive: true, force: true }),
       mtimeMs: (path) => { try { return statSync(path).mtimeMs; } catch { return null; } },
@@ -1005,7 +1118,6 @@ export const createCtoPorts = async (input: {
       // The packaged copy beside this build, then the source tree (a generation keeps both).
       provisioner: firstExisting([env["ACP_HOST_PROJECT_PROVISIONER"], fileURLToPath(new URL("../host/host-project-provisioner.mjs", import.meta.url)),
         fileURLToPath(new URL("../../scripts/host-project-provisioner.mjs", import.meta.url))]),
-      rotate: firstExisting([env["ACP_ROTATE_CANONICAL_CTO"], fileURLToPath(new URL("../../scripts/rotate-canonical-cto.mjs", import.meta.url))]),
     },
   };
 };

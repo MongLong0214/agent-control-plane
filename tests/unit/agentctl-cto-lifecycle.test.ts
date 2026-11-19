@@ -10,9 +10,10 @@ import {
 import { allow, deny, type Decision } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { createCtoMcpPort, createCtoServer } from "../../src/mcp/cto-server.ts";
+import { CHANNEL_REGISTERED_LINE } from "../../src/runtime/cto-channel-launch.ts";
 import { formatHostProvisionerReason, hostProvisionerReason, hostReasonKind, hostRefusalText } from "../../src/runtime/host-provisioner-reason.ts";
 import { cleanupTempDirs, commitAll, gitSync, tempDir } from "../helpers/fixtures.ts";
-import { rmSync, writeFileSync } from "node:fs";
+import { realpathSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { makeHarness } from "../helpers/harness.ts";
 
@@ -43,6 +44,7 @@ const MAP_SCRIPT = `${HOME}/.hermes/bridge/buzz-identity-map.sh`;
 const TRANSCRIPT = `${HOME}/.claude/projects/-home-op-projects-e2e-sort-fixture/${CONVERSATION}.jsonl`;
 const NOW = Date.parse("2026-11-17T12:00:00.000Z");
 const CLAUDE = 16590;
+const LOCAL_CLAUDE = "/Users/isaac/.local/bin/claude";
 const CHANNEL = "--dangerously-load-development-channels server:acp-buzz-channel";
 const recordedExit = hostRefusalText(formatHostProvisionerReason(hostProvisionerReason("claude", "ensure-resident", hostReasonKind.nonZeroExit, 143)!));
 
@@ -71,10 +73,14 @@ interface World {
   daemonRejects: boolean;
   /** How many times the daemon actually executed `project.retire`; a replayed cached answer is not one. */
   retireExecutions: number;
-  /** The canonical CTO's Buzz delivery as `canonicalCto.status` reports it. */
-  buzzVerified: boolean;
+  /** Every run of the old rotation launcher: there must be none. */
   rotateRuns: string[];
-  rotateAnswers: Array<(to: string) => CtoExecResult>;
+  /** Each process's exact argv, as the kernel gives it. */
+  argv: Map<number, string[]>;
+  /** tmux panes: the pane's process and its session. */
+  panes: Map<number, string>;
+  /** The launcher tmux last started, and whether the conversation it resumes claims the role. */
+  launched: { command: string | null; claims: boolean };
 }
 
 const results = (w: World): Array<[string, string]> => w.out.filter((l) => typeof l["result"] === "string" && typeof l["step"] === "string").map((l) => [l["step"] as string, l["result"] as string]);
@@ -90,7 +96,8 @@ const makeWorld = (overrides: Partial<CtoRecord> = {}, env: Record<string, strin
   const mtimes = new Map([[TRANSCRIPT, NOW - (IDLE_SECONDS + 60) * 1000]]);
   const w = {
     out: [], changes: [], ran: [], files, mtimes, tmux: new Set([TMUX]), repo: { exists: true }, worker: { unpublished: false, fetchFails: false }, operatorAnswers: [], provisionerAnswers: [],
-    dirty: new Set<string>(), archiveUnpublished: false, daemonRejects: false, retireExecutions: 0, buzzVerified: true, rotateRuns: [], rotateAnswers: [],
+    dirty: new Set<string>(), archiveUnpublished: false, daemonRejects: false, retireExecutions: 0, rotateRuns: [],
+    argv: new Map<number, string[]>(), panes: new Map([[100, TMUX]]), launched: { command: null, claims: true },
     procs: [
       { pid: 100, ppid: 1, command: "/bin/sh /state/resident-e2e-sort-fixture.sh" },
       { pid: CLAUDE, ppid: 100, command: `/bin/claude --model opus ${CHANNEL} --resume ${CONVERSATION} --name e2e CTO` },
@@ -100,9 +107,9 @@ const makeWorld = (overrides: Partial<CtoRecord> = {}, env: Record<string, strin
     record: {
       projectId: P, name: P, retiredAt: null, kind: "resident",
       repositories: [{ repositoryId: "repo_1", identity: `github:${REPO}`, checkoutPath: WORKER }],
-      conversation: CONVERSATION, generation: 3, session: { pid: CLAUDE, startedAt: "t", workdir: CLONE },
+      conversation: CONVERSATION, generation: 3, session: { pid: CLAUDE, startedAt: `start-${CLAUDE}`, workdir: CLONE },
       room: ROOM, actorId: ACTOR, resident: { status: "COMPLETE", allocation: { projectId: P, sessionUuid: CONVERSATION, clonePath: CLONE, roomId: ROOM } },
-      lastRotation: null, lastBuzzAt: null, ...overrides,
+      lastBuzzAt: null, ...overrides,
     },
   } as unknown as World;
   const exists = (path: string): boolean => files.has(path) || [...files.keys()].some((k) => k.startsWith(`${path}/`));
@@ -124,16 +131,23 @@ const makeWorld = (overrides: Partial<CtoRecord> = {}, env: Record<string, strin
   const tempRefs = new Set<string>();
   let clock = NOW;
   let uuids = 0;
-  const canonicalStatus = (): Record<string, unknown> => ({
-    holderSessionUuid: w.record.conversation, generation: w.record.generation,
-    binding: { generation: w.record.generation, sessionId: "ses_holder", lifecycle: "READY", liveRuns: [] },
-    buzz: { verdict: "ADMITTED", sessionId: "ses_holder", reception: { subscriber: { connected: w.buzzVerified, liveness: w.buzzVerified ? "LIVE" : "STALE", delivering: w.buzzVerified }, ingress: { listening: true } } },
-  });
   const subprocess = (bin: string, args: readonly string[], options: CtoExecOptions = {}): CtoExecResult => {
     const line = [bin, ...args].join(" ");
     w.ran.push(line);
     const answer = (status: number, stdout = "", stderr = ""): CtoExecResult => ({ status, stdout, stderr });
-    if (bin === "tmux" && args[0] === "list-panes") return answer(0, `100 ${TMUX}\n`);
+    if (bin === "tmux" && args[0] === "list-panes") return answer(0, [...w.panes].map(([pid, session]) => `${pid} ${session}\n`).join(""));
+    // A launch: tmux starts the launcher, which resumes the conversation with its channel; the conversation claims the role.
+    if (bin === "tmux" && (args[0] === "new-session" || args[0] === "new-window")) {
+      w.changes.push(line);
+      if (args[0] === "new-session") w.tmux.add(args[args.indexOf("-s") + 1]!);
+      w.launched.command = args[args.length - 1]!;
+      w.procs.push({ pid: 30000, ppid: 1, command: `${LOCAL_CLAUDE} --mcp-config {} ${CHANNEL} --resume ${w.record.conversation}` });
+      if (w.launched.claims) w.record = { ...w.record, generation: 4, session: { pid: 30000, startedAt: "t3", workdir: null } };
+      return answer(0, "%9\n");
+    }
+    if (bin === "tmux" && args[0] === "display-message") return answer(0, args[4] === "#{pane_id}" ? "%9\n" : `${w.launched.command}\n`);
+    if (bin === "tmux" && args[0] === "capture-pane") return answer(0, `${CHANNEL_REGISTERED_LINE}\n`);
+    if (bin === LOCAL_CLAUDE && args[0] === "mcp") { w.changes.push(line); return answer(args[1] === "remove" ? 1 : 0); }
     if (bin === "tmux" && args[0] === "has-session") return answer(w.tmux.has(args[2]!.slice(1)) ? 0 : 1);
     if (bin === "tmux" && args[0] === "kill-session") { w.changes.push(line); w.tmux.delete(args[2]!.slice(1)); return answer(0); }
     if (bin === "git" && args[2] === "status") return answer(0, w.dirty.has(args[1]!) ? "?? scratch.txt\n" : "");
@@ -178,7 +192,7 @@ const makeWorld = (overrides: Partial<CtoRecord> = {}, env: Record<string, strin
       w.changes.push(line);
       const to = args[args.indexOf("--to") + 1]!;
       w.rotateRuns.push(to);
-      return w.rotateAnswers.shift()?.(to) ?? answer(0, `${JSON.stringify({ step: "verify", generation: 27 })}\n`);
+      return answer(0, `${JSON.stringify({ step: "verify", generation: 27 })}\n`);
     }
     throw new Error(`unexpected subprocess: ${line}`);
   };
@@ -189,7 +203,6 @@ const makeWorld = (overrides: Partial<CtoRecord> = {}, env: Record<string, strin
       request: async (method: string, params: Record<string, unknown> = {}, idempotencyKey?: string) => {
         if (w.daemonRejects) return deny(ReasonCode.OPERATOR_UNAUTHENTICATED, "operator authentication failed");
         if (method === "daemon.status") return allow(ReasonCode.OK, { mode: "RUNNING" });
-        if (method === "canonicalCto.status") return allow(ReasonCode.OK, canonicalStatus());
         const key = idempotencyKey ?? `operator:${JSON.stringify({ method, params })}`;
         const cached = daemonCache.get(key);
         if (cached) return cached;
@@ -204,7 +217,14 @@ const makeWorld = (overrides: Partial<CtoRecord> = {}, env: Record<string, strin
     run: subprocess,
     processes: () => w.procs.slice(),
     startToken: (pid: number) => (w.procs.some((p) => p.pid === pid) ? `start-${pid}` : null),
-    signal: (pid: number) => { w.changes.push(`SIGTERM ${pid}`); w.procs = w.procs.filter((p) => p.pid !== pid && p.ppid !== pid); },
+    signal: (pid: number) => {
+      w.changes.push(`SIGTERM ${pid}`);
+      w.procs = w.procs.filter((p) => p.pid !== pid && p.ppid !== pid);
+      // A pane whose own process was claude ends with it, and so does its session.
+      const session = w.panes.get(pid);
+      if (session) { w.panes.delete(pid); w.tmux.delete(session); }
+    },
+    argv: (pid: number) => w.argv.get(pid) ?? null,
     files: {
       exists,
       read: (path: string) => { const body = files.get(path); if (body === undefined) throw new Error(`ENOENT ${path}`); return body; },
@@ -217,7 +237,7 @@ const makeWorld = (overrides: Partial<CtoRecord> = {}, env: Record<string, strin
     publicKeyOf: (keyFile: string) => files.get(keyFile) ?? null,
     now: () => clock, sleep: async (ms: number) => { clock += ms; }, newUuid: () => `99999999-8888-4777-8666-${String(++uuids).padStart(12, "5")}`,
     write: (line: Record<string, unknown>) => { w.out.push(line); },
-    node: "/node", scripts: { provisioner: "/prov.mjs", rotate: "/rotate.mjs" },
+    node: "/node", scripts: { provisioner: "/prov.mjs" },
   };
   return w;
 };
@@ -393,17 +413,6 @@ describe("agentctl cto relaunch", () => {
     expect(w.changes).toEqual(["provisioner ensure-resident"]);
   });
 
-  it("moves a canonical CTO through rotate-canonical-cto, which needs a handoff package", async () => {
-    const w = makeWorld({ kind: "canonical", resident: null, generation: 26 });
-    expect(await runCtoCommand(["relaunch", P, "--apply"], w.ports)).toBe(1);
-    expect(results(w)).toEqual([["idle", "done"], ["rotate", "failed"]]);
-    expect(w.changes).toEqual([]);
-    w.out.length = 0;
-    expect(await runCtoCommand(["relaunch", P, "--handoff", "/h.json", "--apply"], w.ports)).toBe(0);
-    const [to] = w.rotateRuns;
-    expect(to).toMatch(/^[0-9a-f-]{36}$/);
-    expect(w.changes.filter((c) => c.startsWith("/node"))).toEqual([`/node /rotate.mjs --project ${P} --to ${to} --expected-generation 26 --cwd ${CLONE} --old-pid ${CLAUDE} --tmux-session cto-${P}-${to!.slice(0, 8)} --handoff /h.json`]);
-  });
 });
 
 describe("review r1", () => {
@@ -445,43 +454,6 @@ describe("review r1", () => {
     expect(await runCtoCommand([...RETIRE, "--apply"], w.ports)).toBe(0);
     expect(w.retireExecutions).toBe(2);
     expect(w.record.retiredAt).not.toBeNull();
-  });
-
-  it("5: a canonical relaunch whose rotation was claimed but not verified verifies that target on a rerun, and never starts another", async () => {
-    const w = makeWorld({ kind: "canonical", resident: null, generation: 26 });
-    w.rotateAnswers.push((to) => {
-      // rotate-canonical-cto's exit 3: the new conversation claimed generation 27, and its Buzz delivery is not verified.
-      w.record = { ...w.record, conversation: to, generation: 27, session: { pid: 30000, startedAt: "t2", workdir: CLONE },
-        lastRotation: { toSessionUuid: to, fromGeneration: 26, claimedGeneration: 27, revoked: false } };
-      w.procs = [...w.procs.filter((p) => p.pid !== CLAUDE), { pid: 30000, ppid: 1, command: `/bin/claude ${CHANNEL} --session-id ${to}` }];
-      const transcript = TRANSCRIPT.replace(CONVERSATION, to);
-      w.files.set(transcript, "{}");
-      w.mtimes.set(transcript, NOW - (IDLE_SECONDS + 60) * 1000);
-      w.buzzVerified = false;
-      return { status: 3, stdout: `${JSON.stringify({ step: "verify", refused: "the new conversation holds the role but is not verified" })}\n`, stderr: "" };
-    });
-    const relaunch = ["relaunch", P, "--handoff", "/h.json", "--apply"];
-    expect(await runCtoCommand(relaunch, w.ports)).toBe(1);
-    expect(w.rotateRuns).toHaveLength(1);
-    const target = w.rotateRuns[0]!;
-
-    // Still not verified: the rerun checks that same target and starts nothing.
-    w.out.length = 0;
-    expect(await runCtoCommand(relaunch, w.ports)).toBe(1);
-    expect(w.rotateRuns).toEqual([target]);
-    expect(JSON.stringify(results(w))).toContain("rotate");
-
-    // Verified now: the rerun completes on that same target, still without another rotation.
-    w.buzzVerified = true;
-    w.out.length = 0;
-    expect(await runCtoCommand(relaunch, w.ports)).toBe(0);
-    expect(w.rotateRuns).toEqual([target]);
-    expect(JSON.stringify(w.out)).toContain(target);
-
-    // That relaunch is finished, so the next one is a new rotation.
-    expect(await runCtoCommand(relaunch, w.ports)).toBe(0);
-    expect(w.rotateRuns).toHaveLength(2);
-    expect(w.rotateRuns[1]).not.toBe(target);
   });
 });
 
@@ -529,28 +501,6 @@ describe("review r1, item 2: held work, read from real repositories", () => {
     writeFileSync(join(worker, "notes.txt"), "x\n");
     expect(checkoutHeldWork(run, primary)).toMatch(/uncommitted or untracked/);
     expect(workerHeldWork(run, primary, worker)).toMatch(/uncommitted or untracked/);
-  });
-});
-
-describe("review r2", () => {
-  const CLAIMED_BY_HOLDER = { toSessionUuid: CONVERSATION, fromGeneration: 25, claimedGeneration: 26, revoked: false };
-
-  it("1: a saved relaunch target is verified only by its own conversation, not by another one holding the role", async () => {
-    const saved = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
-    const w = makeWorld({ kind: "canonical", resident: null, generation: 26, lastRotation: CLAIMED_BY_HOLDER });
-    w.files.set(`${STATE}/cto-relaunch-${P}.json`, JSON.stringify({ to: saved }));
-    expect(await runCtoCommand(["relaunch", P, "--handoff", "/h.json", "--apply"], w.ports)).toBe(0);
-    expect(w.rotateRuns).toEqual([saved]);
-  });
-
-  it("2: a fresh relaunch is not held back by the current holder's broken Buzz reception: it warns and relaunches", async () => {
-    const w = makeWorld({ kind: "canonical", resident: null, generation: 26, lastRotation: CLAIMED_BY_HOLDER });
-    w.buzzVerified = false;
-    expect(await runCtoCommand(["relaunch", P, "--handoff", "/h.json", "--apply"], w.ports)).toBe(0);
-    expect(w.rotateRuns).toHaveLength(1);
-    expect(w.rotateRuns[0]).not.toBe(CONVERSATION);
-    const rotated = w.out.find((l) => l["step"] === "rotate" && l["result"] === "done")!;
-    expect(JSON.stringify(rotated["detail"])).toMatch(/warning.*not verified on Buzz/);
   });
 });
 
@@ -627,6 +577,86 @@ describe("review r3: temporary refs that cannot be cleared", () => {
     rmSync(lock);
     expect(checkoutHeldWork(run, primary)).toBeNull();
     expect(workerHeldWork(run, primary, worker)).toBeNull();
+  });
+});
+
+/** Owner requirement R1 (#1437): one long-lived conversation per project is its PRIMARY_CTO, so a canonical CTO is resumed, never rotated. */
+describe("a canonical relaunch resumes the role's bound conversation", () => {
+  /** Logic Pro MCP's shape: its claude is the tmux pane's own process, it runs without the channel, and its role is unbound. */
+  const canonicalWorld = (options: { trusted?: boolean; conversation?: string | null } = {}): { w: World; cwd: string } => {
+    const cwd = realpathSync(tempDir("acp-cto-canonical-"));
+    const config = tempDir("acp-cto-claude-config-");
+    writeFileSync(join(config, ".claude.json"), JSON.stringify({ projects: options.trusted === false ? {} : { [cwd]: { hasTrustDialogAccepted: true } } }));
+    const w = makeWorld({ kind: "canonical", resident: null, generation: null, session: null, conversation: options.conversation === undefined ? CONVERSATION : options.conversation,
+      repositories: [{ repositoryId: "repo_1", identity: `github:${REPO}`, checkoutPath: cwd }] }, { ACP_OPERATOR_TOKEN: "operator-test-credential", CLAUDE_CONFIG_DIR: config });
+    const argv = [LOCAL_CLAUDE, "--resume", CONVERSATION, "--model", "claude-opus-5-5", "--effort", "medium", "--name", "Logic CTO",
+      "--remote-control", "Logic CTO", "--permission-mode", "bypassPermissions", "--mcp-config", "/x/canonical-mcp.json"];
+    w.procs = [{ pid: CLAUDE, ppid: 1, command: argv.join(" ") }];
+    w.argv.set(CLAUDE, argv);
+    w.panes = new Map([[CLAUDE, "logic-claude-handoff"]]);
+    w.tmux = new Set(["logic-claude-handoff"]);
+    const transcript = `${HOME}/.claude/projects/${cwd.replace(/[^A-Za-z0-9]/g, "-")}/${CONVERSATION}.jsonl`;
+    w.files.set(transcript, "{}");
+    w.mtimes.set(transcript, NOW - (IDLE_SECONDS + 60) * 1000);
+    return { w, cwd };
+  };
+  const RESUME_STEPS = ["idle", "trust", "channel", "launcher", "mcp", "stop", "launch", "claimed"];
+
+  it("stops the exact claude process and resumes the bound conversation with the channel in its tmux session, claiming with auto; no rotation", async () => {
+    const { w } = canonicalWorld();
+    expect(await runCtoCommand(["relaunch", P, "--apply"], w.ports)).toBe(0);
+    // The fake conversation claims as it starts, so the wait for the claim finds it already made.
+    expect(results(w)).toEqual([...RESUME_STEPS.slice(0, -1).map((step) => [step, "done"]), ["claimed", "skipped"]]);
+    expect(last(w)).toEqual({ result: "done" });
+    expect(w.changes).toContain(`SIGTERM ${CLAUDE}`);
+    const launch = w.out.find((l) => l["step"] === "launch" && l["result"] === "done")!["detail"] as { argv: string[]; tmux: string };
+    expect(launch.argv[0]).toBe(LOCAL_CLAUDE);
+    expect(launch.argv.slice(launch.argv.indexOf("--resume"), launch.argv.indexOf("--resume") + 2)).toEqual(["--resume", CONVERSATION]);
+    expect(launch.argv).toEqual(expect.arrayContaining(["--mcp-config", "--dangerously-load-development-channels", "server:acp-buzz-channel"]));
+    expect(launch.argv.slice(launch.argv.indexOf("--name"), launch.argv.indexOf("--name") + 2)).toEqual(["--name", "Logic CTO"]);
+    expect(launch.argv).not.toContain("/x/canonical-mcp.json");
+    expect(launch.tmux).toBe("logic-claude-handoff");
+    expect(w.changes.some((c) => c.startsWith("tmux new-session -d -s logic-claude-handoff "))).toBe(true);
+    expect(w.changes).toContain(`${LOCAL_CLAUDE} mcp add --scope local acp-cto -- ${STATE}/current/dist/bin/node ${STATE}/current/dist/cli/agentctl.js attach canonical-cto --claimed-session-id ${CONVERSATION} --project-id ${P} --expected-binding-generation auto`);
+    expect(w.rotateRuns).toEqual([]);
+    expect(w.ran.filter((l) => /rotate/.test(l))).toEqual([]);
+  });
+
+  it("reports a resumed conversation that does not claim the role, and leaves it running", async () => {
+    const { w } = canonicalWorld();
+    w.launched.claims = false;
+    expect(await runCtoCommand(["relaunch", P, "--apply"], w.ports)).toBe(1);
+    expect(results(w).at(-1)).toEqual(["claimed", "failed"]);
+    expect(w.procs.some((p) => p.pid === 30000)).toBe(true);
+  });
+
+  it("refuses a launch folder that is not trusted (launchFolderTrust), before anything is stopped", async () => {
+    const { w } = canonicalWorld({ trusted: false });
+    expect(await runCtoCommand(["relaunch", P, "--apply"], w.ports)).toBe(1);
+    expect(results(w)).toEqual([["idle", "done"], ["trust", "failed"]]);
+    expect(JSON.stringify(w.out)).toContain("no-record");
+    expect(w.changes).toEqual([]);
+  });
+
+  it("add --canonical resumes an existing conversation the same way", async () => {
+    const { w } = canonicalWorld();
+    expect(await runCtoCommand(["add", P, "--canonical", "--apply"], w.ports)).toBe(0);
+    expect(results(w).filter(([, r]) => r === "done").map(([s]) => s)).toEqual(RESUME_STEPS.slice(0, -1));
+    expect(w.changes).toContain(`SIGTERM ${CLAUDE}`);
+  });
+
+  it("add --canonical refuses a canonical CTO with no conversation yet", async () => {
+    const { w } = canonicalWorld({ conversation: null });
+    expect(await runCtoCommand(["add", P, "--canonical", "--apply"], w.ports)).toBe(1);
+    expect(results(w).at(-1)).toEqual(["identity", "failed"]);
+    expect(JSON.stringify(w.out)).toContain("has no conversation yet");
+    expect(w.changes).toEqual([]);
+  });
+
+  it("takes no --handoff: there is no handoff package and no new conversation", async () => {
+    const { w } = canonicalWorld();
+    expect(await runCtoCommand(["relaunch", P, "--handoff", "/h.json", "--apply"], w.ports)).toBe(2);
+    expect(w.changes).toEqual([]);
   });
 });
 
