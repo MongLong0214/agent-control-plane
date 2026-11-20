@@ -24,8 +24,8 @@ const ensureDir = (stateDir: string): void => {
   mkdirSync(channelDir(stateDir), { recursive: true, mode: 0o700 });
 };
 
-/** One receipt as one line; `O_APPEND` makes concurrent writers' lines whole. */
-export const appendChannelReceipt = (stateDir: string, projectId: string, receipt: ChannelReceipt): void => {
+/** One receipt as one line, stamped with the launch the server was started by; `O_APPEND` makes concurrent writers' lines whole. */
+export const appendChannelReceipt = (stateDir: string, projectId: string, receipt: ChannelReceipt, launchId?: string): void => {
   ensureDir(stateDir);
   const fd = openSync(
     channelReceiptPath(stateDir, projectId),
@@ -33,7 +33,7 @@ export const appendChannelReceipt = (stateDir: string, projectId: string, receip
     0o600,
   );
   try {
-    writeSync(fd, `${JSON.stringify(receipt)}\n`);
+    writeSync(fd, `${JSON.stringify(launchId === undefined ? receipt : { ...receipt, launchId })}\n`);
   } finally {
     closeSync(fd);
   }

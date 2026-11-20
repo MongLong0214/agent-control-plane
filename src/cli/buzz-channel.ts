@@ -31,7 +31,7 @@ import { loadBuzzSubscriberKey, readBuzzSubscriberConfig } from "../buzz/buzz-me
 
 const USAGE =
   "usage: buzz-channel --project-id <id> --key-file <absolute path> --room <room id> [--room <room id>] " +
-  "--state-dir <dir> [--relay-url <wss url>] [--ceo-pubkey <hex>] [--key-encoding hex|nsec]";
+  "--state-dir <dir> [--relay-url <wss url>] [--ceo-pubkey <hex>] [--key-encoding hex|nsec] [--launch-id <id>]";
 
 interface Args {
   projectId: string;
@@ -41,10 +41,12 @@ interface Args {
   stateDir: string;
   relayUrl: string | null;
   ceoPubkeys: string[];
+  /** The launch that started this server, written into every receipt so the launcher can tell its own. */
+  launchId: string | null;
 }
 
-const parseArgs = (argv: readonly string[]): Args => {
-  const out: Args = { projectId: "", keyFile: "", keyEncoding: "hex", rooms: [], stateDir: "", relayUrl: null, ceoPubkeys: [] };
+export const parseBuzzChannelArgs = (argv: readonly string[]): Args => {
+  const out: Args = { projectId: "", keyFile: "", keyEncoding: "hex", rooms: [], stateDir: "", relayUrl: null, ceoPubkeys: [], launchId: null };
   for (let i = 0; i < argv.length; i += 2) {
     const flag = argv[i];
     const value = argv[i + 1];
@@ -58,6 +60,10 @@ const parseArgs = (argv: readonly string[]): Args => {
     else if (flag === "--state-dir") out.stateDir = value;
     else if (flag === "--relay-url") out.relayUrl = value;
     else if (flag === "--ceo-pubkey") out.ceoPubkeys.push(value);
+    else if (flag === "--launch-id") {
+      if (!/^[A-Za-z0-9][A-Za-z0-9-]{3,63}$/u.test(value)) throw new Error("--launch-id must be 4 to 64 letters, digits or dashes");
+      out.launchId = value;
+    }
     else throw new Error(`unknown argument ${flag}`);
   }
   if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/u.test(out.projectId)) throw new Error("--project-id is required");
@@ -96,7 +102,7 @@ const canonicalCeoResolver = (reads: () => DaemonReads | null): (() => readonly 
 export const runBuzzChannel = async (argv: readonly string[]): Promise<number> => {
   let args: Args;
   try {
-    args = parseArgs(argv);
+    args = parseBuzzChannelArgs(argv);
   } catch (error) {
     log(`${(error as Error).message}\n${USAGE}`);
     return 2;
@@ -130,7 +136,7 @@ export const runBuzzChannel = async (argv: readonly string[]): Promise<number> =
       onNotification: (n: ChannelNotification) => emitChannelNotification(server, n),
       onReceipt: (receipt) => {
         try {
-          appendChannelReceipt(args.stateDir, args.projectId, receipt);
+          appendChannelReceipt(args.stateDir, args.projectId, receipt, args.launchId ?? undefined);
         } catch {
           log("a receipt could not be written; the message stays pending in the control plane's queue");
         }

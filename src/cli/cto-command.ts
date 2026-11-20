@@ -12,7 +12,7 @@ import {
 } from "../cto/one-cto-per-project.ts";
 import { residentWorkerCheckoutPath } from "../core/resident-allocation-paths.ts";
 import { daemonBuzzSigner } from "../outbox/ceo-buzz-signer.ts";
-import { BUZZ_CHANNEL_SERVER, CHANNEL_DEV_FLAG, channelEmittedSince, channelLaunchArgs, confirmChannelStartup, launchFolderTrust, tmuxChannelDriver } from "../runtime/cto-channel-launch.ts";
+import { BUZZ_CHANNEL_SERVER, CHANNEL_DEV_FLAG, channelEmittedBy, channelLaunchArgs, confirmChannelStartup, launchFolderTrust, tmuxChannelDriver } from "../runtime/cto-channel-launch.ts";
 import { readHostProvisionerReason, recordedResidentExitStatus } from "../runtime/host-provisioner-reason.ts";
 
 /**
@@ -235,11 +235,12 @@ const stopTargetOf = (ports: CtoPorts, record: CtoRecord | null, role: RoleProce
   if (pid && token !== null) {
     const recorded = record!.session!.startedAt;
     const row = role.snapshot.rows.find((one) => one.pid === pid);
-    if (recorded === null || recorded === token || (row !== undefined && row.startedAt === recorded)) {
+    if (recorded !== null && (recorded === token || (row !== undefined && row.startedAt === recorded))) {
       return { pid, startToken: token, tmux: role.matches.find((one) => one.pid === pid)?.tmuxSession ?? null };
     }
-    // An lstart-recorded start this table does not show cannot be told from another process's: refused, never guessed.
-    if (/^[A-Z][a-z]{2} [A-Z][a-z]{2} /.test(recorded) && row === undefined) return { refused: `pid ${pid} is alive and its start cannot be compared with the one ACP recorded; nothing was signalled` };
+    // Alive with another start, or none recorded: the bound session's identity cannot be confirmed, and no other
+    // process is taken in its place. Nothing is stopped and, since the one-cto and stop steps refuse, nothing launched.
+    return { refused: `the bound session's os_pid ${pid} is alive with a start that is not the one ACP recorded, so its identity cannot be confirmed; nothing was stopped or launched` };
   }
   if (record?.kind !== "resident") return null;
   if (role.matches.length > 1) return { refused: `${role.matches.length} processes are this CTO role's (${role.matches.map((one) => one.pid).join(", ")}); nothing was signalled` };
@@ -422,7 +423,19 @@ const channelOf = (ports: CtoPorts, record: CtoRecord): { keyFile: string; roomI
   return keyFile ? { keyFile, roomId: room } : `no key file here is the Buzz identity ACP holds for this CTO (${record.actorId}): looked at ${candidates.join(", ")}`;
 };
 
-interface CanonicalLauncher { tmux: string; argv: string[] }
+/** What a canonical launch starts: the binary, the resume and the options it keeps, and its channel's key and room. */
+interface CanonicalLauncher { tmux: string; cwd: string; claude: string; keyFile: string; roomId: string; resume: string[] }
+const quoteShell = (v: string): string => `'${v.replaceAll("'", "'\\''")}'`;
+/** The launcher script for one launch: `launchId` is this launch's own, passed to its channel server. */
+const writeCanonicalLauncher = (ports: CtoPorts, projectId: string, plan: CanonicalLauncher, launchId?: string): string[] => {
+  const argv = [plan.claude,
+    ...channelLaunchArgs({ runtimeNode: runtimeNodeOf(ports), runtimeCli: runtimeCliOf(ports), projectId, keyFile: plan.keyFile, roomId: plan.roomId, stateDir: ports.stateDir, ...(launchId ? { launchId } : {}) }),
+    ...plan.resume];
+  ports.files.replace(canonicalLauncherOf(ports, projectId), `#!/bin/sh\n# cto-launch: ${JSON.stringify(plan)}\n` +
+    "unset ACP_OPERATOR_TOKEN ACP_MCP_TOKEN ACP_BUZZ_INGRESS_SECRET GH_TOKEN GITHUB_TOKEN\n" +
+    `cd ${quoteShell(plan.cwd)} || exit 1\nexec ${argv.map(quoteShell).join(" ")}\n`, 0o700);
+  return argv;
+};
 const readCanonicalLauncher = (ports: CtoPorts, projectId: string): CanonicalLauncher | null => {
   const file = canonicalLauncherOf(ports, projectId);
   if (!ports.files.exists(file)) return null;
@@ -493,7 +506,7 @@ const canonicalResumeSteps = (ports: CtoPorts, projectId: string, restart: boole
     done: async () => {
       const record = fresh(ports, projectId);
       const role = await roleProcesses(ports, projectId);
-      return role.matches.length === 0 && readCanonicalLauncher(ports, projectId)?.argv.includes(record?.conversation ?? "\0") === true;
+      return role.matches.length === 0 && readCanonicalLauncher(ports, projectId)?.resume.includes(record?.conversation ?? "\0") === true;
     },
     run: async () => {
       const at = bound();
@@ -509,15 +522,11 @@ const canonicalResumeSteps = (ports: CtoPorts, projectId: string, restart: boole
       const claude = claudeBinaryOf(ports, argv);
       if (!claude) return refused("the claude binary is not known: set ACP_CLAUDE_BINARY (agentcpd's launcher pins ACP_RESOLVED_CLAUDE_BINARY)");
       const earlier = readCanonicalLauncher(ports, projectId);
-      const kept = argv ? carriedOptions(argv) : earlier ? carriedOptions(earlier.argv) : [];
-      const resume = [claude,
-        ...channelLaunchArgs({ runtimeNode: runtimeNodeOf(ports), runtimeCli: runtimeCliOf(ports), projectId, keyFile: channel.keyFile, roomId: channel.roomId, stateDir: ports.stateDir }),
-        "--resume", at.uuid, ...kept, ...(kept.includes("--permission-mode") ? [] : ["--permission-mode", "bypassPermissions"])];
+      const kept = argv ? carriedOptions(argv) : earlier ? carriedOptions([earlier.claude, ...earlier.resume]) : [];
+      const resume = ["--resume", at.uuid, ...kept, ...(kept.includes("--permission-mode") ? [] : ["--permission-mode", "bypassPermissions"])];
       const tmux = target?.tmux ?? earlier?.tmux ?? `cto-${projectId}`;
-      const quote = (v: string): string => `'${v.replaceAll("'", "'\\''")}'`;
-      ports.files.replace(launcher, `#!/bin/sh\n# cto-launch: ${JSON.stringify({ tmux, argv: resume })}\n` +
-        "unset ACP_OPERATOR_TOKEN ACP_MCP_TOKEN ACP_BUZZ_INGRESS_SECRET GH_TOKEN GITHUB_TOKEN\n" +
-        `cd ${quote(at.cwd)} || exit 1\nexec ${resume.map(quote).join(" ")}\n`, 0o700);
+      // The launch writes its own id into this script before tmux starts it; this one is the plan a rerun starts from.
+      writeCanonicalLauncher(ports, projectId, { tmux, cwd: at.cwd, claude, keyFile: channel.keyFile, roomId: channel.roomId, resume });
       return ok({ launcher, tmux });
     },
   }, {
@@ -535,7 +544,8 @@ const canonicalResumeSteps = (ports: CtoPorts, projectId: string, restart: boole
     run: () => {
       const at = bound();
       if (typeof at === "string") return refused(at);
-      const claude = claudeBinaryOf(ports, readCanonicalLauncher(ports, projectId)?.argv ?? null);
+      const earlier = readCanonicalLauncher(ports, projectId);
+      const claude = claudeBinaryOf(ports, earlier ? [earlier.claude] : null);
       if (!claude) return refused("the claude binary is not known: set ACP_CLAUDE_BINARY");
       // Absent is fine; the add below is what has to succeed.
       ports.run(claude, ["mcp", "remove", "--scope", "local", "acp-cto"], { cwd: at.cwd, timeoutMs: 30_000 });
@@ -555,8 +565,10 @@ const canonicalResumeSteps = (ports: CtoPorts, projectId: string, restart: boole
       // The one definition of running, asked with the role's whole scope; only the process this run stopped is excused.
       const one = await assertNoOtherCtoProcess(roleScopeOf(ports, projectId), ports.ctoProcesses, stopped);
       if (!one.ok) return refused(`${one.message}; nothing was started`);
+      // This launch's own id, in the script tmux is about to start and so in its channel server's every receipt.
+      const launchId = ports.newUuid();
+      const argv = writeCanonicalLauncher(ports, projectId, planned, launchId);
       const tmuxRun = (args: string[]): CtoExecResult => ports.run("tmux", args, { timeoutMs: 10_000 });
-      const launchedAt = Math.floor(ports.now() / 1000);
       const started = tmuxExists(ports, planned.tmux)
         ? tmuxRun(["new-window", "-d", "-P", "-F", "#{pane_id}", "-t", `=${planned.tmux}:`, launcher])
         : tmuxRun(["new-session", "-d", "-s", planned.tmux, "-P", "-F", "#{pane_id}", launcher]);
@@ -567,13 +579,13 @@ const canonicalResumeSteps = (ports: CtoPorts, projectId: string, restart: boole
         if (answer.status !== 0) throw new Error(firstLine(answer.stderr) || `${bin} exited ${answer.status ?? "on timeout"}`);
         return answer.stdout;
       };
-      // A backlog flood can scroll the registered line away; the channel's own receipt after this launch proves it too.
-      const registered = channelEmittedSince(ports.stateDir, projectId, launchedAt, (path) => ports.files.read(path));
+      // A backlog flood can scroll the registered line away; a receipt carrying this launch's id proves it too, and nothing older does.
+      const registered = channelEmittedBy(ports.stateDir, projectId, launchId, (path) => ports.files.read(path));
       const startup = await confirmChannelStartup(tmuxChannelDriver({ tmux: "tmux", target: pane, startCommand: launcher, run, registered }));
       if (!startup.ok) {
         return refused(`the resumed conversation was started in tmux ${planned.tmux} (${pane}) and its channel did not come up (${startup.failure}, screen ${startup.screen}); it was left running there`, { tmux: planned.tmux, pane });
       }
-      return ok({ argv: planned.argv, tmux: planned.tmux, pane, confirmed: startup.confirmed });
+      return ok({ argv, tmux: planned.tmux, pane, launchId, confirmed: startup.confirmed });
     },
   }, {
     id: "claimed",

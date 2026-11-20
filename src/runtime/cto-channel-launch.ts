@@ -28,6 +28,11 @@ export interface ChannelLaunchInput {
   readonly keyFile: string;
   readonly roomId: string;
   readonly stateDir: string;
+  /**
+   * This launch's own id. The channel server writes it into every receipt (`--launch-id`), and only a receipt carrying
+   * it proves this launch's channel registered (`channelEmittedBy`).
+   */
+  readonly launchId?: string;
 }
 
 export const channelMcpConfig = (input: ChannelLaunchInput): string =>
@@ -41,6 +46,7 @@ export const channelMcpConfig = (input: ChannelLaunchInput): string =>
           "--key-file", input.keyFile,
           "--room", input.roomId,
           "--state-dir", input.stateDir,
+          ...(input.launchId === undefined ? [] : ["--launch-id", input.launchId]),
         ],
       },
     },
@@ -330,16 +336,17 @@ export const tmuxChannelDriver = (input: {
 };
 
 /**
- * Whether the project's channel server appended an `emitted` receipt after `sinceSeconds`: it writes one only once
- * Claude Code took a channel notification into the session (`src/buzz/buzz-channel.ts`), so one written after this
- * launch proves its channel registered whatever the screen shows. The file is `channelReceiptPath`'s
- * (`src/buzz/buzz-channel-files.ts`), named here because that module cannot load under the type stripping the host
- * provisioner runs with. An unreadable file or line is no proof.
+ * Whether this launch's channel server has taken a message into the session: an `emitted` receipt carrying this
+ * launch's id (`ChannelLaunchInput.launchId`). The server writes one only once Claude Code took a channel notification
+ * (`src/buzz/buzz-channel.ts`), so it proves the channel registered whatever the screen shows. Time never counts: an
+ * older channel process still appending while this one starts writes no id, or another launch's. The file is
+ * `channelReceiptPath`'s (`src/buzz/buzz-channel-files.ts`), named here because that module cannot load under the type
+ * stripping the host provisioner runs with. An unreadable file or line is no proof.
  */
-export const channelEmittedSince = (
+export const channelEmittedBy = (
   stateDir: string,
   projectId: string,
-  sinceSeconds: number,
+  launchId: string,
   read: (path: string) => string = (path) => readFileSync(path, "utf8"),
 ): (() => boolean) => () => {
   let text: string;
@@ -350,8 +357,8 @@ export const channelEmittedSince = (
   }
   return text.split("\n").some((line) => {
     try {
-      const receipt = JSON.parse(line) as { type?: unknown; emittedAt?: unknown };
-      return receipt.type === "emitted" && typeof receipt.emittedAt === "number" && receipt.emittedAt > sinceSeconds;
+      const receipt = JSON.parse(line) as { type?: unknown; launchId?: unknown };
+      return receipt.type === "emitted" && receipt.launchId === launchId;
     } catch {
       return false;
     }

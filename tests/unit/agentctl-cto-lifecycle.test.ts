@@ -85,8 +85,10 @@ interface World {
   panes: Map<number, string>;
   /** The launcher tmux last started, and whether the conversation it resumes claims the role. */
   launched: { command: string | null; claims: boolean };
-  /** The launch's pane: the registered line, or the warning and then a backlog flood that scrolls that line away. */
-  pane: "registered" | "flood";
+  /** The launch's pane: the registered line; the warning and then a backlog flood that scrolls that line away; or still loading. */
+  pane: "registered" | "flood" | "loading";
+  /** The old channel process appends a receipt (a later time, no launch id) while the launch asks tmux for its session. */
+  oldReceiptDuringLaunch: boolean;
   /** Pids alive in the kernel that `ps` does not list (a process table that could not be read whole). */
   hiddenFromPs: Set<number>;
   /** `ps` cannot be spawned at all. */
@@ -109,7 +111,7 @@ const makeWorld = (overrides: Partial<CtoRecord> = {}, env: Record<string, strin
   const w = {
     out: [], changes: [], ran: [], files, mtimes, tmux: new Set([TMUX]), repo: { exists: true }, worker: { unpublished: false, fetchFails: false }, operatorAnswers: [], provisionerAnswers: [],
     dirty: new Set<string>(), archiveUnpublished: false, daemonRejects: false, retireExecutions: 0, rotateRuns: [],
-    argv: new Map<number, string[]>(), panes: new Map([[100, TMUX]]), launched: { command: null, claims: true }, pane: "registered", hiddenFromPs: new Set<number>(), psFails: false, roleConversations: [],
+    argv: new Map<number, string[]>(), panes: new Map([[100, TMUX]]), launched: { command: null, claims: true }, pane: "registered", oldReceiptDuringLaunch: false, hiddenFromPs: new Set<number>(), psFails: false, roleConversations: [],
     procs: [
       { pid: 100, ppid: 1, command: "/bin/sh /state/resident-e2e-sort-fixture.sh" },
       { pid: CLAUDE, ppid: 100, command: `/bin/claude --model opus ${CHANNEL} --resume ${CONVERSATION} --name e2e CTO` },
@@ -160,16 +162,24 @@ const makeWorld = (overrides: Partial<CtoRecord> = {}, env: Record<string, strin
     if (bin === "tmux" && args[0] === "display-message") return answer(0, args[4] === "#{pane_id}" ? "%9\n" : `${w.launched.command}\n`);
     if (bin === "tmux" && args[0] === "capture-pane") {
       if (w.pane === "registered") return answer(0, `${CHANNEL_REGISTERED_LINE}\n`);
+      if (w.pane === "loading") return answer(0, "Loading...\n");
       return answer(0, w.changes.includes("tmux send-keys -t %9 Enter") ? `${Array.from({ length: 40 }, (_, i) => `← acp-buzz-channel: backlog ${i}`).join("\n")}\n` : `${DEV_CHANNELS_WARNING}\n`);
     }
     if (bin === "tmux" && args[0] === "send-keys") {
       w.changes.push(line);
-      // The channel delivers its backlog into the session and appends its emitted receipts.
-      files.set(`${STATE}/buzz-channel/${P}.receipts.jsonl`, `${JSON.stringify({ type: "emitted", eventId: "e1", room: ROOM, senderPubkey: "p", emittedAt: Math.floor(Date.now() / 1000) + 1 })}\n`);
+      // This launch's channel delivers its backlog into the session and appends emitted receipts carrying its launch id.
+      const launchId = /\\?"--launch-id\\?",\\?"([^"\\]+)/.exec(files.get(w.launched.command ?? "") ?? "")?.[1];
+      files.set(`${STATE}/buzz-channel/${P}.receipts.jsonl`, `${JSON.stringify({ type: "emitted", eventId: "e1", room: ROOM, senderPubkey: "p", emittedAt: 1, ...(launchId ? { launchId } : {}) })}\n`);
       return answer(0);
     }
     if (bin === LOCAL_CLAUDE && args[0] === "mcp") { w.changes.push(line); return answer(args[1] === "remove" ? 1 : 0); }
-    if (bin === "tmux" && args[0] === "has-session") return answer(w.tmux.has(args[2]!.slice(1)) ? 0 : 1);
+    if (bin === "tmux" && args[0] === "has-session") {
+      if (w.oldReceiptDuringLaunch) {
+        const file = `${STATE}/buzz-channel/${P}.receipts.jsonl`;
+        files.set(file, `${files.get(file) ?? ""}${JSON.stringify({ type: "emitted", eventId: "old", room: ROOM, senderPubkey: "p", emittedAt: 9_999_999_999 })}\n`);
+      }
+      return answer(w.tmux.has(args[2]!.slice(1)) ? 0 : 1);
+    }
     if (bin === "tmux" && args[0] === "kill-session") { w.changes.push(line); w.tmux.delete(args[2]!.slice(1)); return answer(0); }
     if (bin === "git" && args[2] === "status") return answer(0, w.dirty.has(args[1]!) ? "?? scratch.txt\n" : "");
     if (bin === "git" && args[2] === "log") return answer(0, "");
@@ -719,6 +729,34 @@ describe("deploy135 live defects", () => {
     expect(await runCtoCommand(["relaunch", P, "--apply"], w.ports)).toBe(0);
     expect(results(w).find(([s]) => s === "launch")).toEqual(["launch", "done"]);
     expect(w.changes.filter((c) => c.startsWith("tmux send-keys"))).toEqual(["tmux send-keys -t %9 Enter"]);
+  });
+
+  it("#1463 r1: an old channel's receipt appended while the launch asks for its tmux session does not count: the screen still loads", async () => {
+    const cwd = realpathSync(tempDir("acp-cto-old-receipt-"));
+    const w = makeWorld({ kind: "canonical", resident: null, generation: 3, session: { pid: CLAUDE, startedAt: `start-${CLAUDE}`, workdir: cwd } });
+    const config = tempDir("acp-cto-old-receipt-config-");
+    writeFileSync(join(config, ".claude.json"), JSON.stringify({ projects: { [cwd]: { hasTrustDialogAccepted: true } } }));
+    w.record = { ...w.record, repositories: [{ repositoryId: "repo_1", identity: `github:${REPO}`, checkoutPath: cwd }] };
+    w.ports = { ...w.ports, env: { ...w.ports.env, CLAUDE_CONFIG_DIR: config } };
+    w.procs = [{ pid: CLAUDE, ppid: 1, command: `${LOCAL_CLAUDE} --resume ${CONVERSATION}`, argv: [LOCAL_CLAUDE, "--resume", CONVERSATION] }];
+    const transcript = `${HOME}/.claude/projects/${cwd.replace(/[^A-Za-z0-9]/g, "-")}/${CONVERSATION}.jsonl`;
+    w.files.set(transcript, "{}");
+    w.mtimes.set(transcript, NOW - (IDLE_SECONDS + 60) * 1000);
+    w.pane = "loading";
+    w.oldReceiptDuringLaunch = true;
+    expect(await runCtoCommand(["relaunch", P, "--apply"], w.ports)).toBe(1);
+    expect(results(w).at(-1)).toEqual(["launch", "failed"]);
+  }, 60_000);
+
+  it("#1463 r1: a recorded os_pid alive with another start refuses: nothing is stopped and nothing launched, not even the process that does match", async () => {
+    // The reviewer's shape: the binding's os_pid 16590 now belongs to some other process, and the CTO's conversation runs as pid 20000.
+    const w = makeWorld({ generation: 4, session: { pid: CLAUDE, startedAt: "start-before-the-pid-was-reused", workdir: CLONE } });
+    w.procs = [{ pid: CLAUDE, ppid: 1, command: "/usr/libexec/some-daemon" }, { pid: 20000, ppid: 1, command: `claude --resume ${CONVERSATION}`, cwd: CLONE }];
+    expect(await runCtoCommand(["relaunch", P, "--apply"], w.ports)).toBe(1);
+    expect(results(w).at(-1)).toEqual(["stop", "failed"]);
+    expect(JSON.stringify(w.out)).toContain("cannot be confirmed");
+    expect(w.changes).toEqual([]);
+    expect(w.procs.map((p) => p.pid)).toEqual([CLAUDE, 20000]);
   });
 
   // myeotnyeon: pid 84604, `claude --resume 36276d16-…` (a bare argv[0]), binding ACTIVE gen 4 with os_pid 84604.
