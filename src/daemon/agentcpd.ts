@@ -4,6 +4,9 @@ import { MAX_MCP_LINE_BYTES } from "../core/mcp-limits.ts";
 import { recordBootstrapServingRuntime } from "../bootstrap/bootstrap-runtime-observation.ts";
 import { readBuzzSubscriberConfig } from '../buzz/buzz-mention-subscriber.ts';
 import { CanonicalSessionRegistry } from '../registry/canonical-session-registry.ts';
+import {
+  CTO_REFRESH_RUN_METHOD, CTO_REFRESH_VERIFY_METHOD, createRefreshQueue, ctoRefreshOperator, runRefreshChild, type CtoRefreshOperator, type RefreshQueue,
+} from "./cto-refresh-queue.ts";
 import { createDaemonRefreshSweep, startCtoRefreshSweep } from "./cto-session-refresh-sweep.ts";
 import { canonicalCtoRotations, drainingRotationFor, inFlightFromPreviousHolder, liveRunIdsOwnedBySession } from "../registry/canonical-cto-rotation.ts";
 import { outboxDeliveryReadback, type OutboxMessage } from "../outbox/outbox.ts";
@@ -858,6 +861,8 @@ export interface LocalOperatorSocketOptions {
    * server-configured CLI owner allowlist; absent on a parked daemon.
    */
   canonicalCto?: CanonicalCtoOperator;
+  /** `ctoRefresh.run` and `ctoRefresh.verify`: a CTO refresh is queued and carried out inside the daemon, one at a time. Owner only, like `canonicalCto`. */
+  ctoRefresh?: CtoRefreshOperator;
   // No `claimCanonicalCto` option on this bearer-token-authenticated socket (#760): a process may
   // prove who it is, but it cannot approve itself, so the claiming connection cannot sit on this
   // credential surface at all, not even behind its own kernel-credential check layered on top. It
@@ -3290,6 +3295,12 @@ export const ownerOnlyCanonicalCtoOperator = (
     ? operator(method, params, operatorActor)
     : deny(ReasonCode.INGRESS_ACTOR_NOT_ALLOWLISTED, "canonical CTO rotation requires an allowlisted CLI owner", {});
 
+/** A CTO refresh, like a canonical rotation, is for the server-configured CLI owner only; every other authenticated operator is refused before params are read. */
+export const ownerOnlyCtoRefresh = (cp: Pick<ControlPlane, "ownerAuthority">, operatorActor: string, operator: CtoRefreshOperator): CtoRefreshOperator => (method, params) =>
+  cp.ownerAuthority.isAllowedActor("cli", operatorActor)
+    ? operator(method, params)
+    : Promise.resolve(deny(ReasonCode.INGRESS_ACTOR_NOT_ALLOWLISTED, "a CTO refresh requires an allowlisted CLI owner", {}));
+
 /** The daemon's running Buzz receivers, read when asked: either is null until it starts and stays as it was once closed. */
 export type CanonicalCtoReception = () => {
   subscriber: Pick<BuzzMentionSubscriberHandle, "replies" | "counters" | "deliveryEligibility"> | null;
@@ -3387,8 +3398,10 @@ export const startDaemonOperatorSocket = (
   const bootstrap = options.bootstrapHermes;
   const adopt = options.adoptHermesIncumbent;
   const canonicalCto = options.canonicalCto;
+  const ctoRefresh = options.ctoRefresh;
   return startOperatorSocket(daemon, stateDir, credential, {
     ...options,
+    ...(ctoRefresh ? { ctoRefresh: ownerOnlyCtoRefresh(cp, operatorActor, ctoRefresh) } : {}),
     // v58 — the bearer authenticates the CLI; only the server-configured owner may rotate or read a rotation.
     ...(canonicalCto ? { canonicalCto: ownerOnlyCanonicalCtoOperator(cp, operatorActor, canonicalCto) } : {}),
     ...(bootstrap ? { bootstrapHermes: (params: Record<string, unknown>) => {
@@ -4154,7 +4167,7 @@ export const startBootstrapOperatorDoor = (
   daemon: Pick<Daemon, "handleOperatorRequest" | "lock">,
   stateDir: string,
   credential: LocalOperatorCredential,
-  options: Omit<LocalOperatorSocketOptions, "bootstrapHermes" | "adoptHermesIncumbent" | "adoptHermesIncumbentOwnerAllowed" | "canonicalCto"> = {},
+  options: Omit<LocalOperatorSocketOptions, "bootstrapHermes" | "adoptHermesIncumbent" | "adoptHermesIncumbentOwnerAllowed" | "canonicalCto" | "ctoRefresh"> = {},
 ): Promise<LocalOperatorListener> => startOperatorSocket(daemon, stateDir, credential, options);
 
 const startMcpSocket = async (
@@ -4399,6 +4412,17 @@ const serveOperatorRequest = (
             error: error instanceof Error ? error.message : String(error),
           }));
         }
+      }
+      if (method === CTO_REFRESH_RUN_METHOD || method === CTO_REFRESH_VERIFY_METHOD) {
+        if (!options.ctoRefresh) return finish(deny(ReasonCode.OPERATOR_METHOD_NOT_ALLOWED, "CTO refresh is not enabled on this socket", {}));
+        if (!daemon.lock.held()) return finish(deny(ReasonCode.DAEMON_LOCK_LOST, "daemon lock is not held for a CTO refresh", {}));
+        const params = operatorRequestParams(value);
+        if (!params) return finish(deny(ReasonCode.INVALID_ARGUMENT, "CTO refresh parameters are invalid", {}));
+        // Answered when its job ends, which can be minutes (it waits behind the jobs queued before it): the client waits that long.
+        void options.ctoRefresh(method === CTO_REFRESH_RUN_METHOD ? "run" : "verify", params).then(finish).catch((error: unknown) => {
+          finish(deny(ReasonCode.INTERNAL_ERROR, "CTO refresh request failed", { error: error instanceof Error ? error.message : String(error) }));
+        });
+        return;
       }
       // `actor.claimCanonicalCto` does not dispatch here (#760): a process may prove who it is,
       // but it cannot approve itself, so the claiming connection is kept off this bearer-token
@@ -6449,6 +6473,8 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
   // receipts. Without it the coordinator keeps its dark default.
   const config = withConfiguredHermesGatewayReceipt(options.config ?? defaultConfig(), process.env);
   const stateDir = dirname(config.databasePath);
+  // Every CTO refresh and recovery, the operator's and the sweep's, runs one at a time through this queue, each as a child it vouches for.
+  const ctoRefreshQueue: RefreshQueue = createRefreshQueue((job) => runRefreshChild(stateDir, process.env, job));
   const buzzActorIngressPolicy = configuredBuzzActorIngressPolicy();
   if (process.env["BUZZ_PRIVATE_KEY"] && !buzzActorIngressPolicy) {
     throw new Error(
@@ -6758,6 +6784,7 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
         bootstrapHermes: (params) => hermesBootstrap!.bootstrap(params),
         ...(adoptHermesIncumbent ? { adoptHermesIncumbent } : {}),
         canonicalCto: canonicalCtoOperator(cp, canonicalSessions, () => ({ subscriber: buzzMentionSubscriber, ingress: buzzMessageIngress })),
+        ctoRefresh: ctoRefreshOperator(ctoRefreshQueue),
       },
     );
     if (canonicalSessions === null) {
@@ -7060,7 +7087,7 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
     // A CTO whose conversation has grown long is replaced by a fresh one (owner directive 2026-11-20); the sweep only decides and
     // asks, and runs `agentctl cto refresh` as a child for the one place that stops and starts a CTO.
     ctoRefreshTimer = startCtoRefreshSweep(
-      createDaemonRefreshSweep(cp, { stateDir, env: process.env }),
+      createDaemonRefreshSweep(cp, { stateDir, env: process.env, queue: ctoRefreshQueue }),
       (line) => process.stdout.write(`${JSON.stringify(line)}\n`),
     );
   } catch (err) {

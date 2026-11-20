@@ -7,10 +7,11 @@ import { createSystemRequestWatcher, systemRequestNotification } from "../../src
 import {
   COMPACT_BOUNDARY_MARK, CTO_CONVERSATION_MAX_BYTES, CTO_CONVERSATION_MAX_COMPACTIONS, CTO_HANDOFF_MAX_BYTES, CTO_HANDOFF_WAIT_MS,
   CTO_REFRESH_BACKOFF_INITIAL_MS, buildFallbackHandoff, clearHandoffRequest, clipUtf8, createConversationMeter, ctoTranscriptPath, handoffPathOf, handoffRequestText,
-  hostConversationFiles, hostStoreFiles, inflightPathOf, listInflightProjects, lockPathOf, longReasons, readHandoff, readHandoffRequest, readInflightRefresher, readLockHolder, readRefreshFailure,
+  hostConversationFiles, hostStoreFiles, inflightPathOf, listInflightProjects, longReasons, readHandoff, readHandoffRequest, readInflightRefresher, readRefreshFailure,
   recordRefreshFailure, refreshLimitsFromEnv, retryNotBefore,
   writeHandoff, writeHandoffRequest, type ConversationFiles, type FallbackFacts,
 } from "../../src/cto/cto-session-refresh.ts";
+import { createRefreshQueue, ctoRefreshOperator } from "../../src/daemon/cto-refresh-queue.ts";
 import { CTO_RECOVERY_RETRY_MS, createCtoRefreshSweep, type RefreshCandidate, type RefreshSweepDeps } from "../../src/daemon/cto-session-refresh-sweep.ts";
 import { Role, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
@@ -462,19 +463,6 @@ describe("an interrupted refresh is recovered by the daemon's sweep", () => {
     expect(log.recovered).toEqual(["dead"]);
   });
 
-  it("waits for a recovery that already holds the project's lock, though the record's own refresher is gone", async () => {
-    const state = tempDir("acp-refresh-recover-locked-");
-    record(state, "a", { pid: 2_147_483_000, startedAt: null });
-    hostStoreFiles.replace(lockPathOf(state, "a"), `${JSON.stringify({ pid: process.pid, startedAt: null })}\n`);
-    expect(readLockHolder(hostStoreFiles, lockPathOf(state, "a"))).toEqual({ pid: process.pid, startedAt: null });
-    const { log, sweep } = deps(state, { refresherRunning: undefined });
-    expect(await sweep.tick()).toEqual([{ projectId: "a", action: "recovery-waiting", because: expect.stringContaining("still running") }]);
-    expect(log.recovered).toEqual([]);
-    // Once its holder is gone the lock is stale and recovery goes on.
-    hostStoreFiles.replace(lockPathOf(state, "a"), `${JSON.stringify({ pid: 2_147_483_001, startedAt: null })}\n`);
-    expect(await sweep.tick()).toEqual([{ projectId: "a", action: "recovered" }]);
-  });
-
   it("tries again after a failed recovery, not before the wait, and every tick at first if the daemon restarts", async () => {
     const state = tempDir("acp-refresh-recover-retry-");
     record(state, "a", { pid: 4242, startedAt: null });
@@ -503,6 +491,92 @@ describe("an interrupted refresh is recovered by the daemon's sweep", () => {
     release();
     expect(await first).toEqual([{ projectId: "a", action: "recovered" }]);
     expect(log.recovered).toEqual(["a"]);
+  });
+});
+
+describe("the daemon's refresh queue", () => {
+  const gated = () => {
+    const events: string[] = [];
+    const gates = new Map<string, () => void>();
+    let live = 0;
+    let most = 0;
+    const queue = createRefreshQueue(async (job) => {
+      events.push(`start ${job.mode}:${job.projectId}`);
+      live++; most = Math.max(most, live);
+      await new Promise<void>((resolve) => gates.set(`${job.mode}:${job.projectId}`, resolve));
+      live--;
+      events.push(`end ${job.mode}:${job.projectId}`);
+      return { ok: true, reason: "", lines: [{ job: `${job.mode}:${job.projectId}` }] };
+    });
+    const settle = () => new Promise((resolve) => setImmediate(resolve));
+    return { queue, events, gates, most: () => most, settle };
+  };
+
+  it("runs jobs one at a time, in the order they were asked, whoever asked", async () => {
+    const g = gated();
+    const results = [g.queue.enqueue("a", "refresh"), g.queue.enqueue("b", "recover"), g.queue.enqueue("c", "refresh")];
+    await g.settle();
+    expect(g.events).toEqual(["start refresh:a"]);
+    for (const key of ["refresh:a", "recover:b", "refresh:c"]) { g.gates.get(key)?.(); await g.settle(); await g.settle(); }
+    expect((await Promise.all(results)).map((r) => r.lines[0]!["job"])).toEqual(["refresh:a", "recover:b", "refresh:c"]);
+    expect(g.most()).toBe(1);
+    expect(g.events).toEqual(["start refresh:a", "end refresh:a", "start recover:b", "end recover:b", "start refresh:c", "end refresh:c"]);
+    expect(g.queue.busy()).toBe(false);
+  });
+
+  it("answers a request for a job that is already queued or running with that job, never a second run", async () => {
+    const g = gated();
+    const first = g.queue.enqueue("a", "refresh");
+    const again = g.queue.enqueue("a", "refresh");
+    const other = g.queue.enqueue("a", "recover");
+    await g.settle();
+    g.gates.get("refresh:a")!();
+    await g.settle(); await g.settle();
+    g.gates.get("recover:a")!();
+    expect(await first).toBe(await again);
+    expect((await other).lines).toEqual([{ job: "recover:a" }]);
+    expect(g.events.filter((e) => e.startsWith("start"))).toEqual(["start refresh:a", "start recover:a"]);
+    // Once it has ended, asking again is a new job.
+    const later = g.queue.enqueue("a", "refresh");
+    await g.settle();
+    g.gates.get("refresh:a")!();
+    await later;
+    expect(g.events.filter((e) => e === "start refresh:a")).toHaveLength(2);
+  });
+
+  it("keeps going after a job that throws, and says why it failed", async () => {
+    const queue = createRefreshQueue(async (job) => { if (job.projectId === "bad") throw new Error("spawn ENOENT"); return { ok: true, reason: "", lines: [] }; });
+    expect(await Promise.all([queue.enqueue("bad", "refresh"), queue.enqueue("good", "refresh")])).toEqual([
+      { ok: false, reason: "spawn ENOENT", lines: [] }, { ok: true, reason: "", lines: [] }]);
+    expect(queue.busy()).toBe(false);
+  });
+
+  it("vouches for exactly the running job's token, for its project and mode, and for nothing before or after it", async () => {
+    let token = "";
+    const verdicts: boolean[] = [];
+    const queue = createRefreshQueue(async (job) => {
+      token = job.token;
+      verdicts.push(queue.verify(job.token, job.projectId, job.mode), queue.verify(job.token, "other", job.mode), queue.verify(job.token, job.projectId, "recover"), queue.verify("forged", job.projectId, job.mode));
+      return { ok: true, reason: "", lines: [] };
+    });
+    expect(queue.verify("anything", "a", "refresh")).toBe(false);
+    await queue.enqueue("a", "refresh");
+    expect(verdicts).toEqual([true, false, false, false]);
+    expect(queue.verify(token, "a", "refresh")).toBe(false);
+  });
+
+  it("is the operator's `run` and `verify`, with exactly their parameters", async () => {
+    const g = gated();
+    const operator = ctoRefreshOperator(g.queue);
+    for (const bad of [{}, { projectId: "../x" }, { projectId: "a", extra: 1 }, { projectId: "a", recover: "yes" }]) {
+      expect(await operator("run", bad)).toMatchObject({ allowed: false, reasonCode: ReasonCode.INVALID_ARGUMENT });
+    }
+    expect(await operator("verify", { projectId: "a" })).toMatchObject({ allowed: false, reasonCode: ReasonCode.INVALID_ARGUMENT });
+    expect(await operator("verify", { projectId: "a", token: "nope" })).toMatchObject({ allowed: false, reasonCode: ReasonCode.CONFLICT });
+    const asked = operator("run", { projectId: "a", recover: true });
+    await g.settle();
+    g.gates.get("recover:a")!();
+    expect(await asked).toMatchObject({ allowed: true, value: { ok: true, lines: [{ job: "recover:a" }] } });
   });
 });
 

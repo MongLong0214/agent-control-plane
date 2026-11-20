@@ -1,17 +1,15 @@
-import { spawn } from "node:child_process";
-import { existsSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 
 import { readProcessStartToken } from "../core/process-argv.ts";
+import type { RefreshQueue } from "./cto-refresh-queue.ts";
 import { pendingRotationOf, liveRunIdsOwnedBySession } from "../registry/canonical-cto-rotation.ts";
 import { CanonicalSessionRegistry } from "../registry/canonical-session-registry.ts";
 import type { ControlPlane } from "../app/control-plane.ts";
 import { SessionLifecycle } from "../domain/types.ts";
 import {
   CTO_HANDOFF_WAIT_MS, CTO_REFRESH_QUIET_SECONDS, buildFallbackHandoff, clearHandoffRequest, clearRefreshFailure, createConversationMeter, ctoTranscriptPath,
-  gatherFallbackFacts, hostStoreFiles, listInflightProjects, lockPathOf, longReasons, readHandoff, readInflightRefresher, readLockHolder, readHandoffRequest, readRefreshFailure, recordRefreshFailure, refreshLimitsFromEnv,
+  gatherFallbackFacts, hostStoreFiles, listInflightProjects, longReasons, readHandoff, readInflightRefresher, readHandoffRequest, readRefreshFailure, recordRefreshFailure, refreshLimitsFromEnv,
   retryNotBefore, writeHandoff, writeHandoffRequest, DEFAULT_REFRESH_LIMITS,
   type ConversationFiles, type ConversationMeasure, type FallbackFacts, type LongReason, type RefreshLimits, type StoreFiles,
 } from "../cto/cto-session-refresh.ts";
@@ -135,9 +133,8 @@ export const createCtoRefreshSweep = (deps: RefreshSweepDeps): CtoRefreshSweep =
       unfinished.add(projectId);
       if (deps.recoverable && !deps.recoverable(projectId)) { verdicts.push({ projectId, action: "recovery-waiting", because: "the project is retired or unknown; its record is left" }); continue; }
       const runs = deps.refresherRunning ? deps.refresherRunning(projectId) : (() => {
-        // The process that wrote the record, or the one that holds the project's lock (a recovery that is already under way).
-        return [readInflightRefresher(files, deps.stateDir, projectId), readLockHolder(files, lockPathOf(deps.stateDir, projectId))]
-          .some((who) => who !== null && processStillRuns(who));
+        const who = readInflightRefresher(files, deps.stateDir, projectId);
+        return who !== null && processStillRuns(who);
       })();
       if (runs) { verdicts.push({ projectId, action: "recovery-waiting", because: "the refresh that wrote the record is still running" }); continue; }
       const last = recoveredAt.get(projectId);
@@ -218,49 +215,12 @@ export const createCtoRefreshSweep = (deps: RefreshSweepDeps): CtoRefreshSweep =
 
 /** How often the daemon looks. A conversation takes hours to grow; a minute is quicker than anything it decides. */
 export const CTO_REFRESH_SWEEP_INTERVAL_MS = 60_000;
-/** A whole refresh (rotate, stop, launch, claim, and a rollback) is bounded; the child is killed past it. */
-export const CTO_REFRESH_CHILD_TIMEOUT_MS = 15 * 60_000;
-
-export interface RefreshChildResult { ok: boolean; reason: string }
-
-/**
- * Runs `agentctl cto refresh <project> [--recover] --apply` (`args`) from the installed runtime as a child, with the daemon's own operator
- * credential in its environment (never printed; the child's output is read for its last JSON line only). A child, not a call
- * into this process: the refresh runs `tmux` and `claude mcp` synchronously and waits on a launch, and the daemon must not
- * stand still for that.
- */
-export const runRefreshChild = (stateDir: string, env: NodeJS.ProcessEnv, args: readonly string[], timeoutMs = CTO_REFRESH_CHILD_TIMEOUT_MS): Promise<RefreshChildResult> => {
-  const node = join(stateDir, "current", "dist", "bin", "node");
-  const cli = join(stateDir, "current", "dist", "cli", "agentctl.js");
-  if (!existsSync(node) || !existsSync(cli)) return Promise.resolve({ ok: false, reason: `the agentctl runtime is not installed under ${join(stateDir, "current")}` });
-  return new Promise((resolve) => {
-    const child = spawn(node, [cli, ...args], { env, stdio: ["ignore", "pipe", "pipe"] });
-    let out = "";
-    child.stdout.on("data", (chunk: Buffer) => { out = (out + chunk.toString("utf8")).slice(-16_384); });
-    child.stderr.on("data", () => undefined);
-    let timedOut = false;
-    const timer = setTimeout(() => { timedOut = true; child.kill("SIGTERM"); }, timeoutMs);
-    const finish = (code: number | null, error?: Error): void => {
-      clearTimeout(timer);
-      const lines = out.trim().split("\n").reverse().flatMap((line) => { try { return [JSON.parse(line) as Record<string, unknown>]; } catch { return []; } });
-      const failed = lines.find((line) => line["result"] === "failed");
-      const reason = error ? error.message : timedOut ? `the refresh did not end within ${timeoutMs / 1000}s` :
-        typeof failed?.["reason"] === "string" ? `${String(failed["step"])}: ${failed["reason"]}`
-          : typeof lines.find((line) => typeof line["refused"] === "string")?.["refused"] === "string" ? String(lines.find((line) => typeof line["refused"] === "string")!["refused"]) : `exit ${code}`;
-      resolve({ ok: !error && !timedOut && code === 0, reason });
-    };
-    child.once("error", (error) => finish(null, error));
-    child.once("close", (code) => finish(code));
-  });
-};
-
 /** The sweep over a live control plane: its candidates and its idleness are read from the database and the transcript, nothing is signalled. */
 export const createDaemonRefreshSweep = (
   cp: Pick<ControlPlane, "db" | "bindings" | "sessions" | "projects" | "clock">,
   options: {
-    stateDir: string; env: NodeJS.ProcessEnv; home?: string; conversationFiles?: ConversationFiles;
-    refresh?: (projectId: string) => Promise<RefreshChildResult>; recover?: (projectId: string) => Promise<RefreshChildResult>;
-    refresherRunning?: (projectId: string) => boolean; now?: () => number; newId?: () => string;
+    stateDir: string; env: NodeJS.ProcessEnv; /** Every refresh and recovery this sweep asks for goes through it, behind whatever the operator asked for. */ queue: RefreshQueue;
+    home?: string; conversationFiles?: ConversationFiles; refresherRunning?: (projectId: string) => boolean; now?: () => number; newId?: () => string;
   },
 ): CtoRefreshSweep => {
   const home = options.home ?? options.env["HOME"] ?? homedir();
@@ -293,8 +253,8 @@ export const createDaemonRefreshSweep = (
       return { idle: true };
     },
     facts: (candidate) => gatherFallbackFacts(cp.db, candidate.projectId, candidate.conversation),
-    refresh: options.refresh ?? ((projectId) => runRefreshChild(options.stateDir, options.env, ["cto", "refresh", projectId, "--apply"])),
-    recover: options.recover ?? ((projectId) => runRefreshChild(options.stateDir, options.env, ["cto", "refresh", projectId, "--recover", "--apply"])),
+    refresh: (projectId) => options.queue.enqueue(projectId, "refresh"),
+    recover: (projectId) => options.queue.enqueue(projectId, "recover"),
     ...(options.refresherRunning ? { refresherRunning: options.refresherRunning } : {}),
     recoverable: (projectId) => cp.projects.get(projectId)?.retiredAt === null,
     newId: options.newId ?? (() => randomUUID()),

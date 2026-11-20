@@ -38,6 +38,7 @@ import {
   hostSessionRegistryAbsent,
 } from "../../src/registry/canonical-self-claim.ts";
 import { CanonicalSessionRegistry } from "../../src/registry/canonical-session-registry.ts";
+import { createRefreshQueue } from "../../src/daemon/cto-refresh-queue.ts";
 import { createDaemonRefreshSweep } from "../../src/daemon/cto-session-refresh-sweep.ts";
 import {
   CTO_CONVERSATION_MAX_BYTES, CTO_CONVERSATION_MAX_COMPACTIONS, ctoTranscriptPath, hostStoreFiles, inflightPathOf, readHandoffRequest, writeHandoff, type ConversationFiles,
@@ -748,9 +749,10 @@ describe("a long CTO conversation is replaced by a fresh one: the daemon's half"
     const transcript = { bytes: CTO_CONVERSATION_MAX_BYTES, compactions: 0, mtimeMs: now - 120_000 };
     const refreshed: string[] = [];
     let ids = 0;
+    // The daemon's queue, with the child it would start replaced by a fake that records which job ran.
+    const queue = createRefreshQueue(async (job) => { refreshed.push(job.projectId); return { ok: true, reason: "", lines: [] }; });
     const sweep = createDaemonRefreshSweep(w.harness.cp, {
-      stateDir, env: {}, home: HOME, conversationFiles: transcriptFiles(path, transcript), now: () => now, newId: () => `request-${++ids}`,
-      refresh: async (projectId) => { refreshed.push(projectId); return { ok: true, reason: "" }; },
+      stateDir, env: {}, queue, home: HOME, conversationFiles: transcriptFiles(path, transcript), now: () => now, newId: () => `request-${++ids}`,
     });
     // The world's other project has no transcript to measure; only this project's verdicts are looked at.
     const mine = async () => (await sweep.tick()).filter((verdict) => verdict.projectId === w.projectId);
@@ -782,18 +784,19 @@ describe("a long CTO conversation is replaced by a fresh one: the daemon's half"
     const now = Date.parse("2026-11-20T12:00:00.000Z");
     const path = ctoTranscriptPath(HOME, workdirOf(w), OLD);
     const recovered: string[] = [];
+    const queue = createRefreshQueue(async (job) => {
+      // No ordinary refresh may start for this project; a recovery is what `agentctl cto refresh --recover` does at the daemon: cancel the
+      // unclaimed switchover (the old conversation is resumed by the CLI) and take the record away.
+      if (job.mode !== "recover") return { ok: false, reason: "no ordinary refresh may start for this project", lines: [] };
+      recovered.push(job.projectId);
+      const cancelled = w.harness.cp.cto.cancelCanonicalSwitchover({ projectId: job.projectId }, OWNER);
+      hostStoreFiles.remove(inflightPathOf(stateDir, job.projectId));
+      return { ok: cancelled.allowed, reason: cancelled.allowed ? "" : cancelled.message, lines: [] };
+    });
     const sweep = createDaemonRefreshSweep(w.harness.cp, {
-      stateDir, env: {}, home: HOME, now: () => now, newId: () => "request-1",
+      stateDir, env: {}, queue, home: HOME, now: () => now, newId: () => "request-1",
       // A transcript far under both limits: only the record can bring the sweep to the project.
       conversationFiles: transcriptFiles(path, { bytes: 1000, compactions: 0, mtimeMs: now - 600_000 }),
-      refresh: async () => { throw new Error("no ordinary refresh may start for this project"); },
-      // What `agentctl cto refresh --recover` does at the daemon: cancel the unclaimed switchover (the old conversation is resumed by the CLI).
-      recover: async (projectId) => {
-        recovered.push(projectId);
-        const cancelled = w.harness.cp.cto.cancelCanonicalSwitchover({ projectId }, OWNER);
-        hostStoreFiles.remove(inflightPathOf(stateDir, projectId));
-        return { ok: cancelled.allowed, reason: cancelled.allowed ? "" : cancelled.message };
-      },
     });
     const mine = async () => (await sweep.tick()).filter((verdict) => verdict.projectId === w.projectId);
     // The refresh recorded its switchover; the old session drains and its process is gone. The role has no candidate and a switchover pending.

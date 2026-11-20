@@ -165,24 +165,12 @@ export const handoffPathOf = (stateDir: string, projectId: string, generation: n
 export const requestPathOf = (stateDir: string, projectId: string): string => join(refreshDir(stateDir), `request-${safeProject(projectId)}.json`);
 export const failurePathOf = (stateDir: string, projectId: string): string => join(refreshDir(stateDir), `failure-${safeProject(projectId)}.json`);
 export const inflightPathOf = (stateDir: string, projectId: string): string => join(refreshDir(stateDir), `inflight-${safeProject(projectId)}.json`);
-/** The one lock a refresh and a recovery of a project share, and the short one held while a dead holder's lock is taken over. */
-export const lockPathOf = (stateDir: string, projectId: string): string => join(refreshDir(stateDir), `lock-${safeProject(projectId)}.json`);
-export const takeoverPathOf = (stateDir: string, projectId: string): string => join(refreshDir(stateDir), `lock-${safeProject(projectId)}.takeover.json`);
-
 /** The projects an unfinished refresh left a record for (`agentctl cto refresh` writes it from its first change to its end). */
 export const listInflightProjects = (files: StoreFiles, stateDir: string): string[] =>
   (files.list?.(refreshDir(stateDir)) ?? []).flatMap((name) => {
     const project = /^inflight-(.+)\.json$/u.exec(name)?.[1];
     return project !== undefined && SAFE_PROJECT.test(project) ? [project] : [];
   }).sort();
-
-/** Who holds a lock file (a process and its start), or null when there is none or it does not say. */
-export const readLockHolder = (files: StoreFiles, path: string): { pid: number; startedAt: string | null } | null => {
-  const value = readJson(files, path);
-  if (!value || typeof value["pid"] !== "number" || !Number.isSafeInteger(value["pid"]) || value["pid"] <= 1) return null;
-  const startedAt = value["startedAt"];
-  return startedAt === null || typeof startedAt === "string" ? { pid: value["pid"], startedAt } : null;
-};
 
 /** The process carrying out the refresh an inflight record belongs to, or null when the record names none. */
 export const readInflightRefresher = (files: StoreFiles, stateDir: string, projectId: string): { pid: number; startedAt: string | null } | null => {

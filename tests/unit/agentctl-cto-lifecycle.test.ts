@@ -10,6 +10,7 @@ import {
 import { allow, deny, type Decision } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { writeHandoff } from "../../src/cto/cto-session-refresh.ts";
+import { createRefreshQueue, ctoRefreshOperator } from "../../src/daemon/cto-refresh-queue.ts";
 import { createCtoMcpPort, createCtoServer } from "../../src/mcp/cto-server.ts";
 import { CHANNEL_REGISTERED_LINE, DEV_CHANNELS_WARNING } from "../../src/runtime/cto-channel-launch.ts";
 import type { CtoProcessReader, CtoRoleScope } from "../../src/cto/one-cto-per-project.ts";
@@ -114,14 +115,17 @@ interface World {
     acked: string[];
     /** The daemon commits the switchover and its answer is lost (DAEMON_LOCK_LOST). */
     lostResponse: boolean;
+    /** The new conversation's claim lands at the very moment the cancel arrives: the claim is made first, and the cancel finds nothing pending. */
+    claimOnCancel: { pid: number } | null;
     /** The 1-based numbers of the `canonicalCto.status` calls that fail, and how many have been made. */
     failStatusAt: number[]; statusCalls: number };
   /** Writes of these paths fail once with EIO, in order of the list. */
   replaceFailures: RegExp[];
   /** Each tmux launch: the conversation it starts and the claude processes alive when it started. */
   launchLog: Array<{ conversation: string; alive: number[] }>;
-  /** From the moment a refresh starts rolling back, the daemon's records show the new conversation as the role's holder (a claim that landed late). */
-  lateClaim: boolean;
+  /** The daemon's queue as `ctoRefresh.run` reaches it: what was asked, and what it answers (else an unanswered run). */
+  refreshRequests: Array<Record<string, unknown>>;
+  refreshAnswer: ((params: Record<string, unknown>) => Decision<unknown>) | null;
   /** The next tmux starts that fail outright, and the claim outcome of each next launch (else `launched.claims`). */
   tmuxStartFails: number;
   claimQueue: boolean[];
@@ -147,8 +151,8 @@ const makeWorld = (overrides: Partial<CtoRecord> = {}, env: Record<string, strin
     tokenUnavailable: new Set<number>(), survivesSigterm: new Set<number>(), tokenGlitchAfterSignal: new Map<number, number>(), signalled: new Set<number>(),
     psStatFails: false, tokenAfterIdle: new Map<number, (read: number) => string | null>(),
     facts: { openRuns: [{ runId: "run_1", state: "ACTIVE", kind: "STANDARD_WORK" }], queued: [] },
-    rotation: { pending: null, draining: false, liveRuns: [], refuses: false, cancelRefuses: false, calls: [], rotated: [], acked: [], lostResponse: false, failStatusAt: [], statusCalls: 0 },
-    replaceFailures: [], launchLog: [], tmuxStartFails: 0, claimQueue: [], lateClaim: false,
+    rotation: { pending: null, draining: false, liveRuns: [], refuses: false, cancelRefuses: false, calls: [], rotated: [], acked: [], lostResponse: false, claimOnCancel: null, failStatusAt: [], statusCalls: 0 },
+    replaceFailures: [], launchLog: [], tmuxStartFails: 0, claimQueue: [], refreshRequests: [], refreshAnswer: null,
     procs: [
       { pid: 100, ppid: 1, command: "/bin/sh /state/resident-e2e-sort-fixture.sh" },
       { pid: CLAUDE, ppid: 100, command: `/bin/claude --model opus ${CHANNEL} --resume ${CONVERSATION} --name e2e CTO` },
@@ -285,6 +289,11 @@ const makeWorld = (overrides: Partial<CtoRecord> = {}, env: Record<string, strin
       request: async (method: string, params: Record<string, unknown> = {}, idempotencyKey?: string) => {
         if (w.daemonRejects) return deny(ReasonCode.OPERATOR_UNAUTHENTICATED, "operator authentication failed");
         if (method === "daemon.status") return allow(ReasonCode.OK, { mode: "RUNNING" });
+        if (method === "ctoRefresh.verify") return params["token"] === "run-token" ? allow(ReasonCode.OK, {}) : deny(ReasonCode.CONFLICT, "not the token of the refresh the daemon is running");
+        if (method === "ctoRefresh.run") {
+          w.refreshRequests.push(params);
+          return w.refreshAnswer ? w.refreshAnswer(params) : deny(ReasonCode.OPERATOR_REQUEST_TIMEOUT, "the daemon did not answer");
+        }
         if (method.startsWith("canonicalCto.")) {
           w.rotation.calls.push(method);
           if (method !== "canonicalCto.status") w.changes.push(`operator ${method}`);
@@ -303,6 +312,11 @@ const makeWorld = (overrides: Partial<CtoRecord> = {}, env: Record<string, strin
             if (w.rotation.lostResponse) return deny(ReasonCode.DAEMON_LOCK_LOST, "daemon lock is not held for canonical CTO rotation");
             return allow(ReasonCode.OK, { outcome: "SWITCHOVER_PENDING", toSessionUuid: params["toSessionUuid"] });
           }
+          if (w.rotation.pending !== null && w.rotation.claimOnCancel !== null) {
+            const { to } = w.rotation.pending;
+            w.record = { ...w.record, conversation: to, generation: (w.record.generation ?? 3) + 1, session: { pid: w.rotation.claimOnCancel.pid, startedAt: `start-${w.rotation.claimOnCancel.pid}`, workdir: null } };
+            w.rotation.acked.push(to); w.rotation.pending = null; w.rotation.draining = false;
+          }
           if (w.rotation.pending === null) return deny(ReasonCode.NOT_FOUND, "no pending switchover");
           if (w.rotation.cancelRefuses) return deny(ReasonCode.CONFLICT, "cancel refused");
           w.rotation.pending = null; w.rotation.draining = false;
@@ -320,11 +334,7 @@ const makeWorld = (overrides: Partial<CtoRecord> = {}, env: Record<string, strin
     },
     state: {
       projects: () => (w.record.retiredAt ? [] : [structuredClone(w.record)]),
-      project: (id: string) => {
-        if (id !== P) return null;
-        const late = w.lateClaim && w.out.some((l) => l["phase"] === "rolling-back");
-        return structuredClone(late ? { ...w.record, conversation: w.rotation.rotated.at(-1)!.to, generation: 4, session: { pid: 30000, startedAt: "start-30000", workdir: null } } : w.record);
-      },
+      project: (id: string) => (id === P ? structuredClone(w.record) : null),
       // The shared rule's scope as the database gives it: the role's conversations, its live checkouts, its bound process.
       roleScope: (id: string, extra: { conversationIds?: readonly string[]; checkouts?: readonly string[] } = {}): CtoRoleScope => ({
         projectId: id,
@@ -373,15 +383,13 @@ const makeWorld = (overrides: Partial<CtoRecord> = {}, env: Record<string, strin
     files: {
       exists,
       read: (path: string) => { const body = files.get(path); if (body === undefined) throw new Error(`ENOENT ${path}`); return body; },
-      // A file that appears whole or not at all: false when the name is taken. The lock's own files are not changes to the world.
-      createExclusive: (path: string, body: string) => { if (files.has(path)) return false; files.set(path, body); return true; },
       replace: (path: string, body: string) => {
         const failing = w.replaceFailures.findIndex((pattern) => pattern.test(path));
         if (failing >= 0) { w.replaceFailures.splice(failing, 1); throw Object.assign(new Error(`EIO: i/o error, write '${path}'`), { code: "EIO" }); }
         w.changes.push(`replace ${path}`); files.set(path, body);
       },
       move: (from: string, to: string) => { w.changes.push(`move ${from} -> ${to}`); move(from, to); },
-      remove: (path: string) => { if (!/\/cto-refresh\/lock-/.test(path)) w.changes.push(`remove ${path}`); for (const k of [...files.keys()]) if (k === path || k.startsWith(`${path}/`)) files.delete(k); },
+      remove: (path: string) => { w.changes.push(`remove ${path}`); for (const k of [...files.keys()]) if (k === path || k.startsWith(`${path}/`)) files.delete(k); },
       mtimeMs: (path: string) => (files.has(path) ? mtimes.get(path) ?? NOW : null),
     },
     // A fake key file holds its own public key.
@@ -1119,7 +1127,7 @@ describe("agentctl cto refresh", () => {
     const config = tempDir("acp-cto-refresh-config-");
     writeFileSync(join(config, ".claude.json"), JSON.stringify({ projects: { [cwd]: { hasTrustDialogAccepted: true } } }));
     const w = makeWorld({ kind: "canonical", resident: null, generation: 3, session: { pid: CLAUDE, startedAt: `start-${CLAUDE}`, workdir: cwd },
-      repositories: [{ repositoryId: "repo_1", identity: `github:${REPO}`, checkoutPath: cwd }] }, { ACP_OPERATOR_TOKEN: "operator-test-credential", CLAUDE_CONFIG_DIR: config });
+      repositories: [{ repositoryId: "repo_1", identity: `github:${REPO}`, checkoutPath: cwd }] }, { ACP_OPERATOR_TOKEN: "operator-test-credential", ACP_CTO_REFRESH_RUN_TOKEN: "run-token", CLAUDE_CONFIG_DIR: config });
     w.procs = [{ pid: CLAUDE, ppid: 1, command: OLD_ARGV.join(" "), argv: OLD_ARGV }];
     w.panes = new Map([[CLAUDE, "logic-claude-handoff"]]);
     w.tmux = new Set(["logic-claude-handoff"]);
@@ -1233,7 +1241,8 @@ describe("agentctl cto refresh", () => {
     expect(await runCtoCommand(["refresh", P, "--apply"], w.ports)).toBe(1);
     expect(JSON.stringify(w.out)).toContain("failed at claim");
     const newPid = 30000;
-    const order = [at(w, `SIGTERM ${CLAUDE}`), at(w, /^tmux new-/), at(w, `SIGTERM ${newPid}`), at(w, "operator canonicalCto.cancel")];
+    // The switchover is cancelled first; only then is the new conversation's process stopped.
+    const order = [at(w, `SIGTERM ${CLAUDE}`), at(w, /^tmux new-/), at(w, "operator canonicalCto.cancel"), at(w, `SIGTERM ${newPid}`)];
     expect(order.every((i) => i >= 0)).toBe(true);
     expect([...order].sort((a, b) => a - b)).toEqual(order);
     const second = w.changes.findIndex((c, i) => i > order[1]! && /^tmux new-/.test(c));
@@ -1324,7 +1333,7 @@ describe("agentctl cto refresh", () => {
     writeFileSync(join(config, ".claude.json"), JSON.stringify({ projects: { [cwd]: { hasTrustDialogAccepted: true } } }));
     const w = makeWorld({ generation: 3, session: { pid: CLAUDE, startedAt: `start-${CLAUDE}`, workdir: cwd },
       resident: { status: "COMPLETE", allocation: { projectId: P, sessionUuid: CONVERSATION, clonePath: cwd, roomId: ROOM } } },
-    { ACP_OPERATOR_TOKEN: "operator-test-credential", CLAUDE_CONFIG_DIR: config });
+    { ACP_OPERATOR_TOKEN: "operator-test-credential", ACP_CTO_REFRESH_RUN_TOKEN: "run-token", CLAUDE_CONFIG_DIR: config });
     const argv = [LOCAL_CLAUDE, "--model", "opus", "--dangerously-load-development-channels", "server:acp-buzz-channel", "--resume", CONVERSATION,
       "--name", "e2e CTO", "--remote-control", "e2e CTO", "--messaging-socket-path", `${STATE}/cc.sock`, "--permission-mode", "bypassPermissions"];
     w.procs = [{ pid: 100, ppid: 1, command: "/bin/sh /state/resident-e2e-sort-fixture.sh" }, { pid: CLAUDE, ppid: 100, command: argv.join(" "), argv }];
@@ -1458,16 +1467,14 @@ describe("agentctl cto refresh", () => {
     });
   });
 
-  describe("recovery proves what survives is the old conversation, and takes the project's lock", () => {
+  describe("recovery cancels first, and proves what survives is the old conversation", () => {
     const NEW = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
-    const LOCK = `${STATE}/cto-refresh/lock-${P}.json`;
-    const GATE = `${STATE}/cto-refresh/lock-${P}.takeover.json`;
     const RECOVER = ["refresh", P, "--recover", "--apply"];
     const NEW_PID = 31000;
 
     /** A resident whose old binding the daemon released: the unclaimed replacement is the only process of the role, and a switchover to it is pending. */
     const releasedResident = (): World => {
-      const w = makeWorld({ generation: null, session: null }, { ACP_OPERATOR_TOKEN: "operator-test-credential" });
+      const w = makeWorld({ generation: null, session: null }, { ACP_OPERATOR_TOKEN: "operator-test-credential", ACP_CTO_REFRESH_RUN_TOKEN: "run-token" });
       const argv = [LOCAL_CLAUDE, "--model", "opus", "--dangerously-load-development-channels", "server:acp-buzz-channel", "--session-id", NEW,
         "--name", "e2e CTO", "--remote-control", "e2e CTO", "--messaging-socket-path", `${STATE}/cc.sock`, "--permission-mode", "bypassPermissions"];
       w.procs = [{ pid: 100, ppid: 1, command: "/bin/sh /state/resident-e2e-sort-fixture.sh" }, { pid: NEW_PID, ppid: 100, command: argv.join(" "), argv },
@@ -1492,7 +1499,8 @@ describe("agentctl cto refresh", () => {
       expect(results(w)).toEqual([["self", "done"], ["recover", "done"]]);
       expect(JSON.stringify(w.out)).toContain(`the old conversation ${CONVERSATION} was resumed`);
       expect(JSON.stringify(w.out)).not.toContain("still runs");
-      const order = [at(w, `SIGTERM ${NEW_PID}`), at(w, "operator canonicalCto.cancel"), at(w, /^tmux new-window/)];
+      // Cancel first: nothing is stopped until the daemon has said the new conversation can no longer claim.
+      const order = [at(w, "operator canonicalCto.cancel"), at(w, `SIGTERM ${NEW_PID}`), at(w, /^tmux new-window/)];
       expect(order.every((i) => i >= 0)).toBe(true);
       expect([...order].sort((a, b) => a - b)).toEqual(order);
       expect(w.launchLog).toEqual([{ conversation: CONVERSATION, alive: [] }]);
@@ -1534,95 +1542,145 @@ describe("agentctl cto refresh", () => {
       w.rotation.pending = null;
       w.rotation.acked.push(NEW);
       expect(await runCtoCommand(RECOVER, w.ports)).toBe(0);
-      expect(JSON.stringify(w.out)).toContain("the new conversation holds the role");
-      expect(w.changes.filter((c) => c.startsWith("SIGTERM") || /^tmux new-/.test(c) || c === "operator canonicalCto.cancel")).toEqual([]);
+      // The cancel is what finds it claimed: it is refused, and nothing is stopped or started.
+      expect(JSON.stringify(w.out)).toContain("the new conversation has claimed the role; the refresh completed");
+      expect(w.rotation.calls).toEqual(["canonicalCto.cancel", "canonicalCto.status"]);
+      expect(w.changes.filter((c) => c.startsWith("SIGTERM") || /^tmux new-/.test(c))).toEqual([]);
       expect(claudes(w).map((p) => p.pid)).toEqual([NEW_PID]);
       expect(w.files.has(INFLIGHT)).toBe(false);
     });
 
-    it("a claim that lands late is seen before anything is stopped: the new conversation is left running and the refresh is not rolled back", async () => {
+    it("a claim that lands mid-recovery is never killed: the cancel finds it claimed, nothing is stopped, and the refresh is complete", async () => {
+      const w = releasedResident();
+      // The new conversation's claim lands at the very moment the cancel arrives.
+      w.rotation.claimOnCancel = { pid: NEW_PID };
+      expect(await runCtoCommand(RECOVER, w.ports)).toBe(0);
+      expect(JSON.stringify(w.out)).toContain("the new conversation has claimed the role; the refresh completed");
+      expect(w.changes.filter((c) => c.startsWith("SIGTERM") || /^tmux new-/.test(c))).toEqual([]);
+      expect(claudes(w).map((p) => p.pid)).toEqual([NEW_PID]);
+      expect(w.record).toMatchObject({ conversation: NEW, generation: 4 });
+      expect(w.files.has(INFLIGHT)).toBe(false);
+    });
+
+    it("a claim that lands while a refresh rolls back is never killed either: the refresh turns out complete", async () => {
       const w = canonicalWorld();
       w.claimQueue = [false];
-      w.lateClaim = true;
-      expect(await runCtoCommand(["refresh", P, "--apply"], w.ports)).toBe(1);
-      expect(JSON.stringify(w.out)).toContain("failed at claim");
-      expect(JSON.stringify(w.out)).toContain("the new conversation has claimed the role; nothing was rolled back");
+      // The new conversation starts and the wait for its claim ends; its claim lands as the rollback's cancel arrives.
+      w.rotation.claimOnCancel = { pid: 30000 };
+      expect(await runCtoCommand(["refresh", P, "--apply"], w.ports)).toBe(0);
+      expect(w.out.some((l) => l["step"] === "switch" && l["phase"] === "completed")).toBe(true);
       expect(w.changes).not.toContain("SIGTERM 30000");
-      expect(w.rotation.calls).not.toContain("canonicalCto.cancel");
       expect(w.launchLog.map((l) => l.conversation)).toEqual([w.rotation.rotated[0]!.to]);
+      expect(w.record).toMatchObject({ conversation: w.rotation.rotated[0]!.to, generation: 4 });
+      expect(w.files.has(INFLIGHT)).toBe(false);
     });
 
-    it("two recoveries of one project exclude each other: one resumes the old conversation, the other is refused and changes nothing", async () => {
+    it("a cancel that cannot be answered changes nothing and keeps the record: no process is stopped on a guess", async () => {
       const w = releasedResident();
-      const first = runCtoCommand(RECOVER, { ...w.ports, selfPid: 777 });
-      const second = runCtoCommand(RECOVER, { ...w.ports, selfPid: 778 });
-      expect(await Promise.all([first, second])).toEqual([0, 2]);
-      expect(JSON.stringify(w.out)).toContain("holds its lock (pid 777); nothing was changed");
-      expect(w.launchLog).toEqual([{ conversation: CONVERSATION, alive: [] }]);
-      expect(w.changes.filter((c) => /^tmux new-/.test(c))).toHaveLength(1);
-      expect(w.changes.filter((c) => c === `SIGTERM ${NEW_PID}`)).toHaveLength(1);
-      expect(claudes(w)).toHaveLength(1);
-      expect(w.files.has(LOCK)).toBe(false);
+      w.rotation.cancelRefuses = true;
+      expect(await runCtoCommand(RECOVER, w.ports)).toBe(1);
+      expect(JSON.stringify(w.out)).toContain("the daemon refused to cancel the switchover");
+      expect(w.changes.filter((c) => c.startsWith("SIGTERM") || /^tmux new-/.test(c))).toEqual([]);
+      expect(claudes(w).map((p) => p.pid)).toEqual([NEW_PID]);
+      expect(w.files.has(INFLIGHT)).toBe(true);
     });
 
-    it("a refresh and a recovery share the lock, and the lock is released when the run ends, by success, failure or throw", async () => {
+    it("a cancel that finds nothing pending and a daemon that cannot say whether it was claimed changes nothing and keeps the record", async () => {
       const w = releasedResident();
-      // A refresh that holds the lock keeps a recovery out, and the reverse.
-      w.files.set(LOCK, JSON.stringify({ pid: 4242, startedAt: "start-4242" }));
-      w.procs.push({ pid: 4242, ppid: 1, command: "/node agentctl.js cto refresh" });
-      for (const args of [RECOVER, ["refresh", P, "--apply"]]) {
-        expect(await runCtoCommand(args, w.ports)).toBe(2);
-        expect(w.files.get(LOCK)).toContain("4242");
-        expect(w.changes.filter((c) => c.startsWith("SIGTERM") || /^tmux new-/.test(c) || c.startsWith("operator canonicalCto.c"))).toEqual([]);
-      }
-      // A dry run changes nothing and asks for no lock.
-      expect(await runCtoCommand(["refresh", P, "--recover"], w.ports)).toBe(0);
-      w.files.delete(LOCK);
-      // Released after a failed run and after one that throws.
-      const failing = canonicalWorld();
-      failing.tmuxStartFails = 1;
-      expect(await runCtoCommand(["refresh", P, "--apply"], failing.ports)).toBe(1);
-      expect(failing.files.has(LOCK)).toBe(false);
-      const throwing = canonicalWorld();
-      throwing.ports = { ...throwing.ports, signal: () => { throw Object.assign(new Error("EPERM"), { code: "EPERM" }); } };
-      expect(await runCtoCommand(["refresh", P, "--apply"], throwing.ports)).toBe(1);
-      expect(throwing.files.has(LOCK)).toBe(false);
+      w.rotation.pending = null;
+      w.rotation.failStatusAt = [1];
+      expect(await runCtoCommand(RECOVER, w.ports)).toBe(1);
+      expect(JSON.stringify(w.out)).toContain("cannot say whether the switchover to the new conversation was claimed");
+      expect(w.changes.filter((c) => c.startsWith("SIGTERM") || /^tmux new-/.test(c))).toEqual([]);
+      expect(w.files.has(INFLIGHT)).toBe(true);
+    });
+  });
+
+  describe("an --apply is a request to the daemon, whose queue is the only place a refresh runs", () => {
+    const withoutToken = (): World => {
+      const w = canonicalWorld();
+      w.ports = { ...w.ports, env: { ACP_OPERATOR_TOKEN: "operator-test-credential" } };
+      return w;
+    };
+
+    it("asks the daemon, runs nothing itself, and prints what the daemon's run did", async () => {
+      const w = withoutToken();
+      w.refreshAnswer = () => allow(ReasonCode.OK, { ok: true, reason: "", lines: [{ step: "switch", result: "done" }] });
+      expect(await runCtoCommand(["refresh", P, "--apply"], w.ports)).toBe(0);
+      expect(w.refreshRequests).toEqual([{ projectId: P }]);
+      expect(w.out.slice(-2)).toEqual([{ step: "switch", result: "done" }, { result: "done", via: "daemon" }]);
+      expect(w.changes).toEqual([]);
+      expect(w.rotation.calls).toEqual([]);
+
+      const recovery = withoutToken();
+      recovery.refreshAnswer = () => allow(ReasonCode.OK, { ok: false, reason: "recover: tmux could not start", lines: [] });
+      expect(await runCtoCommand(["refresh", P, "--recover", "--apply"], recovery.ports)).toBe(1);
+      expect(recovery.refreshRequests).toEqual([{ projectId: P, recover: true }]);
+      expect(last(recovery)).toEqual({ result: "failed", via: "daemon", reason: "recover: tmux could not start" });
     });
 
-    it("takes over a lock only when its holder is gone: a dead pid, or a pid another process now has", async () => {
-      for (const stale of [{ pid: 9999, startedAt: "start-9999" }, { pid: 5252, startedAt: "the-start-it-had-before-the-pid-was-reused" }]) {
-        const w = releasedResident();
-        w.procs.push({ pid: 5252, ppid: 1, command: "/node something-else" });
-        w.files.set(LOCK, JSON.stringify(stale));
-        expect(await runCtoCommand(RECOVER, w.ports)).toBe(0);
-        expect(w.launchLog).toEqual([{ conversation: CONVERSATION, alive: [] }]);
-        expect(w.files.has(LOCK)).toBe(false);
-        expect(w.files.has(GATE)).toBe(false);
-      }
-      // An unreadable lock is stale too: nothing runs behind it.
-      const w = releasedResident();
-      w.files.set(LOCK, "not json");
-      expect(await runCtoCommand(RECOVER, w.ports)).toBe(0);
-      expect(w.files.has(LOCK)).toBe(false);
+    it("a daemon that does not take the request leaves everything as it was", async () => {
+      const w = withoutToken();
+      expect(await runCtoCommand(["refresh", P, "--apply"], w.ports)).toBe(2);
+      expect(JSON.stringify(w.out)).toContain("the daemon did not take the request");
+      expect(w.changes).toEqual([]);
     });
 
-    it("a takeover is taken by one run at a time: a stale lock's takeover gate held by a running run refuses the other, and a dead run's gate is cleared", async () => {
-      const held = releasedResident();
-      held.procs.push({ pid: 4242, ppid: 1, command: "/node agentctl.js cto refresh" });
-      held.files.set(LOCK, JSON.stringify({ pid: 9999, startedAt: "start-9999" }));
-      held.files.set(GATE, JSON.stringify({ pid: 4242, startedAt: "start-4242" }));
-      expect(await runCtoCommand(RECOVER, held.ports)).toBe(2);
-      expect(JSON.stringify(held.out)).toContain("holds its lock");
-      expect(held.changes.filter((c) => c.startsWith("SIGTERM") || /^tmux new-/.test(c))).toEqual([]);
-      expect(held.files.get(GATE)).toContain("4242");
+    it("a run the daemon's queue did not start refuses and changes nothing: the token must be the running job's", async () => {
+      const w = canonicalWorld();
+      w.ports = { ...w.ports, env: { ...w.ports.env, ACP_CTO_REFRESH_RUN_TOKEN: "a-token-the-daemon-never-minted" } };
+      expect(await runCtoCommand(["refresh", P, "--apply"], w.ports)).toBe(2);
+      expect(JSON.stringify(w.out)).toContain("the daemon does not vouch for this run");
+      expect(w.changes).toEqual([]);
+      expect(w.rotation.calls).toEqual([]);
+      expect(w.refreshRequests).toEqual([]);
+    });
 
-      const dead = releasedResident();
-      dead.files.set(LOCK, JSON.stringify({ pid: 9999, startedAt: "start-9999" }));
-      dead.files.set(GATE, JSON.stringify({ pid: 9998, startedAt: "start-9998" }));
-      expect(await runCtoCommand(RECOVER, dead.ports)).toBe(0);
-      expect(dead.launchLog).toEqual([{ conversation: CONVERSATION, alive: [] }]);
-      expect(dead.files.has(GATE)).toBe(false);
-      expect(dead.files.has(LOCK)).toBe(false);
+    it("two --apply requests at once run one after the other through the daemon's queue", async () => {
+      // The daemon's side: its queue and its operator handler, with the child a run would start replaced by a gated fake.
+      const events: string[] = [];
+      let live = 0;
+      let most = 0;
+      const gates = new Map<string, () => void>();
+      const queue = createRefreshQueue(async (job) => {
+        events.push(`start ${job.projectId}`);
+        live++; most = Math.max(most, live);
+        await new Promise<void>((resolve) => gates.set(job.projectId, resolve));
+        live--;
+        events.push(`end ${job.projectId}`);
+        return { ok: true, reason: "", lines: [{ step: "switch", result: "done", project: job.projectId }] };
+      });
+      const daemon = ctoRefreshOperator(queue);
+      const worldFor = (): World => {
+        const w = withoutToken();
+        w.refreshAnswer = () => { throw new Error("replaced below"); };
+        return w;
+      };
+      const first = worldFor();
+      const second = worldFor();
+      // Two operators, two projects (the fake world has one, so the project id is rewritten on the way to the daemon).
+      const asProject = (w: World, project: string): void => {
+        const inner = w.ports.operator;
+        w.ports = { ...w.ports, operator: { request: async (method, params, key) => (method === "ctoRefresh.run" ? daemon("run", { ...params, projectId: project }) : inner.request(method, params, key)) } };
+      };
+      asProject(first, "alpha");
+      asProject(second, "beta");
+      const one = runCtoCommand(["refresh", P, "--apply"], first.ports);
+      const two = runCtoCommand(["refresh", P, "--apply"], second.ports);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      // Only the first is running; the second waits behind it.
+      expect(events).toEqual(["start alpha"]);
+      expect(queue.busy()).toBe(true);
+      gates.get("alpha")!();
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(events).toEqual(["start alpha", "end alpha", "start beta"]);
+      gates.get("beta")!();
+      expect(await Promise.all([one, two])).toEqual([0, 0]);
+      expect(most).toBe(1);
+      expect(events).toEqual(["start alpha", "end alpha", "start beta", "end beta"]);
+      expect(first.out.at(-2)).toEqual({ step: "switch", result: "done", project: "alpha" });
+      expect(second.out.at(-2)).toEqual({ step: "switch", result: "done", project: "beta" });
+      expect(queue.busy()).toBe(false);
     });
   });
 

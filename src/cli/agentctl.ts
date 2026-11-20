@@ -185,6 +185,8 @@ export const main = async (argv: string[]): Promise<number> => {
     socketPath:
       process.env["ACP_OPERATOR_SOCKET"] ?? join(config.databasePath, "..", "agentcpd.operator.sock"),
     token: process.env["ACP_OPERATOR_TOKEN"],
+    // `cto refresh --apply` is answered when the daemon's queue has run it, which can be minutes behind the jobs queued before it.
+    ...(command === "cto" ? { timeoutMs: 25 * 60_000 } : {}),
   });
 
   // The CTO lifecycle group composes the operator methods below with host steps; it reads the token from this
