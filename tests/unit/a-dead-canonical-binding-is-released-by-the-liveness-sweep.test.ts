@@ -229,6 +229,87 @@ describe("the sweep at a watchdog tick", () => {
   });
 });
 
+/**
+ * #1466 review: a surviving switch (`switchTo({ conversation: "SURVIVED" })`) moves the actor's runtime
+ * and leaves `boundSessionId` on the old session. The binding's holder is then the CURRENT runtime, so the
+ * old session's death proves nothing about it: only a current runtime proven gone may release the role.
+ */
+describe.each(["PRIMARY_CTO", "CEO"] as const)("the liveness sweep and a %s binding whose runtime moved", (role) => {
+  /** The dead holder's binding moved, by a surviving switch, onto a second session with the given process. */
+  const movedTo = async (current: { osPid: number | null; osStartedAt: string | null }) => {
+    const fixture = await holder({ role, osPid: deadPid(), settled: true });
+    const { harness } = fixture;
+    const next = harness.cp.sessions.create({ provider: "scripted", model: `scripted-${role}-next` });
+    expect(harness.cp.sessions.transition(next.sessionId, SessionLifecycle.READY, "moved runtime").allowed).toBe(true);
+    setProcess(harness, next.sessionId, current.osPid, current.osStartedAt);
+    const switched = harness.cp.bindings.switchTo({
+      role: role === "CEO" ? Role.CEO : Role.PRIMARY_CTO,
+      ...(role === "CEO" ? {} : { projectId: fixture.projectId }),
+      sessionId: next.sessionId,
+      conversation: "SURVIVED",
+      reason: "surviving runtime move",
+    });
+    if (!switched.allowed) throw new Error(switched.message);
+    const binding = harness.cp.bindings.require(fixture.roleKey);
+    expect(binding).toMatchObject({ sessionId: next.sessionId, boundSessionId: fixture.sessionId, assignmentId: fixture.assignmentId });
+    return { fixture, currentSessionId: next.sessionId };
+  };
+
+  const stillBound = (fixture: Fixture, currentSessionId: string): void => {
+    expect(fixture.harness.cp.bindings.active(fixture.roleKey)).toMatchObject({
+      assignmentId: fixture.assignmentId,
+      sessionId: currentSessionId,
+    });
+    expect(assignment(fixture)).toMatchObject({ status: "ACTIVE", revoked_reason: null });
+    expect(fixture.harness.cp.audit.byKind("DEAD_BINDING_RECOVERED")).toHaveLength(0);
+  };
+
+  it("keeps the binding when the current runtime is ALIVE, though the bound session is dead", async () => {
+    const { fixture, currentSessionId } = await movedTo({ osPid: process.pid, osStartedAt: ownStartToken() });
+
+    await reconcile(fixture);
+
+    expect(fixture.harness.cp.sessions.get(currentSessionId)?.lifecycle).toBe(SessionLifecycle.READY);
+    stillBound(fixture, currentSessionId);
+  });
+
+  it("keeps the binding when the current runtime's liveness is UNKNOWN", async () => {
+    const { fixture, currentSessionId } = await movedTo({ osPid: null, osStartedAt: null });
+
+    await reconcile(fixture);
+
+    stillBound(fixture, currentSessionId);
+  });
+
+  it("keeps the binding when the current runtime answers EPERM (ALIVE)", async () => {
+    const { fixture, currentSessionId } = await movedTo({ osPid: 2147483646, osStartedAt: null });
+    const realKill = process.kill.bind(process);
+    const signal = vi.spyOn(process, "kill").mockImplementation((pid, sig) => {
+      if (pid === 2147483646 && sig === 0) throw Object.assign(new Error("permission denied"), { code: "EPERM" });
+      return realKill(pid, sig);
+    });
+    try {
+      await reconcile(fixture);
+    } finally {
+      signal.mockRestore();
+    }
+
+    stillBound(fixture, currentSessionId);
+  });
+
+  it("releases the binding once the current runtime is proven dead too", async () => {
+    const { fixture, currentSessionId } = await movedTo({ osPid: deadPid(), osStartedAt: null });
+
+    await reconcile(fixture);
+
+    expect(fixture.harness.cp.bindings.active(fixture.roleKey)).toBeNull();
+    expect(assignment(fixture)).toMatchObject({ status: "REVOKED" });
+    const [recorded] = fixture.harness.cp.audit.byKind("DEAD_BINDING_RECOVERED");
+    expect(recorded).toMatchObject({ actor: DEAD_BINDING_SWEEP_ACTOR, evidence: { liveness: "DEAD" } });
+    expect(currentSessionId).not.toBe(fixture.sessionId);
+  });
+});
+
 describe("what a dead holder's release does to the role's queued mail", () => {
   it("keeps a queued CEO notification PENDING, and the next CEO holder is addressed it", async () => {
     const fixture = await holder({ role: "CEO", osPid: deadPid() });

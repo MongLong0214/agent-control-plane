@@ -1708,7 +1708,8 @@ export class Daemon {
    *
    * `recoverDeadCanonicalBinding` keeps every proof and no liveness seam is threaded in, so the
    * real probe answers: it re-probes and refuses unless DEAD (EPERM stays ALIVE, anything it cannot
-   * decide is UNKNOWN), compares generation and incarnation, and refuses a binding that still owns
+   * decide is UNKNOWN), compares generation and incarnation, requires a moved binding's CURRENT runtime to be
+   * proven dead too (a surviving switch leaves the bound session behind), and refuses a binding that still owns
    * live runs (REVOCATION_BLOCKED_ACTIVE_RUNS), which continuity's pause and revoke handles. A
    * refusal changes nothing and is read again on the next tick. A release that throws is recorded
    * (DAEMON_TIMER_FAILED, once per role and message) and does not stop the other bindings or the caller.

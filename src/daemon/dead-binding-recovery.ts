@@ -307,26 +307,6 @@ export const recoverDeadCanonicalBinding = (
         },
       );
     }
-    // The CEO only: a surviving switch moves the actor's runtime and leaves the binding row, so
-    // the bound session can be dead while the CEO answers on another one. The bound session's
-    // death proves nothing about that runtime, so the release requires the two to be one. The
-    // CTO branch is left as it was.
-    if (
-      request.role === Role.CEO &&
-      (current.sessionId !== current.boundSessionId ||
-        current.sessionIncarnation !== current.boundSessionIncarnation)
-    ) {
-      return deny(
-        ReasonCode.INVALID_ARGUMENT,
-        "the CEO's live runtime is not the bound session; this release covers only a binding whose runtime is the dead one",
-        {
-          roleKey,
-          boundSessionId: current.boundSessionId,
-          liveSessionId: current.sessionId,
-        },
-      );
-    }
-
     const session = deps.sessions.get(request.sessionId);
     if (!session) {
       // A binding whose session row is gone is a real state, and it is also one in which no
@@ -373,6 +353,36 @@ export const recoverDeadCanonicalBinding = (
       );
     }
 
+    // A surviving switch moves the actor's runtime and leaves the binding on the session it was
+    // bound to, so the bound session can be dead while the role's holder answers on another one.
+    // The bound session's death proves nothing about that holder: for a CTO and for the CEO alike,
+    // a binding whose current runtime differs from the bound one is released only once the current
+    // runtime is itself proven DEAD. ALIVE, UNKNOWN, an absent row and a different incarnation of
+    // that row all refuse, and nothing is changed.
+    const moved = current.sessionId !== current.boundSessionId ||
+      current.sessionIncarnation !== current.boundSessionIncarnation;
+    if (moved) {
+      const runtime = deps.sessions.get(current.sessionId);
+      const runtimeLiveness: SessionLiveness = runtime && runtime.incarnation === current.sessionIncarnation
+        ? probeSessionLiveness(runtime.osPid, runtime.osProcessStartedAt, deps.liveness ?? {})
+        : "UNKNOWN";
+      if (runtimeLiveness !== "DEAD") {
+        return deny(
+          ReasonCode.RECOVERY_TAKEOVER_REQUIRES_UNREACHABLE_OWNER,
+          runtimeLiveness === "ALIVE"
+            ? "the role's current runtime is not the bound session and is still running; this release covers only a dead holder"
+            : "the role's current runtime is not the bound session and could not be proven dead, and unproven is not recoverable",
+          {
+            projectId: request.projectId,
+            roleKey,
+            boundSessionId: current.boundSessionId,
+            runtimeSessionId: current.sessionId,
+            liveness: runtimeLiveness,
+          },
+        );
+      }
+    }
+
     // No `allowBlockedRuns`. `revokePausedBinding` may pass it because it has already paused the
     // work; nothing here has, so a role that still owns live runs is refused and the daemon goes
     // on blocking. Sweeping that state out of sight is the outcome this whole door exists to
@@ -404,6 +414,7 @@ export const recoverDeadCanonicalBinding = (
         sessionIncarnation: session.incarnation,
         osPid: session.osPid,
         liveness,
+        ...(moved ? { runtimeSessionId: current.sessionId } : {}),
       },
     });
 
