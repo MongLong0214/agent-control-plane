@@ -477,7 +477,6 @@ export const createCtoMcpPort = (source: CtoMcpSource) => {
     capacity: () => source.capacity.all(),
     continuityMode: () => source.continuity.mode(),
     doctorRun: (...args: Parameters<Doctor["run"]>) => source.doctor.run(...args),
-    manualReview: (sessionId: string, runId: string) => source.review.manualInvocation(sessionId, runId),
   });
   CTO_MCP_PORTS.add(port);
   return port;
@@ -1051,14 +1050,6 @@ const createCtoServerFromPort = (
     "doctor_run",
     { description: "Read-only doctor pass.", inputSchema: { scope: z.enum(["system", "project", "cto", "run", "session", "capacity", "github", "worktree"]).default("run"), target: z.string().optional() } },
     async (args) => read("doctor_run", async () => ok(await port.doctorRun(args.scope, args.target))),
-  );
-  server.registerTool(
-    "blind_review_request",
-    { description: "Not available: blind review is invoked by the control plane.", inputSchema: runIdentity },
-    async (args) => read("blind_review_request", (peer) => {
-      const fenced = owner(peer, args.runId);
-      return fenced.allowed ? respond(port.manualReview(fenced.value.sessionId, args.runId)) : respond(fenced);
-    }),
   );
   return server;
 };

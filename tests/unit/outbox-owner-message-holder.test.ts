@@ -522,7 +522,7 @@ describe("an owner-message is taken by its exact holder, and by nothing else", (
     // (ACP-R1-01), so it is not the control any more.
     const dispatch = core.outbox.enqueue({ idempotencyKey: `review:${crypto.randomUUID()}`, roleKey: seeded.roleKey,
       bindingGeneration: seeded.generation, targetSessionId: seeded.sessionId, runId: seeded.runId,
-      kind: MessageKind.REVIEW_REQUEST, payload: { runId: seeded.runId } });
+      kind: MessageKind.HANDOFF_PACKAGE, payload: { runId: seeded.runId } });
     expect(owner.allowed && dispatch.allowed).toBe(true);
     if (!owner.allowed || !dispatch.allowed) return;
 

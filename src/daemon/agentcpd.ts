@@ -1460,19 +1460,6 @@ export const startLocalMcpListeners = async (
       // binding-scoped re-check at delivery time reintroduces that dependency through the back
       // door, and moving the admitted project away took the session's other project with it.
       server.server.onclose = ctoConversation.attach(server, connectionAuth());
-      // `role_wake_endpoint_register` is kept for clients that still call it, and does nothing but
-      // answer: no frame is ever written to an endpoint, so none is recorded either.
-      server.registerTool(
-        "role_wake_endpoint_register",
-        {
-          description:
-            "Retained for older clients: accepted and ignored. Nothing is written to a session; messages are taken with " +
-            "role_owner_message_claim.",
-          inputSchema: { endpoint: z.string().min(1), acceptance: z.literal("relay-v1").optional() },
-        },
-        async (_args: { endpoint: string; acceptance?: "relay-v1" }) =>
-          respond(ctoConversation.acknowledgeRegistration(server)),
-      );
       /*
        * The owner-message tools, registered in this same composition — not on a second
        * server, and not against a durable endpoint registry.
@@ -1561,9 +1548,9 @@ export const startLocalMcpListeners = async (
       // notification is sent once that answer is written, so it is behind it on the wire.
       //
       // Two relays end a restore with a request of their own: this build's asks a `ping` under
-      // `CANONICAL_CTO_RESTORED_PING_PREFIX`, and an earlier build's replays its wake registration,
-      // `role_wake_endpoint_register`, which this daemon still answers. Either is the point at which
-      // the relay stops refusing the client, so either is followed by the notification. One restore
+      // `CANONICAL_CTO_RESTORED_PING_PREFIX`, and an older build's replays `role_wake_endpoint_register`,
+      // which the SDK answers with an unknown-tool error. Either answer is the point at which the
+      // relay stops refusing the client, so either is followed by the notification. One restore
       // is told once: after `notifications/initialized` the first trigger answered sends it, and a
       // later one on the same connection does not.
       const triggers = new Set<string | number>();
@@ -6398,12 +6385,6 @@ export const configuredCanonicalSessions = (raw: string): readonly CanonicalAdop
 export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => {
   // Classify the complete environment-only group before reading config or acquiring resources.
   // Blank values are absent; nonblank values are retained exactly for the claim boundary.
-  //
-  // Three, not six. `ACP_CANONICAL_REQUIRED_EXECUTOR_VERSION`, `…_EXPECTED_EXECUTOR_REALPATH` and
-  // `…_EXPECTED_EXECUTOR_SHA256` used to belong to the group; the claim no longer compares the
-  // executing image against anything, so nothing reads them. They are not refused either: a
-  // deployment that still provisions them starts exactly as one that does not, and they count
-  // neither toward the group being present nor toward it being partial.
   const CANONICAL_ACTIVATION_VARS = [
     "ACP_CANONICAL_SESSIONS_JSON",
     "ACP_CANONICAL_CTO_PEER_PROTOCOL",

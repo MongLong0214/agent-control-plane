@@ -505,7 +505,7 @@ describe("outbox fencing (PRD §15.7, §27.5)", () => {
   });
 
   it("expires overdue messages instead of delivering them late", () => {
-    const { outbox, clock } = enqueue(MessageKind.REVIEW_REQUEST);
+    const { outbox, clock } = enqueue(MessageKind.HANDOFF_PACKAGE);
     clock.advance(31 * 60 * 1000);
     expect(outbox.expireOverdue()).toBe(1);
     expect(outbox.claimDeliverable()).toHaveLength(0);
