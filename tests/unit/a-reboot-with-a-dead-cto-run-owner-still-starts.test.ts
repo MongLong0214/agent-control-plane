@@ -342,7 +342,7 @@ describe("a reboot that kills a canonical CTO owning an ACTIVE run", () => {
       const f = await rebootedCto();
       f.harness.cp.sessions.setPid(f.ceoSessionId, deadPid());
       f.settle(f.ceoSessionId);
-      // Without the run, a settled CEO is the operator door's other role and does not block.
+      // Without the run, a settled CEO is the liveness sweep's other role and does not block.
       expect(await f.finding("system", f.ceoSessionId)).toEqual({ severity: "ERROR", blocking: false });
       // The run re-pinned onto the CEO's own binding tuple, which its owner foreign key admits.
       f.db.run(

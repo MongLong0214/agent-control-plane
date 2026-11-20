@@ -54,19 +54,6 @@ const USAGE = `agentctl — Agent Control Plane operator CLI
   agentctl actor unregister <id> <generation> <expected-set-generation> <reason>
   agentctl telegram reply acknowledge <nonce> <reason-code> <evidence-digest>
                                            record that a terminal reply was reviewed and will not retry
-  agentctl binding recover-dead <projectId> <sessionId> <incarnation> <generation>
-                                           release a PRIMARY_CTO binding whose session's OS process
-                                           this host can prove is gone. Refuses a live session and
-                                           refuses one whose liveness cannot be established. Mints
-                                           no session and no generation; the role is simply left
-                                           unbound. Reachable while agentcpd is parked, which is
-                                           the state this exists for. There is no owner approval
-                                           to present: the liveness proof is the whole bound, and
-                                           <generation> is what stops a repeat.
-  agentctl binding recover-dead-ceo <sessionId> <incarnation> <generation>
-                                           the same release for the CEO binding, on the same proof.
-                                           The same CEO actor then re-attaches at the next
-                                           generation through adopt hermes or bootstrap hermes.
   agentctl conversation contradictions     turns whose records disagree, with the ids to cite
   agentctl conversation adjudicate <actor> <turn> <reason-code> <evidence-digest> <id>...
   agentctl conversation unresolved         turns waiting on a person, with what each already holds
@@ -575,41 +562,6 @@ export const dispatch = async (
       return call("capacity.observe", { provider, payload: parsed });
     }
     return fail(`unknown capacity subcommand: ${args[0] ?? ""}`);
-  }
-
-  if (command === "binding") {
-    const [sub, projectId, sessionId, sessionIncarnation, generation] = args;
-    if (sub === "recover-dead") {
-      return call("binding.recoverDead", {
-        projectId: required(projectId, "projectId"),
-        // Fixed, not taken from the command line. The door recovers the canonical CTO binding and
-        // the CEO's (`recover-dead-ceo` below) and refuses any other role, so offering a role
-        // argument would only invite a request the daemon is going to refuse.
-        role: "PRIMARY_CTO",
-        sessionId: required(sessionId, "sessionId"),
-        sessionIncarnation: required(sessionIncarnation, "sessionIncarnation"),
-        expectedBindingGeneration: requiredInteger(generation, "expectedBindingGeneration", 1),
-        // There is no `nonce` and no `approved` here any more. This command used to require both,
-        // with `approved` hard-coded to `true` under a comment saying that reaching the command
-        // *was* the owner's approval — which is the whole argument for deleting them: a field
-        // that can only hold one value, and a nonce whose only job was to make that field's
-        // envelope unique, recorded a decision nobody had made. The generation above is what
-        // keeps a repeat from doing anything, and it did that before these two existed.
-      });
-    }
-    if (sub === "recover-dead-ceo") {
-      // The same door for its one other role. The CEO has no project, so the arguments shift by
-      // one and the project travels as an explicit null rather than as an omitted field.
-      const [, ceoSessionId, ceoSessionIncarnation, ceoGeneration] = args;
-      return call("binding.recoverDead", {
-        projectId: null,
-        role: "CEO",
-        sessionId: required(ceoSessionId, "sessionId"),
-        sessionIncarnation: required(ceoSessionIncarnation, "sessionIncarnation"),
-        expectedBindingGeneration: requiredInteger(ceoGeneration, "expectedBindingGeneration", 1),
-      });
-    }
-    return fail(`unknown binding subcommand: ${sub ?? ""}`);
   }
 
   if (command === "project") {

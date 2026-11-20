@@ -42,10 +42,9 @@ const COVERAGE = finding("ROLE_COVERAGE_NO_VALID_COVERAGE", "continuity");
 /**
  * The unparkable example these cases need.
  *
- * It used to be CTO_BINDING_POINTS_AT_DEAD_SESSION, and that stopped being true when the parked
- * door gained `binding.recoverDead` — a finding an operator *can* now clear is exactly the wrong
- * illustration for "a block that drifts into one no observation can answer", and using it here
- * made these two cases hang rather than fail, because the daemon correctly kept waiting.
+ * It used to be CTO_BINDING_POINTS_AT_DEAD_SESSION. That finding is not unparkable-by-accident:
+ * the daemon's own liveness sweep clears a proven-dead binding, so it is the wrong illustration
+ * for "a block that drifts into one no observation can answer".
  *
  * ACTIVE_RUN_WITHOUT_OWNER is the replacement: CRITICAL, blocking, raised by `checkRuns`, and
  * answerable only by re-pinning the run's owner or failing the run — neither of which is on the
@@ -174,12 +173,6 @@ const status = (daemon: Daemon) =>
  * sentence true rather than aspirational.
  */
 const PARKED_DOOR = [
-  // The dead canonical binding recovery. It releases one PRIMARY_CTO assignment whose session's
-  // process this machine can prove is gone, under an owner approval it verifies before it acts,
-  // and it spawns nothing. Admitted for the same reason the two conversation pairs are: without
-  // it the doctor named a blocking state that no command reachable from a parked daemon could
-  // clear, and the door that could clear it opened only after start() had already refused.
-  "binding.recoverDead",
   "capacity.observe",
   "conversation.adjudicate",
   "conversation.contradictions",
@@ -588,8 +581,8 @@ describe("#568: the documented capacity remedy is reachable in the state that ne
     // The check exists for a finding the *sweep* produces rather than the doctor-only re-check:
     // the pass that can create one is the promote attempt, so a scope check placed only where the
     // finding cannot appear is not a check. CTO_BINDING_POINTS_AT_DEAD_SESSION was the original
-    // motivating example and is no longer unparkable — the parked door can clear it now — so the
-    // case is carried by ACTIVE_RUN_WITHOUT_OWNER, which the same argument covers.
+    // motivating example, and the daemon's liveness sweep clears it now, so the case is carried by
+    // ACTIVE_RUN_WITHOUT_OWNER, which the same argument covers.
     const { harness, daemon } = makeDaemon([
       report("BLOCKED", [COVERAGE]),
       report("HEALTHY", []),
