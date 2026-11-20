@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { randomUUID } from "node:crypto";
 import { existsSync, readFileSync, realpathSync } from "node:fs";
-import { createConnection } from "node:net";
+import { createConnection, type Socket } from "node:net";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -112,6 +112,15 @@ export interface OperatorClient {
     params?: Record<string, unknown>,
     idempotencyKey?: string,
   ): Promise<Decision<unknown>>;
+  /** A request whose answer leaves the connection open: the daemon's hold lasts as long as it does. */
+  hold?(method: string, params?: Record<string, unknown>): Promise<OperatorHold>;
+}
+
+export interface OperatorHold {
+  decision: Decision<unknown>;
+  /** The connection is still open, so the hold is still held. */
+  open(): boolean;
+  release(): void;
 }
 
 const OPERATOR_MUTATION_METHOD_NAMES = new Set([
@@ -132,6 +141,15 @@ const OPERATOR_MUTATION_METHOD_NAMES = new Set([
 
 /** Creates a daemon-only operator client. It never opens SQLite or constructs a service. */
 export const createOperatorClient = (options: OperatorClientOptions): OperatorClient => ({
+  hold: async (method, params = {}) => {
+    let held: Socket | null = null;
+    let closed = false;
+    const decision = await exchangeOperatorRequest(options, { requestId: randomUUID(), method, params }, (socket) => {
+      held = socket;
+      for (const event of ["close", "end", "error"] as const) socket.once(event, () => { closed = true; });
+    });
+    return { decision, open: () => held !== null && !closed && !(held as Socket).destroyed, release: () => { closed = true; (held as Socket | null)?.destroy(); } };
+  },
   request: (method, params = {}, idempotencyKey) =>
     exchangeOperatorRequest(options, {
       requestId: randomUUID(),
@@ -732,6 +750,8 @@ const exchangeOneLineRequest = (
   requestBody: Record<string, unknown>,
   timeoutMs: number,
   messages: OneLineExchangeMessages,
+  /** Given the socket of an allowed answer, which is then left open for the caller instead of ended. */
+  keepOpen?: (socket: Socket) => void,
 ): Promise<Decision<unknown>> =>
   new Promise<Decision<unknown>>((resolveExchange) => {
     const socket = createConnection(socketPath);
@@ -742,7 +762,8 @@ const exchangeOneLineRequest = (
       if (settled) return;
       settled = true;
       if (timeout) clearTimeout(timeout);
-      socket.end();
+      if (keepOpen && result.allowed) keepOpen(socket);
+      else socket.end();
       resolveExchange(result);
     };
     const unavailable = (error: unknown): void =>
@@ -794,6 +815,7 @@ const OPERATOR_EXCHANGE_MESSAGES: OneLineExchangeMessages = {
 const exchangeOperatorRequest = (
   options: OperatorClientOptions,
   request: { requestId: string; method: string; params: Record<string, unknown>; idempotencyKey?: string },
+  keepOpen?: (socket: Socket) => void,
 ): Promise<Decision<unknown>> => {
   const token = options.token?.trim() ?? "";
   if (token.length === 0) {
@@ -810,7 +832,7 @@ const exchangeOperatorRequest = (
   // this client timing out first and reporting a healthy daemon as unauthenticated or as having
   // lost its lock (#609).
   const timeoutMs = options.timeoutMs ?? DEFAULT_OPERATOR_CLIENT_TIMEOUT_MS;
-  return exchangeOneLineRequest(options.socketPath, { token, ...request }, timeoutMs, OPERATOR_EXCHANGE_MESSAGES);
+  return exchangeOneLineRequest(options.socketPath, { token, ...request }, timeoutMs, OPERATOR_EXCHANGE_MESSAGES, keepOpen);
 };
 
 /**

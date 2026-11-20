@@ -64,7 +64,9 @@ interface World {
   /** The daemon's canonical switchovers (canonicalCto.status/rotate): what it recorded, what rotate was asked, and whether its answer is lost. */
   switchovers: Array<{ toSessionUuid: string; state: "PENDING" | "ACKED" }>;
   rotateCalls: Array<{ params: Record<string, unknown>; handoffFile: string | undefined }>;
-  rotate: { answer: "ok" | "lost" | "denied" };
+  rotate: { answer: "ok" | "lost" | "denied" | "competing" };
+  /** The daemon's hold on the project (ctoRefresh.hold): refused because another run holds it, or the connection it is kept on is open. */
+  hold: { refused: boolean; open: boolean; calls: Array<Record<string, unknown>>; released: number };
   /** Interleavings: what another run does to the world right after a process-table reading, or just before the daemon answers a status read. */
   onTable?: () => void;
   onStatus?: () => void;
@@ -139,7 +141,7 @@ const makeWorld = (overrides: Partial<CtoRecord> = {}, env: Record<string, strin
       // The acp-cto relay names the conversation too, but is not the conversation's process.
       { pid: 16970, ppid: CLAUDE, command: `/node agentctl.js attach resident-cto --claimed-session-id ${CONVERSATION} --project-id ${P}` },
     ],
-    openRuns: [], switchovers: [], rotateCalls: [], rotate: { answer: "ok" },
+    openRuns: [], switchovers: [], rotateCalls: [], rotate: { answer: "ok" }, hold: { refused: false, open: false, calls: [], released: 0 },
     record: {
       projectId: P, name: P, retiredAt: null, kind: "resident",
       repositories: [{ repositoryId: "repo_1", identity: `github:${REPO}`, checkoutPath: WORKER }],
@@ -259,6 +261,12 @@ const makeWorld = (overrides: Partial<CtoRecord> = {}, env: Record<string, strin
   w.ports = {
     home: HOME, stateDir: STATE, databasePath: `${STATE}/state.sqlite`, env,
     operator: {
+      hold: async (_method: string, params: Record<string, unknown> = {}) => {
+        w.hold.calls.push(params);
+        if (w.hold.refused) return { decision: deny(ReasonCode.CTO_REFRESH_IN_PROGRESS, "another cto relaunch --fresh holds project e2e-sort-fixture (pid 4242); nothing was changed"), open: () => false, release: () => undefined };
+        w.hold.open = true;
+        return { decision: allow(ReasonCode.OK, { projectId: params["projectId"] }), open: () => w.hold.open, release: () => { w.hold.open = false; w.hold.released++; } };
+      },
       // The daemon: it authenticates every request, answers reads, and replays a mutation's answer for a key it has seen.
       request: async (method: string, params: Record<string, unknown> = {}, idempotencyKey?: string) => {
         if (w.daemonRejects) return deny(ReasonCode.OPERATOR_UNAUTHENTICATED, "operator authentication failed");
@@ -269,6 +277,8 @@ const makeWorld = (overrides: Partial<CtoRecord> = {}, env: Record<string, strin
           w.changes.push(`operator ${method}`);
           w.rotateCalls.push({ params, handoffFile: files.get(`${STATE}/cto-refresh/handoff-${P}.json`) });
           if (w.rotate.answer === "denied") return deny(ReasonCode.CONFLICT, "the switchover is refused");
+          // Another rotate (the owner's own, say) won: its conversation is the one pending, and ours is refused.
+          if (w.rotate.answer === "competing") { w.switchovers.push({ toSessionUuid: "dddddddd-bbbb-4ccc-8ddd-eeeeeeeeeeee", state: "PENDING" }); return deny(ReasonCode.CONFLICT, "a canonical switchover of this project is pending"); }
           w.switchovers.push({ toSessionUuid: params["toSessionUuid"] as string, state: "PENDING" });
           if (w.rotate.answer === "lost") throw new Error("operator socket closed before the answer");
           return allow(ReasonCode.OK, { outcome: "SWITCHOVER_PENDING" });
@@ -994,6 +1004,77 @@ describe("a canonical relaunch resumes the role's bound conversation", () => {
       expect(await runCtoCommand(["relaunch", P, "--fresh", "--apply"], after.ports)).toBe(1);
       expect(mutations(after).filter((c) => !c.startsWith("operator canonicalCto.rotate"))).toEqual([]);
       expect(after.procs.some((p) => p.pid === CLAUDE)).toBe(true);
+    });
+
+    it("takes the daemon's hold first and keeps it for the whole run; a dry run takes none", async () => {
+      const { w } = canonicalWorld();
+      expect(await runCtoCommand(["relaunch", P, "--fresh"], w.ports)).toBe(0);
+      expect(w.hold.calls).toEqual([]);
+      expect(await runCtoCommand(["relaunch", P, "--fresh", "--apply"], w.ports)).toBe(0);
+      expect(w.hold.calls).toEqual([{ projectId: P, holderPid: process.pid }]);
+      expect(w.hold.released).toBe(1);
+    });
+
+    it("refuses when the daemon refuses the hold, and nothing is mutated", async () => {
+      const { w } = canonicalWorld();
+      w.hold.refused = true;
+      expect(await runCtoCommand(["relaunch", P, "--fresh", "--apply"], w.ports)).toBe(2);
+      expect(JSON.stringify(w.out)).toContain("holds project");
+      expect(JSON.stringify(w.out)).toContain(`agentctl cto relaunch ${P} --fresh --apply`);
+      expect(w.changes).toEqual([]);
+      expect(w.rotateCalls).toEqual([]);
+      expect(w.files.has(`${STATE}/cto-refresh/handoff-${P}.json`)).toBe(false);
+    });
+
+    it("a hold lost mid-run aborts before the next mutation and prints the rerun command", async () => {
+      const { w } = canonicalWorld();
+      let fired = false;
+      // The connection closes (the daemon restarted, say) right after the channel step.
+      w.onStatus = () => { if (!fired && w.out.some((l) => l["step"] === "channel" && l["result"])) { fired = true; w.hold.open = false; } };
+      expect(await runCtoCommand(["relaunch", P, "--fresh", "--apply"], w.ports)).toBe(1);
+      expect(fired).toBe(true);
+      expect(mutations(w)).toEqual([]);
+      expect(last(w)).toEqual({ result: "stopped", at: "switchover", rerun: `agentctl cto relaunch ${P} --fresh --apply` });
+    });
+
+    it("(a) a conversation that claims during the launch preflight is not launched a second time", async () => {
+      const { w } = canonicalWorld();
+      w.switchovers = [{ toSessionUuid: U1, state: "PENDING" }];
+      let reads = 0;
+      // The second process-table reading after the stop is the launch's own preflight; U claims right after it.
+      w.onTable = () => { if (w.out.some((l) => l["step"] === "stop" && l["result"]) && ++reads === 2) claimByNew(w, U1); };
+      expect(await runCtoCommand(["relaunch", P, "--fresh", "--apply"], w.ports)).toBe(0);
+      expect(reads).toBeGreaterThanOrEqual(2);
+      expect(w.changes.filter((c) => c.startsWith("tmux new-"))).toEqual([]);
+      expect(handoffFile(w)).toMatchObject({ next: U1, completed: true });
+    });
+
+    it("(b) a swap another run saw through, whose conversation holds the role, is a success for a run that began with the old one", async () => {
+      const { w } = canonicalWorld();
+      let fired = false;
+      w.onStatus = () => {
+        if (fired || !w.out.some((l) => l["step"] === "channel" && l["result"])) return;
+        fired = true;
+        // The other run: prepared U, launched it, saw it claim, and marked the handoff completed.
+        claimByNew(w, U1);
+        w.files.set(`${STATE}/cto-refresh/handoff-${P}.json`, JSON.stringify({ ...handoffFile(w), next: U1, completed: true }));
+      };
+      w.switchovers = [{ toSessionUuid: U1, state: "ACKED" }];
+      expect(await runCtoCommand(["relaunch", P, "--fresh", "--apply"], w.ports)).toBe(0);
+      expect(fired).toBe(true);
+      expect(mutations(w)).toEqual([]);
+      expect(w.record.conversation).toBe(U1);
+    });
+
+    it("(c) the target the daemon's read-back names is the one written down, whoever asked for it", async () => {
+      const { w } = canonicalWorld();
+      const V = "dddddddd-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+      w.rotate.answer = "competing";
+      w.launched.claims = false;
+      expect(await runCtoCommand(["relaunch", P, "--fresh", "--apply"], w.ports)).toBe(1);
+      expect(handoffFile(w).next).toBe(V);
+      const argv = launched(w);
+      expect(argv.slice(argv.indexOf("--session-id"), argv.indexOf("--session-id") + 2)).toEqual(["--session-id", V]);
     });
 
     it("a dry run prints the plan and asks the daemon for nothing but a read", async () => {
