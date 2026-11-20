@@ -8,29 +8,94 @@ import type { QueuedBuzzMessage, SignedEvent } from "./buzz-channel.ts";
 
 /**
  * What a CTO's channel reads from the daemon's own database, read the way the daemon reads it. The channel server holds
- * no credential to the control plane: it opens `state.sqlite` read-only, as the host provisioner does, and writes nothing
- * there (what it learns of delivery goes back through the receipt files).
+ * no credential to the control plane: it opens `state.sqlite` read-only and writes nothing there (what it learns of
+ * delivery goes back through the receipt files).
+ *
+ * It also holds nothing between reads. A deploy stops the daemon and then needs zero processes holding the database, and a
+ * channel server lives as long as its CTO's session, so a handle opened once and kept (the file, its -wal and its -shm)
+ * blocked every deploy while any CTO had a channel. A read opens the database, runs, and closes it in a `finally`.
  */
 export interface DaemonReads {
   get<T>(sql: string, params?: unknown[]): T | undefined;
   all<T>(sql: string, params?: unknown[]): T[];
 }
 
-export const openDaemonReads = (stateDir: string): DaemonReads | null => {
+/** A read-only handle on the daemon's database that exists for one read: whoever opens it closes it. */
+export interface OpenedDaemonDb {
+  readonly reads: DaemonReads;
+  close(): void;
+}
+
+/** Opens the daemon's database read-only, or `null` when it cannot be opened. Injected so a test can count handles. */
+export type DaemonDbOpener = (stateDir: string) => OpenedDaemonDb | null;
+
+export const openDaemonDb: DaemonDbOpener = (stateDir) => {
   try {
     const Database = createRequire(import.meta.url)("better-sqlite3") as new (
       path: string,
       options: { readonly: boolean; fileMustExist: boolean },
-    ) => { prepare(sql: string): { get(...params: unknown[]): unknown; all(...params: unknown[]): unknown[] } };
+    ) => { prepare(sql: string): { get(...params: unknown[]): unknown; all(...params: unknown[]): unknown[] }; close(): void };
     const db = new Database(join(stateDir, "state.sqlite"), { readonly: true, fileMustExist: true });
     return {
-      get: <T>(sql: string, params: unknown[] = []) => db.prepare(sql).get(...params) as T | undefined,
-      all: <T>(sql: string, params: unknown[] = []) => db.prepare(sql).all(...params) as T[],
+      reads: {
+        get: <T>(sql: string, params: unknown[] = []) => db.prepare(sql).get(...params) as T | undefined,
+        all: <T>(sql: string, params: unknown[] = []) => db.prepare(sql).all(...params) as T[],
+      },
+      close: () => db.close(),
     };
   } catch {
     return null;
   }
 };
+
+/**
+ * Runs `read` over the daemon's database opened for it alone, and closes the database again whatever the read does: its
+ * answer, an error it throws (which goes on to the caller) or a close that itself fails (which is not the read's business).
+ * `null` when the database cannot be opened. This is the only place the channel opens the database.
+ */
+export const readDaemonDb = <T>(stateDir: string, read: (db: DaemonReads) => T, open: DaemonDbOpener = openDaemonDb): T | null => {
+  const opened = open(stateDir);
+  if (opened === null) return null;
+  try {
+    return read(opened.reads);
+  } finally {
+    try {
+      opened.close();
+    } catch {
+      /* a handle that will not close has nothing left to read */
+    }
+  }
+};
+
+/** How long the bound CEO's key is remembered, as a value in memory, before the database is asked again. */
+export const CEO_KEY_CACHE_MS = 5_000;
+
+/**
+ * The bound CEO's key as of the last time it was asked, at most five seconds old, and empty (nobody is heard) when the
+ * database cannot be read. The cache is the key itself; no handle is kept to refresh it.
+ */
+export const ceoPubkeyResolver = (
+  stateDir: string,
+  options: { readonly open?: DaemonDbOpener; readonly now?: () => number } = {},
+): (() => readonly string[]) => {
+  const now = options.now ?? Date.now;
+  let askedAt = Number.NEGATIVE_INFINITY;
+  let cached: readonly string[] = [];
+  return () => {
+    const at = now();
+    if (at - askedAt < CEO_KEY_CACHE_MS) return cached;
+    askedAt = at;
+    try {
+      return (cached = readDaemonDb(stateDir, ceoPubkeysFromDb, options.open) ?? []);
+    } catch {
+      return (cached = []);
+    }
+  };
+};
+
+/** The queue's pending messages for this project's CTO, read with the database opened for that one read. */
+export const backlogReader = (stateDir: string, projectId: string, open?: DaemonDbOpener): (() => QueuedBuzzMessage[]) =>
+  () => readDaemonDb(stateDir, (db) => queuedBuzzBacklog(db, projectId), open) ?? [];
 
 /**
  * The bound CEO's Buzz identity, by the daemon's own rule (`resolveCeoBuzzIdentity`): the live CEO session's identity, and
