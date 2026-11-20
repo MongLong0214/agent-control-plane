@@ -38,6 +38,10 @@ import {
   hostSessionRegistryAbsent,
 } from "../../src/registry/canonical-self-claim.ts";
 import { CanonicalSessionRegistry } from "../../src/registry/canonical-session-registry.ts";
+import { createDaemonRefreshSweep } from "../../src/daemon/cto-session-refresh-sweep.ts";
+import {
+  CTO_CONVERSATION_MAX_BYTES, CTO_CONVERSATION_MAX_COMPACTIONS, ctoTranscriptPath, hostStoreFiles, readHandoffRequest, writeHandoff, type ConversationFiles,
+} from "../../src/cto/cto-session-refresh.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 import { bootstrapCtoProvider, makeHarness, registerFixtureProject } from "../helpers/harness.ts";
 import { noOtherCtoProcesses } from "../helpers/cto-process-table.ts";
@@ -267,7 +271,7 @@ const world = async () => {
   return {
     harness, db, projectId, roleKey, registry, configured, oldSessionId, other, claimAs, rotate, take, ledger, holder,
     actorOf, target, status, audits, judge, ceoSays, otherProjectRows, cto, run, newPid: next.pid,
-    reception: () => ({ subscriber, ingress }), closeReception,
+    reception: () => ({ subscriber, ingress }), closeReception, livePid: live.pid,
   };
 };
 type World = Awaited<ReturnType<typeof world>>;
@@ -641,3 +645,134 @@ describe("agentctl canonical-cto", () => {
   });
 });
 
+
+/**
+ * A long CTO conversation is replaced by a fresh one. The daemon's half is what these prove against the real database,
+ * claim and hand-over: a switchover that never claimed is cancellable (and then the old conversation is its role's holder
+ * again), the new conversation's claim carries the queued messages, the doctor names a long conversation at either limit,
+ * and the sweep's candidates and its idleness are read from the daemon's records.
+ */
+describe("a long CTO conversation is replaced by a fresh one: the daemon's half", () => {
+  const HOME = "/home/refresh-test";
+  const transcriptFiles = (path: string, state: { bytes: number; compactions: number; mtimeMs: number }): ConversationFiles => ({
+    stat: (asked) => (asked === path ? { size: state.bytes, mtimeMs: state.mtimeMs } : null),
+    countMarks: (asked) => (asked === path ? state.compactions : null),
+  });
+  const workdirOf = (w: World): string => w.db.get<{ workdir: string }>(`SELECT workdir FROM sessions WHERE session_id = ?`, [w.oldSessionId])!.workdir;
+
+  it("cancels a switchover that never claimed: the old conversation holds the role again, unfenced, and claims at the next generation", async () => {
+    const w = await world();
+    const queued = await w.ceoSays("queued before the refresh");
+    const prepared = pending(w.rotate(NEW, 1));
+    expectUnmoved(w, SessionLifecycle.DRAINING);
+    expect(w.take(w.oldSessionId, 1).claimed).toBeNull();
+
+    const cancelled = w.harness.cp.cto.cancelCanonicalSwitchover({ projectId: w.projectId }, OWNER);
+    expect(cancelled).toMatchObject({ allowed: true, value: { outcome: "SWITCHOVER_CANCELLED", transferId: prepared.transferId, fromSessionUuid: OLD, toSessionUuid: NEW } });
+    // The role is as it was: the old conversation holds the entitlement and the binding, ready, and is handed mail again.
+    expectUnmoved(w, SessionLifecycle.READY);
+    expect(w.db.get(`SELECT claimed_at, revoked_at IS NOT NULL AS revoked FROM canonical_entitlement_transfers WHERE transfer_id = ?`, [prepared.transferId]))
+      .toEqual({ claimed_at: null, revoked: 1 });
+    expect(w.take(w.oldSessionId, 1).claimed?.messageId).toBe(queued);
+    // Nothing pending is left to cancel, and the conversation the cancelled switchover named is not entitled any more.
+    expect(w.harness.cp.cto.cancelCanonicalSwitchover({ projectId: w.projectId }, OWNER)).toMatchObject({ allowed: false, reasonCode: ReasonCode.NOT_FOUND });
+    expect(await w.claimAs(NEW, 2, w.newPid)).toMatchObject({ allowed: false });
+    // The old conversation, relaunched after its process went, is not fenced: it claims the role at the next generation.
+    process.kill(w.livePid, "SIGKILL");
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    const resumed = claimed(await w.claimAs(OLD, 2, w.newPid));
+    expect(w.target(w.actorOf(2)!)?.target_locator).toBe(OLD);
+    expect(resumed.sessionId).not.toBe(w.oldSessionId);
+    // A switchover can be prepared again from it, to a new conversation.
+    expect(w.rotate(SPARE, 2).allowed).toBe(true);
+  });
+
+  it("never cancels a switchover its conversation has claimed", async () => {
+    const w = await world();
+    const prepared = pending(w.rotate(NEW, 1));
+    const incoming = claimed(await w.claimAs(NEW, prepared.toGeneration, w.newPid));
+    expect(w.harness.cp.cto.cancelCanonicalSwitchover({ projectId: w.projectId }, OWNER)).toMatchObject({ allowed: false, reasonCode: ReasonCode.NOT_FOUND });
+    expect(w.registry.effective(w.configured).find((entry) => entry.projectId === w.projectId)?.sessionUuid).toBe(NEW);
+    expect(w.harness.cp.bindings.active(w.roleKey)).toMatchObject({ sessionId: incoming.sessionId, bindingGeneration: 2 });
+    // The old conversation stays a tombstone.
+    expect((await w.claimAs(OLD, 3, 24)).allowed).toBe(false);
+  });
+
+  it("carries the queued peer and owner messages to the new conversation's generation", async () => {
+    const w = await world();
+    const first = await w.ceoSays("queued while the conversation grew long");
+    const second = await w.ceoSays("and a second one");
+    const prepared = pending(w.rotate(NEW, 1));
+    const incoming = claimed(await w.claimAs(NEW, prepared.toGeneration, w.newPid));
+    expect(incoming.carried).toMatchObject({ pendingMessageIds: [first, second], inFlightMessageIds: [] });
+    expect(w.db.all(`SELECT message_id, binding_generation, target_session_id FROM outbox WHERE kind = ? ORDER BY rowid`, [MessageKind.PEER_MESSAGE])).toEqual([
+      { message_id: first, binding_generation: 2, target_session_id: incoming.sessionId },
+      { message_id: second, binding_generation: 2, target_session_id: incoming.sessionId },
+    ]);
+    expect(w.take(incoming.sessionId, 2).claimed?.messageId).toBe(first);
+  });
+
+  it("only the allowlisted CLI owner reaches cancel, with exactly projectId", async () => {
+    const w = await world();
+    const operator = canonicalCtoOperator(w.harness.cp, w.configured);
+    pending(w.rotate(NEW, 1));
+    expect(ownerOnlyCanonicalCtoOperator(w.harness.cp, "someone-else", operator)("cancel", { projectId: w.projectId }, "someone-else"))
+      .toMatchObject({ allowed: false, reasonCode: ReasonCode.INGRESS_ACTOR_NOT_ALLOWLISTED });
+    expect(operator("cancel", { projectId: w.projectId, extra: 1 }, OWNER)).toMatchObject({ allowed: false, reasonCode: ReasonCode.INVALID_ARGUMENT });
+    expect(ownerOnlyCanonicalCtoOperator(w.harness.cp, OWNER, operator)("cancel", { projectId: w.projectId }, OWNER)).toMatchObject({ allowed: true });
+  });
+
+  it("the doctor names a conversation at 20 MB or at three compactions, and no shorter one", async () => {
+    const w = await world();
+    const path = ctoTranscriptPath(HOME, workdirOf(w), OLD);
+    const findings = async (bytes: number, compactions: number) => {
+      w.harness.cp.doctor.useCtoConversations({ files: transcriptFiles(path, { bytes, compactions, mtimeMs: 1 }), home: HOME });
+      return (await w.harness.cp.doctor.run("cto")).findings.filter((finding) => finding.code === "CTO_CONVERSATION_LONG");
+    };
+    expect(await findings(CTO_CONVERSATION_MAX_BYTES - 1, CTO_CONVERSATION_MAX_COMPACTIONS - 1)).toEqual([]);
+    const bytes = await findings(CTO_CONVERSATION_MAX_BYTES, 0);
+    expect(bytes).toEqual([expect.objectContaining({ code: "CTO_CONVERSATION_LONG", severity: "INFO", blocking: false, scope: `project:${w.projectId}` })]);
+    expect(bytes[0]!.observedEvidence).toMatchObject({ conversation: OLD, generation: 1, reasons: ["bytes"], handoff: "not asked" });
+    expect((await findings(10, CTO_CONVERSATION_MAX_COMPACTIONS))[0]!.observedEvidence).toMatchObject({ reasons: ["compactions"], compactions: 3 });
+    expect((await findings(CTO_CONVERSATION_MAX_BYTES + 1, 9))[0]!.observedEvidence).toMatchObject({ reasons: ["bytes", "compactions"] });
+    // A transcript that cannot be read says nothing: unknown is not long.
+    w.harness.cp.doctor.useCtoConversations({ files: { stat: () => null, countMarks: () => null }, home: HOME });
+    expect((await w.harness.cp.doctor.run("cto")).findings.filter((finding) => finding.code === "CTO_CONVERSATION_LONG")).toEqual([]);
+  });
+
+  it("the sweep reads its candidates from the daemon's records: asks a long, idle CTO for a handoff, refreshes once it has one, and never while the CTO owns a run", async () => {
+    const w = await world();
+    const stateDir = tempDir("acp-refresh-sweep-");
+    const now = Date.parse("2026-11-20T12:00:00.000Z");
+    const path = ctoTranscriptPath(HOME, workdirOf(w), OLD);
+    const transcript = { bytes: CTO_CONVERSATION_MAX_BYTES, compactions: 0, mtimeMs: now - 120_000 };
+    const refreshed: string[] = [];
+    let ids = 0;
+    const sweep = createDaemonRefreshSweep(w.harness.cp, {
+      stateDir, env: {}, home: HOME, conversationFiles: transcriptFiles(path, transcript), now: () => now, newId: () => `request-${++ids}`,
+      refresh: async (projectId) => { refreshed.push(projectId); return { ok: true, reason: "" }; },
+    });
+    // The world's other project has no transcript to measure; only this project's verdicts are looked at.
+    const mine = async () => (await sweep.tick()).filter((verdict) => verdict.projectId === w.projectId);
+    // A transcript written ten seconds ago is mid-turn: nothing is asked.
+    transcript.mtimeMs = now - 10_000;
+    expect(await mine()).toEqual([expect.objectContaining({ projectId: w.projectId, action: "waiting-idle" })]);
+    expect(readHandoffRequest(hostStoreFiles, stateDir, w.projectId)).toBeNull();
+    // Quiet for two minutes, but the CTO owns a live run: not idle either.
+    transcript.mtimeMs = now - 120_000;
+    const owned = await w.run(true);
+    expect(owned.dispatched).toMatchObject({ allowed: true });
+    expect(await mine()).toEqual([expect.objectContaining({ action: "waiting-idle", because: expect.stringContaining("live runs") })]);
+    expect(refreshed).toEqual([]);
+    w.harness.cp.runs.cancel(owned.runId, "the test ends the run");
+    // Idle: asked, once, for this conversation and generation.
+    expect(await mine()).toEqual([expect.objectContaining({ action: "asked", requestId: "request-1" })]);
+    expect(readHandoffRequest(hostStoreFiles, stateDir, w.projectId)).toMatchObject({ conversation: OLD, generation: 1, requestId: "request-1" });
+    expect(await mine()).toEqual([expect.objectContaining({ action: "waiting-handoff" })]);
+    // The CTO's handoff arrives: the refresh runs, and the request is cleared.
+    expect(writeHandoff(hostStoreFiles, stateDir, { projectId: w.projectId, generation: 1, conversation: OLD, source: "cto", text: "carry on with the sort fixture", now: new Date(now).toISOString() }).ok).toBe(true);
+    expect(await mine()).toEqual([expect.objectContaining({ action: "refreshed", source: "cto" })]);
+    expect(refreshed).toEqual([w.projectId]);
+    expect(readHandoffRequest(hostStoreFiles, stateDir, w.projectId)).toBeNull();
+  });
+});

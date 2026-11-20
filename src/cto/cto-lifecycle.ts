@@ -18,6 +18,7 @@ import { MessageKind } from "../outbox/envelope.ts";
 import { outboxDeliveryReadback, type Outbox } from "../outbox/outbox.ts";
 import { SELF_CLAIM_EXECUTOR_KIND, defaultProcessAncestryInspector, isAdoptedCanonicalRuntime } from "../registry/canonical-self-claim.ts";
 import { pendingRotationOf, recordCanonicalRotation } from "../registry/canonical-cto-rotation.ts";
+import { CanonicalSessionRegistry } from "../registry/canonical-session-registry.ts";
 import type { ProjectRegistry } from "../registry/project-registry.ts";
 import type { ProviderAdapter, ProviderRegistry, SessionHandle } from "../runtime/provider.ts";
 import { DRIVEN_PRIMARY_CTO_SPAWN_RECORD, type DrivenMode, type ProvisionedSessionRuntime, type SpawnAttestation, drivenModeOf, drivenSpawnRecordOf } from "../runtime/provisioned-session-runtime.ts";
@@ -29,6 +30,11 @@ import type { SessionRecord, SessionRegistry } from "../session/session-registry
 export interface CanonicalSwitchoverPrepared {
   outcome: "SWITCHOVER_PENDING"; transferId: string; projectId: string; actorId: string;
   fromSessionUuid: string; toSessionUuid: string; fromGeneration: number; toGeneration: number;
+}
+
+/** What `cancelCanonicalSwitchover` answers: the switchover that never took effect. */
+export interface CanonicalSwitchoverCancelled {
+  outcome: "SWITCHOVER_CANCELLED"; transferId: string; projectId: string; fromSessionUuid: string; toSessionUuid: string;
 }
 
 /** PRD §10.2 — the mandatory contents of a handoff package. */
@@ -844,6 +850,38 @@ export class CtoLifecycle {
       return allow(ReasonCode.OK, {
         outcome: "SWITCHOVER_PENDING" as const, transferId: transfer.transferId, projectId, actorId: rotation.actorId,
         fromSessionUuid: transfer.fromSessionUuid, toSessionUuid, fromGeneration: rotation.fromGeneration, toGeneration: rotation.toGeneration,
+      });
+    });
+  }
+
+  /**
+   * Cancels the project's PENDING canonical switchover, one whose conversation has not claimed: the transfer is revoked
+   * unclaimed (`CanonicalSessionRegistry.cancel`), the outgoing conversation is the project's holder again and is no
+   * longer fenced (`switchoverPreparedFrom`), and its session leaves DRAINING if it still sits there. This is the one
+   * way back from `prepareCanonicalSwitchover`, and only before the named conversation claims: a claimed switchover
+   * is never rolled back. A CTO session refresh whose new conversation failed to start uses it to resume the old one.
+   */
+  cancelCanonicalSwitchover(request: { projectId: string }, requestedBy: string): Decision<CanonicalSwitchoverCancelled> {
+    const { projectId } = request;
+    if (typeof projectId !== "string" || projectId.length === 0) return deny(ReasonCode.INVALID_ARGUMENT, "projectId is required", {});
+    const roleKey = roleKeyFor(Role.PRIMARY_CTO, { projectId });
+    return this.db.txDecision((): Decision<CanonicalSwitchoverCancelled> => {
+      const pending = pendingRotationOf(this.db, projectId);
+      if (pending === null) return deny(ReasonCode.NOT_FOUND, "this project has no pending canonical switchover to cancel", { projectId });
+      const cancelled = new CanonicalSessionRegistry(this.db).cancel(projectId, pending.transfer.transferId, this.clock.nowIso());
+      if (!cancelled.allowed) return cancelled as Decision<never>;
+      const outgoing = this.sessions.get(pending.rotation.fromSessionId);
+      if (outgoing?.lifecycle === SessionLifecycle.DRAINING) {
+        const ready = this.sessions.transition(outgoing.sessionId, SessionLifecycle.READY, "canonical switchover cancelled");
+        if (!ready.allowed) return ready as Decision<never>;
+      }
+      this.audit.record({
+        kind: "HANDOFF_SUBMITTED", projectId, sessionId: pending.rotation.fromSessionId, roleKey, actor: requestedBy,
+        evidence: { transferId: pending.transfer.transferId, cancelled: true, toSessionUuid: pending.transfer.toSessionUuid },
+      });
+      return allow(ReasonCode.OK, {
+        outcome: "SWITCHOVER_CANCELLED" as const, transferId: pending.transfer.transferId, projectId,
+        fromSessionUuid: pending.transfer.fromSessionUuid, toSessionUuid: pending.transfer.toSessionUuid,
       });
     });
   }

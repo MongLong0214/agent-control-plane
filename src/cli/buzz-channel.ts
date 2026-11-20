@@ -14,6 +14,7 @@ import {
   trimChannelReceipts,
 } from "../buzz/buzz-channel-files.ts";
 import { loadBuzzSubscriberKey, readBuzzSubscriberConfig } from "../buzz/buzz-mention-subscriber.ts";
+import { createSystemRequestWatcher } from "../buzz/buzz-channel-system-request.ts";
 
 /**
  * A CTO session's Buzz channel, as the stdio MCP server Claude Code spawns for it.
@@ -126,10 +127,14 @@ export const runBuzzChannel = async (argv: readonly string[]): Promise<number> =
 
   await server.connect(new StdioServerTransport());
   relay.start();
+  // ACP's own request (a long conversation's handoff) is shown here, once per request, from a file the daemon writes.
+  const requests = createSystemRequestWatcher({ stateDir: args.stateDir, projectId: args.projectId, emit: (n) => emitChannelNotification(server, n), onDiagnostic: log });
+  requests.start();
   await new Promise<void>((resolve) => {
     server.onclose = () => resolve();
     process.stdin.once("close", () => resolve());
   });
+  requests.stop();
   relay.close();
   return 0;
 };

@@ -1,6 +1,6 @@
 ---
-description: List, add, relaunch or retire an ACP project CTO with agentctl cto (a dry run unless --apply)
-argument-hint: list | add <project> [--repo <owner/name>] [--canonical] | relaunch <project> | retire <project> --reason <text> [--delete-repo --yes-delete-repo <owner/name>] [--apply]
+description: List, add, relaunch, refresh or retire an ACP project CTO with agentctl cto (a dry run unless --apply)
+argument-hint: list | add <project> [--repo <owner/name>] [--canonical] | relaunch <project> | refresh <project> | retire <project> --reason <text> [--delete-repo --yes-delete-repo <owner/name>] [--apply]
 allowed-tools: Bash
 ---
 Operator only: install this where the operator works, never where a project CTO runs.

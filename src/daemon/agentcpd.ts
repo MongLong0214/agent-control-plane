@@ -4,6 +4,7 @@ import { MAX_MCP_LINE_BYTES } from "../core/mcp-limits.ts";
 import { recordBootstrapServingRuntime } from "../bootstrap/bootstrap-runtime-observation.ts";
 import { readBuzzSubscriberConfig } from '../buzz/buzz-mention-subscriber.ts';
 import { CanonicalSessionRegistry } from '../registry/canonical-session-registry.ts';
+import { createDaemonRefreshSweep, startCtoRefreshSweep } from "./cto-session-refresh-sweep.ts";
 import { canonicalCtoRotations, drainingRotationFor, inFlightFromPreviousHolder, liveRunIdsOwnedBySession } from "../registry/canonical-cto-rotation.ts";
 import { outboxDeliveryReadback, type OutboxMessage } from "../outbox/outbox.ts";
 import type { CeoNoticeAttempt } from "../outbox/ceo-notification-route.ts";
@@ -853,7 +854,7 @@ export interface LocalOperatorSocketOptions {
   /** Server-configured actor predicate; checked before reading request parameters. */
   adoptHermesIncumbentOwnerAllowed?: () => boolean;
   /**
-   * v58 — `canonicalCto.rotate` and `canonicalCto.status`. Composed by `startDaemonOperatorSocket` behind the
+   * v58 — `canonicalCto.rotate`, `canonicalCto.status` and `canonicalCto.cancel`. Composed by `startDaemonOperatorSocket` behind the
    * server-configured CLI owner allowlist; absent on a parked daemon.
    */
   canonicalCto?: CanonicalCtoOperator;
@@ -3264,7 +3265,9 @@ export const assertCanonicalRoomsAreSubscribed = (
 
 export const CANONICAL_CTO_ROTATE_METHOD = "canonicalCto.rotate";
 export const CANONICAL_CTO_STATUS_METHOD = "canonicalCto.status";
-export type CanonicalCtoOperator = (method: "rotate" | "status", params: Record<string, unknown>, actor: string) => Decision<unknown>;
+/** Cancels a switchover that is still pending (its conversation has not claimed); a CTO session refresh's way back. */
+export const CANONICAL_CTO_CANCEL_METHOD = "canonicalCto.cancel";
+export type CanonicalCtoOperator = (method: "rotate" | "status" | "cancel", params: Record<string, unknown>, actor: string) => Decision<unknown>;
 
 /** `operator` for the server-configured CLI owner only; every other authenticated operator is refused before params are read. */
 export const ownerOnlyCanonicalCtoOperator = (
@@ -3313,6 +3316,10 @@ export const canonicalCtoOperator = (
       projectId, toSessionUuid: params["toSessionUuid"], expectedGeneration: params["expectedGeneration"],
       ...(handoff === undefined ? {} : { handoff: handoff as HandoffPackage }),
     }, actor);
+  }
+  if (method === "cancel") {
+    if (Object.keys(params).length !== 1) return deny(ReasonCode.INVALID_ARGUMENT, "cancel takes exactly projectId", {});
+    return cp.cto.cancelCanonicalSwitchover({ projectId }, actor);
   }
   if (Object.keys(params).length !== 1) return deny(ReasonCode.INVALID_ARGUMENT, "status takes exactly projectId", {});
   const holder = new CanonicalSessionRegistry(cp.db).holder(projectId);
@@ -4353,7 +4360,7 @@ const serveOperatorRequest = (
         });
         return;
       }
-      if (method === CANONICAL_CTO_ROTATE_METHOD || method === CANONICAL_CTO_STATUS_METHOD) {
+      if (method === CANONICAL_CTO_ROTATE_METHOD || method === CANONICAL_CTO_STATUS_METHOD || method === CANONICAL_CTO_CANCEL_METHOD) {
         if (!options.canonicalCto) {
           return finish(deny(ReasonCode.OPERATOR_METHOD_NOT_ALLOWED, "canonical CTO rotation is not enabled on this socket", {}));
         }
@@ -4363,7 +4370,8 @@ const serveOperatorRequest = (
         const params = operatorRequestParams(value);
         if (!params) return finish(deny(ReasonCode.INVALID_ARGUMENT, "canonical CTO parameters are invalid", {}));
         try {
-          return finish(options.canonicalCto(method === CANONICAL_CTO_ROTATE_METHOD ? "rotate" : "status", params, peer.value.actor));
+          return finish(options.canonicalCto(
+            method === CANONICAL_CTO_ROTATE_METHOD ? "rotate" : method === CANONICAL_CTO_CANCEL_METHOD ? "cancel" : "status", params, peer.value.actor));
         } catch (error) {
           return finish(deny(ReasonCode.INTERNAL_ERROR, "canonical CTO request failed", {
             error: error instanceof Error ? error.message : String(error),
@@ -6607,6 +6615,7 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
   let canonicalSelfClaim: CanonicalSelfClaimListener | null = null;
   let adoptedCeoTools: CanonicalSelfClaimListener | null = null;
   let hermesAutoAdoptionTimer: NodeJS.Timeout | null = null;
+  let ctoRefreshTimer: NodeJS.Timeout | null = null;
   let hermesBootstrap: HermesBootstrapAuthority | null = null;
   let telegram: TelegramLongPollListener | null = null;
   let telegramExternal: LocalTelegramExternalIngress | null = null;
@@ -6622,6 +6631,7 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
     shuttingDown = (async () => {
     process.stdout.write(`\nshutting down on ${signal}\n`);
     if (hermesAutoAdoptionTimer) clearInterval(hermesAutoAdoptionTimer);
+    if (ctoRefreshTimer) clearInterval(ctoRefreshTimer);
     await telegram?.close();
     ownerReplies?.close();
     peerMessageNotices?.close();
@@ -7025,8 +7035,15 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
     // The last statement of startup, after every step that can still refuse it (PR1060-FU-01): the
     // subscriber is decided, its rooms are checked, and only now may a claim or correction open a room.
     settleCanonicalRooms();
+    // A CTO whose conversation has grown long is replaced by a fresh one (owner directive 2026-11-20); the sweep only decides and
+    // asks, and runs `agentctl cto refresh` as a child for the one place that stops and starts a CTO.
+    ctoRefreshTimer = startCtoRefreshSweep(
+      createDaemonRefreshSweep(cp, { stateDir, env: process.env }),
+      (line) => process.stdout.write(`${JSON.stringify(line)}\n`),
+    );
   } catch (err) {
     if (hermesAutoAdoptionTimer) clearInterval(hermesAutoAdoptionTimer);
+    if (ctoRefreshTimer) clearInterval(ctoRefreshTimer);
     await telegram?.close();
     await telegramExternal?.close();
     // Both Buzz listeners, which this teardown used to walk past: a startup that failed after

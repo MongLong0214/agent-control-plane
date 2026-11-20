@@ -143,12 +143,15 @@ export const carriedMessagesOf = (db: Pick<Db, "all">, roleKey: string): Canonic
 /**
  * Whether a switchover was ever prepared from `sessionUuid`, the project's conversation: from then on it is fenced
  * for good. While its switchover is pending it keeps its binding (draining) but claims nothing, so it is never
- * re-activated by a relaunch; once acknowledged it is a tombstone. No path restores it.
+ * re-activated by a relaunch; once acknowledged it is a tombstone. The one thing that lifts it is a switchover that
+ * was cancelled before its conversation ever claimed (`cancelCanonicalSwitchover`): that transfer never took effect,
+ * the conversation is still the project's holder, and a refresh whose new conversation failed to start resumes it.
  */
 export const switchoverPreparedFrom = (db: Pick<Db, "get">, projectId: string, sessionUuid: string): string | null =>
   db.get<{ transfer_id: string }>(
     `SELECT t.transfer_id FROM canonical_entitlement_transfers t JOIN canonical_cto_rotations r ON r.transfer_id = t.transfer_id
-      WHERE t.project_id = ? AND t.from_session_uuid = ? ORDER BY t.created_at, t.transfer_id LIMIT 1`,
+      WHERE t.project_id = ? AND t.from_session_uuid = ? AND NOT (t.claimed_at IS NULL AND t.revoked_at IS NOT NULL)
+      ORDER BY t.created_at, t.transfer_id LIMIT 1`,
     [projectId, sessionUuid],
   )?.transfer_id ?? null;
 

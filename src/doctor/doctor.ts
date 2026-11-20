@@ -2,7 +2,7 @@ import { execFile } from "node:child_process";
 import { accessSync, constants, existsSync, statSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { promisify } from "node:util";
-import { totalmem } from "node:os";
+import { homedir, totalmem } from "node:os";
 
 import type { Clock } from "../core/clock.ts";
 import { type Decision, allow, deny } from "../core/errors.ts";
@@ -25,6 +25,10 @@ import { contractChangeRunsWithoutGrant } from "../registry/manifest-activation-
 import { inspectDatabaseStatePaths, inspectPrivatePath } from "../db/state-preflight.ts";
 import { probeSessionLiveness } from "../daemon/dead-binding-recovery.ts";
 import { RoleScopeUnreadable, type CtoProcessReader, ctoProcessesFor, ctoRoleScope, snapshotCtoProcesses, systemCtoProcessReader } from "../cto/one-cto-per-project.ts";
+import {
+  createConversationMeter, ctoTranscriptPath, hostStoreFiles, longReasons, readHandoff, readHandoffRequest, readRefreshFailure, refreshLimitsFromEnv, retryNotBefore,
+  type ConversationFiles, type ConversationMeasure,
+} from "../cto/cto-session-refresh.ts";
 import { Role, RunState, SessionLifecycle, roleKeyFor } from "../domain/types.ts";
 import type { GitHubKernel } from "../github/github-kernel.ts";
 import { git, isClean, tryRevParse } from "../git/git.ts";
@@ -552,6 +556,13 @@ export class Doctor {
     this.#ctoProcessReader = reader;
   }
 
+  /** Where CTO conversations are measured: the real transcripts under the home folder unless a test says otherwise. */
+  #conversations: { meter: { measure(path: string): ConversationMeasure | null }; home: string } = { meter: createConversationMeter(), home: homedir() };
+
+  useCtoConversations(input: { files: ConversationFiles; home: string }): void {
+    this.#conversations = { meter: createConversationMeter(input.files), home: input.home };
+  }
+
   async run(
     scope: DoctorScope = "system",
     target?: string,
@@ -571,6 +582,7 @@ export class Doctor {
     if (scope === "system" || scope === "cto" || scope === "project") {
       findings.push(...this.checkBindings(target ?? null, scope));
       findings.push(...(await this.checkOneCtoPerProject(target ?? null)));
+      findings.push(...this.checkCtoConversationsLong(target ?? null));
     }
     if (scope === "system" || scope === "run") {
       findings.push(...this.checkRuns(target ?? null));
@@ -751,6 +763,53 @@ export class Doctor {
         confidence: "HIGH",
         observedEvidence: { processes },
         recommendedAction: "nothing is requested of anyone: more than one live claude process resumes this project's CTO conversation, sits in its checkout or is its bound session; which one stays is an open decision",
+      });
+    }
+    return findings;
+  }
+
+  /**
+   * A CTO whose conversation has grown long: its transcript is at least 20 MB, or it was compacted at least three times.
+   * The daemon replaces such a conversation with a fresh one when its CTO is idle (`src/daemon/cto-session-refresh-sweep.ts`),
+   * so this is a notice about a role that is waiting for that, or that failed at it; never blocking, since a long conversation
+   * is a cost and not an outage. A transcript that cannot be read says nothing: unknown is not long.
+   */
+  private checkCtoConversationsLong(projectId: string | null): Finding[] {
+    const findings: Finding[] = [];
+    const limits = refreshLimitsFromEnv(process.env);
+    const stateDir = join(this.statePaths.databasePath, "..");
+    for (const project of this.projectsCovered(projectId)) {
+      if (project.retiredAt !== null) continue;
+      const binding = this.bindings.activePrimaryCto(project.projectId);
+      const session = binding ? this.sessions.get(binding.sessionId) : null;
+      if (!binding || !session?.workdir) continue;
+      const conversation = this.db.get<{ target_locator: string }>(
+        `SELECT tb.target_locator FROM actor_target_bindings tb JOIN assignments a ON a.actor_id = tb.target_actor_id
+          WHERE a.role_key = ? AND a.status = 'ACTIVE' AND a.binding_generation = ?`, [binding.roleKey, binding.bindingGeneration])?.target_locator;
+      if (!conversation) continue;
+      const measure = this.#conversations.meter.measure(ctoTranscriptPath(this.#conversations.home, session.workdir, conversation));
+      if (measure === null) continue;
+      const reasons = longReasons(measure, limits);
+      if (reasons.length === 0) continue;
+      const failure = readRefreshFailure(hostStoreFiles, stateDir, project.projectId);
+      const handoff = readHandoff(hostStoreFiles, stateDir, project.projectId, binding.bindingGeneration);
+      const request = readHandoffRequest(hostStoreFiles, stateDir, project.projectId);
+      findings.push({
+        code: "CTO_CONVERSATION_LONG",
+        severity: failure === null ? "INFO" : "WARN",
+        scope: `project:${project.projectId}`,
+        blocking: false,
+        confidence: "HIGH",
+        observedEvidence: {
+          conversation, generation: binding.bindingGeneration, bytes: measure.bytes, compactions: measure.compactions, reasons,
+          limits: { maxBytes: limits.maxBytes, maxCompactions: limits.maxCompactions },
+          handoff: handoff === null ? (request?.conversation === conversation && request.generation === binding.bindingGeneration ? "asked" : "not asked") : handoff.source,
+          ...(failure === null ? {} : { refreshFailures: failure.failures, lastRefreshFailure: failure.lastReason, lastRefreshFailureAt: failure.lastFailureAt,
+            retryAfter: new Date(retryNotBefore(failure)).toISOString() }),
+        },
+        recommendedAction: failure === null
+          ? "nothing is requested of anyone: ACP asks this CTO for a handoff and replaces the conversation with a fresh one when the CTO is idle, owns no live run and its transcript has been quiet for a minute; agentctl cto refresh <project> --apply does it now"
+          : "ACP tried to replace this CTO's conversation and could not (lastRefreshFailure); the previous conversation was resumed, and ACP tries again after the retry time; agentctl cto refresh <project> --apply tries now and says why it stops",
       });
     }
     return findings;

@@ -45,7 +45,7 @@ const USAGE = `agentctl — Agent Control Plane operator CLI
   agentctl project retire <id> <reason>    retire a project, preserving history
   agentctl project list                   list projects with derived activity and CI observations
   agentctl cto list                       every CTO: generation, live session, channel, room, last Buzz
-  agentctl cto add|relaunch|retire <project> ...
+  agentctl cto add|relaunch|refresh|retire <project> ...
                                            one command per CTO lifecycle step, composed from the ones
                                            below; prints its plan and changes nothing without --apply
                                            (operator only). agentctl cto help for the arguments
