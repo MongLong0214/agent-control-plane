@@ -5,12 +5,16 @@ import { afterAll, describe, expect, it, vi } from "vitest";
 import { main } from "../../src/cli/agentctl.ts";
 import {
   CTO_SUBCOMMANDS, IDLE_SECONDS, checkoutHeldWork, hostRunner, runCtoCommand, workerHeldWork,
-  type CtoExec, type CtoExecOptions, type CtoExecResult, type CtoPorts, type CtoProcess, type CtoRecord,
+  type CtoExec, type CtoExecOptions, type CtoExecResult, type CtoPorts, type CtoRecord,
 } from "../../src/cli/cto-command.ts";
 import { allow, deny, type Decision } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { createCtoMcpPort, createCtoServer } from "../../src/mcp/cto-server.ts";
-import { CHANNEL_REGISTERED_LINE } from "../../src/runtime/cto-channel-launch.ts";
+import { CHANNEL_REGISTERED_LINE, DEV_CHANNELS_WARNING } from "../../src/runtime/cto-channel-launch.ts";
+import type { CtoProcessReader, CtoRoleScope } from "../../src/cto/one-cto-per-project.ts";
+
+/** A process of the fake host: its kernel argv (else its command split on spaces) and its working directory. */
+interface FakeProcess { pid: number; ppid: number; command: string; argv?: string[]; cwd?: string }
 import { formatHostProvisionerReason, hostProvisionerReason, hostReasonKind, hostRefusalText } from "../../src/runtime/host-provisioner-reason.ts";
 import { cleanupTempDirs, commitAll, gitSync, tempDir } from "../helpers/fixtures.ts";
 import { realpathSync, rmSync, writeFileSync } from "node:fs";
@@ -57,7 +61,7 @@ interface World {
   ran: string[];
   record: CtoRecord;
   files: Map<string, string>;
-  procs: CtoProcess[];
+  procs: FakeProcess[];
   tmux: Set<string>;
   repo: { exists: boolean };
   /** What the primary clone answers about the worker's commits: a commit no remote-tracking branch has, or a fetch that fails. */
@@ -81,6 +85,27 @@ interface World {
   panes: Map<number, string>;
   /** The launcher tmux last started, and whether the conversation it resumes claims the role. */
   launched: { command: string | null; claims: boolean };
+  /** The launch's pane: the registered line; the warning and then a backlog flood that scrolls that line away; or still loading. */
+  pane: "registered" | "flood" | "loading";
+  /** The old channel process appends a receipt (a later time, no launch id) while the launch asks tmux for its session. */
+  oldReceiptDuringLaunch: boolean;
+  /** Pids alive in the kernel that `ps` does not list (a process table that could not be read whole). */
+  hiddenFromPs: Set<number>;
+  /** `ps` cannot be spawned at all. */
+  psFails: boolean;
+  /** Earlier conversations of the role, as the database's role scope lists them. */
+  roleConversations: string[];
+  /** Pids whose native start token cannot be read although they run. */
+  tokenUnavailable: Set<number>;
+  /** Pids that outlive SIGTERM. */
+  survivesSigterm: Set<number>;
+  /** Pids whose token read answers null this many times once they have been signalled. */
+  tokenGlitchAfterSignal: Map<number, number>;
+  signalled: Set<number>;
+  /** The shared reader's alive() answers false for every pid: the old reading of `ps -o stat= -p` exiting 1. */
+  psStatFails: boolean;
+  /** Per pid, what each token read answers once the plan's first step has reported: by read number, from 1. */
+  tokenAfterIdle: Map<number, (read: number) => string | null>;
 }
 
 const results = (w: World): Array<[string, string]> => w.out.filter((l) => typeof l["result"] === "string" && typeof l["step"] === "string").map((l) => [l["step"] as string, l["result"] as string]);
@@ -97,7 +122,9 @@ const makeWorld = (overrides: Partial<CtoRecord> = {}, env: Record<string, strin
   const w = {
     out: [], changes: [], ran: [], files, mtimes, tmux: new Set([TMUX]), repo: { exists: true }, worker: { unpublished: false, fetchFails: false }, operatorAnswers: [], provisionerAnswers: [],
     dirty: new Set<string>(), archiveUnpublished: false, daemonRejects: false, retireExecutions: 0, rotateRuns: [],
-    argv: new Map<number, string[]>(), panes: new Map([[100, TMUX]]), launched: { command: null, claims: true },
+    argv: new Map<number, string[]>(), panes: new Map([[100, TMUX]]), launched: { command: null, claims: true }, pane: "registered", oldReceiptDuringLaunch: false, hiddenFromPs: new Set<number>(), psFails: false, roleConversations: [],
+    tokenUnavailable: new Set<number>(), survivesSigterm: new Set<number>(), tokenGlitchAfterSignal: new Map<number, number>(), signalled: new Set<number>(),
+    psStatFails: false, tokenAfterIdle: new Map<number, (read: number) => string | null>(),
     procs: [
       { pid: 100, ppid: 1, command: "/bin/sh /state/resident-e2e-sort-fixture.sh" },
       { pid: CLAUDE, ppid: 100, command: `/bin/claude --model opus ${CHANNEL} --resume ${CONVERSATION} --name e2e CTO` },
@@ -128,6 +155,7 @@ const makeWorld = (overrides: Partial<CtoRecord> = {}, env: Record<string, strin
     return allow(ReasonCode.OK, { projectId: P });
   };
   const daemonCache = new Map<string, Decision<unknown>>();
+  const tokenReads = new Map<number, number>();
   const tempRefs = new Set<string>();
   let clock = NOW;
   let uuids = 0;
@@ -142,13 +170,30 @@ const makeWorld = (overrides: Partial<CtoRecord> = {}, env: Record<string, strin
       if (args[0] === "new-session") w.tmux.add(args[args.indexOf("-s") + 1]!);
       w.launched.command = args[args.length - 1]!;
       w.procs.push({ pid: 30000, ppid: 1, command: `${LOCAL_CLAUDE} --mcp-config {} ${CHANNEL} --resume ${w.record.conversation}` });
-      if (w.launched.claims) w.record = { ...w.record, generation: 4, session: { pid: 30000, startedAt: "t3", workdir: null } };
+      if (w.launched.claims) w.record = { ...w.record, generation: 4, session: { pid: 30000, startedAt: "start-30000", workdir: null } };
       return answer(0, "%9\n");
     }
     if (bin === "tmux" && args[0] === "display-message") return answer(0, args[4] === "#{pane_id}" ? "%9\n" : `${w.launched.command}\n`);
-    if (bin === "tmux" && args[0] === "capture-pane") return answer(0, `${CHANNEL_REGISTERED_LINE}\n`);
+    if (bin === "tmux" && args[0] === "capture-pane") {
+      if (w.pane === "registered") return answer(0, `${CHANNEL_REGISTERED_LINE}\n`);
+      if (w.pane === "loading") return answer(0, "Loading...\n");
+      return answer(0, w.changes.includes("tmux send-keys -t %9 Enter") ? `${Array.from({ length: 40 }, (_, i) => `← acp-buzz-channel: backlog ${i}`).join("\n")}\n` : `${DEV_CHANNELS_WARNING}\n`);
+    }
+    if (bin === "tmux" && args[0] === "send-keys") {
+      w.changes.push(line);
+      // This launch's channel delivers its backlog into the session and appends emitted receipts carrying its launch id.
+      const launchId = /\\?"--launch-id\\?",\\?"([^"\\]+)/.exec(files.get(w.launched.command ?? "") ?? "")?.[1];
+      files.set(`${STATE}/buzz-channel/${P}.receipts.jsonl`, `${JSON.stringify({ type: "emitted", eventId: "e1", room: ROOM, senderPubkey: "p", emittedAt: 1, ...(launchId ? { launchId } : {}) })}\n`);
+      return answer(0);
+    }
     if (bin === LOCAL_CLAUDE && args[0] === "mcp") { w.changes.push(line); return answer(args[1] === "remove" ? 1 : 0); }
-    if (bin === "tmux" && args[0] === "has-session") return answer(w.tmux.has(args[2]!.slice(1)) ? 0 : 1);
+    if (bin === "tmux" && args[0] === "has-session") {
+      if (w.oldReceiptDuringLaunch) {
+        const file = `${STATE}/buzz-channel/${P}.receipts.jsonl`;
+        files.set(file, `${files.get(file) ?? ""}${JSON.stringify({ type: "emitted", eventId: "old", room: ROOM, senderPubkey: "p", emittedAt: 9_999_999_999 })}\n`);
+      }
+      return answer(w.tmux.has(args[2]!.slice(1)) ? 0 : 1);
+    }
     if (bin === "tmux" && args[0] === "kill-session") { w.changes.push(line); w.tmux.delete(args[2]!.slice(1)); return answer(0); }
     if (bin === "git" && args[2] === "status") return answer(0, w.dirty.has(args[1]!) ? "?? scratch.txt\n" : "");
     if (bin === "git" && args[2] === "log") return answer(0, "");
@@ -213,18 +258,53 @@ const makeWorld = (overrides: Partial<CtoRecord> = {}, env: Record<string, strin
         return answered;
       },
     },
-    state: { projects: () => (w.record.retiredAt ? [] : [structuredClone(w.record)]), project: (id: string) => (id === P ? structuredClone(w.record) : null) },
+    state: {
+      projects: () => (w.record.retiredAt ? [] : [structuredClone(w.record)]),
+      project: (id: string) => (id === P ? structuredClone(w.record) : null),
+      // The shared rule's scope as the database gives it: the role's conversations, its live checkouts, its bound process.
+      roleScope: (id: string, extra: { conversationIds?: readonly string[]; checkouts?: readonly string[] } = {}): CtoRoleScope => ({
+        projectId: id,
+        conversationIds: [...new Set([...(w.record.conversation ? [w.record.conversation] : []), ...w.roleConversations, ...(extra.conversationIds ?? [])])],
+        checkouts: [...new Set([...w.record.repositories.map((r) => r.checkoutPath), ...(extra.checkouts ?? [])])],
+        bound: w.record.generation !== null && w.record.session?.pid ? [{ pid: w.record.session.pid, startedAt: w.record.session.startedAt }] : [],
+      }),
+    },
     run: subprocess,
-    processes: () => w.procs.slice(),
-    startToken: (pid: number) => (w.procs.some((p) => p.pid === pid) ? `start-${pid}` : null),
+    // The shared one-CTO reader: the kernel's argv, the table ps gives (this test process included), working directories.
+    ctoProcesses: {
+      table: async () => {
+        if (w.psFails) throw Object.assign(new Error("spawn /bin/ps ENOENT"), { code: "ENOENT" });
+        return [{ pid: process.pid, ppid: 1, uid: process.getuid?.() ?? 0, startedAt: "Fri Jan  1 00:00:00 2027", command: "node vitest" },
+          ...w.procs.filter((p) => !w.hiddenFromPs.has(p.pid)).map((p) => ({ pid: p.pid, ppid: p.ppid, uid: process.getuid?.() ?? 0, startedAt: `lstart-${p.pid}`, command: p.command }))];
+      },
+      argv: (pid: number) => { const p = w.procs.find((x) => x.pid === pid); return p ? (p.argv ?? p.command.split(" ")) : null; },
+      cwds: async (pids: readonly number[]) => new Map(pids.flatMap((pid) => { const p = w.procs.find((x) => x.pid === pid); return p ? [[pid, p.cwd ?? "/"] as [number, string]] : []; })),
+      tmuxPanes: async () => new Map(w.panes),
+      alive: (pid: number) => !w.psStatFails && w.procs.some((p) => p.pid === pid),
+      startToken: (pid: number) => (w.procs.some((p) => p.pid === pid) ? `start-${pid}` : null),
+    } satisfies CtoProcessReader,
+    // The kernel: a pid it no longer has (kill(pid, 0) would throw ESRCH).
+    kernelGone: (pid: number) => !w.procs.some((p) => p.pid === pid),
+    startToken: (pid: number) => {
+      if (!w.procs.some((p) => p.pid === pid) || w.tokenUnavailable.has(pid)) return null;
+      const script = w.tokenAfterIdle.get(pid);
+      if (script && w.out.some((l) => l["step"] === "idle" && l["result"] === "done")) {
+        tokenReads.set(pid, (tokenReads.get(pid) ?? 0) + 1);
+        return script(tokenReads.get(pid)!);
+      }
+      const glitches = w.signalled.has(pid) ? w.tokenGlitchAfterSignal.get(pid) ?? 0 : 0;
+      if (glitches > 0) { w.tokenGlitchAfterSignal.set(pid, glitches - 1); return null; }
+      return `start-${pid}`;
+    },
     signal: (pid: number) => {
       w.changes.push(`SIGTERM ${pid}`);
+      w.signalled.add(pid);
+      if (w.survivesSigterm.has(pid)) return;
       w.procs = w.procs.filter((p) => p.pid !== pid && p.ppid !== pid);
       // A pane whose own process was claude ends with it, and so does its session.
       const session = w.panes.get(pid);
       if (session) { w.panes.delete(pid); w.tmux.delete(session); }
     },
-    argv: (pid: number) => w.argv.get(pid) ?? null,
     files: {
       exists,
       read: (path: string) => { const body = files.get(path); if (body === undefined) throw new Error(`ENOENT ${path}`); return body; },
@@ -582,17 +662,17 @@ describe("review r3: temporary refs that cannot be cleared", () => {
 
 /** Owner requirement R1 (#1437): one long-lived conversation per project is its PRIMARY_CTO, so a canonical CTO is resumed, never rotated. */
 describe("a canonical relaunch resumes the role's bound conversation", () => {
-  /** Logic Pro MCP's shape: its claude is the tmux pane's own process, it runs without the channel, and its role is unbound. */
+  /** Logic Pro MCP's shape: its claude is the tmux pane's own process, it runs without the channel, and its role is bound to it. */
   const canonicalWorld = (options: { trusted?: boolean; conversation?: string | null } = {}): { w: World; cwd: string } => {
     const cwd = realpathSync(tempDir("acp-cto-canonical-"));
     const config = tempDir("acp-cto-claude-config-");
     writeFileSync(join(config, ".claude.json"), JSON.stringify({ projects: options.trusted === false ? {} : { [cwd]: { hasTrustDialogAccepted: true } } }));
-    const w = makeWorld({ kind: "canonical", resident: null, generation: null, session: null, conversation: options.conversation === undefined ? CONVERSATION : options.conversation,
+    const w = makeWorld({ kind: "canonical", resident: null, generation: 3, session: { pid: CLAUDE, startedAt: `start-${CLAUDE}`, workdir: cwd },
+      conversation: options.conversation === undefined ? CONVERSATION : options.conversation,
       repositories: [{ repositoryId: "repo_1", identity: `github:${REPO}`, checkoutPath: cwd }] }, { ACP_OPERATOR_TOKEN: "operator-test-credential", CLAUDE_CONFIG_DIR: config });
     const argv = [LOCAL_CLAUDE, "--resume", CONVERSATION, "--model", "claude-opus-5-5", "--effort", "medium", "--name", "Logic CTO",
       "--remote-control", "Logic CTO", "--permission-mode", "bypassPermissions", "--mcp-config", "/x/canonical-mcp.json"];
-    w.procs = [{ pid: CLAUDE, ppid: 1, command: argv.join(" ") }];
-    w.argv.set(CLAUDE, argv);
+    w.procs = [{ pid: CLAUDE, ppid: 1, command: argv.join(" "), argv }];
     w.panes = new Map([[CLAUDE, "logic-claude-handoff"]]);
     w.tmux = new Set(["logic-claude-handoff"]);
     const transcript = `${HOME}/.claude/projects/${cwd.replace(/[^A-Za-z0-9]/g, "-")}/${CONVERSATION}.jsonl`;
@@ -600,7 +680,7 @@ describe("a canonical relaunch resumes the role's bound conversation", () => {
     w.mtimes.set(transcript, NOW - (IDLE_SECONDS + 60) * 1000);
     return { w, cwd };
   };
-  const RESUME_STEPS = ["idle", "trust", "channel", "launcher", "mcp", "stop", "launch", "claimed"];
+  const RESUME_STEPS = ["idle", "trust", "channel", "one-cto", "launcher", "mcp", "stop", "launch", "claimed"];
 
   it("stops the exact claude process and resumes the bound conversation with the channel in its tmux session, claiming with auto; no rotation", async () => {
     const { w } = canonicalWorld();
@@ -660,13 +740,261 @@ describe("a canonical relaunch resumes the role's bound conversation", () => {
   });
 });
 
+/** deploy135, live: two relaunches the channel served were reported as failed, and a stop read as already done while its CTO ran. */
+describe("deploy135 live defects", () => {
+  it("1: a relaunch whose backlog flood scrolls the registered line away counts as registered by the channel's emitted receipt", async () => {
+    const cwd = realpathSync(tempDir("acp-cto-flood-"));
+    const w = makeWorld({ kind: "canonical", resident: null, generation: 3, session: { pid: CLAUDE, startedAt: `start-${CLAUDE}`, workdir: cwd } });
+    const config = tempDir("acp-cto-flood-config-");
+    writeFileSync(join(config, ".claude.json"), JSON.stringify({ projects: { [cwd]: { hasTrustDialogAccepted: true } } }));
+    w.record = { ...w.record, repositories: [{ repositoryId: "repo_1", identity: `github:${REPO}`, checkoutPath: cwd }] };
+    w.ports = { ...w.ports, env: { ...w.ports.env, CLAUDE_CONFIG_DIR: config } };
+    w.procs = [{ pid: CLAUDE, ppid: 1, command: `${LOCAL_CLAUDE} --resume ${CONVERSATION}`, argv: [LOCAL_CLAUDE, "--resume", CONVERSATION] }];
+    const transcript = `${HOME}/.claude/projects/${cwd.replace(/[^A-Za-z0-9]/g, "-")}/${CONVERSATION}.jsonl`;
+    w.files.set(transcript, "{}");
+    w.mtimes.set(transcript, NOW - (IDLE_SECONDS + 60) * 1000);
+    w.pane = "flood";
+    expect(await runCtoCommand(["relaunch", P, "--apply"], w.ports)).toBe(0);
+    expect(results(w).find(([s]) => s === "launch")).toEqual(["launch", "done"]);
+    expect(w.changes.filter((c) => c.startsWith("tmux send-keys"))).toEqual(["tmux send-keys -t %9 Enter"]);
+  });
+
+  it("#1463 r1: an old channel's receipt appended while the launch asks for its tmux session does not count: the screen still loads", async () => {
+    const cwd = realpathSync(tempDir("acp-cto-old-receipt-"));
+    const w = makeWorld({ kind: "canonical", resident: null, generation: 3, session: { pid: CLAUDE, startedAt: `start-${CLAUDE}`, workdir: cwd } });
+    const config = tempDir("acp-cto-old-receipt-config-");
+    writeFileSync(join(config, ".claude.json"), JSON.stringify({ projects: { [cwd]: { hasTrustDialogAccepted: true } } }));
+    w.record = { ...w.record, repositories: [{ repositoryId: "repo_1", identity: `github:${REPO}`, checkoutPath: cwd }] };
+    w.ports = { ...w.ports, env: { ...w.ports.env, CLAUDE_CONFIG_DIR: config } };
+    w.procs = [{ pid: CLAUDE, ppid: 1, command: `${LOCAL_CLAUDE} --resume ${CONVERSATION}`, argv: [LOCAL_CLAUDE, "--resume", CONVERSATION] }];
+    const transcript = `${HOME}/.claude/projects/${cwd.replace(/[^A-Za-z0-9]/g, "-")}/${CONVERSATION}.jsonl`;
+    w.files.set(transcript, "{}");
+    w.mtimes.set(transcript, NOW - (IDLE_SECONDS + 60) * 1000);
+    w.pane = "loading";
+    w.oldReceiptDuringLaunch = true;
+    expect(await runCtoCommand(["relaunch", P, "--apply"], w.ports)).toBe(1);
+    expect(results(w).at(-1)).toEqual(["launch", "failed"]);
+  }, 60_000);
+
+  it("#1463 r1: a recorded os_pid alive with another start refuses: nothing is stopped and nothing launched, not even the process that does match", async () => {
+    // The reviewer's shape: the binding's os_pid 16590 now belongs to some other process, and the CTO's conversation runs as pid 20000.
+    const w = makeWorld({ generation: 4, session: { pid: CLAUDE, startedAt: "start-before-the-pid-was-reused", workdir: CLONE } });
+    w.procs = [{ pid: CLAUDE, ppid: 1, command: "/usr/libexec/some-daemon" }, { pid: 20000, ppid: 1, command: `claude --resume ${CONVERSATION}`, cwd: CLONE }];
+    expect(await runCtoCommand(["relaunch", P, "--apply"], w.ports)).toBe(1);
+    expect(results(w).at(-1)).toEqual(["stop", "failed"]);
+    expect(JSON.stringify(w.out)).toContain("cannot be confirmed");
+    expect(w.changes).toEqual([]);
+    expect(w.procs.map((p) => p.pid)).toEqual([CLAUDE, 20000]);
+  });
+
+  // myeotnyeon: pid 84604, `claude --resume 36276d16-…` (a bare argv[0]), binding ACTIVE gen 4 with os_pid 84604.
+  const MYEOTNYEON = "36276d16-29e8-4946-bb88-3e5c1895e0d7";
+  const myeotnyeon = (): World => {
+    const w = makeWorld({ conversation: MYEOTNYEON, generation: 4, session: { pid: 84604, startedAt: "start-84604", workdir: CLONE } });
+    w.procs = [{ pid: 84604, ppid: 3327, command: `claude --resume ${MYEOTNYEON} --messaging-socket-path ${STATE}/cc-session-acp-myeotnyeon.sock --remote-control myeotnyeon CTO --permission-mode bypassPermissions --dangerously-skip-permissions` }];
+    w.files.set(TRANSCRIPT.replace(CONVERSATION, MYEOTNYEON), "{}");
+    w.mtimes.set(TRANSCRIPT.replace(CONVERSATION, MYEOTNYEON), NOW - (IDLE_SECONDS + 60) * 1000);
+    return w;
+  };
+
+  it("2: a stop is not already done while the bound session's os_pid is alive, even when the process table does not show it", async () => {
+    const w = myeotnyeon();
+    w.hiddenFromPs.add(84604);
+    expect(await runCtoCommand(["relaunch", P], w.ports)).toBe(0);
+    expect(w.out.find((l) => l["step"] === "stop")).toMatchObject({ already: false });
+    expect(await runCtoCommand(["relaunch", P, "--apply"], w.ports)).toBe(0);
+    expect(w.changes[0]).toBe("SIGTERM 84604");
+  });
+
+  it("2: with that exact argv and binding, the stop is planned and stops pid 84604", async () => {
+    const w = myeotnyeon();
+    expect(await runCtoCommand(["relaunch", P], w.ports)).toBe(0);
+    expect(w.out.find((l) => l["step"] === "stop")).toMatchObject({ already: false });
+  });
+
+});
+
+/** #1436 final review of cto-command.ts: the three shapes the reviewer reproduced. */
+describe("one CTO per project, through the shared check (#1463)", () => {
+  /** A canonical CTO whose role is bound to the claude process running `argv`. */
+  const canonical = (argv: string[], bound: boolean): { w: World; cwd: string } => {
+    const cwd = realpathSync(tempDir("acp-cto-one-"));
+    const config = tempDir("acp-cto-one-config-");
+    writeFileSync(join(config, ".claude.json"), JSON.stringify({ projects: { [cwd]: { hasTrustDialogAccepted: true } } }));
+    const w = makeWorld({ kind: "canonical", resident: null, generation: bound ? 3 : null, session: bound ? { pid: CLAUDE, startedAt: `start-${CLAUDE}`, workdir: cwd } : null,
+      repositories: [{ repositoryId: "repo_1", identity: `github:${REPO}`, checkoutPath: cwd }] }, { ACP_OPERATOR_TOKEN: "operator-test-credential", CLAUDE_CONFIG_DIR: config });
+    w.procs = [{ pid: CLAUDE, ppid: 1, command: argv.join(" "), argv, cwd: "/elsewhere" }];
+    w.panes = new Map([[CLAUDE, "logic-claude-handoff"]]);
+    w.tmux = new Set(["logic-claude-handoff"]);
+    const transcript = `${HOME}/.claude/projects/${cwd.replace(/[^A-Za-z0-9]/g, "-")}/${CONVERSATION}.jsonl`;
+    w.files.set(transcript, "{}");
+    w.mtimes.set(transcript, NOW - (IDLE_SECONDS + 60) * 1000);
+    return { w, cwd };
+  };
+  const launched = (w: World): string[] => w.changes.filter((c) => /^tmux new-(session|window)/.test(c));
+
+  it("P1 510: a bound holder started with --resume=<uuid> is stopped before the resume starts", async () => {
+    const { w } = canonical([LOCAL_CLAUDE, `--resume=${CONVERSATION}`, "--permission-mode", "bypassPermissions"], true);
+    expect(await runCtoCommand(["relaunch", P, "--apply"], w.ports)).toBe(0);
+    expect(w.changes).toContain(`SIGTERM ${CLAUDE}`);
+    expect(launched(w)).toHaveLength(1);
+  });
+
+  for (const [shape, argv, cwdIsCheckout, earlier] of [
+    ["an unbound holder started with --resume=<uuid>", [LOCAL_CLAUDE, `--resume=${CONVERSATION}`], false, false],
+    ["an earlier conversation of the role", [LOCAL_CLAUDE, "--resume", "11111111-2222-4333-8444-555555555555"], false, true],
+    ["an interactive claude in the project's checkout, naming no conversation", [LOCAL_CLAUDE, "--permission-mode", "bypassPermissions"], true, false],
+  ] as const) {
+    it(`P1 510: ${shape} refuses the launch with CTO_ALREADY_RUNNING, and no second claude starts`, async () => {
+      const { w, cwd } = canonical([...argv], false);
+      if (cwdIsCheckout) w.procs[0]!.cwd = cwd;
+      if (earlier) w.roleConversations.push("11111111-2222-4333-8444-555555555555");
+      expect(await runCtoCommand(["relaunch", P, "--apply"], w.ports)).toBe(1);
+      expect(results(w).at(-1)).toEqual(["one-cto", "failed"]);
+      expect(JSON.stringify(w.out)).toContain("CTO_ALREADY_RUNNING");
+      expect(w.changes).toEqual([]);
+      expect(launched(w)).toEqual([]);
+      expect(w.changes.filter((c) => c.startsWith("SIGTERM"))).toEqual([]);
+    });
+  }
+
+  it("P1 1096: a process reader that cannot spawn ps stops the relaunch before anything is stopped or launched", async () => {
+    const { w } = canonical([LOCAL_CLAUDE, "--resume", CONVERSATION], true);
+    w.psFails = true;
+    expect(await runCtoCommand(["relaunch", P, "--apply"], w.ports)).toBe(1);
+    expect(JSON.stringify(w.out)).toContain("CTO_PROCESS_TABLE_UNREADABLE");
+    expect(w.changes.filter((c) => c.startsWith("SIGTERM") || /^tmux new-/.test(c))).toEqual([]);
+  });
+
+  it("P1 317: prompt text \"Explain --resume <uuid> please\" is one argv element, and that process is never stopped", async () => {
+    const w = makeWorld({ generation: null, session: null });
+    w.procs = [{ pid: 40000, ppid: 1, command: `claude -p Explain --resume ${CONVERSATION} please`, argv: ["claude", "-p", `Explain --resume ${CONVERSATION} please`], cwd: "/tmp/elsewhere" }];
+    expect(await runCtoCommand(["relaunch", P, "--apply"], w.ports)).toBe(0);
+    expect(w.changes.filter((c) => c.startsWith("SIGTERM"))).toEqual([]);
+    expect(w.procs.some((p) => p.pid === 40000)).toBe(true);
+  });
+});
+
+/** #1463 review r2: a token that cannot be read is never proof of exit, and a binding is never stepped around. */
+describe("#1463 r2: gone, alive and unavailable are three states", () => {
+  const canonicalBound = (): World => {
+    const cwd = realpathSync(tempDir("acp-cto-r2-"));
+    const config = tempDir("acp-cto-r2-config-");
+    writeFileSync(join(config, ".claude.json"), JSON.stringify({ projects: { [cwd]: { hasTrustDialogAccepted: true } } }));
+    const w = makeWorld({ kind: "canonical", resident: null, generation: 3, session: { pid: CLAUDE, startedAt: `start-${CLAUDE}`, workdir: cwd },
+      repositories: [{ repositoryId: "repo_1", identity: `github:${REPO}`, checkoutPath: cwd }] }, { ACP_OPERATOR_TOKEN: "operator-test-credential", CLAUDE_CONFIG_DIR: config });
+    w.procs = [{ pid: CLAUDE, ppid: 1, command: `${LOCAL_CLAUDE} --resume ${CONVERSATION}`, argv: [LOCAL_CLAUDE, "--resume", CONVERSATION], cwd }];
+    const transcript = `${HOME}/.claude/projects/${cwd.replace(/[^A-Za-z0-9]/g, "-")}/${CONVERSATION}.jsonl`;
+    w.files.set(transcript, "{}");
+    w.mtimes.set(transcript, NOW - (IDLE_SECONDS + 60) * 1000);
+    return w;
+  };
+  const launches = (w: World): string[] => w.changes.filter((c) => /^tmux new-(session|window)/.test(c) || c === "provisioner ensure-resident");
+
+  it("P1 346: a pid that survives SIGTERM and whose token reads null once is not taken as exited; nothing launches beside it", async () => {
+    const w = canonicalBound();
+    w.survivesSigterm.add(CLAUDE);
+    w.tokenGlitchAfterSignal.set(CLAUDE, 1);
+    expect(await runCtoCommand(["relaunch", P, "--apply"], w.ports)).toBe(1);
+    expect(results(w).at(-1)).toEqual(["stop", "failed"]);
+    expect(JSON.stringify(w.out)).toContain("did not provably exit");
+    expect(launches(w)).toEqual([]);
+  });
+
+  it("P1 234: a bound os_pid whose start cannot be read refuses, and the resident fallback never signals pid 20000 in its place", async () => {
+    const w = makeWorld({ generation: 4, session: { pid: CLAUDE, startedAt: `start-${CLAUDE}`, workdir: CLONE } });
+    w.procs = [{ pid: CLAUDE, ppid: 1, command: "/bin/claude --model opus", cwd: "/elsewhere" }, { pid: 20000, ppid: 1, command: `claude --resume ${CONVERSATION}`, cwd: CLONE }];
+    w.tokenUnavailable.add(CLAUDE);
+    expect(await runCtoCommand(["relaunch", P], w.ports)).toBe(0);
+    expect(w.out.find((l) => l["step"] === "stop")).toMatchObject({ already: false });
+    w.out.length = 0;
+    expect(await runCtoCommand(["relaunch", P, "--apply"], w.ports)).toBe(1);
+    expect(results(w).at(-1)).toEqual(["stop", "failed"]);
+    expect(JSON.stringify(w.out)).toContain("cannot be read");
+    expect(w.changes).toEqual([]);
+  });
+
+  it("P1 234: a bound os_pid that is provably gone is nothing to stop; another matching process is never signalled in its place", async () => {
+    const w = makeWorld({ generation: 4, session: { pid: 16591, startedAt: "start-16591", workdir: CLONE } });
+    w.procs = [{ pid: 20000, ppid: 1, command: `claude --resume ${CONVERSATION}`, cwd: CLONE }];
+    await runCtoCommand(["relaunch", P, "--apply"], w.ports);
+    expect(w.changes.filter((c) => c.startsWith("SIGTERM"))).toEqual([]);
+  });
+
+  it("P1 234: the fallback to the shared check's match is an unbound resident's only", async () => {
+    const w = makeWorld({ generation: null, session: null });
+    w.procs = [{ pid: 20000, ppid: 1, command: `claude --resume ${CONVERSATION}`, cwd: CLONE }];
+    expect(await runCtoCommand(["relaunch", P, "--apply"], w.ports)).toBe(0);
+    expect(w.changes[0]).toBe("SIGTERM 20000");
+  });
+
+  it("P2 509: a launcher an earlier version wrote ({tmux, argv}) is regenerated, keeping what it carried, and the relaunch goes on", async () => {
+    const w = canonicalBound();
+    w.procs = [];
+    w.record = { ...w.record, generation: null, session: null };
+    const legacy = { tmux: "logic-claude-handoff", argv: [LOCAL_CLAUDE, "--mcp-config", "{}", "--dangerously-load-development-channels", "server:acp-buzz-channel", "--resume", CONVERSATION, "--name", "Logic CTO", "--permission-mode", "bypassPermissions"] };
+    w.files.set(`${STATE}/cto-launch-${P}.sh`, `#!/bin/sh\n# cto-launch: ${JSON.stringify(legacy)}\nexec true\n`);
+    expect(await runCtoCommand(["relaunch", P, "--apply"], w.ports)).toBe(0);
+    expect(results(w).find(([s]) => s === "launcher")).toEqual(["launcher", "done"]);
+    const launch = w.out.find((l) => l["step"] === "launch" && l["result"] === "done")!["detail"] as { argv: string[]; tmux: string };
+    expect(launch.argv.slice(launch.argv.indexOf("--name"), launch.argv.indexOf("--name") + 2)).toEqual(["--name", "Logic CTO"]);
+    expect(launch.tmux).toBe("logic-claude-handoff");
+  });
+});
+
+/** #1463 final review: the reviewer's two repros, by name. */
+describe("#1463 final review repros", () => {
+  const canonicalBound = (): World => {
+    const cwd = realpathSync(tempDir("acp-cto-final-"));
+    const config = tempDir("acp-cto-final-config-");
+    writeFileSync(join(config, ".claude.json"), JSON.stringify({ projects: { [cwd]: { hasTrustDialogAccepted: true } } }));
+    const w = makeWorld({ kind: "canonical", resident: null, generation: 3, session: { pid: CLAUDE, startedAt: `start-${CLAUDE}`, workdir: cwd },
+      repositories: [{ repositoryId: "repo_1", identity: `github:${REPO}`, checkoutPath: cwd }] }, { ACP_OPERATOR_TOKEN: "operator-test-credential", CLAUDE_CONFIG_DIR: config });
+    w.procs = [{ pid: CLAUDE, ppid: 1, command: `${LOCAL_CLAUDE} --resume ${CONVERSATION}`, argv: [LOCAL_CLAUDE, "--resume", CONVERSATION], cwd }];
+    const transcript = `${HOME}/.claude/projects/${cwd.replace(/[^A-Za-z0-9]/g, "-")}/${CONVERSATION}.jsonl`;
+    w.files.set(transcript, "{}");
+    w.mtimes.set(transcript, NOW - (IDLE_SECONDS + 60) * 1000);
+    return w;
+  };
+  const launchesOrSignals = (w: World): string[] => w.changes.filter((c) => /^tmux new-(session|window)|^SIGTERM|^provisioner ensure-resident/.test(c));
+
+  it("a surviving CTO with one null token after SIGTERM while ps -o stat exits 1 is not exited, and pid 30000 never launches beside it", async () => {
+    const w = canonicalBound();
+    w.survivesSigterm.add(CLAUDE);
+    w.tokenGlitchAfterSignal.set(CLAUDE, 1);
+    w.psStatFails = true;
+    expect(await runCtoCommand(["relaunch", P, "--apply"], w.ports)).toBe(1);
+    expect(results(w).at(-1)).toEqual(["stop", "failed"]);
+    expect(w.changes.filter((c) => /^tmux new-/.test(c))).toEqual([]);
+    expect(w.procs.some((p) => p.pid === 30000)).toBe(false);
+  });
+
+  // After the plan's first step, the stop's done() and its target selection read the token once each; the read right
+  // before the signal is the 3rd.
+  it("pid 16590 replaced after its selection, with the last token read unavailable: the replacement is never signalled", async () => {
+    const w = makeWorld();
+    w.tokenAfterIdle.set(CLAUDE, (read) => (read <= 2 ? `start-${CLAUDE}` : null));
+    expect(await runCtoCommand(["relaunch", P, "--apply"], w.ports)).toBe(1);
+    expect(results(w).at(-1)).toEqual(["stop", "failed"]);
+    expect(launchesOrSignals(w)).toEqual([]);
+  });
+
+  it("pid 16590 replaced after its selection, with a different token read right before the signal: refused, nothing signalled", async () => {
+    const w = makeWorld();
+    w.tokenAfterIdle.set(CLAUDE, (read) => (read <= 2 ? `start-${CLAUDE}` : "start-of-the-replacement"));
+    expect(await runCtoCommand(["relaunch", P, "--apply"], w.ports)).toBe(1);
+    expect(results(w).at(-1)).toEqual(["stop", "failed"]);
+    expect(launchesOrSignals(w)).toEqual([]);
+  });
+});
+
 describe("agentctl cto list", () => {
   it("reports the CTO's generation, live session, channel, room and route, and not its relay", async () => {
     const w = makeWorld();
     expect(await runCtoCommand(["list"], w.ports)).toBe(0);
     expect(w.out).toEqual([{ ctos: [expect.objectContaining({
       project: P, kind: "resident", generation: 3, conversation: CONVERSATION, room: ROOM, roomRouted: true,
-      session: [{ pid: CLAUDE, tmux: TMUX, channel: true }],
+      session: [{ pid: CLAUDE, tmux: TMUX, channel: true, matchedBy: ["conversation", "bound-pid"] }],
     })] }]);
   });
 });

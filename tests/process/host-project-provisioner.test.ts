@@ -305,8 +305,11 @@ it('starts the resident CTO with its Buzz channel: the development flag, the ser
   expect(words[at+2]).toMatch(/^--/);
   const config = JSON.parse(words[words.indexOf('--mcp-config')+1]!);
   expect(words[words.indexOf('--mcp-config')+2]).toMatch(/^--/);
+  // The launch's own id, the one its launch marker names, so only this launch's channel receipts prove it registered.
+  const launch = JSON.parse(readFileSync(join(f.state,`launched-${f.a.projectId}`),'utf8')).launch;
+  expect(launch).toMatch(/^[0-9a-f-]{36}$/);
   expect(config.mcpServers['acp-buzz-channel']).toEqual({command:f.runtimeNode,args:[join(dirname(f.runtimeCli),'buzz-channel.js'),
-    '--project-id',f.a.projectId,'--key-file',f.a.privateKeyFile,'--room',f.a.roomId,'--state-dir',f.state]});
+    '--project-id',f.a.projectId,'--key-file',f.a.privateKeyFile,'--room',f.a.roomId,'--state-dir',f.state,'--launch-id',launch]});
   // Only a key's path is on the command line, never the key.
   expect(JSON.stringify(config)).not.toContain(readFileSync(f.a.privateKeyFile,'utf8').trim());
   expect(words.at(-1)).toMatch(/^You are .* CTO\. Connect to acp-cto/);

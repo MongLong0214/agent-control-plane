@@ -28,6 +28,11 @@ export interface ChannelLaunchInput {
   readonly keyFile: string;
   readonly roomId: string;
   readonly stateDir: string;
+  /**
+   * This launch's own id. The channel server writes it into every receipt (`--launch-id`), and only a receipt carrying
+   * it proves this launch's channel registered (`channelEmittedBy`).
+   */
+  readonly launchId?: string;
 }
 
 export const channelMcpConfig = (input: ChannelLaunchInput): string =>
@@ -41,6 +46,7 @@ export const channelMcpConfig = (input: ChannelLaunchInput): string =>
           "--key-file", input.keyFile,
           "--room", input.roomId,
           "--state-dir", input.stateDir,
+          ...(input.launchId === undefined ? [] : ["--launch-id", input.launchId]),
         ],
       },
     },
@@ -192,6 +198,11 @@ export interface ChannelScreenDriver {
   capture(): string | Promise<string>;
   /** The one confirming keystroke (`Enter`). */
   press(): void | Promise<void>;
+  /**
+   * A durable sign that the channel is up and delivering into the session (`channelEmittedSince`), for when the screen
+   * cannot show it: a backlog flood scrolls the one registered line away. Never a reason to press anything.
+   */
+  registered?(): boolean | Promise<boolean>;
   now(): number;
   sleep(ms: number): Promise<void>;
 }
@@ -242,6 +253,7 @@ export const confirmChannelStartup = async (
     return { verdict, settled, raw: text };
   };
   let verdict: ScreenVerdict = "OTHER";
+  const durable = async (): Promise<boolean> => (driver.registered ? (await driver.registered()) === true : false);
   // The one keystroke is authorized by agreement, never by one snapshot: two reads of the same pane in a row, byte for
   // byte the same, each exactly the warning. A screen is redrawn between any two reads, so a single exact read can be
   // followed by something else before the key lands; this narrows that to the one read taken immediately before it.
@@ -250,7 +262,7 @@ export const confirmChannelStartup = async (
   while (true) {
     const read = await look();
     verdict = read.verdict;
-    if (verdict === "REGISTERED") return { ok: true, confirmed: false };
+    if (verdict === "REGISTERED" || (verdict !== "EXACT_WARNING" && await durable())) return { ok: true, confirmed: false };
     if (verdict === "EXACT_WARNING") {
       if (exactBefore !== null && exactBefore === read.raw) break;
       exactBefore = read.raw;
@@ -278,7 +290,8 @@ export const confirmChannelStartup = async (
     await driver.sleep(bounds.pollMs);
     const read = await look();
     verdict = read.verdict;
-    if (verdict === "REGISTERED") return { ok: true, confirmed: true };
+    // The registered line, or the channel's own receipt when its backlog has scrolled that line off the screen.
+    if (verdict === "REGISTERED" || await durable()) return { ok: true, confirmed: true };
     if (driver.now() - pressed >= bounds.registerWaitMs) break;
     // The warning may take a moment to be redrawn away, so it is waited out; a different dialog is not.
     if (read.settled && (verdict === "OTHER_DIALOG" || verdict === "WARNING_ALTERED" || verdict === "WARNING_OTHER_CHANNELS")) break;
@@ -298,6 +311,8 @@ export const tmuxChannelDriver = (input: {
   /** What `#{pane_start_command}` must be: the launcher script this launch started. */
   readonly startCommand: string;
   readonly run: (bin: string, args: string[]) => string;
+  /** The launch's durable registration signal, usually `channelEmittedSince`. */
+  readonly registered?: () => boolean | Promise<boolean>;
 }): ChannelScreenDriver => {
   let pane: string | null = null;
   const own = (): string => {
@@ -316,5 +331,36 @@ export const tmuxChannelDriver = (input: {
     },
     now: () => Date.now(),
     sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+    ...(input.registered ? { registered: input.registered } : {}),
   };
+};
+
+/**
+ * Whether this launch's channel server has taken a message into the session: an `emitted` receipt carrying this
+ * launch's id (`ChannelLaunchInput.launchId`). The server writes one only once Claude Code took a channel notification
+ * (`src/buzz/buzz-channel.ts`), so it proves the channel registered whatever the screen shows. Time never counts: an
+ * older channel process still appending while this one starts writes no id, or another launch's. The file is
+ * `channelReceiptPath`'s (`src/buzz/buzz-channel-files.ts`), named here because that module cannot load under the type
+ * stripping the host provisioner runs with. An unreadable file or line is no proof.
+ */
+export const channelEmittedBy = (
+  stateDir: string,
+  projectId: string,
+  launchId: string,
+  read: (path: string) => string = (path) => readFileSync(path, "utf8"),
+): (() => boolean) => () => {
+  let text: string;
+  try {
+    text = read(join(stateDir, "buzz-channel", `${projectId}.receipts.jsonl`));
+  } catch {
+    return false;
+  }
+  return text.split("\n").some((line) => {
+    try {
+      const receipt = JSON.parse(line) as { type?: unknown; launchId?: unknown };
+      return receipt.type === "emitted" && receipt.launchId === launchId;
+    } catch {
+      return false;
+    }
+  });
 };

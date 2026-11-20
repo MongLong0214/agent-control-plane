@@ -72,8 +72,12 @@ export interface ChannelNotification {
   readonly meta: Readonly<Record<string, string>>;
 }
 
-/** What the daemon is told, in order to move its durable queue. Written by the server, applied by the daemon. */
-export type ChannelReceipt =
+/**
+ * What the daemon is told, in order to move its durable queue. Written by the server, applied by the daemon. `launchId`
+ * is the launch the server was started by (`--launch-id`), so a launcher can tell its own channel's receipts from an
+ * older channel process's.
+ */
+export type ChannelReceipt = (
   | {
       readonly type: "emitted";
       readonly eventId: string;
@@ -88,7 +92,8 @@ export type ChannelReceipt =
       readonly parentEventId: string;
       readonly ack: "ACCEPTED" | "DUPLICATE";
       readonly repliedAt: number;
-    };
+    }
+) & { readonly launchId?: string };
 
 export interface SignedEvent {
   readonly id: string;
@@ -111,6 +116,7 @@ const isCount = (value: unknown): value is number => typeof value === "number" &
 export const isChannelReceipt = (value: unknown): value is ChannelReceipt => {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
   const r = value as Record<string, unknown>;
+  if (r["launchId"] !== undefined && !isString(r["launchId"])) return false;
   if (r["type"] === "emitted") {
     return isString(r["eventId"]) && isString(r["room"]) && isString(r["senderPubkey"]) && isCount(r["emittedAt"]);
   }
