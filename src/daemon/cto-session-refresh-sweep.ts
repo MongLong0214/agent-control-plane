@@ -11,7 +11,7 @@ import type { ControlPlane } from "../app/control-plane.ts";
 import { SessionLifecycle } from "../domain/types.ts";
 import {
   CTO_HANDOFF_WAIT_MS, CTO_REFRESH_QUIET_SECONDS, buildFallbackHandoff, clearHandoffRequest, clearRefreshFailure, createConversationMeter, ctoTranscriptPath,
-  gatherFallbackFacts, hostStoreFiles, listInflightProjects, longReasons, readHandoff, readInflightRefresher, readHandoffRequest, readRefreshFailure, recordRefreshFailure, refreshLimitsFromEnv,
+  gatherFallbackFacts, hostStoreFiles, listInflightProjects, lockPathOf, longReasons, readHandoff, readInflightRefresher, readLockHolder, readHandoffRequest, readRefreshFailure, recordRefreshFailure, refreshLimitsFromEnv,
   retryNotBefore, writeHandoff, writeHandoffRequest, DEFAULT_REFRESH_LIMITS,
   type ConversationFiles, type ConversationMeasure, type FallbackFacts, type LongReason, type RefreshLimits, type StoreFiles,
 } from "../cto/cto-session-refresh.ts";
@@ -135,8 +135,9 @@ export const createCtoRefreshSweep = (deps: RefreshSweepDeps): CtoRefreshSweep =
       unfinished.add(projectId);
       if (deps.recoverable && !deps.recoverable(projectId)) { verdicts.push({ projectId, action: "recovery-waiting", because: "the project is retired or unknown; its record is left" }); continue; }
       const runs = deps.refresherRunning ? deps.refresherRunning(projectId) : (() => {
-        const who = readInflightRefresher(files, deps.stateDir, projectId);
-        return who !== null && processStillRuns(who);
+        // The process that wrote the record, or the one that holds the project's lock (a recovery that is already under way).
+        return [readInflightRefresher(files, deps.stateDir, projectId), readLockHolder(files, lockPathOf(deps.stateDir, projectId))]
+          .some((who) => who !== null && processStillRuns(who));
       })();
       if (runs) { verdicts.push({ projectId, action: "recovery-waiting", because: "the refresh that wrote the record is still running" }); continue; }
       const last = recoveredAt.get(projectId);

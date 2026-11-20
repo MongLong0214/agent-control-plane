@@ -7,7 +7,7 @@ import { createSystemRequestWatcher, systemRequestNotification } from "../../src
 import {
   COMPACT_BOUNDARY_MARK, CTO_CONVERSATION_MAX_BYTES, CTO_CONVERSATION_MAX_COMPACTIONS, CTO_HANDOFF_MAX_BYTES, CTO_HANDOFF_WAIT_MS,
   CTO_REFRESH_BACKOFF_INITIAL_MS, buildFallbackHandoff, clearHandoffRequest, clipUtf8, createConversationMeter, ctoTranscriptPath, handoffPathOf, handoffRequestText,
-  hostConversationFiles, hostStoreFiles, inflightPathOf, listInflightProjects, longReasons, readHandoff, readHandoffRequest, readInflightRefresher, readRefreshFailure,
+  hostConversationFiles, hostStoreFiles, inflightPathOf, listInflightProjects, lockPathOf, longReasons, readHandoff, readHandoffRequest, readInflightRefresher, readLockHolder, readRefreshFailure,
   recordRefreshFailure, refreshLimitsFromEnv, retryNotBefore,
   writeHandoff, writeHandoffRequest, type ConversationFiles, type FallbackFacts,
 } from "../../src/cto/cto-session-refresh.ts";
@@ -460,6 +460,19 @@ describe("an interrupted refresh is recovered by the daemon's sweep", () => {
     const { log, sweep } = deps(state, { refresherRunning: undefined });
     expect((await sweep.tick()).map((v) => `${v.projectId}:${v.action}`)).toEqual(["alive:recovery-waiting", "dead:recovered"]);
     expect(log.recovered).toEqual(["dead"]);
+  });
+
+  it("waits for a recovery that already holds the project's lock, though the record's own refresher is gone", async () => {
+    const state = tempDir("acp-refresh-recover-locked-");
+    record(state, "a", { pid: 2_147_483_000, startedAt: null });
+    hostStoreFiles.replace(lockPathOf(state, "a"), `${JSON.stringify({ pid: process.pid, startedAt: null })}\n`);
+    expect(readLockHolder(hostStoreFiles, lockPathOf(state, "a"))).toEqual({ pid: process.pid, startedAt: null });
+    const { log, sweep } = deps(state, { refresherRunning: undefined });
+    expect(await sweep.tick()).toEqual([{ projectId: "a", action: "recovery-waiting", because: expect.stringContaining("still running") }]);
+    expect(log.recovered).toEqual([]);
+    // Once its holder is gone the lock is stale and recovery goes on.
+    hostStoreFiles.replace(lockPathOf(state, "a"), `${JSON.stringify({ pid: 2_147_483_001, startedAt: null })}\n`);
+    expect(await sweep.tick()).toEqual([{ projectId: "a", action: "recovered" }]);
   });
 
   it("tries again after a failed recovery, not before the wait, and every tick at first if the daemon restarts", async () => {

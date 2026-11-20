@@ -1,6 +1,6 @@
 import { spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, linkSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -16,7 +16,7 @@ import { daemonBuzzSigner } from "../outbox/ceo-buzz-signer.ts";
 import { BUZZ_CHANNEL_SERVER, CHANNEL_DEV_FLAG, channelEmittedBy, channelLaunchArgs, confirmChannelStartup, launchFolderTrust, tmuxChannelDriver } from "../runtime/cto-channel-launch.ts";
 import { readHostProvisionerReason, recordedResidentExitStatus } from "../runtime/host-provisioner-reason.ts";
 import {
-  buildFallbackHandoff, clearRefreshFailure, ctoTranscriptPath, gatherFallbackFacts, firstPromptOf, handoffPackageOf, inflightPathOf, readHandoff, writeHandoff,
+  buildFallbackHandoff, clearRefreshFailure, ctoTranscriptPath, gatherFallbackFacts, firstPromptOf, handoffPackageOf, inflightPathOf, lockPathOf, readHandoff, readLockHolder, takeoverPathOf, writeHandoff,
   type FallbackFacts,
 } from "../cto/cto-session-refresh.ts";
 
@@ -102,6 +102,8 @@ export interface CtoFiles {
   /** Removes a file or a directory tree. */
   remove(path: string): void;
   mtimeMs(path: string): number | null;
+  /** Creates the file with this body only if it does not exist, whole at the moment it appears; false when it was already there. */
+  createExclusive(path: string, body: string): boolean;
 }
 
 /** The operator socket, as `agentctl`'s own client speaks it. */
@@ -768,6 +770,53 @@ const canonicalStatus = async (ports: CtoPorts, projectId: string): Promise<Cano
   }
 };
 
+/** A lock's holder runs while the kernel has its pid and, when the start was recorded, still gives it that start. Our own pid never counts: this process is not running a second command. */
+const lockHolderRunning = (ports: CtoPorts, held: { pid: number; startedAt: string | null }): boolean => {
+  if (held.pid === (ports.selfPid ?? process.pid)) return false;
+  const token = ports.startToken(held.pid);
+  if (token === null) return !ports.kernelGone(held.pid);
+  return held.startedAt === null || token === held.startedAt;
+};
+
+/**
+ * The one lock every refresh and every recovery of a project takes before it changes anything: a file created whole and only if
+ * absent, holding this process's pid and start token. A holder that is gone (the kernel says so, or its pid now has another
+ * start) leaves a stale lock, and that is taken over only under a second short lock of its own, so that two runs that both see
+ * the same stale lock cannot each remove the other's fresh one. Nothing else ever takes a lock that its holder still runs.
+ */
+const acquireRefreshLock = async (ports: CtoPorts, projectId: string): Promise<{ ok: true; release: () => void } | { ok: false; holder: number }> => {
+  const path = lockPathOf(ports.stateDir, projectId);
+  const gate = takeoverPathOf(ports.stateDir, projectId);
+  const pid = ports.selfPid ?? process.pid;
+  const mine = { pid, startedAt: ports.startToken(pid) };
+  const body = `${JSON.stringify({ ...mine, at: new Date(ports.now()).toISOString() })}\n`;
+  const holderOf = (file: string) => { try { return ports.files.exists(file) ? readLockHolder(ports.files, file) : null; } catch { return null; } };
+  const still = (file: string): boolean => { const held = holderOf(file); return held !== null && held.pid === mine.pid && held.startedAt === mine.startedAt; };
+  const release = (): void => { try { if (still(path)) ports.files.remove(path); } catch { /* a lock that cannot be removed goes stale with its holder */ } };
+  for (let attempt = 0; attempt < 8; attempt++) {
+    if (ports.files.createExclusive(path, body)) return { ok: true, release };
+    const held = holderOf(path);
+    if (held !== null && lockHolderRunning(ports, held)) return { ok: false, holder: held.pid };
+    // Stale (its holder is gone) or unreadable: taken over one run at a time.
+    if (!ports.files.createExclusive(gate, body)) {
+      const taking = holderOf(gate);
+      if (taking !== null && !lockHolderRunning(ports, taking)) ports.files.remove(gate);
+      await ports.sleep(50);
+      continue;
+    }
+    try {
+      // Only a lock that is there is removed: while it is, nothing else can create one, so what is removed is the stale one seen.
+      if (ports.files.exists(path)) {
+        const again = holderOf(path);
+        if (again !== null && lockHolderRunning(ports, again)) return { ok: false, holder: again.pid };
+        ports.files.remove(path);
+      }
+      if (ports.files.createExclusive(path, body)) return { ok: true, release };
+    } finally { if (still(gate)) ports.files.remove(gate); }
+  }
+  return { ok: false, holder: 0 };
+};
+
 /**
  * Whether the daemon holds a switchover to `conversation`, read from its own records. A failed or unanswered rotate proves
  * nothing about whether it was recorded (the daemon may have committed it and lost the answer, as with DAEMON_LOCK_LOST), so
@@ -860,6 +909,31 @@ const terminateRole = async (ports: CtoPorts, projectId: string, extraConversati
   return null;
 };
 
+/** The daemon's own records name the new conversation as the role's holder. */
+const newHoldsRole = (ports: CtoPorts, record: RefreshRecord): boolean => {
+  const now = fresh(ports, record.projectId);
+  return now?.conversation === record.newConversation && now.generation !== null && now.generation > record.oldGeneration;
+};
+
+/**
+ * The pids among the role's processes that are provably the OLD conversation: the session the active binding names while it
+ * still names the old conversation (its recorded pid and start), or a process whose own argv names the old conversation and
+ * not the new one. Everything else the shared check matched is not proven old, whatever it is the only match of.
+ */
+const provablyOld = async (ports: CtoPorts, record: RefreshRecord, role: RoleProcesses): Promise<Set<number>> => {
+  const old = new Set<number>();
+  const now = fresh(ports, record.projectId);
+  if (now?.generation !== null && now?.generation !== undefined && now.conversation === record.oldConversation) {
+    const bound = await stopTargetOf(ports, now, role);
+    if (bound !== null && !("refused" in bound)) old.add(bound.pid);
+  }
+  for (const match of role.matches) {
+    const named = (role.snapshot.claude.get(match.pid)?.conversationIds ?? []).map((id) => id.toLowerCase());
+    if (named.includes(record.oldConversation.toLowerCase()) && !named.includes(record.newConversation.toLowerCase())) old.add(match.pid);
+  }
+  return old;
+};
+
 /**
  * Back to the old conversation after a failure past the switchover's record: whatever the new launch left running is
  * stopped and proven gone, the unclaimed switchover is cancelled, and `claude --resume <old>` is started and waited for.
@@ -879,17 +953,21 @@ const rollBackSteps = async (ports: CtoPorts, record: RefreshRecord, stopped: Ex
     // No pending switchover is the state this wants (the daemon never recorded it, or it was already cancelled).
     return cancelled.allowed || cancelled.reasonCode === ReasonCode.NOT_FOUND ? null : `the daemon refused to cancel the switchover (${cancelled.message})`;
   };
-  // The old process was never stopped (or not proven stopped) and is still the role's only process: nothing to start, only the fence to lift.
+  // The new conversation holding the role is never undone, and never stopped: a refresh that got that far succeeded.
+  const claimedNew = "the new conversation has claimed the role; nothing was rolled back";
+  if (newHoldsRole(ports, record) || await claimedBy(ports, projectId, record.newConversation, record.oldGeneration + 1)) return { resumed: false, detail: claimedNew };
+  // The old conversation is still running only when a process of the role is PROVEN to be it. A process that merely is the role's only
+  // one is not: with the old binding released, that can be the new conversation's unclaimed process, and it is a leftover.
   const role = await roleProcesses(ports, projectId, extra);
-  const running = await stopTargetOf(ports, fresh(ports, projectId), role);
-  if (running !== null && !("refused" in running) && role.matches.every((one) => one.pid === running.pid)) {
+  const old = await provablyOld(ports, record, role);
+  if (role.matches.length > 0 && role.matches.every((one) => old.has(one.pid))) {
     const refusal = await cancel();
     return refusal === null ? { resumed: true, detail: `the old conversation ${record.oldConversation} still runs, and the switchover was cancelled` }
       : { resumed: false, detail: `${refusal}; the old conversation still runs but stays fenced` };
   }
   const left = await terminateRole(ports, projectId, extra, stopped);
-  if (left !== null) return { resumed: false, detail: `the new conversation's process could not be stopped (${left}); the switchover is still pending and nothing was resumed` };
-  if (await claimedBy(ports, projectId, record.newConversation, record.oldGeneration + 1)) return { resumed: false, detail: "the new conversation has claimed the role; nothing was rolled back" };
+  if (left !== null) return { resumed: false, detail: `a process of the role could not be stopped (${left}); the switchover is still pending and nothing was resumed` };
+  if (newHoldsRole(ports, record)) return { resumed: false, detail: claimedNew };
   const refusal = await cancel();
   if (refusal !== null) return { resumed: false, detail: `${refusal}; the old conversation stays fenced and was not resumed` };
   const pointed = pointAcpCtoAt(ports, record.old.cwd, record.old.claude, projectId, record.oldConversation);
@@ -1543,8 +1621,13 @@ export const runCtoCommand = async (args: readonly string[], ports: CtoPorts): P
   if (sub === "refresh") {
     if (record.retiredAt) return refuse(ports, `project ${projectId} is retired`);
     if (record.kind === "none") return refuse(ports, `project ${projectId} has no CTO allocation or entitlement to refresh`);
-    return executeCtoPlan(ports, { command: "refresh", project: projectId, kind: record.kind, ...(flags.has("--recover") ? { recoverOnly: true } : {}) },
+    const run = (): Promise<number> => executeCtoPlan(ports, { command: "refresh", project: projectId, kind: record.kind, ...(flags.has("--recover") ? { recoverOnly: true } : {}) },
       refreshPlan(ports, record, flags.has("--recover")), apply, rerun);
+    if (!apply) return run();
+    // A refresh and a recovery of one project exclude each other, and themselves, from here to the end: neither changes anything without the lock.
+    const lock = await acquireRefreshLock(ports, projectId);
+    if (!lock.ok) return refuse(ports, `another refresh or recovery of project ${projectId} holds its lock${lock.holder > 0 ? ` (pid ${lock.holder})` : ""}; nothing was changed`);
+    try { return await run(); } finally { lock.release(); }
   }
   // retire
   const reason = value("--reason");
@@ -1683,6 +1766,16 @@ export const createCtoPorts = async (input: {
       move: (from, to) => { mkdirSync(dirname(to), { recursive: true, mode: 0o700 }); renameSync(from, to); },
       remove: (path) => rmSync(path, { recursive: true, force: true }),
       mtimeMs: (path) => { try { return statSync(path).mtimeMs; } catch { return null; } },
+      createExclusive: (path, body) => {
+        mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+        // Written beside it and linked into place, so the file exists whole or not at all; link fails when the name is taken.
+        const staging = `${path}.${process.pid}.${randomUUID()}.tmp`;
+        writeFileSync(staging, body, { mode: 0o600 });
+        try { linkSync(staging, path); return true; } catch (error) {
+          if ((error as NodeJS.ErrnoException).code === "EEXIST") return false;
+          throw error;
+        } finally { rmSync(staging, { force: true }); }
+      },
     },
     publicKeyOf: (keyFile) => { try { return daemonBuzzSigner(readFileSync(keyFile, "utf8")); } catch { return null; } },
     now: () => Date.now(),
