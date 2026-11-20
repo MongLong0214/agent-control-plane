@@ -348,7 +348,7 @@ const connectRolePeer = async (
   /**
    * The client build this connection announces.
    *
-   * Defaulted, because no row depends on which build it is: `role_wake_endpoint_register` admits
+   * Defaulted, because no row depends on which build it is: `role_owner_message_claim` admits
    * any client build.
    */
   clientInfo: { name: string; version: string } = { name: "buzz-role-peer", version: "1" },
@@ -1548,9 +1548,7 @@ describe("the daemon's Buzz message ingress", () => {
         () => listeners.ctoConversation.connected(roleKey),
         "the CTO connection to become the role's live peer",
       );
-      const registered = await peer.callTool("role_wake_endpoint_register", {
-        endpoint: endpoint.path,
-      });
+      const registered = await peer.callTool("role_owner_message_claim", { roleKey });
       expect(registered.ok, registered.message).toBe(true);
       // A registration wake with no confirmed work is skipped (FIX-ROLE-WAKE), and the message does
       // not exist yet, so the wake this row is about is the first one.

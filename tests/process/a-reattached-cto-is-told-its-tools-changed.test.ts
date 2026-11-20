@@ -11,7 +11,6 @@ import { ATTACH_EXIT, runAttachRelay, type ReattachPolicy } from "../../src/cli/
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { startLocalMcpListeners, type LocalMcpListeners } from "../../src/daemon/agentcpd.ts";
 import { Role, SessionLifecycle } from "../../src/domain/types.ts";
-import { RoleConversationPort } from "../../src/mcp/role-conversation.ts";
 import { digestOf } from "../../src/core/digest.ts";
 import { MessageKind } from "../../src/outbox/envelope.ts";
 import { count } from "../helpers/adopted-ceo.ts";
@@ -425,7 +424,8 @@ describe("W3: a relay of an earlier build, which replays its registration and ne
 
     const first = registration(f, "acp-relay-rewake-1");
     const answered = await client.request("tools/call", { name: first.name, arguments: first.arguments }, first.id);
-    expect(answered.result?.structuredContent).toMatchObject({ ok: true });
+    // The tool is gone, so the SDK answers it as an unknown tool; the restore still ends with that answer.
+    expect(answered.error ?? (answered.result as { isError?: boolean } | undefined)?.isError).toBeTruthy();
     servesTheList(await refreshed(client, 2));
 
     const second = registration(f, "acp-relay-rewake-2");
@@ -611,32 +611,5 @@ describe("the relay as a process, across a restart", () => {
       expect(before.claims).toBe(0);
       await r.finish();
     }, 60_000);
-
-    if (compat) {
-      it(`${name}: a registration answered 100 ms late still ends in a served refresh, not a refused one`, async () => {
-        const f = await started();
-        const r = await processRelay(f, root, compat);
-        expect((await r.client.initialize(qualified)).error, r.err()).toBeUndefined();
-        servesTheList(await refreshed(r.client, fresh));
-        await settled(r.client, fresh);
-
-        // The daemon is slow to answer the replayed registration, so the relay is still refusing when the
-        // notification sent at initialized can reach its client; only the one after the answer is served.
-        const answer = RoleConversationPort.prototype.acknowledgeRegistration;
-        vi.spyOn(RoleConversationPort.prototype, "acknowledgeRegistration").mockImplementation(function (
-          this: RoleConversationPort,
-          server,
-        ) {
-          for (const until = Date.now() + 100; Date.now() < until;) { /* the daemon is busy */ }
-          return answer.call(this, server);
-        });
-        await f.restart();
-        const last = await refreshed(r.client, restarted, 30_000);
-        expect(last.error?.code).not.toBe(RELAY_REATTACHING_ERROR_CODE);
-        servesTheList(last);
-        await settled(r.client, restarted);
-        await r.finish();
-      }, 60_000);
-    }
   }
 });

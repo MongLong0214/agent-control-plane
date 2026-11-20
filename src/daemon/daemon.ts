@@ -3551,9 +3551,6 @@ export class Daemon {
    * `cp.doctor.setSupplementalFindings` in `start()` is where it ends: this list has exactly one
    * caller now, and it is the doctor itself (#1010).
    */
-  // No `canonicalExecutorPinFindings` any more (#886, withdrawn 2026-09-27). It compared the
-  // claim's executor pin, ACP_CANONICAL_REQUIRED_EXECUTOR_VERSION, against a build a client declared.
-  // The claim no longer pins a build, so there is nothing to disagree and no such finding.
   private supplementalSystemFindings(): Finding[] {
     return [
       ...this.telegramIngressFindings(),

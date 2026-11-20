@@ -14,7 +14,7 @@ if it silently skipped part of the diff.
 
 **Automatic invocation.** The control plane calls the reviewer after deterministic
 verification passes. There is no CTO- or Hermes-facing operation to request or skip it;
-a manual attempt is denied with `REVIEW_MANUAL_INVOCATION_DENIED`.
+an in-process call outside the pipeline is denied with `REVIEW_MANUAL_INVOCATION_DENIED`.
 
 **Independence by session set.** The producer set for a run is computed from the
 bindings actually recorded for that run (primary/bootstrap CTO, workers, integrator,

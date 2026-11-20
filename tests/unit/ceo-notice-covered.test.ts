@@ -238,7 +238,7 @@ describe("a CEO notice whose exact request an official record concluded is settl
     const seeded = seedRun({ db: harness.cp.db, clock: harness.clock, repoPath: harness.repoPath, claim: false });
     const queue = (key: string): string => {
       const queued = harness.cp.outbox.enqueue({ idempotencyKey: key, roleKey: seeded.roleKey, bindingGeneration: 1,
-        targetSessionId: seeded.sessionId, runId: seeded.runId, kind: MessageKind.TASK_ASSIGN, payload: { taskId: key } });
+        targetSessionId: seeded.sessionId, runId: seeded.runId, kind: MessageKind.RUN_DISPATCH, payload: { taskId: key } });
       if (!queued.allowed) throw new Error(queued.message);
       return queued.value.messageId;
     };

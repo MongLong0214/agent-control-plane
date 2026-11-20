@@ -1595,11 +1595,11 @@ describe("schema v40: the carry record arrives by an additive migration", () => 
       ["msg_peer_pending", MessageKind.PEER_MESSAGE, "PENDING"],
       ["msg_owner_pending", MessageKind.OWNER_MESSAGE, "PENDING"],
       // Not holder-claimed: recorded all the same, since the kind is no more fixed than the status.
-      ["msg_dispatch_sent", MessageKind.RUN_DISPATCH, "SENT"],
-      ["msg_dispatch_pending", MessageKind.RUN_DISPATCH, "PENDING"],
+      ["msg_dispatch_sent", MessageKind.HANDOFF_PACKAGE, "SENT"],
+      ["msg_dispatch_pending", MessageKind.HANDOFF_PACKAGE, "PENDING"],
     ];
     for (const [id, kind, status] of rows) {
-      row.run(id, `key:${id}`, kind, kind === MessageKind.RUN_DISPATCH ? "{}" : pointer(id), `fp:${id}`, NOW, NOW, status);
+      row.run(id, `key:${id}`, kind, kind === MessageKind.HANDOFF_PACKAGE ? "{}" : pointer(id), `fp:${id}`, NOW, NOW, status);
     }
     // An admitted Buzz event whose turn was already answered, and one still open.
     const inbound = legacy.prepare(
@@ -1867,7 +1867,7 @@ describe("finding 01: a holder-claimed message that ever left PENDING is never h
         .toThrow(/OUTBOX_DEPARTED_ROW_NO_DELETE/);
       const target = external.prepare(`SELECT rowid AS r FROM outbox WHERE message_id = ?`).get(id) as { r: number };
       const decoy: Record<string, unknown> = {
-        ...row, message_id: "msg_decoy", idempotency_key: "decoy", kind: MessageKind.TASK_ASSIGN,
+        ...row, message_id: "msg_decoy", idempotency_key: "decoy", kind: MessageKind.HANDOFF_PACKAGE,
         status: "REJECTED", payload_json: "{}",
       };
       const decoyColumns = Object.keys(decoy);
@@ -1948,13 +1948,13 @@ describe("finding 01: a holder-claimed message that ever left PENDING is never h
       };
 
       // One goes out through the generic sweep, as a generic kind, and the lease reclaim puts it back.
-      flip(swept!.message_id, MessageKind.TASK_ASSIGN);
+      flip(swept!.message_id, MessageKind.CEO_NOTIFICATION);
       expect(harness.cp.outbox.claimDeliverable().map((message) => message.messageId)).toEqual([swept!.message_id]);
       expect(rowOf(fixture, swept!.message_id)).toMatchObject({ status: "IN_FLIGHT" });
       harness.clock.advance(5 * 60 * 1000 + 1);
       expect(harness.cp.outbox.reclaimStaleLeases()).toBe(1);
       // The other is moved PENDING -> IN_FLIGHT -> PENDING by raw statements, as a generic kind.
-      flip(handled!.message_id, MessageKind.TASK_ASSIGN);
+      flip(handled!.message_id, MessageKind.CEO_NOTIFICATION);
       harness.cp.db.run(
         `UPDATE outbox SET status = 'IN_FLIGHT', claim_token = 'tok-raw', claimed_at = ? WHERE message_id = ?`,
         [harness.clock.nowIso(), handled!.message_id],
@@ -2177,7 +2177,7 @@ describe("finding 01: a holder-claimed message that ever left PENDING is never h
         const target = external.prepare(`SELECT rowid AS r FROM outbox WHERE message_id = ?`).get(first!.message_id) as
           { r: number };
         const decoy: Record<string, unknown> = {
-          ...original, message_id: "msg_decoy", idempotency_key: "decoy", kind: MessageKind.TASK_ASSIGN,
+          ...original, message_id: "msg_decoy", idempotency_key: "decoy", kind: MessageKind.HANDOFF_PACKAGE,
           status: "REJECTED", payload_json: "{}",
         };
         const columns = Object.keys(decoy);
