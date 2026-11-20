@@ -229,24 +229,46 @@ interface StopTarget { pid: number; startToken: string; tmux: string | null }
  * start ACP recorded, or, for a resident whose role is unbound, the one process the shared check matched. Never a
  * match over command text. Null is nothing to stop; the pre-launch check decides whether a launch is then safe.
  */
-const stopTargetOf = (ports: CtoPorts, record: CtoRecord | null, role: RoleProcesses): StopTarget | null | { refused: string } => {
-  const pid = record?.generation !== null ? record?.session?.pid ?? null : null;
-  const token = pid ? ports.startToken(pid) : null;
-  if (pid && token !== null) {
-    const recorded = record!.session!.startedAt;
+/**
+ * A pid as the kernel says it is: GONE (provably: no such process, or only waiting to be reaped), ALIVE with its native
+ * start token, or UNAVAILABLE (alive, or not known not to be, and its token cannot be read). An unreadable token is never
+ * taken as exited.
+ */
+type Liveness = { state: "gone" } | { state: "alive"; token: string } | { state: "unavailable" };
+const livenessOf = async (ports: CtoPorts, pid: number): Promise<Liveness> => {
+  const token = ports.startToken(pid);
+  if (token !== null) return { state: "alive", token };
+  return (await ports.ctoProcesses.alive(pid)) ? { state: "unavailable" } : { state: "gone" };
+};
+
+const stopTargetOf = async (ports: CtoPorts, record: CtoRecord | null, role: RoleProcesses): Promise<StopTarget | null | { refused: string }> => {
+  // An ACTIVE binding: its recorded os_pid is the only thing a stop may signal, and nothing ever stands in for it.
+  if (record?.generation !== null && record?.generation !== undefined) {
+    const pid = record.session?.pid ?? null;
+    if (!pid) return null;
+    const live = await livenessOf(ports, pid);
+    if (live.state === "gone") return null;
+    if (live.state === "unavailable") {
+      return { refused: `the bound session's os_pid ${pid} is not provably gone and its start cannot be read, so its identity cannot be confirmed; nothing was stopped or launched` };
+    }
+    const recorded = record.session!.startedAt;
     const row = role.snapshot.rows.find((one) => one.pid === pid);
-    if (recorded !== null && (recorded === token || (row !== undefined && row.startedAt === recorded))) {
-      return { pid, startToken: token, tmux: role.matches.find((one) => one.pid === pid)?.tmuxSession ?? null };
+    if (recorded !== null && (recorded === live.token || (row !== undefined && row.startedAt === recorded))) {
+      return { pid, startToken: live.token, tmux: role.matches.find((one) => one.pid === pid)?.tmuxSession ?? null };
     }
     // Alive with another start, or none recorded: the bound session's identity cannot be confirmed, and no other
     // process is taken in its place. Nothing is stopped and, since the one-cto and stop steps refuse, nothing launched.
     return { refused: `the bound session's os_pid ${pid} is alive with a start that is not the one ACP recorded, so its identity cannot be confirmed; nothing was stopped or launched` };
   }
+  // No ACTIVE binding at all: only a resident falls back to the one process the shared check matched.
   if (record?.kind !== "resident") return null;
   if (role.matches.length > 1) return { refused: `${role.matches.length} processes are this CTO role's (${role.matches.map((one) => one.pid).join(", ")}); nothing was signalled` };
   const only = role.matches[0];
-  const onlyToken = only ? ports.startToken(only.pid) : null;
-  return only && onlyToken !== null ? { pid: only.pid, startToken: onlyToken, tmux: only.tmuxSession } : null;
+  if (!only) return null;
+  const live = await livenessOf(ports, only.pid);
+  if (live.state === "gone") return null;
+  if (live.state === "unavailable") return { refused: `pid ${only.pid}, this CTO role's process, is not provably gone and its start cannot be read; nothing was signalled` };
+  return { pid: only.pid, startToken: live.token, tmux: only.tmuxSession };
 };
 
 const tmuxExists = (ports: CtoPorts, name: string): boolean =>
@@ -329,22 +351,29 @@ const stopStep = (ports: CtoPorts, projectId: string, id = "stop", keepChanneled
     : "send SIGTERM to the CTO's bound session's process (the recorded pid, checked by its native start token; for an unbound resident, the one process the shared one-CTO check matches), nothing else, and wait for it to exit",
   done: async () => {
     const role = await roleProcesses(ports, projectId);
-    const target = stopTargetOf(ports, fresh(ports, projectId), role);
+    const target = await stopTargetOf(ports, fresh(ports, projectId), role);
     if (target === null) return true;
     return !("refused" in target) && keepChanneled && withChannel(role, target.pid);
   },
   run: async () => {
     const role = await roleProcesses(ports, projectId);
-    const target = stopTargetOf(ports, fresh(ports, projectId), role);
+    const target = await stopTargetOf(ports, fresh(ports, projectId), role);
     if (target === null) return ok({ running: false });
     if ("refused" in target) return refused(target.refused);
-    if (ports.startToken(target.pid) !== target.startToken) return ok({ pid: target.pid, alreadyGone: true });
+    // Exited is proven only by the kernel: the pid gone, or a readable token that is another process's.
+    const exited = async (): Promise<boolean | null> => {
+      const live = await livenessOf(ports, target.pid);
+      return live.state === "gone" || (live.state === "alive" && live.token !== target.startToken) ? true : live.state === "unavailable" ? null : false;
+    };
+    if ((await exited()) === true) return ok({ pid: target.pid, alreadyGone: true });
     try { ports.signal(target.pid, "SIGTERM"); } catch (error) {
       // Gone between the read and the signal is the outcome this step wants; anything else is reported.
       if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
     }
-    for (const deadline = ports.now() + STOP_TIMEOUT_MS; ports.startToken(target.pid) === target.startToken;) {
-      if (ports.now() >= deadline) return refused(`pid ${target.pid} did not exit within ${STOP_TIMEOUT_MS / 1000}s of SIGTERM; nothing else was signalled`);
+    for (const deadline = ports.now() + STOP_TIMEOUT_MS; (await exited()) !== true;) {
+      if (ports.now() >= deadline) {
+        return refused(`pid ${target.pid} did not provably exit within ${STOP_TIMEOUT_MS / 1000}s of SIGTERM (it still runs, or its start could not be read); nothing else was signalled and nothing was launched`);
+      }
       await ports.sleep(POLL_MS);
     }
     stopped.push({ pid: target.pid, startedAt: target.startToken });
@@ -436,11 +465,27 @@ const writeCanonicalLauncher = (ports: CtoPorts, projectId: string, plan: Canoni
     `cd ${quoteShell(plan.cwd)} || exit 1\nexec ${argv.map(quoteShell).join(" ")}\n`, 0o700);
   return argv;
 };
-const readCanonicalLauncher = (ports: CtoPorts, projectId: string): CanonicalLauncher | null => {
+/** The launcher's recorded line, whatever version wrote it; null when there is none or it does not parse. */
+const launcherRecordOf = (ports: CtoPorts, projectId: string): Record<string, unknown> | null => {
   const file = canonicalLauncherOf(ports, projectId);
   if (!ports.files.exists(file)) return null;
   const line = ports.files.read(file).split("\n").find((l) => l.startsWith("# cto-launch: "));
-  try { return line ? JSON.parse(line.slice("# cto-launch: ".length)) as CanonicalLauncher : null; } catch { return null; }
+  try {
+    const value: unknown = line ? JSON.parse(line.slice("# cto-launch: ".length)) : null;
+    return value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null;
+  } catch { return null; }
+};
+const isStrings = (value: unknown): value is string[] => Array.isArray(value) && value.every((one) => typeof one === "string");
+/** This version's launcher record, or null: one with any of its metadata missing is regenerated, never used. */
+const readCanonicalLauncher = (ports: CtoPorts, projectId: string): CanonicalLauncher | null => {
+  const r = launcherRecordOf(ports, projectId);
+  return r && ["tmux", "cwd", "claude", "keyFile", "roomId"].every((key) => typeof r[key] === "string") && isStrings(r["resume"])
+    ? r as unknown as CanonicalLauncher : null;
+};
+/** What an earlier version's launcher (`{tmux, argv}`) carried: its tmux session and its full argv, for the options it kept. */
+const readLegacyLauncher = (ports: CtoPorts, projectId: string): { tmux: string | null; argv: string[] } | null => {
+  const r = launcherRecordOf(ports, projectId);
+  return r && isStrings(r["argv"]) && r["argv"].length > 0 ? { tmux: typeof r["tmux"] === "string" ? r["tmux"] : null, argv: r["argv"] } : null;
 };
 
 /**
@@ -494,7 +539,7 @@ const canonicalResumeSteps = (ports: CtoPorts, projectId: string, restart: boole
     plan: "check with the shared one-CTO rule (the role's whole scope, real argv) that no process of the role runs but the bound session's own, which the stop replaces",
     run: async () => {
       const role = await roleProcesses(ports, projectId);
-      const target = stopTargetOf(ports, fresh(ports, projectId), role);
+      const target = await stopTargetOf(ports, fresh(ports, projectId), role);
       if (target !== null && "refused" in target) return refused(target.refused);
       const one = await assertNoOtherCtoProcess(roleScopeOf(ports, projectId), ports.ctoProcesses, target ? [{ pid: target.pid, startedAt: target.startToken }] : []);
       return one.ok ? ok(target ? { replaces: target.pid } : {}) : refused(`${one.message}; nothing was written, stopped or started`);
@@ -514,17 +559,18 @@ const canonicalResumeSteps = (ports: CtoPorts, projectId: string, restart: boole
       const channel = channelOf(ports, at.record);
       if (typeof channel === "string") return refused(channel);
       const role = await roleProcesses(ports, projectId);
-      const target = stopTargetOf(ports, at.record, role);
+      const target = await stopTargetOf(ports, at.record, role);
       if (target !== null && "refused" in target) return refused(target.refused);
       // What the bound session was started with, from its kernel argv; nothing is read from command text.
       const argv = target ? role.snapshot.claude.get(target.pid)?.argv ?? null : null;
       if (target && argv === null) return refused(`pid ${target.pid}'s argv cannot be read, so what its session was started with is unknown; nothing was written`);
-      const claude = claudeBinaryOf(ports, argv);
-      if (!claude) return refused("the claude binary is not known: set ACP_CLAUDE_BINARY (agentcpd's launcher pins ACP_RESOLVED_CLAUDE_BINARY)");
       const earlier = readCanonicalLauncher(ports, projectId);
-      const kept = argv ? carriedOptions(argv) : earlier ? carriedOptions([earlier.claude, ...earlier.resume]) : [];
+      const legacy = earlier ? null : readLegacyLauncher(ports, projectId);
+      const claude = claudeBinaryOf(ports, argv ?? (earlier ? [earlier.claude] : legacy?.argv ?? null));
+      if (!claude) return refused("the claude binary is not known: set ACP_CLAUDE_BINARY (agentcpd's launcher pins ACP_RESOLVED_CLAUDE_BINARY)");
+      const kept = argv ? carriedOptions(argv) : earlier ? carriedOptions([earlier.claude, ...earlier.resume]) : legacy ? carriedOptions(legacy.argv) : [];
       const resume = ["--resume", at.uuid, ...kept, ...(kept.includes("--permission-mode") ? [] : ["--permission-mode", "bypassPermissions"])];
-      const tmux = target?.tmux ?? earlier?.tmux ?? `cto-${projectId}`;
+      const tmux = target?.tmux ?? earlier?.tmux ?? legacy?.tmux ?? `cto-${projectId}`;
       // The launch writes its own id into this script before tmux starts it; this one is the plan a rerun starts from.
       writeCanonicalLauncher(ports, projectId, { tmux, cwd: at.cwd, claude, keyFile: channel.keyFile, roomId: channel.roomId, resume });
       return ok({ launcher, tmux });
@@ -545,7 +591,7 @@ const canonicalResumeSteps = (ports: CtoPorts, projectId: string, restart: boole
       const at = bound();
       if (typeof at === "string") return refused(at);
       const earlier = readCanonicalLauncher(ports, projectId);
-      const claude = claudeBinaryOf(ports, earlier ? [earlier.claude] : null);
+      const claude = claudeBinaryOf(ports, earlier ? [earlier.claude] : readLegacyLauncher(ports, projectId)?.argv ?? null);
       if (!claude) return refused("the claude binary is not known: set ACP_CLAUDE_BINARY");
       // Absent is fine; the add below is what has to succeed.
       ports.run(claude, ["mcp", "remove", "--scope", "local", "acp-cto"], { cwd: at.cwd, timeoutMs: 30_000 });

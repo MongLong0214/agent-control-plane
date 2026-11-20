@@ -95,6 +95,13 @@ interface World {
   psFails: boolean;
   /** Earlier conversations of the role, as the database's role scope lists them. */
   roleConversations: string[];
+  /** Pids whose native start token cannot be read although they run. */
+  tokenUnavailable: Set<number>;
+  /** Pids that outlive SIGTERM. */
+  survivesSigterm: Set<number>;
+  /** Pids whose token read answers null this many times once they have been signalled. */
+  tokenGlitchAfterSignal: Map<number, number>;
+  signalled: Set<number>;
 }
 
 const results = (w: World): Array<[string, string]> => w.out.filter((l) => typeof l["result"] === "string" && typeof l["step"] === "string").map((l) => [l["step"] as string, l["result"] as string]);
@@ -112,6 +119,7 @@ const makeWorld = (overrides: Partial<CtoRecord> = {}, env: Record<string, strin
     out: [], changes: [], ran: [], files, mtimes, tmux: new Set([TMUX]), repo: { exists: true }, worker: { unpublished: false, fetchFails: false }, operatorAnswers: [], provisionerAnswers: [],
     dirty: new Set<string>(), archiveUnpublished: false, daemonRejects: false, retireExecutions: 0, rotateRuns: [],
     argv: new Map<number, string[]>(), panes: new Map([[100, TMUX]]), launched: { command: null, claims: true }, pane: "registered", oldReceiptDuringLaunch: false, hiddenFromPs: new Set<number>(), psFails: false, roleConversations: [],
+    tokenUnavailable: new Set<number>(), survivesSigterm: new Set<number>(), tokenGlitchAfterSignal: new Map<number, number>(), signalled: new Set<number>(),
     procs: [
       { pid: 100, ppid: 1, command: "/bin/sh /state/resident-e2e-sort-fixture.sh" },
       { pid: CLAUDE, ppid: 100, command: `/bin/claude --model opus ${CHANNEL} --resume ${CONVERSATION} --name e2e CTO` },
@@ -269,9 +277,16 @@ const makeWorld = (overrides: Partial<CtoRecord> = {}, env: Record<string, strin
       alive: (pid: number) => w.procs.some((p) => p.pid === pid),
       startToken: (pid: number) => (w.procs.some((p) => p.pid === pid) ? `start-${pid}` : null),
     } satisfies CtoProcessReader,
-    startToken: (pid: number) => (w.procs.some((p) => p.pid === pid) ? `start-${pid}` : null),
+    startToken: (pid: number) => {
+      if (!w.procs.some((p) => p.pid === pid) || w.tokenUnavailable.has(pid)) return null;
+      const glitches = w.signalled.has(pid) ? w.tokenGlitchAfterSignal.get(pid) ?? 0 : 0;
+      if (glitches > 0) { w.tokenGlitchAfterSignal.set(pid, glitches - 1); return null; }
+      return `start-${pid}`;
+    },
     signal: (pid: number) => {
       w.changes.push(`SIGTERM ${pid}`);
+      w.signalled.add(pid);
+      if (w.survivesSigterm.has(pid)) return;
       w.procs = w.procs.filter((p) => p.pid !== pid && p.ppid !== pid);
       // A pane whose own process was claude ends with it, and so does its session.
       const session = w.panes.get(pid);
@@ -844,6 +859,73 @@ describe("one CTO per project, through the shared check (#1463)", () => {
     expect(await runCtoCommand(["relaunch", P, "--apply"], w.ports)).toBe(0);
     expect(w.changes.filter((c) => c.startsWith("SIGTERM"))).toEqual([]);
     expect(w.procs.some((p) => p.pid === 40000)).toBe(true);
+  });
+});
+
+/** #1463 review r2: a token that cannot be read is never proof of exit, and a binding is never stepped around. */
+describe("#1463 r2: gone, alive and unavailable are three states", () => {
+  const canonicalBound = (): World => {
+    const cwd = realpathSync(tempDir("acp-cto-r2-"));
+    const config = tempDir("acp-cto-r2-config-");
+    writeFileSync(join(config, ".claude.json"), JSON.stringify({ projects: { [cwd]: { hasTrustDialogAccepted: true } } }));
+    const w = makeWorld({ kind: "canonical", resident: null, generation: 3, session: { pid: CLAUDE, startedAt: `start-${CLAUDE}`, workdir: cwd },
+      repositories: [{ repositoryId: "repo_1", identity: `github:${REPO}`, checkoutPath: cwd }] }, { ACP_OPERATOR_TOKEN: "operator-test-credential", CLAUDE_CONFIG_DIR: config });
+    w.procs = [{ pid: CLAUDE, ppid: 1, command: `${LOCAL_CLAUDE} --resume ${CONVERSATION}`, argv: [LOCAL_CLAUDE, "--resume", CONVERSATION], cwd }];
+    const transcript = `${HOME}/.claude/projects/${cwd.replace(/[^A-Za-z0-9]/g, "-")}/${CONVERSATION}.jsonl`;
+    w.files.set(transcript, "{}");
+    w.mtimes.set(transcript, NOW - (IDLE_SECONDS + 60) * 1000);
+    return w;
+  };
+  const launches = (w: World): string[] => w.changes.filter((c) => /^tmux new-(session|window)/.test(c) || c === "provisioner ensure-resident");
+
+  it("P1 346: a pid that survives SIGTERM and whose token reads null once is not taken as exited; nothing launches beside it", async () => {
+    const w = canonicalBound();
+    w.survivesSigterm.add(CLAUDE);
+    w.tokenGlitchAfterSignal.set(CLAUDE, 1);
+    expect(await runCtoCommand(["relaunch", P, "--apply"], w.ports)).toBe(1);
+    expect(results(w).at(-1)).toEqual(["stop", "failed"]);
+    expect(JSON.stringify(w.out)).toContain("did not provably exit");
+    expect(launches(w)).toEqual([]);
+  });
+
+  it("P1 234: a bound os_pid whose start cannot be read refuses, and the resident fallback never signals pid 20000 in its place", async () => {
+    const w = makeWorld({ generation: 4, session: { pid: CLAUDE, startedAt: `start-${CLAUDE}`, workdir: CLONE } });
+    w.procs = [{ pid: CLAUDE, ppid: 1, command: "/bin/claude --model opus", cwd: "/elsewhere" }, { pid: 20000, ppid: 1, command: `claude --resume ${CONVERSATION}`, cwd: CLONE }];
+    w.tokenUnavailable.add(CLAUDE);
+    expect(await runCtoCommand(["relaunch", P], w.ports)).toBe(0);
+    expect(w.out.find((l) => l["step"] === "stop")).toMatchObject({ already: false });
+    w.out.length = 0;
+    expect(await runCtoCommand(["relaunch", P, "--apply"], w.ports)).toBe(1);
+    expect(results(w).at(-1)).toEqual(["stop", "failed"]);
+    expect(JSON.stringify(w.out)).toContain("cannot be read");
+    expect(w.changes).toEqual([]);
+  });
+
+  it("P1 234: a bound os_pid that is provably gone is nothing to stop; another matching process is never signalled in its place", async () => {
+    const w = makeWorld({ generation: 4, session: { pid: 16591, startedAt: "start-16591", workdir: CLONE } });
+    w.procs = [{ pid: 20000, ppid: 1, command: `claude --resume ${CONVERSATION}`, cwd: CLONE }];
+    await runCtoCommand(["relaunch", P, "--apply"], w.ports);
+    expect(w.changes.filter((c) => c.startsWith("SIGTERM"))).toEqual([]);
+  });
+
+  it("P1 234: the fallback to the shared check's match is an unbound resident's only", async () => {
+    const w = makeWorld({ generation: null, session: null });
+    w.procs = [{ pid: 20000, ppid: 1, command: `claude --resume ${CONVERSATION}`, cwd: CLONE }];
+    expect(await runCtoCommand(["relaunch", P, "--apply"], w.ports)).toBe(0);
+    expect(w.changes[0]).toBe("SIGTERM 20000");
+  });
+
+  it("P2 509: a launcher an earlier version wrote ({tmux, argv}) is regenerated, keeping what it carried, and the relaunch goes on", async () => {
+    const w = canonicalBound();
+    w.procs = [];
+    w.record = { ...w.record, generation: null, session: null };
+    const legacy = { tmux: "logic-claude-handoff", argv: [LOCAL_CLAUDE, "--mcp-config", "{}", "--dangerously-load-development-channels", "server:acp-buzz-channel", "--resume", CONVERSATION, "--name", "Logic CTO", "--permission-mode", "bypassPermissions"] };
+    w.files.set(`${STATE}/cto-launch-${P}.sh`, `#!/bin/sh\n# cto-launch: ${JSON.stringify(legacy)}\nexec true\n`);
+    expect(await runCtoCommand(["relaunch", P, "--apply"], w.ports)).toBe(0);
+    expect(results(w).find(([s]) => s === "launcher")).toEqual(["launcher", "done"]);
+    const launch = w.out.find((l) => l["step"] === "launch" && l["result"] === "done")!["detail"] as { argv: string[]; tmux: string };
+    expect(launch.argv.slice(launch.argv.indexOf("--name"), launch.argv.indexOf("--name") + 2)).toEqual(["--name", "Logic CTO"]);
+    expect(launch.tmux).toBe("logic-claude-handoff");
   });
 });
 
