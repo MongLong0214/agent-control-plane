@@ -5,7 +5,7 @@ import type { AuditLog } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
 import { OWNERLESS_STALL_ROUTED, runProgressAt } from "../doctor/watchdog.ts";
 import { isTerminal } from "../domain/run-state.ts";
-import { Role, RunState, roleKeyFor } from "../domain/types.ts";
+import { Role, type RoleBinding, RunState, roleKeyFor } from "../domain/types.ts";
 import { MessageKind } from "../outbox/envelope.ts";
 import { type Outbox, type OutboxMessage, outboxDeliveryReadback } from "../outbox/outbox.ts";
 import type { BindingRegistry } from "../session/binding-registry.ts";
@@ -26,10 +26,10 @@ import type { BindingRegistry } from "../session/binding-registry.ts";
  * nothing more is delivered for it; an ACK is receipt, never resolution. A notice of a resolved incident is
  * withdrawn rather than carried to a CEO it was not addressed to (`withdrawResolvedNotices`).
  *
- * Two notices keep their own owners: a candidate's READY_FOR_CEO_REVIEW (`ProductionGate.buildPacket`, and
- * its re-delivery after a CEO recovery, deduplicated by the decision and the candidate, in
- * `AgentOwnedWaits.redeliverPendingReviews`), and an agent-owned wait's RENOTIFY and REASSIGN steps, which
- * re-send that wait's own notice on its deadline ladder by design.
+ * Every CEO notice is enqueued here, by `enqueueCeoNotice`. Two keep their own keys and dedup: a candidate's
+ * READY_FOR_CEO_REVIEW (`ProductionGate.buildPacket`, and its re-delivery after a CEO recovery, deduplicated by the
+ * decision and the candidate, in `AgentOwnedWaits.redeliverPendingReviews`), and an agent-owned wait's RENOTIFY
+ * and REASSIGN steps, which re-send that wait's own notice on its deadline ladder by design.
  */
 
 /** PRD §19.3 — the only three automatic Hermes notifications. */
@@ -39,6 +39,22 @@ export const NotificationKind = {
   CRITICAL_SYSTEM_FAILURE: "CRITICAL_SYSTEM_FAILURE",
 } as const;
 export type NotificationKind = (typeof NotificationKind)[keyof typeof NotificationKind];
+
+/** #1442 — the one enqueue of a CEO notice, addressed to `ceo`. No lookup, dedup or audit: those stay with the caller. */
+export const enqueueCeoNotice = (
+  outbox: Pick<Outbox, "enqueue">,
+  ceo: Pick<RoleBinding, "roleKey" | "bindingGeneration" | "sessionId">,
+  notice: { idempotencyKey: string; runId: string | null; payload: unknown },
+): Decision<OutboxMessage> =>
+  outbox.enqueue({
+    idempotencyKey: notice.idempotencyKey,
+    roleKey: ceo.roleKey,
+    bindingGeneration: ceo.bindingGeneration,
+    targetSessionId: ceo.sessionId,
+    runId: notice.runId,
+    kind: MessageKind.CEO_NOTIFICATION,
+    payload: notice.payload,
+  });
 
 /**
  * The incident classes, one correlation per (subject, class): `ceo-incident:<class>:<subject>`.
@@ -867,13 +883,9 @@ export const deliverIncident = (ports: NoticePorts, incident: Incident): Decisio
     const payload = incident.describe ? { ...incident.payload, ...incident.describe() } : incident.payload;
     let refusal: { reasonCode: ReasonCode; outcome: "REFUSED" | "UNKNOWN"; error?: string } | null = null;
     try {
-      const enqueued = ports.outbox.enqueue({
+      const enqueued = enqueueCeoNotice(ports.outbox, ceo, {
         idempotencyKey: key,
-        roleKey: ceo.roleKey,
-        bindingGeneration: ceo.bindingGeneration,
-        targetSessionId: ceo.sessionId,
         runId: incident.runId,
-        kind: MessageKind.CEO_NOTIFICATION,
         payload: {
           notification: rule.notification,
           runId: incident.runId,
@@ -1010,13 +1022,9 @@ export const enqueueAdHocNotice = (
   let refused: ReasonCode | null = null;
   let created = false;
   try {
-    const enqueued = ports.outbox.enqueue({
+    const enqueued = enqueueCeoNotice(ports.outbox, ceo, {
       idempotencyKey: key,
-      roleKey: ceo.roleKey,
-      bindingGeneration: ceo.bindingGeneration,
-      targetSessionId: ceo.sessionId,
       runId,
-      kind: MessageKind.CEO_NOTIFICATION,
       payload: { notification: kind, runId, ...payload },
     });
     if (!enqueued.allowed) refused = enqueued.reasonCode;
