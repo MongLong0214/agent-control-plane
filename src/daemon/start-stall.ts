@@ -82,7 +82,7 @@ const START_FINDING_CLASSES: Readonly<Record<string, StartFindingClass>> = {
   // A checkout that is not there or not a repository: its registration, or the owner-gated project suspend.
   REPOSITORY_UNREADABLE: permanent("CEO", "OWNER_GATED", "nothing is requested of anyone: a registered checkout is missing or not a repository, so this start stays refused; re-registering it or suspending its project is an open decision"),
   // The restart reconcile marks a dead session ERROR and stops there: a binding it still holds or a run
-  // it still owns is released through the operator door, which a refused start never opens.
+  // it still owns is released by the daemon's own liveness sweep, once the daemon is running.
   SESSION_PROCESS_MISSING: permanent("CEO", "DEAD_SESSION", "nothing is requested of anyone: a dead session still holds a binding or owns work, so this start stays refused; releasing them is an open decision, and no operator door opens while starts refuse"),
   // Re-pinning or ending a run is a decision about that run; no restart makes it.
   ACTIVE_RUN_WITHOUT_OWNER: permanent("CEO", "RUN_DECISION", "re-pin the run's owner or end the run; neither is reachable until the daemon starts"),

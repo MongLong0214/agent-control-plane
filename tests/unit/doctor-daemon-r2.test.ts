@@ -443,9 +443,15 @@ describe("round 2 daemon regressions", () => {
       const reconciled = await new Daemon(harness.cp, { stateDir: tempDir("acp-startup-sweep-") }).reconcile();
       expect(reconciled.sessionsMarkedError).toContain(sessionId);
       expect(harness.cp.sessions.require(sessionId).lifecycle).toBe(SessionLifecycle.ERROR);
-      if (reference === "active CEO") expect(harness.cp.bindings.active("CEO")?.sessionId).toBe(sessionId);
-      else expect(harness.cp.runs.activeRunsOwnedBy(sessionId).map((owned) => owned.runId)).toContain(run.runId);
-      // A settled CEO is the operator door's other role (`binding recover-dead-ceo`), and a settled
+      if (reference === "active CEO") {
+        // A dead CEO that owns no run is released by the sweep itself, so there is no binding left
+        // to keep actionable: the release is the action.
+        expect(harness.cp.bindings.active("CEO")).toBeNull();
+        expect(harness.cp.audit.byKind("DEAD_BINDING_RECOVERED")).toHaveLength(1);
+        return;
+      }
+      expect(harness.cp.runs.activeRunsOwnedBy(sessionId).map((owned) => owned.runId)).toContain(run.runId);
+      // A settled CEO is the liveness sweep's other role, and a settled
       // session's project PRIMARY_CTO runs, its binding ACTIVE or already revoked, are reached once the
       // daemon is up (its same actor's next generation, or the CEO's run_cancel), so the system report
       // names each as a non-blocking ERROR; its own session report still blocks.

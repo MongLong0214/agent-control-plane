@@ -1,4 +1,5 @@
 import Database from "better-sqlite3";
+import { spawnSync } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { createConnection } from "node:net";
 import { join } from "node:path";
@@ -29,6 +30,7 @@ import {
 import { createCtoBindingRuntime } from "../../src/daemon/cto-binding-runtime.ts";
 import { type DaemonNoticeBody, deliverOwedPeerMessageNotices } from "../../src/runtime/acp-daemon-notice.ts";
 import { runBoundedChild } from "../helpers/bounded-child.ts";
+import { Daemon } from "../../src/daemon/daemon.ts";
 import { recoverDeadCanonicalBinding } from "../../src/daemon/dead-binding-recovery.ts";
 import { Role, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
 import { buzzMessageNonce } from "../../src/ingress/buzz-message.ts";
@@ -1356,6 +1358,79 @@ describe("a canonical restart keeps the CEO's queued peer message (2026-10-03)",
       expect(handedOver(taken.allowed ? taken.value : null).claimed?.text).toBe("retained instead of refused");
       expect((taken.allowed ? taken.value : null)?.refusedAtRestart).toBeUndefined();
     } finally { await fixture.close(); }
+  });
+});
+
+/** A pid that is gone: `spawnSync` returns after the child exited and was reaped, so `kill(pid, 0)` answers ESRCH. */
+const reapedPid = (): number => {
+  const finished = spawnSync("/usr/bin/true", [], { stdio: "ignore", timeout: 30_000 });
+  const pid = finished.pid;
+  if (finished.signal !== null || typeof pid !== "number" || pid <= 0) throw new Error("could not obtain a reaped child pid");
+  expect(() => process.kill(pid, 0)).toThrow();
+  return pid;
+};
+
+describe("the daemon's liveness sweep releases a dead canonical CTO before its conversation restarts (#1448)", () => {
+  /** Records the dead process on the first generation's session, then runs the daemon's own sweep once. */
+  const sweepReleasesTheDeadCto = async (fixture: Fixture) => {
+    const { harness } = fixture;
+    harness.cp.db.run(`UPDATE sessions SET os_pid = ?, os_process_started_at = NULL WHERE session_id = ?`, [
+      reapedPid(),
+      fixture.first.sessionId,
+    ]);
+    const report = await new Daemon(harness.cp, { stateDir: tempDir("acp-sweep-restart-") }).reconcile();
+    expect(report.sessionsMarkedError).toContain(fixture.first.sessionId);
+    expect(harness.cp.bindings.active(fixture.ctoRoleKey)).toBeNull();
+    expect(harness.cp.audit.byKind("DEAD_BINDING_RECOVERED")).toHaveLength(1);
+  };
+
+  it("keeps the queued CEO message PENDING, and the restarted conversation is handed it with its turn still open", async () => {
+    const fixture = await startFixture();
+    try {
+      const event = await fixture.ceoSays("살아 있는 동안 보낸 CEO 지시");
+      const [queued] = fixture.peerRows();
+
+      await sweepReleasesTheDeadCto(fixture);
+      // Released by the sweep, not rejected: the row is exactly as it was and its turn is open.
+      expect(fixture.peerRows()).toEqual([queued]);
+      expect(fixture.turnClaim(event.id)["noReplyAt"]).toBeUndefined();
+
+      const successor = await restart(fixture, 2);
+      expect(successor.binding.bindingGeneration).toBe(2);
+      const ledger = ownerMessageLedger(fixture.harness.cp);
+      const holder = fixture.holderOf(successor.sessionId);
+      const taken = ledger.claim(holder);
+      expect(taken.allowed, JSON.stringify(taken)).toBe(true);
+      expect(handedOver(taken.allowed ? taken.value : null)).toMatchObject({
+        claimed: { messageId: queued!.message_id, text: "살아 있는 동안 보낸 CEO 지시", principal: "peer" },
+        withheld: [],
+      });
+      expect(ledger.complete(queued!.message_id, holder).reasonCode).toBe(ReasonCode.OK);
+      expect(fixture.peerRows()[0]).toMatchObject({ status: "ACKED", target_session_id: successor.sessionId, binding_generation: 2 });
+    } finally {
+      await fixture.close();
+    }
+  });
+
+  it("redelivers a message the dead CTO had taken but not acknowledged, with the same id", async () => {
+    const fixture = await startFixture();
+    try {
+      const event = await fixture.ceoSays("unACKed peer work");
+      const ledger = ownerMessageLedger(fixture.harness.cp);
+      const first = ledger.claim(fixture.holderOf(fixture.first.sessionId));
+      const id = handedOver(first.allowed ? first.value : null).claimed!.messageId;
+
+      await sweepReleasesTheDeadCto(fixture);
+      const successor = await restart(fixture, 2);
+
+      expect(fixture.peerRows()[0]).toMatchObject({ status: "SENT", binding_generation: 2, message_id: id });
+      expect(fixture.turnClaim(event.id)["noReplyAt"]).toBeUndefined();
+      const holder = fixture.holderOf(successor.sessionId);
+      expect(handedOver((ledger.claim(holder) as { value: unknown }).value).claimed).toMatchObject({ messageId: id, text: "unACKed peer work" });
+      expect(ledger.complete(id, holder).allowed).toBe(true);
+    } finally {
+      await fixture.close();
+    }
   });
 });
 

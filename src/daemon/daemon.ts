@@ -103,8 +103,7 @@ import {
 import {
   probeSessionLiveness,
   recoverDeadCanonicalBinding,
-  parseDeadBindingRecoveryRequest,
-  type DeadBindingRecoveryReceipt,
+  DEAD_BINDING_SWEEP_ACTOR,
 } from "./dead-binding-recovery.ts";
 import { SingleInstanceLock } from "./single-instance.ts";
 import { readProcessGroup } from "../bootstrap/attempt-writer-group.ts";
@@ -354,13 +353,6 @@ export const OPERATOR_METHOD = {
   OWNER_APPROVE: "owner.approve",
   ROLE_ATTACHMENT_ISSUE: ROLE_ATTACHMENT_OPERATION,
   ROLE_ATTACHMENT_REVOKE: "roleAttachment.revoke",
-  /**
-   * The parked daemon's recovery for CTO_BINDING_POINTS_AT_DEAD_SESSION: release a PRIMARY_CTO
-   * binding — or the CEO binding, the door's one other role — whose session's process is provably
-   * gone. It mints no session and no generation — see `dead-binding-recovery.ts` for why the
-   * spawning `CtoLifecycle.recoveryTakeover` is deliberately not what a parked daemon serves.
-   */
-  BINDING_RECOVER_DEAD: "binding.recoverDead",
   REPAIR_LIST: "repair.list",
   REPAIR_DRY_RUN: "repair.dry-run",
   REPAIR_EXECUTE: "repair.execute",
@@ -390,7 +382,6 @@ export const OPERATOR_MUTATION_METHODS: ReadonlySet<OperatorMethod> = new Set([
   OPERATOR_METHOD.OWNER_APPROVE,
   OPERATOR_METHOD.ROLE_ATTACHMENT_ISSUE,
   OPERATOR_METHOD.ROLE_ATTACHMENT_REVOKE,
-  OPERATOR_METHOD.BINDING_RECOVER_DEAD,
   OPERATOR_METHOD.REPAIR_DRY_RUN,
   OPERATOR_METHOD.REPAIR_EXECUTE,
   OPERATOR_METHOD.CAPACITY_OBSERVE,
@@ -424,15 +415,6 @@ export const BOOTSTRAP_OPERATOR_METHODS: ReadonlySet<OperatorMethod> = new Set([
   // could clear. #668.
   OPERATOR_METHOD.CONVERSATION_UNRESOLVED,
   OPERATOR_METHOD.CONVERSATION_RESOLVE,
-  // The remedy for CTO_BINDING_POINTS_AT_DEAD_SESSION, admitted here for the same reason the
-  // adjudication pair is: without it the doctor named a state that no command reachable from a
-  // parked daemon could clear, and the only door that could clear it was opened after start()
-  // had already refused. This method is narrower than the others on this list, not wider — it
-  // spawns nothing, mints no generation, and releases exactly one binding whose process this
-  // machine can prove is gone. The proof is what makes it narrow; it carried an owner approval
-  // too, until that approval turned out to be one this same door minted from the request that
-  // was asking for it.
-  OPERATOR_METHOD.BINDING_RECOVER_DEAD,
   OPERATOR_METHOD.DAEMON_STATUS,
 ]);
 
@@ -473,20 +455,7 @@ export const canParkForBootstrap = (blockingFindings: readonly BlockingFinding[]
       // and until one did, the rule read as "park for capacity" rather than as what it says.
       // Parking does not weaken the quarantine: a claim is refused by the ledger, not by the
       // daemon's mode, so a parked daemon admits no new turn for that actor either.
-      finding.code.startsWith("CANONICAL_TURN_") ||
-      // The CRITICAL that used to end the process. It is admitted here only because
-      // `OPERATOR_METHOD.BINDING_RECOVER_DEAD` exists to clear it: this entry and that method
-      // are one change and must not be separated. Alone, this line is the bypass — a daemon
-      // parking on a finding no reachable command can answer, waiting forever behind a held
-      // lock. Alone, that method is unreachable, because the door serving it only opens for a
-      // park this line has to permit.
-      //
-      // Parking is not admission. The daemon holds its lock, serves `BOOTSTRAP_OPERATOR_METHODS`
-      // and nothing else, runs no dispatch, no delivery timer and no continuity coordinator, and
-      // `parkForBootstrap` promotes only after the doctor itself stops blocking. A project that
-      // still owns live runs is refused by `BindingRegistry.revoke` and goes on blocking here,
-      // which is the property this must not cost.
-      finding.code === "CTO_BINDING_POINTS_AT_DEAD_SESSION",
+      finding.code.startsWith("CANONICAL_TURN_"),
   );
 
 /**
@@ -703,6 +672,8 @@ export class Daemon {
   #bootstrapAbandoned = false;
   #bootstrapWaiter: (() => void) | null = null;
   #timerFailures = new Map<string, TimerFailure>();
+  /** The last failure message recorded for each role whose dead-holder release threw, until it succeeds. */
+  #sweepReleaseFailures = new Map<string, string>();
   // Unset until `main`'s composition root reports Telegram's outcome — `null` renders in
   // `health.json` as "this daemon has no opinion yet", distinct from `configured: false`.
   #telegramIngress: IngressChannelStatus | null = null;
@@ -996,17 +967,6 @@ export class Daemon {
         case OPERATOR_METHOD.ROLE_ATTACHMENT_REVOKE:
           return this.attachments.revoke(request.params);
 
-        case OPERATOR_METHOD.BINDING_RECOVER_DEAD: {
-          const recovered = this.executeDeadBindingRecovery(request, peer);
-          // Only a release that actually happened can change the doctor's mind, so a refused
-          // recovery must not consume the park's wake-up — the same rule the capacity and
-          // adjudication doors follow, for the same reason: an operator who applied the remedy
-          // should not then watch `daemon.status` report the stale finding for a recheck
-          // interval, and one who was refused should not see the daemon act as though they had.
-          if (recovered.allowed && this.#mode === "BOOTSTRAP") this.wakeBootstrap("OBSERVED");
-          return recovered;
-        }
-
         case OPERATOR_METHOD.REPAIR_LIST:
           return allow(ReasonCode.OK, this.cp.repair.catalog());
 
@@ -1248,42 +1208,6 @@ export class Daemon {
       approved,
       note,
       receipt: admitted.value,
-    });
-  }
-
-  /**
-   * Releases a canonical PRIMARY_CTO binding, or the CEO binding, whose session's process is
-   * provably gone.
-   *
-   * No owner-approval envelope is minted, admitted or consumed here. This method used to build
-   * one and put it through `admitCliOwnerApproval`, and the reason it had to build its own rather
-   * than load one minted earlier was itself the tell: the state this recovers is one in which
-   * `start()` has already refused, `OWNER_APPROVE` is outside `BOOTSTRAP_OPERATOR_METHODS`, and
-   * in a real outage nobody had minted anything beforehand. So the door minted the approval for
-   * the caller, from the caller's own request, at the moment the caller asked — a decision that
-   * could only ever say yes, recorded as though someone had been asked.
-   *
-   * `peer.actor` still travels, and it is still the socket's authenticated identity rather than
-   * a request field, but it is now evidence written into the audit record instead of a name
-   * checked against `cp.config.ownerIdentities`. What the daemon proves before releasing anything
-   * is in `dead-binding-recovery.ts`: the named generation is the one in force and the process
-   * holding it is provably gone.
-   */
-  private executeDeadBindingRecovery(
-    request: OperatorRequest,
-    peer: AuthenticatedOperatorPeer,
-  ): Decision<DeadBindingRecoveryReceipt> {
-    const parsed = parseDeadBindingRecoveryRequest(request.params);
-    if (!parsed.allowed) return parsed;
-    return recoverDeadCanonicalBinding(peer.actor, parsed.value, {
-      db: this.cp.db,
-      audit: this.cp.audit,
-      sessions: this.cp.sessions,
-      bindings: this.cp.bindings,
-      // No liveness seam is threaded through here on purpose. The probe's own injection points
-      // exist so `probeSessionLiveness` can be exercised for the codes a test cannot provoke
-      // (EPERM in particular); the daemon path takes the real syscall, so a test that drives
-      // this method is measuring the same question production asks.
     });
   }
 
@@ -1772,7 +1696,90 @@ export class Daemon {
       const result = this.cp.sessions.transition(session.sessionId, SessionLifecycle.ERROR, "session process is dead");
       if (result.allowed) settled.push(session.sessionId);
     }
+    this.releaseDeadCanonicalBindings();
     return settled;
+  }
+
+  /**
+   * Releases an ACTIVE canonical CTO or CEO binding whose bound session is settled (ERROR or
+   * STOPPED) and whose process is proven DEAD, so the role can be claimed again without a person
+   * running anything. It walks bindings, not the sessions settled just now: a session an earlier
+   * pass or an earlier build left ERROR is covered too.
+   *
+   * `recoverDeadCanonicalBinding` keeps every proof and no liveness seam is threaded in, so the
+   * real probe answers: it re-probes and refuses unless DEAD (EPERM stays ALIVE, anything it cannot
+   * decide is UNKNOWN), compares generation and incarnation, requires a moved binding's CURRENT runtime to be
+   * proven dead too (a surviving switch leaves the bound session behind), and refuses a binding that still owns
+   * live runs (REVOCATION_BLOCKED_ACTIVE_RUNS), which continuity's pause and revoke handles. A
+   * refusal changes nothing and is read again on the next tick. A release that throws is recorded
+   * (DAEMON_TIMER_FAILED, once per role and message) and does not stop the other bindings or the caller.
+   *
+   * The release is the plain one: it neither holds the role's queued peer mail for a successor nor takes
+   * over live runs, because it binds no successor. Queued role mail stays PENDING at the released generation
+   * and the next holder is handed it (`a-canonical-restart-keeps-the-ceo-peer-message.test.ts`); a holder
+   * that owns live runs is left to continuity's pause and revoke.
+   */
+  private releaseDeadCanonicalBindings(): void {
+    const bindings = [
+      ...this.cp.bindings.activePrimaryCtos(),
+      this.cp.bindings.active(roleKeyFor(Role.CEO)),
+    ];
+    const attempted = new Set<string>();
+    for (const binding of bindings) {
+      if (binding === null || (binding.role !== Role.CEO && binding.projectId === null)) continue;
+      const session = this.cp.sessions.get(binding.boundSessionId);
+      if (session?.lifecycle !== SessionLifecycle.ERROR && session?.lifecycle !== SessionLifecycle.STOPPED) continue;
+      attempted.add(binding.roleKey);
+      // One binding's failure must not starve the others or `reconcile()`: the release is its own
+      // transaction, so a throw leaves that binding exactly as it was, and the next sweep reads it again.
+      try {
+        recoverDeadCanonicalBinding(
+          DEAD_BINDING_SWEEP_ACTOR,
+          {
+            projectId: binding.role === Role.CEO ? null : binding.projectId,
+            role: binding.role,
+            sessionId: binding.boundSessionId,
+            sessionIncarnation: binding.boundSessionIncarnation,
+            expectedBindingGeneration: binding.bindingGeneration,
+          },
+          {
+            db: this.cp.db,
+            audit: this.cp.audit,
+            sessions: this.cp.sessions,
+            bindings: this.cp.bindings,
+          },
+        );
+        this.#sweepReleaseFailures.delete(binding.roleKey);
+      } catch (error) {
+        this.#recordSweepReleaseFailure(binding.roleKey, error);
+      }
+    }
+    // A binding no longer in the sweep's reach (released, replaced, or its holder alive again) owes no retry.
+    for (const roleKey of this.#sweepReleaseFailures.keys()) {
+      if (!attempted.has(roleKey)) this.#sweepReleaseFailures.delete(roleKey);
+    }
+  }
+
+  /**
+   * Records a release that threw, once per role and message until it succeeds or leaves the sweep's reach, so a
+   * persistent fault is visible without writing a row every tick. Recording is itself guarded: the audit log is
+   * a likely cause of the failure, and the sweep still has to reach the next binding.
+   */
+  #recordSweepReleaseFailure(roleKey: string, error: unknown): void {
+    const message = safeErrorMessage(error);
+    if (this.#sweepReleaseFailures.get(roleKey) === message) return;
+    this.#sweepReleaseFailures.set(roleKey, message);
+    try {
+      this.cp.audit.record({
+        kind: "DAEMON_TIMER_FAILED",
+        reasonCode: ReasonCode.DAEMON_TIMER_FAILED,
+        roleKey,
+        // `role`, not `roleKey`: the audit log redacts evidence keys that read as secrets.
+        evidence: { timer: "liveness-sweep", role: roleKey, error: message },
+      });
+    } catch {
+      // The reporting channel is the thing that failed; the next tick reads the binding again.
+    }
   }
 
   private async observeRepositories(): Promise<void> {

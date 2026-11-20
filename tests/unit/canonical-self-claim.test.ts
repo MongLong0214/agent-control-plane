@@ -2077,7 +2077,7 @@ describe("CanonicalSelfClaim — the six-clause contract", () => {
    * the same claimed conversation UUID, re-derived and re-verified — so the binding it finds is its
    * own. When the predecessor session's recorded `(osPid, start token)` is provably gone, the claim
    * releases the binding through `recoverDeadCanonicalBinding` inside its own transaction: the
-   * same proof and the same audit record as `binding recover-dead`, landing only together with the
+   * same proof and the same audit record as the daemon's liveness sweep, landing only together with the
    * successor generation.
    *
    * Every other shape keeps the refusal it had before, with nothing written; the counter-example
