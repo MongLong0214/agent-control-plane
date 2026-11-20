@@ -2,7 +2,7 @@ import { execFile } from "node:child_process";
 import { accessSync, constants, existsSync, statSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { promisify } from "node:util";
-import { totalmem } from "node:os";
+import { homedir, totalmem } from "node:os";
 
 import type { Clock } from "../core/clock.ts";
 import { type Decision, allow, deny } from "../core/errors.ts";
@@ -25,6 +25,7 @@ import { contractChangeRunsWithoutGrant } from "../registry/manifest-activation-
 import { inspectDatabaseStatePaths, inspectPrivatePath } from "../db/state-preflight.ts";
 import { probeSessionLiveness } from "../daemon/dead-binding-recovery.ts";
 import { RoleScopeUnreadable, type CtoProcessReader, ctoProcessesFor, ctoRoleScope, snapshotCtoProcesses, systemCtoProcessReader } from "../cto/one-cto-per-project.ts";
+import { ctoTranscriptPath, longReasons, measureConversation, refreshLimitsFromEnv } from "../cto/cto-conversation.ts";
 import { Role, RunState, SessionLifecycle, roleKeyFor } from "../domain/types.ts";
 import type { GitHubKernel } from "../github/github-kernel.ts";
 import { git, isClean, tryRevParse } from "../git/git.ts";
@@ -552,6 +553,13 @@ export class Doctor {
     this.#ctoProcessReader = reader;
   }
 
+  #homeDir = homedir();
+
+  /** Where CTO transcripts are read from; the real home folder unless a test says otherwise. */
+  useHomeDir(home: string): void {
+    this.#homeDir = home;
+  }
+
   async run(
     scope: DoctorScope = "system",
     target?: string,
@@ -571,6 +579,7 @@ export class Doctor {
     if (scope === "system" || scope === "cto" || scope === "project") {
       findings.push(...this.checkBindings(target ?? null, scope));
       findings.push(...(await this.checkOneCtoPerProject(target ?? null)));
+      findings.push(...this.checkCtoConversationsLong(target ?? null));
     }
     if (scope === "system" || scope === "run") {
       findings.push(...this.checkRuns(target ?? null));
@@ -751,6 +760,35 @@ export class Doctor {
         confidence: "HIGH",
         observedEvidence: { processes },
         recommendedAction: "nothing is requested of anyone: more than one live claude process resumes this project's CTO conversation, sits in its checkout or is its bound session; which one stays is an open decision",
+      });
+    }
+    return findings;
+  }
+
+  /** A CTO whose conversation transcript is at least 20 MB or compacted at least 3 times. Never blocking; unreadable says nothing. */
+  private checkCtoConversationsLong(projectId: string | null): Finding[] {
+    const findings: Finding[] = [];
+    const limits = refreshLimitsFromEnv(process.env);
+    for (const project of this.projectsCovered(projectId)) {
+      if (project.retiredAt !== null) continue;
+      const binding = this.bindings.activePrimaryCto(project.projectId);
+      const session = binding ? this.sessions.get(binding.sessionId) : null;
+      if (!binding || !session?.workdir) continue;
+      const conversation = this.db.get<{ target_locator: string }>(
+        `SELECT tb.target_locator FROM actor_target_bindings tb JOIN assignments a ON a.actor_id = tb.target_actor_id
+          WHERE a.role_key = ? AND a.status = 'ACTIVE' AND a.binding_generation = ?`, [binding.roleKey, binding.bindingGeneration])?.target_locator;
+      if (!conversation) continue;
+      const measure = measureConversation(ctoTranscriptPath(this.#homeDir, session.workdir, conversation));
+      const reasons = measure ? longReasons(measure, limits) : [];
+      if (!measure || reasons.length === 0) continue;
+      findings.push({
+        code: "CTO_CONVERSATION_LONG",
+        severity: "INFO",
+        scope: `project:${project.projectId}`,
+        blocking: false,
+        confidence: "HIGH",
+        observedEvidence: { conversation, generation: binding.bindingGeneration, bytes: measure.bytes, compactions: measure.compactions, reasons, limits },
+        recommendedAction: "the CTO may write a handoff (cto_handoff_write); the coordinator swaps it for a fresh conversation, when no run is live, with agentctl cto relaunch <project> --fresh --apply",
       });
     }
     return findings;

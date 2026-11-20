@@ -19,6 +19,7 @@ import { allow, deny, type Decision } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import { parseVerificationCommand } from "../contracts/verification-command.ts";
 import type { CtoLifecycle, HandoffAcknowledgement } from "../cto/cto-lifecycle.ts";
+import { CTO_HANDOFF_MAX_BYTES, hostStoreFiles, writeHandoff } from "../cto/cto-conversation.ts";
 import type { ArtifactStore } from "../db/artifacts.ts";
 import type { AuditLog } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
@@ -453,6 +454,26 @@ export const createCtoMcpPort = (source: CtoMcpSource) => {
       source.pipeline.replaySubmission(runId, idempotencyKey, requestFingerprint),
     openEscalation: (input: Parameters<ProductionGate["openEscalation"]>[0]) => source.ceo.openEscalation(input),
     activePrimaryCto: (projectId: string) => source.bindings.activePrimaryCto(projectId),
+    // The handoff a long conversation's CTO leaves for the fresh one that replaces it, stored by project under the state root.
+    writeCtoHandoff: (peer: AuthenticatedMcpPeer, text: string): Decision<{ projectId: string; bytes: number; maxBytes: number }> => {
+      if (!peer.sessionId || !peer.sessionIncarnation) return deny(ReasonCode.MCP_PEER_UNAUTHENTICATED, "CTO MCP peer is missing a session incarnation");
+      const held = source.bindings.bySession(peer.sessionId)
+        .filter((binding) => binding.status === "ACTIVE" && binding.roleKey.startsWith("PRIMARY_CTO:") &&
+          (peer.binding === undefined || (binding.roleKey === peer.binding.roleKey && binding.bindingGeneration === peer.binding.bindingGeneration)));
+      if (held.length !== 1) return deny(ReasonCode.MCP_PEER_UNAUTHENTICATED, "authenticated peer holds no single PRIMARY_CTO binding");
+      const binding = held[0]!;
+      const projectId = binding.roleKey.slice("PRIMARY_CTO:".length);
+      const current = source.bindings.activePrimaryCto(projectId);
+      if (!current || current.sessionId !== peer.sessionId || current.sessionIncarnation !== peer.sessionIncarnation || current.bindingGeneration !== binding.bindingGeneration) {
+        return deny(ReasonCode.MCP_PEER_UNAUTHENTICATED, "authenticated peer is not this project's primary CTO", { projectId });
+      }
+      const conversation = source.db.get<{ target_locator: string }>(
+        `SELECT tb.target_locator FROM actor_target_bindings tb JOIN assignments a ON a.actor_id = tb.target_actor_id
+          WHERE a.role_key = ? AND a.status = 'ACTIVE' AND a.binding_generation = ?`, [binding.roleKey, binding.bindingGeneration])?.target_locator ?? binding.boundSessionId;
+      const written = writeHandoff(hostStoreFiles, dirname(source.config.databasePath), { projectId, conversation, source: "cto", text, now: source.clock.nowIso() });
+      if (!written.ok) return deny(ReasonCode.INVALID_ARGUMENT, written.reason, { maxBytes: CTO_HANDOFF_MAX_BYTES });
+      return allow(ReasonCode.OK, { projectId, bytes: Buffer.byteLength(written.handoff.text, "utf8"), maxBytes: CTO_HANDOFF_MAX_BYTES });
+    },
     prepareSwitchover: (...args: Parameters<CtoLifecycle["prepareSwitchover"]>) => source.cto.prepareSwitchover(...args),
     handoffAuthority: (messageId: string) => {
       const message = source.outbox.get(messageId);
@@ -1035,6 +1056,16 @@ const createCtoServerFromPort = (
         },
       });
     }),
+  );
+  server.registerTool(
+    "cto_handoff_write",
+    {
+      description:
+        `Write the handoff for the fresh conversation that will replace this long one. At most ${CTO_HANDOFF_MAX_BYTES} bytes of plain text: what is in flight, ` +
+        `what you decided and why, what to do first, what to watch for. It is stored for this project and becomes the new conversation's first prompt; calling it again replaces it. Current PRIMARY_CTO only.`,
+      inputSchema: { text: z.string().min(1) },
+    },
+    async (args) => read("cto_handoff_write", (peer) => respond(port.writeCtoHandoff(peer, args.text))),
   );
   server.registerTool(
     "capacity_get",

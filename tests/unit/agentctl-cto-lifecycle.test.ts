@@ -60,6 +60,7 @@ interface World {
   /** Every subprocess the command ran, in order. */
   ran: string[];
   record: CtoRecord;
+  openRuns: Array<{ runId: string; state: string; kind: string }>;
   files: Map<string, string>;
   procs: FakeProcess[];
   tmux: Set<string>;
@@ -131,6 +132,7 @@ const makeWorld = (overrides: Partial<CtoRecord> = {}, env: Record<string, strin
       // The acp-cto relay names the conversation too, but is not the conversation's process.
       { pid: 16970, ppid: CLAUDE, command: `/node agentctl.js attach resident-cto --claimed-session-id ${CONVERSATION} --project-id ${P}` },
     ],
+    openRuns: [],
     record: {
       projectId: P, name: P, retiredAt: null, kind: "resident",
       repositories: [{ repositoryId: "repo_1", identity: `github:${REPO}`, checkoutPath: WORKER }],
@@ -261,6 +263,7 @@ const makeWorld = (overrides: Partial<CtoRecord> = {}, env: Record<string, strin
     state: {
       projects: () => (w.record.retiredAt ? [] : [structuredClone(w.record)]),
       project: (id: string) => (id === P ? structuredClone(w.record) : null),
+      openRuns: () => structuredClone(w.openRuns),
       // The shared rule's scope as the database gives it: the role's conversations, its live checkouts, its bound process.
       roleScope: (id: string, extra: { conversationIds?: readonly string[]; checkouts?: readonly string[] } = {}): CtoRoleScope => ({
         projectId: id,
@@ -737,6 +740,69 @@ describe("a canonical relaunch resumes the role's bound conversation", () => {
     const { w } = canonicalWorld();
     expect(await runCtoCommand(["relaunch", P, "--handoff", "/h.json", "--apply"], w.ports)).toBe(2);
     expect(w.changes).toEqual([]);
+  });
+
+  describe("relaunch --fresh", () => {
+    const FRESH_STEPS = ["no-live-run", "handoff", ...RESUME_STEPS];
+    const launcherOf = (w: World): { resume: string[] } => JSON.parse(w.files.get(`${STATE}/cto-launch-${P}.sh`)!.split("\n").find((l) => l.startsWith("# cto-launch: "))!.slice("# cto-launch: ".length)) as { resume: string[] };
+
+    it("starts a new conversation with --session-id and the stored handoff as its first prompt, not --resume", async () => {
+      const { w } = canonicalWorld();
+      w.files.set(`${STATE}/cto-refresh/handoff-${P}.json`, JSON.stringify({ schema: "acp.cto-handoff.v1", projectId: P, conversation: CONVERSATION, source: "cto", text: "Finish run_3 first.", writtenAt: "2026-11-20T00:00:00Z" }));
+      expect(await runCtoCommand(["relaunch", P, "--fresh", "--apply"], w.ports)).toBe(0);
+      expect(results(w).map(([step]) => step)).toEqual(FRESH_STEPS);
+      const launch = w.out.find((l) => l["step"] === "launch" && l["result"] === "done")!["detail"] as { argv: string[] };
+      const id = launch.argv[launch.argv.indexOf("--session-id") + 1]!;
+      expect(id).toMatch(/^99999999-/);
+      expect(launch.argv).not.toContain("--resume");
+      expect(launch.argv.at(-1)).toContain("Finish run_3 first.");
+      expect(launch.argv.at(-1)).toContain(CONVERSATION);
+      expect(w.changes).toContain(`${LOCAL_CLAUDE} mcp add --scope local acp-cto -- ${STATE}/current/dist/bin/node ${STATE}/current/dist/cli/agentctl.js attach canonical-cto --claimed-session-id ${id} --project-id ${P} --expected-binding-generation auto`);
+      expect(w.changes).toContain(`SIGTERM ${CLAUDE}`);
+      expect(w.rotateRuns).toEqual([]);
+    });
+
+    it("writes a short ACP handoff from the binding and open runs when none is stored, and records the old conversation", async () => {
+      const { w } = canonicalWorld();
+      w.openRuns = [{ runId: "run_9", state: "BLOCKED", kind: "IMPLEMENT" }];
+      expect(await runCtoCommand(["relaunch", P, "--fresh", "--apply"], w.ports)).toBe(0);
+      const stored = JSON.parse(w.files.get(`${STATE}/cto-refresh/handoff-${P}.json`)!) as { conversation: string; source: string; text: string };
+      expect(stored).toMatchObject({ conversation: CONVERSATION, source: "acp" });
+      expect(Buffer.byteLength(stored.text)).toBeLessThanOrEqual(2048);
+      expect(stored.text).toContain("run_9 BLOCKED");
+      expect(launcherOf(w).resume.at(-1)).toContain("run_9 BLOCKED");
+    });
+
+    it("refuses while the project has running work, before anything is written or stopped", async () => {
+      const { w } = canonicalWorld();
+      w.openRuns = [{ runId: "run_1", state: "ACTIVE", kind: "IMPLEMENT" }];
+      expect(await runCtoCommand(["relaunch", P, "--fresh", "--apply"], w.ports)).toBe(1);
+      expect(results(w)).toEqual([["no-live-run", "failed"]]);
+      expect(w.changes).toEqual([]);
+    });
+
+    it("on failure rolls nothing back and prints the one command that resumes the old conversation", async () => {
+      const { w } = canonicalWorld();
+      w.launched.claims = false;
+      expect(await runCtoCommand(["relaunch", P, "--fresh", "--apply"], w.ports)).toBe(1);
+      expect(last(w)).toEqual({ oldConversation: CONVERSATION, recovery: `agentctl cto relaunch ${P} --conversation ${CONVERSATION} --apply` });
+      expect(w.out.find((l) => l["command"] === "relaunch")).toMatchObject({ fresh: true, oldConversation: CONVERSATION });
+      expect(w.changes.some((c) => c.includes(" mcp remove "))).toBe(true);
+      // The recovery command is a plain relaunch of the named conversation: --resume, no prompt, no handoff step.
+      w.launched.claims = true;
+      w.procs = w.procs.filter((p) => p.pid !== 30000);
+      w.changes.length = 0; w.out.length = 0;
+      expect(await runCtoCommand(["relaunch", P, "--conversation", CONVERSATION, "--apply"], w.ports)).toBe(0);
+      expect(launcherOf(w).resume.slice(0, 2)).toEqual(["--resume", CONVERSATION]);
+      expect(results(w).map(([step]) => step)).toEqual(RESUME_STEPS.slice(0, -1).map((step) => step).concat("claimed"));
+    });
+
+    it("takes a canonical CTO only, and --conversation not with --fresh", async () => {
+      const { w } = canonicalWorld();
+      expect(await runCtoCommand(["relaunch", P, "--fresh", "--conversation", CONVERSATION], w.ports)).toBe(2);
+      const resident = makeWorld({}, { ACP_OPERATOR_TOKEN: "operator-test-credential" });
+      expect(await runCtoCommand(["relaunch", P, "--fresh"], resident.ports)).toBe(2);
+    });
   });
 });
 
