@@ -7,10 +7,11 @@ import { createSystemRequestWatcher, systemRequestNotification } from "../../src
 import {
   COMPACT_BOUNDARY_MARK, CTO_CONVERSATION_MAX_BYTES, CTO_CONVERSATION_MAX_COMPACTIONS, CTO_HANDOFF_MAX_BYTES, CTO_HANDOFF_WAIT_MS,
   CTO_REFRESH_BACKOFF_INITIAL_MS, buildFallbackHandoff, clearHandoffRequest, clipUtf8, createConversationMeter, ctoTranscriptPath, handoffPathOf, handoffRequestText,
-  hostConversationFiles, hostStoreFiles, longReasons, readHandoff, readHandoffRequest, readRefreshFailure, recordRefreshFailure, refreshLimitsFromEnv, retryNotBefore,
+  hostConversationFiles, hostStoreFiles, inflightPathOf, listInflightProjects, longReasons, readHandoff, readHandoffRequest, readInflightRefresher, readRefreshFailure,
+  recordRefreshFailure, refreshLimitsFromEnv, retryNotBefore,
   writeHandoff, writeHandoffRequest, type ConversationFiles, type FallbackFacts,
 } from "../../src/cto/cto-session-refresh.ts";
-import { createCtoRefreshSweep, type RefreshCandidate, type RefreshSweepDeps } from "../../src/daemon/cto-session-refresh-sweep.ts";
+import { CTO_RECOVERY_RETRY_MS, createCtoRefreshSweep, type RefreshCandidate, type RefreshSweepDeps } from "../../src/daemon/cto-session-refresh-sweep.ts";
 import { Role, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
@@ -234,7 +235,8 @@ describe("a CTO's channel shows ACP's request once", () => {
 });
 
 describe("the daemon's sweep", () => {
-  interface Setup { state: string; clock: { now: number }; refreshed: string[]; concurrent: { now: number; max: number }; sweep: ReturnType<typeof createCtoRefreshSweep>;
+  interface Setup { state: string; clock: { now: number }; refreshed: string[]; recovered: string[]; recovery: { outcome: { ok: boolean; reason: string } }; candidateList: { projects: string[] };
+    concurrent: { now: number; max: number }; sweep: ReturnType<typeof createCtoRefreshSweep>;
     transcripts: Map<string, { bytes: number; compactions: number; mtimeMs: number }>; idle: Map<string, string | null>; refresh: { outcome: { ok: boolean; reason: string }; gate: Promise<void> | null } }
   const candidate = (projectId: string, over: Partial<RefreshCandidate> = {}): RefreshCandidate =>
     ({ projectId, roleKey: `PRIMARY_CTO:${projectId}`, generation: 3, conversation: `conv-${projectId}`, sessionId: `ses-${projectId}`, cwd: `/work/${projectId}`, ...over });
@@ -245,6 +247,9 @@ describe("the daemon's sweep", () => {
     const transcripts = new Map<string, { bytes: number; compactions: number; mtimeMs: number }>();
     const idle = new Map<string, string | null>();
     const refreshed: string[] = [];
+    const recovered: string[] = [];
+    const recovery = { outcome: { ok: true, reason: "" } };
+    const candidateList = { projects };
     const concurrent = { now: 0, max: 0 };
     const refresh: Setup["refresh"] = { outcome: { ok: true, reason: "" }, gate: null };
     let ids = 0;
@@ -252,7 +257,7 @@ describe("the daemon's sweep", () => {
     const measureOf = (path: string) => { const t = transcripts.get(path); return t ? { path, ...t } : null; };
     const sweep = createCtoRefreshSweep({
       stateDir: state, now: () => clock.now,
-      candidates: () => projects.map((project) => candidate(project)),
+      candidates: () => candidateList.projects.map((project) => candidate(project)),
       transcriptOf: (c) => c.projectId,
       measure: measureOf,
       idle: (c) => { const because = idle.get(c.projectId) ?? null; return because === null ? { idle: true } : { idle: false, because }; },
@@ -262,10 +267,12 @@ describe("the daemon's sweep", () => {
         concurrent.now++; concurrent.max = Math.max(concurrent.max, concurrent.now);
         try { if (refresh.gate) await refresh.gate; refreshed.push(projectId); return refresh.outcome; } finally { concurrent.now--; }
       },
+      recover: async (projectId) => { recovered.push(projectId); return recovery.outcome; },
+      refresherRunning: () => false,
       newId: () => `request-${++ids}`,
       ...over,
     });
-    return { state, clock, refreshed, concurrent, sweep, transcripts, idle, refresh };
+    return { state, clock, refreshed, recovered, recovery, candidateList, concurrent, sweep, transcripts, idle, refresh };
   };
   const verdicts = async (s: Setup) => (await s.sweep.tick()).map((v) => `${v.projectId}:${v.action}`);
 
@@ -382,11 +389,107 @@ describe("the daemon's sweep", () => {
     expect(s.sweep.running()).toBe(false);
   });
 
+  it("refreshes nothing for a project whose refresh is unfinished, even when it is a candidate and long and idle", async () => {
+    const s = setup(["a", "b"], { refresherRunning: () => false });
+    hostStoreFiles.replace(inflightPathOf(s.state, "a"), `${JSON.stringify({ projectId: "a", phase: "stopped", refresher: { pid: 4242, startedAt: null } })}\n`);
+    s.recovery.outcome = { ok: false, reason: "still failing" };
+    for (const project of ["a", "b"]) writeHandoff(hostStoreFiles, s.state, { projectId: project, generation: 3, conversation: `conv-${project}`, source: "cto", text: "ready", now: iso(T0) });
+    expect((await s.sweep.tick()).map((v) => `${v.projectId}:${v.action}`)).toEqual(["a:recovery-failed", "b:refreshed"]);
+    expect(s.recovered).toEqual(["a"]);
+    expect(s.refreshed).toEqual(["b"]);
+  });
+
   it("leaves a conversation whose transcript it cannot measure alone", async () => {
     const s = setup(["a"]);
     s.transcripts.delete("a");
     expect(await verdicts(s)).toEqual(["a:unmeasured"]);
     expect(s.refreshed).toEqual([]);
+  });
+});
+
+describe("an interrupted refresh is recovered by the daemon's sweep", () => {
+  const record = (state: string, projectId: string, refresher?: { pid: number; startedAt: string | null }) =>
+    hostStoreFiles.replace(inflightPathOf(state, projectId), `${JSON.stringify({ projectId, phase: "stopped", ...(refresher ? { refresher } : {}) })}\n`);
+  const deps = (state: string, over: Partial<RefreshSweepDeps> = {}) => {
+    const log = { recovered: [] as string[], refreshed: [] as string[], now: T0, outcome: { ok: true, reason: "" } };
+    const sweep = createCtoRefreshSweep({
+      stateDir: state, now: () => log.now, candidates: () => [], transcriptOf: () => null, measure: () => null, idle: () => ({ idle: true }), facts: () => null,
+      refresh: async (projectId) => { log.refreshed.push(projectId); return { ok: true, reason: "" }; },
+      recover: async (projectId) => { log.recovered.push(projectId); return log.outcome; }, newId: () => "id", ...over,
+    });
+    return { log, sweep };
+  };
+
+  it("lists the projects with a record, and who is carrying the refresh out", () => {
+    const state = tempDir("acp-refresh-inflight-");
+    expect(listInflightProjects(hostStoreFiles, state)).toEqual([]);
+    record(state, "b", { pid: 4242, startedAt: "Fri Nov 20 12:00:00 2026" });
+    record(state, "a");
+    hostStoreFiles.replace(join(state, "cto-refresh", "inflight-../x.json"), "{}");
+    hostStoreFiles.replace(join(state, "cto-refresh", "handoff-a-g1.json"), "{}");
+    expect(listInflightProjects(hostStoreFiles, state)).toEqual(["a", "b"]);
+    expect(readInflightRefresher(hostStoreFiles, state, "b")).toEqual({ pid: 4242, startedAt: "Fri Nov 20 12:00:00 2026" });
+    expect(readInflightRefresher(hostStoreFiles, state, "a")).toBeNull();
+  });
+
+  it("recovers a project that has no candidate at all: its session is gone or draining and a switchover is pending", async () => {
+    const state = tempDir("acp-refresh-recover-");
+    record(state, "a", { pid: 4242, startedAt: null });
+    const { log, sweep } = deps(state, { refresherRunning: () => false });
+    expect(await sweep.tick()).toEqual([{ projectId: "a", action: "recovered" }]);
+    expect(log.recovered).toEqual(["a"]);
+    expect(log.refreshed).toEqual([]);
+  });
+
+  it("leaves a refresh that is still running alone, and a retired project's record", async () => {
+    const state = tempDir("acp-refresh-recover-running-");
+    record(state, "a", { pid: 4242, startedAt: null });
+    record(state, "gone", { pid: 4243, startedAt: null });
+    const { log, sweep } = deps(state, { refresherRunning: (project) => project === "a", recoverable: (project) => project !== "gone" });
+    expect(await sweep.tick()).toEqual([
+      { projectId: "a", action: "recovery-waiting", because: expect.stringContaining("still running") },
+      { projectId: "gone", action: "recovery-waiting", because: expect.stringContaining("retired or unknown") },
+    ]);
+    expect(log.recovered).toEqual([]);
+  });
+
+  it("asks the kernel about the recorded refresher by default: this very process is running, a pid that is not there is not", async () => {
+    const state = tempDir("acp-refresh-recover-kernel-");
+    record(state, "alive", { pid: process.pid, startedAt: null });
+    record(state, "dead", { pid: 2_147_483_000, startedAt: null });
+    const { log, sweep } = deps(state, { refresherRunning: undefined });
+    expect((await sweep.tick()).map((v) => `${v.projectId}:${v.action}`)).toEqual(["alive:recovery-waiting", "dead:recovered"]);
+    expect(log.recovered).toEqual(["dead"]);
+  });
+
+  it("tries again after a failed recovery, not before the wait, and every tick at first if the daemon restarts", async () => {
+    const state = tempDir("acp-refresh-recover-retry-");
+    record(state, "a", { pid: 4242, startedAt: null });
+    const { log, sweep } = deps(state);
+    log.outcome = { ok: false, reason: "recover: tmux could not start" };
+    expect(await sweep.tick()).toEqual([{ projectId: "a", action: "recovery-failed", reason: expect.stringContaining("tmux could not start") }]);
+    log.now = T0 + CTO_RECOVERY_RETRY_MS - 1;
+    expect((await sweep.tick()).map((v) => v.action)).toEqual(["recovery-waiting"]);
+    expect(log.recovered).toEqual(["a"]);
+    log.now = T0 + CTO_RECOVERY_RETRY_MS;
+    log.outcome = { ok: true, reason: "" };
+    expect(await sweep.tick()).toEqual([{ projectId: "a", action: "recovered" }]);
+    expect(log.recovered).toEqual(["a", "a"]);
+  });
+
+  it("runs recovery as the one refresh at a time: a tick during it starts nothing", async () => {
+    const state = tempDir("acp-refresh-recover-serial-");
+    record(state, "a", { pid: 4242, startedAt: null });
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const { log, sweep } = deps(state, { recover: async (projectId) => { await gate; log.recovered.push(projectId); return { ok: true, reason: "" }; } });
+    const first = sweep.tick();
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(sweep.running()).toBe(true);
+    expect(await sweep.tick()).toEqual([]);
+    release();
+    expect(await first).toEqual([{ projectId: "a", action: "recovered" }]);
+    expect(log.recovered).toEqual(["a"]);
   });
 });
 

@@ -4,13 +4,14 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 
+import { readProcessStartToken } from "../core/process-argv.ts";
 import { pendingRotationOf, liveRunIdsOwnedBySession } from "../registry/canonical-cto-rotation.ts";
 import { CanonicalSessionRegistry } from "../registry/canonical-session-registry.ts";
 import type { ControlPlane } from "../app/control-plane.ts";
 import { SessionLifecycle } from "../domain/types.ts";
 import {
   CTO_HANDOFF_WAIT_MS, CTO_REFRESH_QUIET_SECONDS, buildFallbackHandoff, clearHandoffRequest, clearRefreshFailure, createConversationMeter, ctoTranscriptPath,
-  gatherFallbackFacts, hostStoreFiles, longReasons, readHandoff, readHandoffRequest, readRefreshFailure, recordRefreshFailure, refreshLimitsFromEnv,
+  gatherFallbackFacts, hostStoreFiles, listInflightProjects, longReasons, readHandoff, readInflightRefresher, readHandoffRequest, readRefreshFailure, recordRefreshFailure, refreshLimitsFromEnv,
   retryNotBefore, writeHandoff, writeHandoffRequest, DEFAULT_REFRESH_LIMITS,
   type ConversationFiles, type ConversationMeasure, type FallbackFacts, type LongReason, type RefreshLimits, type StoreFiles,
 } from "../cto/cto-session-refresh.ts";
@@ -25,7 +26,12 @@ import {
  *   - a project whose refresh failed is not tried again until its backoff has passed (it doubles with every failure);
  *   - "idle" is all of: the transcript unchanged for a minute, no live run the session owns, no running work of the
  *     project, and no switchover already pending;
- *   - the handoff is waited for at most `CTO_HANDOFF_WAIT_MS`; then ACP writes one itself. Nothing waits forever.
+ *   - the handoff is waited for at most `CTO_HANDOFF_WAIT_MS`; then ACP writes one itself. Nothing waits forever;
+ *   - an interrupted refresh is finished first, before any eligibility rule: once the switchover is recorded the old session
+ *     drains and, when its process is gone, is released, so the project has no candidate at all, and a pending switchover
+ *     is what the ordinary pass refuses. The unfinished refresh's own record (`inflight-<project>.json`) is what names it,
+ *     and `agentctl cto refresh --recover` is what undoes it: stops what is left, cancels the unclaimed switchover and
+ *     resumes the old conversation. A record whose refresher still runs is a refresh in progress and is left alone.
  */
 
 export interface RefreshCandidate {
@@ -47,7 +53,10 @@ export type RefreshVerdict =
   | { projectId: string; action: "waiting-handoff"; since: string }
   | { projectId: string; action: "busy" }
   | { projectId: string; action: "refreshed"; source: "cto" | "acp" }
-  | { projectId: string; action: "failed"; reason: string };
+  | { projectId: string; action: "failed"; reason: string }
+  | { projectId: string; action: "recovered" }
+  | { projectId: string; action: "recovery-failed"; reason: string }
+  | { projectId: string; action: "recovery-waiting"; because: string };
 
 export interface RefreshSweepDeps {
   stateDir: string;
@@ -64,8 +73,26 @@ export interface RefreshSweepDeps {
   facts(candidate: RefreshCandidate): FallbackFacts | null;
   /** Runs one refresh to its end; resolves when it has succeeded or failed. */
   refresh(projectId: string): Promise<{ ok: boolean; reason: string }>;
+  /** Finishes undoing an interrupted refresh of the project (`refresh --recover`); ok when the role holds a CTO again. */
+  recover(projectId: string): Promise<{ ok: boolean; reason: string }>;
+  /** The projects with an unfinished refresh on record. Defaults to the record files beneath the state directory. */
+  inflight?(): string[];
+  /** Whether a project is registered and not retired, so that a CTO is still owed it. Defaults to yes. */
+  recoverable?(projectId: string): boolean;
+  /** Whether the process carrying out a recorded refresh is still running. Defaults to the kernel's word on the recorded pid and start. */
+  refresherRunning?(projectId: string): boolean;
   newId(): string;
 }
+
+/** A recovery that failed is not tried again for this long; it is in memory, so a restarted daemon tries at once. */
+export const CTO_RECOVERY_RETRY_MS = 2 * 60_000;
+
+/** A recorded pid is running while the kernel has it and, when its start was recorded, still gives it that start. */
+const processStillRuns = (who: { pid: number; startedAt: string | null }): boolean => {
+  const token = readProcessStartToken(who.pid);
+  if (token !== null) return who.startedAt === null || token === who.startedAt;
+  try { process.kill(who.pid, 0); return true; } catch (error) { return (error as NodeJS.ErrnoException).code !== "ESRCH"; }
+};
 
 export interface CtoRefreshSweep {
   tick(): Promise<RefreshVerdict[]>;
@@ -78,6 +105,7 @@ export const createCtoRefreshSweep = (deps: RefreshSweepDeps): CtoRefreshSweep =
   const limits = deps.limits ?? DEFAULT_REFRESH_LIMITS;
   const waitMs = deps.handoffWaitMs ?? CTO_HANDOFF_WAIT_MS;
   let busy = false;
+  const recoveredAt = new Map<string, number>();
   const iso = (): string => new Date(deps.now()).toISOString();
 
   const start = async (candidate: RefreshCandidate, source: "cto" | "acp"): Promise<RefreshVerdict> => {
@@ -100,10 +128,42 @@ export const createCtoRefreshSweep = (deps: RefreshSweepDeps): CtoRefreshSweep =
     }
   };
 
+  /** Unfinished refreshes first, through no eligibility rule of the ordinary pass; a project that has one is not refreshed this tick. */
+  const recoveries = async (verdicts: RefreshVerdict[]): Promise<Set<string>> => {
+    const unfinished = new Set<string>();
+    for (const projectId of (deps.inflight?.() ?? listInflightProjects(files, deps.stateDir))) {
+      unfinished.add(projectId);
+      if (deps.recoverable && !deps.recoverable(projectId)) { verdicts.push({ projectId, action: "recovery-waiting", because: "the project is retired or unknown; its record is left" }); continue; }
+      const runs = deps.refresherRunning ? deps.refresherRunning(projectId) : (() => {
+        const who = readInflightRefresher(files, deps.stateDir, projectId);
+        return who !== null && processStillRuns(who);
+      })();
+      if (runs) { verdicts.push({ projectId, action: "recovery-waiting", because: "the refresh that wrote the record is still running" }); continue; }
+      const last = recoveredAt.get(projectId);
+      if (last !== undefined && deps.now() - last < CTO_RECOVERY_RETRY_MS) { verdicts.push({ projectId, action: "recovery-waiting", because: "a recovery failed a moment ago" }); continue; }
+      busy = true;
+      try {
+        const outcome = await deps.recover(projectId);
+        if (outcome.ok) { recoveredAt.delete(projectId); verdicts.push({ projectId, action: "recovered" }); } else {
+          recoveredAt.set(projectId, deps.now());
+          verdicts.push({ projectId, action: "recovery-failed", reason: outcome.reason });
+        }
+      } catch (error) {
+        recoveredAt.set(projectId, deps.now());
+        verdicts.push({ projectId, action: "recovery-failed", reason: error instanceof Error ? error.message : String(error) });
+      } finally {
+        busy = false;
+      }
+    }
+    return unfinished;
+  };
+
   const tick = async (): Promise<RefreshVerdict[]> => {
     const verdicts: RefreshVerdict[] = [];
+    const unfinished = await recoveries(verdicts);
     for (const candidate of deps.candidates()) {
       const projectId = candidate.projectId;
+      if (unfinished.has(projectId)) continue;
       const path = deps.transcriptOf(candidate);
       const measure = path === null ? null : deps.measure(path);
       if (measure === null) { verdicts.push({ projectId, action: "unmeasured" }); continue; }
@@ -163,17 +223,17 @@ export const CTO_REFRESH_CHILD_TIMEOUT_MS = 15 * 60_000;
 export interface RefreshChildResult { ok: boolean; reason: string }
 
 /**
- * Runs `agentctl cto refresh <project> --apply` from the installed runtime as a child, with the daemon's own operator
+ * Runs `agentctl cto refresh <project> [--recover] --apply` (`args`) from the installed runtime as a child, with the daemon's own operator
  * credential in its environment (never printed; the child's output is read for its last JSON line only). A child, not a call
  * into this process: the refresh runs `tmux` and `claude mcp` synchronously and waits on a launch, and the daemon must not
  * stand still for that.
  */
-export const runRefreshChild = (stateDir: string, env: NodeJS.ProcessEnv, projectId: string, timeoutMs = CTO_REFRESH_CHILD_TIMEOUT_MS): Promise<RefreshChildResult> => {
+export const runRefreshChild = (stateDir: string, env: NodeJS.ProcessEnv, args: readonly string[], timeoutMs = CTO_REFRESH_CHILD_TIMEOUT_MS): Promise<RefreshChildResult> => {
   const node = join(stateDir, "current", "dist", "bin", "node");
   const cli = join(stateDir, "current", "dist", "cli", "agentctl.js");
   if (!existsSync(node) || !existsSync(cli)) return Promise.resolve({ ok: false, reason: `the agentctl runtime is not installed under ${join(stateDir, "current")}` });
   return new Promise((resolve) => {
-    const child = spawn(node, [cli, "cto", "refresh", projectId, "--apply"], { env, stdio: ["ignore", "pipe", "pipe"] });
+    const child = spawn(node, [cli, ...args], { env, stdio: ["ignore", "pipe", "pipe"] });
     let out = "";
     child.stdout.on("data", (chunk: Buffer) => { out = (out + chunk.toString("utf8")).slice(-16_384); });
     child.stderr.on("data", () => undefined);
@@ -196,7 +256,11 @@ export const runRefreshChild = (stateDir: string, env: NodeJS.ProcessEnv, projec
 /** The sweep over a live control plane: its candidates and its idleness are read from the database and the transcript, nothing is signalled. */
 export const createDaemonRefreshSweep = (
   cp: Pick<ControlPlane, "db" | "bindings" | "sessions" | "projects" | "clock">,
-  options: { stateDir: string; env: NodeJS.ProcessEnv; home?: string; conversationFiles?: ConversationFiles; refresh?: (projectId: string) => Promise<RefreshChildResult>; now?: () => number; newId?: () => string },
+  options: {
+    stateDir: string; env: NodeJS.ProcessEnv; home?: string; conversationFiles?: ConversationFiles;
+    refresh?: (projectId: string) => Promise<RefreshChildResult>; recover?: (projectId: string) => Promise<RefreshChildResult>;
+    refresherRunning?: (projectId: string) => boolean; now?: () => number; newId?: () => string;
+  },
 ): CtoRefreshSweep => {
   const home = options.home ?? options.env["HOME"] ?? homedir();
   const meter = createConversationMeter(options.conversationFiles);
@@ -228,7 +292,10 @@ export const createDaemonRefreshSweep = (
       return { idle: true };
     },
     facts: (candidate) => gatherFallbackFacts(cp.db, candidate.projectId, candidate.conversation),
-    refresh: options.refresh ?? ((projectId) => runRefreshChild(options.stateDir, options.env, projectId)),
+    refresh: options.refresh ?? ((projectId) => runRefreshChild(options.stateDir, options.env, ["cto", "refresh", projectId, "--apply"])),
+    recover: options.recover ?? ((projectId) => runRefreshChild(options.stateDir, options.env, ["cto", "refresh", projectId, "--recover", "--apply"])),
+    ...(options.refresherRunning ? { refresherRunning: options.refresherRunning } : {}),
+    recoverable: (projectId) => cp.projects.get(projectId)?.retiredAt === null,
     newId: options.newId ?? (() => randomUUID()),
   });
 };
@@ -246,7 +313,7 @@ export const startCtoRefreshSweep = (
   const timer = setInterval(() => {
     void sweep.tick().then(
       // What a person reading the log needs: a request made, a refresh done or failed. Waiting is the usual state and says nothing.
-      (verdicts) => { const news = verdicts.filter((v) => v.action === "asked" || v.action === "refreshed" || v.action === "failed"); if (news.length > 0) report({ ctoRefresh: news }); },
+      (verdicts) => { const news = verdicts.filter((v) => v.action === "asked" || v.action === "refreshed" || v.action === "failed" || v.action === "recovered" || v.action === "recovery-failed"); if (news.length > 0) report({ ctoRefresh: news }); },
       (error: unknown) => report({ ctoRefreshSweepFailed: error instanceof Error ? error.message : String(error) }),
     );
   }, intervalMs);

@@ -109,7 +109,15 @@ interface World {
   tokenAfterIdle: Map<number, (read: number) => string | null>;
   /** The daemon's switchover (`canonicalCto.rotate`) as a refresh drives it: what is pending, and what makes it refuse. */
   rotation: { pending: { to: string; handoff: Record<string, unknown> } | null; draining: boolean; liveRuns: string[]; refuses: boolean; cancelRefuses: boolean; calls: string[];
-    rotated: Array<{ to: string; handoff: Record<string, unknown> }> };
+    rotated: Array<{ to: string; handoff: Record<string, unknown>; from: string | null }>;
+    /** The conversations that claimed their switchover. */
+    acked: string[];
+    /** The daemon commits the switchover and its answer is lost (DAEMON_LOCK_LOST). */
+    lostResponse: boolean;
+    /** The 1-based numbers of the `canonicalCto.status` calls that fail, and how many have been made. */
+    failStatusAt: number[]; statusCalls: number };
+  /** Writes of these paths fail once with EIO, in order of the list. */
+  replaceFailures: RegExp[];
   /** Each tmux launch: the conversation it starts and the claude processes alive when it started. */
   launchLog: Array<{ conversation: string; alive: number[] }>;
   /** The next tmux starts that fail outright, and the claim outcome of each next launch (else `launched.claims`). */
@@ -137,7 +145,8 @@ const makeWorld = (overrides: Partial<CtoRecord> = {}, env: Record<string, strin
     tokenUnavailable: new Set<number>(), survivesSigterm: new Set<number>(), tokenGlitchAfterSignal: new Map<number, number>(), signalled: new Set<number>(),
     psStatFails: false, tokenAfterIdle: new Map<number, (read: number) => string | null>(),
     facts: { openRuns: [{ runId: "run_1", state: "ACTIVE", kind: "STANDARD_WORK" }], queued: [] },
-    rotation: { pending: null, draining: false, liveRuns: [], refuses: false, cancelRefuses: false, calls: [], rotated: [] }, launchLog: [], tmuxStartFails: 0, claimQueue: [],
+    rotation: { pending: null, draining: false, liveRuns: [], refuses: false, cancelRefuses: false, calls: [], rotated: [], acked: [], lostResponse: false, failStatusAt: [], statusCalls: 0 },
+    replaceFailures: [], launchLog: [], tmuxStartFails: 0, claimQueue: [],
     procs: [
       { pid: 100, ppid: 1, command: "/bin/sh /state/resident-e2e-sort-fixture.sh" },
       { pid: CLAUDE, ppid: 100, command: `/bin/claude --model opus ${CHANNEL} --resume ${CONVERSATION} --name e2e CTO` },
@@ -195,7 +204,7 @@ const makeWorld = (overrides: Partial<CtoRecord> = {}, env: Record<string, strin
       const named_ = w.rotation.pending !== null && started === w.rotation.pending.to;
       if (claims && (w.rotation.pending === null || named_)) {
         w.record = { ...w.record, ...(named_ ? { conversation: started } : {}), generation: (w.record.generation ?? 3) + 1, session: { pid, startedAt: `start-${pid}`, workdir: null } };
-        if (named_) { w.rotation.pending = null; w.rotation.draining = false; }
+        if (named_) { w.rotation.acked.push(started!); w.rotation.pending = null; w.rotation.draining = false; }
       }
       return answer(0, "%9\n");
     }
@@ -278,14 +287,18 @@ const makeWorld = (overrides: Partial<CtoRecord> = {}, env: Record<string, strin
           w.rotation.calls.push(method);
           if (method !== "canonicalCto.status") w.changes.push(`operator ${method}`);
           if (method === "canonicalCto.status") {
+            if (w.rotation.failStatusAt.includes(++w.rotation.statusCalls)) return deny(ReasonCode.DAEMON_LOCK_LOST, "daemon lock is not held");
             return allow(ReasonCode.OK, { projectId: params["projectId"], holderSessionUuid: w.record.conversation, generation: w.record.generation ?? 0,
-              binding: w.record.generation === null ? null : { generation: w.record.generation, sessionId: "session-1", lifecycle: w.rotation.draining ? "DRAINING" : "READY", liveRuns: w.rotation.liveRuns } });
+              binding: w.record.generation === null ? null : { generation: w.record.generation, sessionId: "session-1", lifecycle: w.rotation.draining ? "DRAINING" : "READY", liveRuns: w.rotation.liveRuns },
+              rotations: [...w.rotation.rotated].reverse().map((one) => ({ toSessionUuid: one.to, fromSessionUuid: one.from,
+                state: w.rotation.pending?.to === one.to ? "PENDING" : w.rotation.acked.includes(one.to) ? "ACKED" : "REVOKED" })) });
           }
           if (method === "canonicalCto.rotate") {
             if (w.rotation.refuses) return deny(ReasonCode.SWITCHOVER_BLOCKED_ACTIVE_RUNS, "switchover requires the outgoing CTO to have zero active runs");
             w.rotation.pending = { to: params["toSessionUuid"] as string, handoff: params["handoff"] as Record<string, unknown> };
-            w.rotation.rotated.push(w.rotation.pending);
+            w.rotation.rotated.push({ ...w.rotation.pending, from: w.record.conversation });
             w.rotation.draining = true;
+            if (w.rotation.lostResponse) return deny(ReasonCode.DAEMON_LOCK_LOST, "daemon lock is not held for canonical CTO rotation");
             return allow(ReasonCode.OK, { outcome: "SWITCHOVER_PENDING", toSessionUuid: params["toSessionUuid"] });
           }
           if (w.rotation.pending === null) return deny(ReasonCode.NOT_FOUND, "no pending switchover");
@@ -354,7 +367,11 @@ const makeWorld = (overrides: Partial<CtoRecord> = {}, env: Record<string, strin
     files: {
       exists,
       read: (path: string) => { const body = files.get(path); if (body === undefined) throw new Error(`ENOENT ${path}`); return body; },
-      replace: (path: string, body: string) => { w.changes.push(`replace ${path}`); files.set(path, body); },
+      replace: (path: string, body: string) => {
+        const failing = w.replaceFailures.findIndex((pattern) => pattern.test(path));
+        if (failing >= 0) { w.replaceFailures.splice(failing, 1); throw Object.assign(new Error(`EIO: i/o error, write '${path}'`), { code: "EIO" }); }
+        w.changes.push(`replace ${path}`); files.set(path, body);
+      },
       move: (from: string, to: string) => { w.changes.push(`move ${from} -> ${to}`); move(from, to); },
       remove: (path: string) => { w.changes.push(`remove ${path}`); for (const k of [...files.keys()]) if (k === path || k.startsWith(`${path}/`)) files.delete(k); },
       mtimeMs: (path: string) => (files.has(path) ? mtimes.get(path) ?? NOW : null),
@@ -1322,11 +1339,122 @@ describe("agentctl cto refresh", () => {
     expect(w.launchLog).toEqual([{ conversation: to, alive: [] }]);
   });
 
+  describe("a throw, or a lost answer, after the switchover is recorded", () => {
+    const expectRolledBack = (w: World): void => {
+      // The old conversation, resumed, holds the role at the next generation; the switchover is cancelled; one process; nothing left on record.
+      expect(w.rotation.calls).toContain("canonicalCto.cancel");
+      expect(w.rotation.pending).toBeNull();
+      expect(w.record).toMatchObject({ conversation: CONVERSATION, generation: 4 });
+      expect(claudes(w)).toHaveLength(1);
+      expect(w.files.has(INFLIGHT)).toBe(false);
+    };
+
+    it("a one-time EIO writing the new conversation's launcher takes the way back: stops what is left, cancels, resumes the old conversation", async () => {
+      const w = canonicalWorld();
+      w.replaceFailures = [/cto-launch-.*\.sh$/];
+      expect(await runCtoCommand(["refresh", P, "--apply"], w.ports)).toBe(1);
+      expect(results(w).at(-1)).toEqual(["switch", "failed"]);
+      expect(JSON.stringify(w.out)).toContain("failed at launch (threw: EIO");
+      expect(JSON.stringify(w.out)).toContain(`the old conversation ${CONVERSATION} was resumed`);
+      const order = [at(w, "operator canonicalCto.rotate"), at(w, `SIGTERM ${CLAUDE}`), at(w, "operator canonicalCto.cancel"), at(w, /^tmux new-(session|window)/)];
+      expect(order.every((i) => i >= 0)).toBe(true);
+      expect([...order].sort((a, b) => a - b)).toEqual(order);
+      expect(w.launchLog).toEqual([{ conversation: CONVERSATION, alive: [] }]);
+      expectRolledBack(w);
+    });
+
+    it("a throw while stopping leaves the old conversation running and only lifts the fence", async () => {
+      const w = canonicalWorld();
+      w.ports = { ...w.ports, signal: () => { throw Object.assign(new Error("EPERM: operation not permitted"), { code: "EPERM" }); } };
+      expect(await runCtoCommand(["refresh", P, "--apply"], w.ports)).toBe(1);
+      expect(JSON.stringify(w.out)).toContain("failed at stop (threw: EPERM");
+      expect(w.rotation.calls).toEqual(["canonicalCto.status", "canonicalCto.rotate", "canonicalCto.cancel"]);
+      expect(w.rotation.pending).toBeNull();
+      expect(claudes(w).map((p) => p.pid)).toEqual([CLAUDE]);
+      expect(w.changes.some((c) => /^tmux new-/.test(c))).toBe(false);
+      expect(w.files.has(INFLIGHT)).toBe(false);
+    });
+
+    it("a way back that itself throws is reported, keeps the record, and `refresh --recover` finishes it", async () => {
+      const w = canonicalWorld();
+      // The new launcher cannot be written, and neither can the old one's, the one time each is tried.
+      w.replaceFailures = [/cto-launch-.*\.sh$/, /cto-launch-.*\.sh$/];
+      expect(await runCtoCommand(["refresh", P, "--apply"], w.ports)).toBe(1);
+      expect(JSON.stringify(w.out)).toContain("the rollback itself threw (EIO");
+      expect(w.out.some((l) => l["step"] === "switch" && l["phase"] === "rolling-back")).toBe(true);
+      expect(w.files.has(INFLIGHT)).toBe(true);
+      expect(claudes(w)).toHaveLength(0);
+
+      w.out.length = 0; w.changes.length = 0; w.rotation.calls.length = 0;
+      expect(await runCtoCommand(["refresh", P, "--recover", "--apply"], w.ports)).toBe(0);
+      expect(results(w)).toEqual([["self", "done"], ["recover", "done"]]);
+      expect(last(w)).toEqual({ result: "done" });
+      // Recovery undoes; it starts no new refresh.
+      expect(w.rotation.calls).not.toContain("canonicalCto.rotate");
+      expect(w.rotation.rotated).toHaveLength(1);
+      expectRolledBack(w);
+    });
+
+    it("a rotate whose answer is lost after the daemon recorded it is read back from the daemon, and the refresh goes on", async () => {
+      const w = canonicalWorld();
+      w.rotation.lostResponse = true;
+      expect(await runCtoCommand(["refresh", P, "--apply"], w.ports)).toBe(0);
+      expect(w.out.find((l) => l["step"] === "switch" && l["phase"] === "rotated")).toMatchObject({ confirmedByReadBack: true });
+      expect(w.rotation.calls).toEqual(["canonicalCto.status", "canonicalCto.rotate", "canonicalCto.status"]);
+      expect(w.record).toMatchObject({ conversation: w.rotation.rotated[0]!.to, generation: 4 });
+      expect(claudes(w)).toHaveLength(1);
+      expect(w.files.has(INFLIGHT)).toBe(false);
+    });
+
+    it("a rotate whose outcome cannot be read back keeps its record, stops nothing, and the next run reconciles it with the daemon", async () => {
+      const w = canonicalWorld();
+      w.rotation.lostResponse = true;
+      // The first status (before the rotate) answers; the read-back after the lost answer does not.
+      w.rotation.failStatusAt = [2];
+      expect(await runCtoCommand(["refresh", P, "--apply"], w.ports)).toBe(1);
+      expect(JSON.stringify(w.out)).toContain("cannot say whether it recorded the switchover");
+      expect(w.files.has(INFLIGHT)).toBe(true);
+      expect(w.changes.filter((c) => c.startsWith("SIGTERM") || /^tmux new-/.test(c))).toEqual([]);
+      // The daemon did record it: the old holder drains, the switchover is pending, and nothing has said so.
+      expect(w.rotation.pending).not.toBeNull();
+      expect(claudes(w).map((p) => p.pid)).toEqual([CLAUDE]);
+
+      // Another refresh's process that still runs is left alone.
+      const record = JSON.parse(w.files.get(INFLIGHT)!) as Record<string, unknown>;
+      w.files.set(INFLIGHT, JSON.stringify({ ...record, refresher: { pid: 4242, startedAt: "start-4242" } }));
+      w.procs.push({ pid: 4242, ppid: 1, command: "/node agentctl.js cto refresh" });
+      w.out.length = 0; w.changes.length = 0;
+      expect(await runCtoCommand(["refresh", P, "--recover", "--apply"], w.ports)).toBe(1);
+      expect(JSON.stringify(w.out)).toContain("another refresh of this project is running (pid 4242)");
+      expect(w.rotation.pending).not.toBeNull();
+
+      // Once it is gone, the record is reconciled: the daemon holds the switchover, so it is cancelled and the old conversation, still running, continues.
+      w.procs = w.procs.filter((p) => p.pid !== 4242);
+      w.out.length = 0;
+      expect(await runCtoCommand(["refresh", P, "--recover", "--apply"], w.ports)).toBe(0);
+      expect(w.rotation.calls.at(-1)).toBe("canonicalCto.cancel");
+      expect(w.rotation.pending).toBeNull();
+      expect(w.files.has(INFLIGHT)).toBe(false);
+      expect(claudes(w).map((p) => p.pid)).toEqual([CLAUDE]);
+      expect(w.changes.filter((c) => c.startsWith("SIGTERM") || /^tmux new-/.test(c))).toEqual([]);
+    });
+
+    it("a refusal the daemon's records confirm as no switchover ends it with nothing stopped, and the record is cleared", async () => {
+      const w = canonicalWorld();
+      w.rotation.refuses = true;
+      expect(await runCtoCommand(["refresh", P, "--apply"], w.ports)).toBe(1);
+      expect(JSON.stringify(w.out)).toContain("the daemon holds no switchover to ");
+      expect(w.files.has(INFLIGHT)).toBe(false);
+      expect(w.rotation.calls).toEqual(["canonicalCto.status", "canonicalCto.rotate", "canonicalCto.status"]);
+      expect(w.changes.filter((c) => c.startsWith("SIGTERM") || /^tmux new-/.test(c))).toEqual([]);
+    });
+  });
+
   it("is listed in the usage and takes only --apply", async () => {
     const w = canonicalWorld();
     expect(await runCtoCommand(["refresh", P, "--handoff", "/h.json"], w.ports)).toBe(2);
     expect(await runCtoCommand(["refresh"], w.ports)).toBe(2);
     expect(CTO_SUBCOMMANDS).toContain("refresh");
-    expect(CTO_USAGE).toContain("agentctl cto refresh <project> [--apply]");
+    expect(CTO_USAGE).toContain("agentctl cto refresh <project> [--recover] [--apply]");
   });
 });

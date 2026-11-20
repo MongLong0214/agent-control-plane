@@ -63,7 +63,7 @@ export const CTO_USAGE = `agentctl cto — a project CTO's lifecycle on this hos
       --expected-binding-generation auto, so its queued messages are kept. No new conversation and
       no handoff package. A resident is stopped and started again by ensure-resident with --resume
       (this resident path overlaps #1447, which replaces it)
-  agentctl cto refresh <project> [--apply]
+  agentctl cto refresh <project> [--recover] [--apply]
       replace a long CTO conversation with a fresh one, for a resident or a canonical CTO: wait for an idle CTO,
       take its handoff (the one the CTO wrote with cto_handoff_write for its generation, else one ACP writes from the
       open runs and queued messages), record the switchover, stop its exact process (pid and start time) and prove it
@@ -71,7 +71,8 @@ export const CTO_USAGE = `agentctl cto — a project CTO's lifecycle on this hos
       same name, remote-control name, messaging socket, model, effort and permission mode, which claims the role at the
       next generation and is handed the queued messages. If anything fails once the old process is stopped, the
       switchover is cancelled and the OLD conversation is resumed (--resume), so the role is never left without a CTO.
-      The daemon runs this itself for a long conversation; this is the manual door
+      The daemon runs this itself for a long conversation; this is the manual door. --recover only finishes undoing a
+      refresh that was interrupted (the daemon runs it for a refresh whose process is gone), and starts nothing new
   agentctl cto retire <project> --reason <text> [--delete-repo --yes-delete-repo <owner/name>] [--apply]
       wait for an idle CTO, then agentctl project retire (stops the session, releases the binding,
       archives its room, retires its roster route, takes it off the fleet), confirm the session,
@@ -720,9 +721,12 @@ interface RefreshRecord {
   oldGeneration: number;
   newConversation: string;
   startedAt: string;
+  /** `prepared`: a rotate may have been sent (its answer is not known); the daemon's own records say whether it was recorded. */
   phase: "prepared" | "rotated" | "stopped" | "launched";
   old: CanonicalLauncher;
   next: CanonicalLauncher;
+  /** The process that is carrying this refresh out: a record whose refresher still runs belongs to a refresh in progress, not to a crashed one. */
+  refresher?: { pid: number; startedAt: string | null };
 }
 
 const readRefreshRecord = (ports: CtoPorts, projectId: string): RefreshRecord | null => {
@@ -734,7 +738,8 @@ const readRefreshRecord = (ports: CtoPorts, projectId: string): RefreshRecord | 
       ["tmux", "cwd", "claude", "keyFile", "roomId"].every((key) => typeof (one as Record<string, unknown>)[key] === "string") && isStrings((one as Record<string, unknown>)["resume"]);
     return value.projectId === projectId && typeof value.oldConversation === "string" && typeof value.newConversation === "string" &&
       typeof value.oldGeneration === "number" && typeof value.startedAt === "string" && plan(value.old) && plan(value.next) &&
-      (value.phase === "prepared" || value.phase === "rotated" || value.phase === "stopped" || value.phase === "launched")
+      (value.phase === "prepared" || value.phase === "rotated" || value.phase === "stopped" || value.phase === "launched") &&
+      (value.refresher === undefined || (typeof value.refresher?.pid === "number" && (value.refresher.startedAt === null || typeof value.refresher.startedAt === "string")))
       ? value as RefreshRecord : null;
   } catch { return null; }
 };
@@ -751,10 +756,40 @@ interface CanonicalStatus {
   holderSessionUuid: string | null;
   generation: number;
   binding: { generation: number; sessionId: string; lifecycle: string | null; liveRuns: string[] } | null;
+  /** The project's switchovers, newest first, with their state (`canonicalCtoRotations`). */
+  rotations?: Array<{ toSessionUuid: string; fromSessionUuid: string; state: "PENDING" | "ACKED" | "REVOKED" }>;
 }
 const canonicalStatus = async (ports: CtoPorts, projectId: string): Promise<CanonicalStatus | string> => {
-  const answer = await asDaemon(ports, "canonicalCto.status", { projectId });
-  return answer.allowed ? answer.value as CanonicalStatus : `the daemon refused canonicalCto.status: ${answer.message}`;
+  try {
+    const answer = await asDaemon(ports, "canonicalCto.status", { projectId });
+    return answer.allowed ? answer.value as CanonicalStatus : `the daemon refused canonicalCto.status: ${answer.message}`;
+  } catch (error) {
+    return `canonicalCto.status could not be asked: ${error instanceof Error ? error.message : String(error)}`;
+  }
+};
+
+/**
+ * Whether the daemon holds a switchover to `conversation`, read from its own records. A failed or unanswered rotate proves
+ * nothing about whether it was recorded (the daemon may have committed it and lost the answer, as with DAEMON_LOCK_LOST), so
+ * nothing is concluded from the answer: `pending` is a recorded, unclaimed switchover to it; `none` is no such switchover
+ * (never recorded, or cancelled); `unknown` is a read that could not be made or that did not say.
+ */
+const switchoverTo = async (ports: CtoPorts, projectId: string, conversation: string): Promise<{ state: "pending" | "none" | "unknown"; why?: string }> => {
+  const status = await canonicalStatus(ports, projectId);
+  if (typeof status === "string") return { state: "unknown", why: status };
+  if (!Array.isArray(status.rotations)) return { state: "unknown", why: "the daemon's answer lists no switchovers" };
+  const seen = status.rotations.find((one) => one.toSessionUuid === conversation);
+  if (seen === undefined || seen.state === "REVOKED") return { state: "none" };
+  return seen.state === "PENDING" ? { state: "pending" } : { state: "unknown", why: `the switchover to ${conversation} is already ${seen.state}` };
+};
+
+/** The pid of the process still carrying out the refresh this record belongs to, or null when that process is provably not running. */
+const refresherRunning = (ports: CtoPorts, record: RefreshRecord): number | null => {
+  const who = record.refresher;
+  if (!who || who.pid === (ports.selfPid ?? process.pid)) return null;
+  const token = ports.startToken(who.pid);
+  if (token === null) return ports.kernelGone(who.pid) ? null : who.pid;
+  return who.startedAt === null || token === who.startedAt ? who.pid : null;
 };
 
 /** The conversation holds the role at `minGeneration` or later, as a process the kernel still knows by its recorded start, with the channel. */
@@ -831,6 +866,12 @@ const terminateRole = async (ports: CtoPorts, projectId: string, extraConversati
  * The new conversation having claimed in the meantime is not undone: the refresh then simply succeeded.
  */
 const rollBackRefresh = async (ports: CtoPorts, record: RefreshRecord, stopped: ExpectedProcess[]): Promise<{ resumed: boolean; detail: string }> => {
+  try { return await rollBackSteps(ports, record, stopped); } catch (error) {
+    // The way back threw (a file write, a read of the process table): it is reported, never raised, and the record of what to undo stays.
+    return { resumed: false, detail: `the rollback itself threw (${error instanceof Error ? error.message : String(error)}); the record of what to undo is kept and the next run finishes it` };
+  }
+};
+const rollBackSteps = async (ports: CtoPorts, record: RefreshRecord, stopped: ExpectedProcess[]): Promise<{ resumed: boolean; detail: string }> => {
   const projectId = record.projectId;
   const extra = [record.newConversation, record.oldConversation];
   const cancel = async (): Promise<string | null> => {
@@ -874,22 +915,35 @@ const selfStep = (ports: CtoPorts, projectId: string): CtoStep => ({
   },
 });
 
-/** A refresh an earlier run began and did not finish: put back as it was, or noted as done, before anything new starts. */
-const recoverStep = (ports: CtoPorts, projectId: string): CtoStep => ({
+/**
+ * A refresh an earlier run began and did not finish: put back as it was, or noted as done, before anything new starts.
+ * A record whose refresher still runs is a refresh in progress and is left alone. A record that says a rotate may have been
+ * sent is reconciled with the daemon's own records first: the answer may have been lost after the daemon recorded it.
+ * `finishes`: undoing it is the whole job (`refresh --recover`, the daemon's own door) and ends well; otherwise it ends the
+ * run, since a fresh attempt belongs to a later run.
+ */
+const recoverStep = (ports: CtoPorts, projectId: string, finishes = false): CtoStep => ({
   id: "recover",
-  plan: "if an earlier refresh was interrupted, finish undoing it (stop what the new launch left, cancel the unclaimed switchover, resume the old conversation) before anything else",
+  plan: "if an earlier refresh was interrupted, finish undoing it (reconcile the switchover with the daemon's records, stop what the new launch left, cancel the unclaimed switchover, resume the old conversation) before anything else",
   done: () => readRefreshRecord(ports, projectId) === null,
   run: async () => {
     const record = readRefreshRecord(ports, projectId);
     if (record === null) return ok();
-    // Nothing was recorded at the daemon yet: the old conversation was never touched.
-    if (record.phase === "prepared") { clearRefreshRecord(ports, projectId); return ok({ recovered: "an earlier refresh stopped before it changed anything" }); }
+    const running = refresherRunning(ports, record);
+    if (running !== null) return refused(`another refresh of this project is running (pid ${running}); nothing was changed`);
+    if (record.phase === "prepared") {
+      // A rotate may have been sent and its answer lost: only the daemon's records say whether the old conversation was touched.
+      const seen = await switchoverTo(ports, projectId, record.newConversation);
+      if (seen.state === "none") { clearRefreshRecord(ports, projectId); return ok({ recovered: "an earlier refresh stopped before the daemon recorded anything" }); }
+      if (seen.state === "unknown") return refused(`an earlier refresh may have recorded a switchover and the daemon's records cannot say (${seen.why}); its record is kept, and nothing was changed`);
+    }
     if (await claimedBy(ports, projectId, record.newConversation, record.oldGeneration + 1) || fresh(ports, projectId)?.conversation === record.newConversation) {
       clearRefreshRecord(ports, projectId);
       return ok({ recovered: "the new conversation holds the role; the interrupted refresh had succeeded" });
     }
     const back = await rollBackRefresh(ports, record, []);
     if (back.resumed) clearRefreshRecord(ports, projectId);
+    if (back.resumed && finishes) return ok({ recovered: back.detail });
     return refused(`an earlier refresh was interrupted: ${back.detail}${back.resumed ? "; run refresh again for a new attempt" : ""}`);
   },
 });
@@ -928,6 +982,7 @@ const switchStep = (ports: CtoPorts, projectId: string): CtoStep => ({
     if (typeof at === "string") return refused(at);
     const record = at.record;
     if (record.generation === null) return refused("the role has no active binding, so no conversation runs to be replaced; agentctl cto relaunch starts one");
+    const generation = record.generation;
     const channel = channelOf(ports, record);
     if (typeof channel === "string") return refused(`${channel}; nothing was stopped`);
     const handoff = readHandoff(ports.files, ports.stateDir, projectId, record.generation);
@@ -962,47 +1017,80 @@ const switchStep = (ports: CtoPorts, projectId: string): CtoStep => ({
     }
     if (status.binding.liveRuns.length > 0) return refused(`the CTO still owns live runs (${status.binding.liveRuns.join(", ")}); a refresh waits until it owns none; nothing was changed`);
 
+    // From here a rotate may reach the daemon whatever its answer: the record is written first and says so (`prepared`).
+    state.refresher = { pid: ports.selfPid ?? process.pid, startedAt: ports.startToken(ports.selfPid ?? process.pid) };
     writeRefreshRecord(ports, state);
+    // Never throws: a way back that cannot be walked says so, and leaves the record for the next run.
     const fail = async (phase: string, reason: string): Promise<Outcome> => {
-      step("rolling-back", { failedAt: phase, reason });
-      const back = await rollBackRefresh(ports, state, stopped);
-      if (back.resumed) clearRefreshRecord(ports, projectId);
-      step(back.resumed ? "rolled-back" : "rollback-failed", { detail: back.detail });
+      let back: { resumed: boolean; detail: string };
+      try {
+        step("rolling-back", { failedAt: phase, reason });
+        back = await rollBackRefresh(ports, state, stopped);
+        if (back.resumed) clearRefreshRecord(ports, projectId);
+        step(back.resumed ? "rolled-back" : "rollback-failed", { detail: back.detail });
+      } catch (error) {
+        back = { resumed: false, detail: `the rollback could not be reported (${error instanceof Error ? error.message : String(error)}); the record of what to undo is kept` };
+      }
       return refused(`the refresh failed at ${phase} (${reason}); ${back.detail}`, { failedAt: phase, rolledBack: back.resumed });
     };
 
-    // rotate: the daemon records the switchover and the old holder drains. Nothing has been stopped yet, so a refusal ends it here.
-    const rotated = await asDaemon(ports, "canonicalCto.rotate", {
-      projectId, toSessionUuid: newConversation, expectedGeneration: record.generation, handoff: handoffPackageOf(handoff.text),
-    });
-    if (!rotated.allowed) { clearRefreshRecord(ports, projectId); return refused(`the daemon refused the switchover (${rotated.message}); nothing was stopped`, { reasonCode: rotated.reasonCode }); }
-    state.phase = "rotated"; writeRefreshRecord(ports, state);
-    step("rotated", { to: newConversation, generation: record.generation + 1 });
+    // rotate: the daemon records the switchover and the old holder drains. Nothing has been stopped yet, so a refusal ends it here,
+    // but only once the daemon's own records say it recorded nothing: a lost answer proves nothing about the mutation.
+    let rotated: Decision<unknown> | null = null;
+    let lost = "";
+    try {
+      rotated = await asDaemon(ports, "canonicalCto.rotate", {
+        projectId, toSessionUuid: newConversation, expectedGeneration: record.generation, handoff: handoffPackageOf(handoff.text),
+      });
+    } catch (error) { lost = error instanceof Error ? error.message : String(error); }
+    if (rotated === null || !rotated.allowed) {
+      const answer = rotated === null ? `no answer arrived: ${lost}` : `the daemon refused the switchover (${rotated.message})`;
+      const seen = await switchoverTo(ports, projectId, newConversation);
+      if (seen.state === "none") { clearRefreshRecord(ports, projectId); return refused(`${answer}; the daemon holds no switchover to ${newConversation}; nothing was stopped`, rotated === null ? undefined : { reasonCode: rotated.reasonCode }); }
+      if (seen.state === "unknown") {
+        return refused(`${answer}; the daemon's records cannot say whether it recorded the switchover (${seen.why}), so nothing was stopped and the record is kept for the next run to reconcile`);
+      }
+      step("rotated", { to: newConversation, generation: record.generation + 1, confirmedByReadBack: true, answer });
+    } else {
+      step("rotated", { to: newConversation, generation: record.generation + 1 });
+    }
+    state.phase = "rotated";
 
-    // stop: the exact process, proven gone by the kernel. Stopping before launching is the one-CTO ordering.
-    const stop = await stopStep(ports, projectId, "stop", false, stopped).run();
-    if (!stop.ok) return fail("stop", stop.reason);
-    state.phase = "stopped"; writeRefreshRecord(ports, state);
-    step("stopped", { pid: target.pid });
+    // Everything after this either returns an outcome or throws: a throw takes the same way back as a returned failure.
+    let phase = "rotated";
+    const proceed = async (): Promise<Outcome> => {
+      writeRefreshRecord(ports, state);
+      // stop: the exact process, proven gone by the kernel. Stopping before launching is the one-CTO ordering.
+      phase = "stop";
+      const stop = await stopStep(ports, projectId, "stop", false, stopped).run();
+      if (!stop.ok) return fail("stop", stop.reason);
+      state.phase = "stopped"; writeRefreshRecord(ports, state);
+      step("stopped", { pid: target.pid });
 
-    // launch: the entry names the new conversation, the launcher resumes nothing, and the one-CTO check runs with the whole scope.
-    const pointed = pointAcpCtoAt(ports, at.cwd, claude, projectId, newConversation);
-    if (!pointed.ok) return fail("mcp", pointed.reason);
-    const launched = await launchPlanned(ports, projectId, state.next, stopped, [newConversation, at.uuid]);
-    if (!launched.ok) return fail("launch", launched.reason);
-    state.phase = "launched"; writeRefreshRecord(ports, state);
-    step("launched", { tmux, ...(launched.detail ?? {}) });
+      // launch: the entry names the new conversation, the launcher resumes nothing, and the one-CTO check runs with the whole scope.
+      phase = "mcp";
+      const pointed = pointAcpCtoAt(ports, at.cwd, claude, projectId, newConversation);
+      if (!pointed.ok) return fail("mcp", pointed.reason);
+      phase = "launch";
+      const launched = await launchPlanned(ports, projectId, state.next, stopped, [newConversation, at.uuid]);
+      if (!launched.ok) return fail("launch", launched.reason);
+      state.phase = "launched"; writeRefreshRecord(ports, state);
+      step("launched", { tmux, ...(launched.detail ?? {}) });
 
-    const claimed = await awaitClaim(ports, projectId, newConversation, record.generation + 1);
-    if (!claimed.ok) return fail("claim", claimed.reason);
-    clearRefreshRecord(ports, projectId);
-    clearRefreshFailure(ports.files, ports.stateDir, projectId);
-    return ok({ from: at.uuid, to: newConversation, fromGeneration: record.generation, generation: record.generation + 1, handoff: handoff.source });
+      phase = "claim";
+      const claimed = await awaitClaim(ports, projectId, newConversation, generation + 1);
+      if (!claimed.ok) return fail("claim", claimed.reason);
+      clearRefreshRecord(ports, projectId);
+      clearRefreshFailure(ports.files, ports.stateDir, projectId);
+      return ok({ from: at.uuid, to: newConversation, fromGeneration: generation, generation: generation + 1, handoff: handoff.source });
+    };
+    try { return await proceed(); } catch (error) { return fail(phase, `threw: ${error instanceof Error ? error.message : String(error)}`); }
   },
 });
 
-const refreshPlan = (ports: CtoPorts, record: CtoRecord): CtoStep[] => {
+const refreshPlan = (ports: CtoPorts, record: CtoRecord, recoverOnly = false): CtoStep[] => {
   const projectId = record.projectId;
+  if (recoverOnly) return [selfStep(ports, projectId), recoverStep(ports, projectId, true)];
   return [recoverStep(ports, projectId), selfStep(ports, projectId), idleStep(ports, projectId), handoffStep(ports, projectId),
     trustStep(ports, projectId), channelStep(ports, projectId), oneCtoStep(ports, projectId), switchStep(ports, projectId)];
 };
@@ -1392,12 +1480,12 @@ export const executeCtoPlan = async (ports: CtoPorts, header: Record<string, unk
   return 0;
 };
 
-const BOOLEAN_FLAGS = new Set(["--apply", "--canonical", "--delete-repo"]);
+const BOOLEAN_FLAGS = new Set(["--apply", "--canonical", "--delete-repo", "--recover"]);
 const VALUE_FLAGS = new Set(["--reason", "--repo", "--yes-delete-repo"]);
 const ALLOWED: Record<string, readonly string[]> = {
   add: ["--apply", "--repo", "--canonical"],
   relaunch: ["--apply"],
-  refresh: ["--apply"],
+  refresh: ["--apply", "--recover"],
   retire: ["--apply", "--reason", "--delete-repo", "--yes-delete-repo"],
 };
 
@@ -1455,7 +1543,8 @@ export const runCtoCommand = async (args: readonly string[], ports: CtoPorts): P
   if (sub === "refresh") {
     if (record.retiredAt) return refuse(ports, `project ${projectId} is retired`);
     if (record.kind === "none") return refuse(ports, `project ${projectId} has no CTO allocation or entitlement to refresh`);
-    return executeCtoPlan(ports, { command: "refresh", project: projectId, kind: record.kind }, refreshPlan(ports, record), apply, rerun);
+    return executeCtoPlan(ports, { command: "refresh", project: projectId, kind: record.kind, ...(flags.has("--recover") ? { recoverOnly: true } : {}) },
+      refreshPlan(ports, record, flags.has("--recover")), apply, rerun);
   }
   // retire
   const reason = value("--reason");

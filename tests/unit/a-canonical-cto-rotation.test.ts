@@ -40,7 +40,7 @@ import {
 import { CanonicalSessionRegistry } from "../../src/registry/canonical-session-registry.ts";
 import { createDaemonRefreshSweep } from "../../src/daemon/cto-session-refresh-sweep.ts";
 import {
-  CTO_CONVERSATION_MAX_BYTES, CTO_CONVERSATION_MAX_COMPACTIONS, ctoTranscriptPath, hostStoreFiles, readHandoffRequest, writeHandoff, type ConversationFiles,
+  CTO_CONVERSATION_MAX_BYTES, CTO_CONVERSATION_MAX_COMPACTIONS, ctoTranscriptPath, hostStoreFiles, inflightPathOf, readHandoffRequest, writeHandoff, type ConversationFiles,
 } from "../../src/cto/cto-session-refresh.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 import { bootstrapCtoProvider, makeHarness, registerFixtureProject } from "../helpers/harness.ts";
@@ -774,5 +774,44 @@ describe("a long CTO conversation is replaced by a fresh one: the daemon's half"
     expect(await mine()).toEqual([expect.objectContaining({ action: "refreshed", source: "cto" })]);
     expect(refreshed).toEqual([w.projectId]);
     expect(readHandoffRequest(hostStoreFiles, stateDir, w.projectId)).toBeNull();
+  });
+
+  it("recovers an interrupted refresh from its record when the project has no candidate: its session drains and a switchover is pending", async () => {
+    const w = await world();
+    const stateDir = tempDir("acp-refresh-recover-");
+    const now = Date.parse("2026-11-20T12:00:00.000Z");
+    const path = ctoTranscriptPath(HOME, workdirOf(w), OLD);
+    const recovered: string[] = [];
+    const sweep = createDaemonRefreshSweep(w.harness.cp, {
+      stateDir, env: {}, home: HOME, now: () => now, newId: () => "request-1",
+      // A transcript far under both limits: only the record can bring the sweep to the project.
+      conversationFiles: transcriptFiles(path, { bytes: 1000, compactions: 0, mtimeMs: now - 600_000 }),
+      refresh: async () => { throw new Error("no ordinary refresh may start for this project"); },
+      // What `agentctl cto refresh --recover` does at the daemon: cancel the unclaimed switchover (the old conversation is resumed by the CLI).
+      recover: async (projectId) => {
+        recovered.push(projectId);
+        const cancelled = w.harness.cp.cto.cancelCanonicalSwitchover({ projectId }, OWNER);
+        hostStoreFiles.remove(inflightPathOf(stateDir, projectId));
+        return { ok: cancelled.allowed, reason: cancelled.allowed ? "" : cancelled.message };
+      },
+    });
+    const mine = async () => (await sweep.tick()).filter((verdict) => verdict.projectId === w.projectId);
+    // The refresh recorded its switchover; the old session drains and its process is gone. The role has no candidate and a switchover pending.
+    pending(w.rotate(NEW, 1));
+    process.kill(w.livePid, "SIGKILL");
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(w.harness.cp.sessions.require(w.oldSessionId).lifecycle).toBe(SessionLifecycle.DRAINING);
+    // Without a record the sweep has nothing to go on: three ticks do nothing, which is the defect.
+    for (let tick = 0; tick < 3; tick++) expect(await mine()).toEqual([]);
+    expect(recovered).toEqual([]);
+    // The refresh's record, as `agentctl cto refresh` writes it from its first change, names its refresher: a process that is gone.
+    hostStoreFiles.replace(inflightPathOf(stateDir, w.projectId), `${JSON.stringify({ projectId: w.projectId, phase: "stopped", refresher: { pid: 2_147_483_000, startedAt: null } })}\n`);
+    expect(await mine()).toEqual([{ projectId: w.projectId, action: "recovered" }]);
+    expect(recovered).toEqual([w.projectId]);
+    // The unclaimed switchover is cancelled: the role is as it was, the old conversation holds it and is ready, and nothing is left to recover.
+    expectUnmoved(w, SessionLifecycle.READY);
+    // It is an ordinary candidate again (and not long): nothing is left to recover.
+    expect(await mine()).toEqual([{ projectId: w.projectId, action: "not-long" }]);
+    expect(recovered).toEqual([w.projectId]);
   });
 });

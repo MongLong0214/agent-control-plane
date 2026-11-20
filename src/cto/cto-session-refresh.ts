@@ -1,4 +1,4 @@
-import { closeSync, mkdirSync, openSync, readFileSync, readSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { closeSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { randomUUID } from "node:crypto";
 
@@ -137,9 +137,12 @@ export interface StoreFiles {
   /** Replaces the file whole, creating its directory, owner-only. */
   replace(path: string, body: string, mode?: number): void;
   remove(path: string): void;
+  /** The names (not paths) in a directory; absent where the files cannot list one. */
+  list?(dir: string): string[];
 }
 
 export const hostStoreFiles: StoreFiles = {
+  list: (dir) => { try { return readdirSync(dir); } catch { return []; } },
   exists: (path) => { try { statSync(path); return true; } catch { return false; } },
   read: (path) => readFileSync(path, "utf8"),
   replace: (path, body, mode = 0o600) => {
@@ -162,6 +165,21 @@ export const handoffPathOf = (stateDir: string, projectId: string, generation: n
 export const requestPathOf = (stateDir: string, projectId: string): string => join(refreshDir(stateDir), `request-${safeProject(projectId)}.json`);
 export const failurePathOf = (stateDir: string, projectId: string): string => join(refreshDir(stateDir), `failure-${safeProject(projectId)}.json`);
 export const inflightPathOf = (stateDir: string, projectId: string): string => join(refreshDir(stateDir), `inflight-${safeProject(projectId)}.json`);
+
+/** The projects an unfinished refresh left a record for (`agentctl cto refresh` writes it from its first change to its end). */
+export const listInflightProjects = (files: StoreFiles, stateDir: string): string[] =>
+  (files.list?.(refreshDir(stateDir)) ?? []).flatMap((name) => {
+    const project = /^inflight-(.+)\.json$/u.exec(name)?.[1];
+    return project !== undefined && SAFE_PROJECT.test(project) ? [project] : [];
+  }).sort();
+
+/** The process carrying out the refresh an inflight record belongs to, or null when the record names none. */
+export const readInflightRefresher = (files: StoreFiles, stateDir: string, projectId: string): { pid: number; startedAt: string | null } | null => {
+  const who = readJson(files, inflightPathOf(stateDir, projectId))?.["refresher"];
+  if (who === null || typeof who !== "object" || Array.isArray(who)) return null;
+  const { pid, startedAt } = who as Record<string, unknown>;
+  return typeof pid === "number" && Number.isSafeInteger(pid) && pid > 1 && (startedAt === null || typeof startedAt === "string") ? { pid, startedAt } : null;
+};
 
 const readJson = (files: StoreFiles, path: string): Record<string, unknown> | null => {
   try {
