@@ -640,6 +640,11 @@ export const ReasonCode = {
   /** An authenticated operator method outlived its execution budget. Not an authentication fact. */
   OPERATOR_REQUEST_TIMEOUT: "OPERATOR_REQUEST_TIMEOUT",
   /**
+   * Another `agentctl cto relaunch --fresh --apply` holds this project's conversation swap, and its connection to the
+   * daemon is still open. Nothing was changed; the hold is released only when that connection closes.
+   */
+  CTO_REFRESH_IN_PROGRESS: "CTO_REFRESH_IN_PROGRESS",
+  /**
    * A git invocation was killed for exceeding its bound, so git never answered.
    *
    * Distinguished from `INTERNAL_ERROR` on purpose, and it is the whole reason the bound was worth

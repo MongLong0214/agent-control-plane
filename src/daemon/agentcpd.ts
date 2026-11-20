@@ -5,6 +5,7 @@ import { recordBootstrapServingRuntime } from "../bootstrap/bootstrap-runtime-ob
 import { readBuzzSubscriberConfig } from '../buzz/buzz-mention-subscriber.ts';
 import { CanonicalSessionRegistry } from '../registry/canonical-session-registry.ts';
 import { canonicalCtoRotations, drainingRotationFor, inFlightFromPreviousHolder, liveRunIdsOwnedBySession } from "../registry/canonical-cto-rotation.ts";
+import { CTO_REFRESH_HOLD_METHOD, createCtoRefreshHolds } from "./cto-refresh-hold.ts";
 import { outboxDeliveryReadback, type OutboxMessage } from "../outbox/outbox.ts";
 import type { CeoNoticeAttempt } from "../outbox/ceo-notification-route.ts";
 import { randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
@@ -857,6 +858,8 @@ export interface LocalOperatorSocketOptions {
    * server-configured CLI owner allowlist; absent on a parked daemon.
    */
   canonicalCto?: CanonicalCtoOperator;
+  /** `ctoRefresh.hold`: takes the project's refresh hold for the connection that asked, owner only; absent on a parked daemon. */
+  ctoRefreshHold?: (projectId: string, socket: Socket, holderPid: number | null) => Decision<unknown>;
   // No `claimCanonicalCto` option on this bearer-token-authenticated socket (#760): a process may
   // prove who it is, but it cannot approve itself, so the claiming connection cannot sit on this
   // credential surface at all, not even behind its own kernel-credential check layered on top. It
@@ -3380,10 +3383,15 @@ export const startDaemonOperatorSocket = (
   const bootstrap = options.bootstrapHermes;
   const adopt = options.adoptHermesIncumbent;
   const canonicalCto = options.canonicalCto;
+  const ctoRefreshHolds = createCtoRefreshHolds();
   return startOperatorSocket(daemon, stateDir, credential, {
     ...options,
     // v58 — the bearer authenticates the CLI; only the server-configured owner may rotate or read a rotation.
     ...(canonicalCto ? { canonicalCto: ownerOnlyCanonicalCtoOperator(cp, operatorActor, canonicalCto) } : {}),
+    // The refresh hold is the owner's too; one in-memory map for this daemon's life.
+    ctoRefreshHold: (projectId, socket, holderPid) => cp.ownerAuthority.isAllowedActor("cli", operatorActor)
+      ? ctoRefreshHolds.acquire(projectId, socket, holderPid)
+      : deny(ReasonCode.INGRESS_ACTOR_NOT_ALLOWLISTED, "a CTO refresh hold requires an allowlisted CLI owner", {}),
     ...(bootstrap ? { bootstrapHermes: (params: Record<string, unknown>) => {
       if (cp.bindings.history(Role.CEO).length > 0 &&
           !cp.ownerAuthority.isAllowedActor("cli", operatorActor)) {
@@ -4113,6 +4121,8 @@ export const startOperatorSocket = async (
   removeStaleSocket(socketPath);
   const server = createServer((socket) => {
     ignorePeerSocketErrors(socket);
+    // A CTO refresh hold keeps its connection open: closing the listener must end it too, or shutdown waits on it for ever.
+    trackConnection(server, socket);
     serveOperatorRequest(socket, daemon, binding, handshakeTimeoutMs, requestTimeoutMs, options);
   });
   try {
@@ -4391,6 +4401,25 @@ const serveOperatorRequest = (
             error: error instanceof Error ? error.message : String(error),
           }));
         }
+      }
+      if (method === CTO_REFRESH_HOLD_METHOD) {
+        if (!options.ctoRefreshHold) return finish(deny(ReasonCode.OPERATOR_METHOD_NOT_ALLOWED, "CTO refresh holds are not enabled on this socket", {}));
+        if (!daemon.lock.held()) return finish(deny(ReasonCode.DAEMON_LOCK_LOST, "daemon lock is not held for a CTO refresh hold", {}));
+        const params = operatorRequestParams(value);
+        const projectId = params?.["projectId"];
+        const holderPid = params?.["holderPid"];
+        if (typeof projectId !== "string" || projectId.length === 0 || (holderPid !== undefined && !Number.isSafeInteger(holderPid))) {
+          return finish(deny(ReasonCode.INVALID_ARGUMENT, "ctoRefresh.hold takes a projectId and, optionally, the holder's pid", {}));
+        }
+        const held = options.ctoRefreshHold(projectId, socket, typeof holderPid === "number" ? holderPid : null);
+        if (!held.allowed) return finish(held);
+        // Answered, and the connection stays open: it is the hold, and closing it releases it.
+        settled = true;
+        if (timeout) clearTimeout(timeout);
+        frame.dispose();
+        socket.write(`${JSON.stringify(held)}\n`);
+        socket.resume();
+        return;
       }
       // `actor.claimCanonicalCto` does not dispatch here (#760): a process may prove who it is,
       // but it cannot approve itself, so the claiming connection is kept off this bearer-token
