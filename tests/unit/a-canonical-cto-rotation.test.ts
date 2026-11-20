@@ -1,3 +1,4 @@
+import { handoffPackageOf } from "../../src/cto/cto-conversation.ts";
 import { type ChildProcess, spawn } from "node:child_process";
 import { once } from "node:events";
 import { chmodSync, writeFileSync } from "node:fs";
@@ -350,6 +351,21 @@ describe("agentctl canonical-cto rotate: the §10.1 switchover of a canonical CT
       buzz: { verdict: "ADMITTED", sessionId: incoming.sessionId, reception: { subscriber: { connected: true, liveness: "LIVE" }, ingress: { listening: true } } },
       rotations: [{ transferId: prepared.transferId, state: "ACKED", handoffId: handoff.handoff_id }],
     });
+  });
+
+  it("`agentctl cto relaunch --fresh`'s package is accepted, and only then is its new conversation entitled: its claim lands one generation up, as the same actor", async () => {
+    const w = await world();
+    const actor = w.actorOf(1)!;
+    // Before the switchover a fresh conversation is not entitled, whatever generation it claims.
+    expect((await w.claimAs(NEW, 2, w.newPid)).allowed).toBe(false);
+    pending(w.rotate(NEW, 1, handoffPackageOf("Finish run_3 first.")));
+    const incoming = claimed(await w.claimAs(NEW, 2, w.newPid));
+    expect(incoming.binding.bindingGeneration).toBe(2);
+    expect(w.actorOf(2)).toBe(actor);
+    expect(w.target(actor)?.target_locator).toBe(NEW);
+    // The old conversation is fenced for good: running the swap again never goes back to it.
+    expect((await w.claimAs(OLD, 3, w.newPid)).allowed).toBe(false);
+    expect(JSON.parse(w.db.get<{ package_json: string }>(`SELECT package_json FROM handoffs WHERE project_id = ?`, [w.projectId])!.package_json)).toMatchObject({ projectStatus: "Finish run_3 first." });
   });
 
   it("Buzz reception is read from the live subscriber connection and ingress, never from registry eligibility alone", async () => {

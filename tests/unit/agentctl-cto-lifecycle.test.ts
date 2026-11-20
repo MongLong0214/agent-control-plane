@@ -61,6 +61,10 @@ interface World {
   ran: string[];
   record: CtoRecord;
   openRuns: Array<{ runId: string; state: string; kind: string }>;
+  /** The daemon's canonical switchovers (canonicalCto.status/rotate): what it recorded, what rotate was asked, and whether its answer is lost. */
+  switchovers: Array<{ toSessionUuid: string; state: "PENDING" | "ACKED" }>;
+  rotateCalls: Array<{ params: Record<string, unknown>; handoffFile: string | undefined }>;
+  rotate: { answer: "ok" | "lost" | "denied" };
   files: Map<string, string>;
   procs: FakeProcess[];
   tmux: Set<string>;
@@ -85,7 +89,7 @@ interface World {
   /** tmux panes: the pane's process and its session. */
   panes: Map<number, string>;
   /** The launcher tmux last started, and whether the conversation it resumes claims the role. */
-  launched: { command: string | null; claims: boolean };
+  launched: { command: string | null; claims: boolean; fails?: boolean };
   /** The launch's pane: the registered line; the warning and then a backlog flood that scrolls that line away; or still loading. */
   pane: "registered" | "flood" | "loading";
   /** The old channel process appends a receipt (a later time, no launch id) while the launch asks tmux for its session. */
@@ -132,7 +136,7 @@ const makeWorld = (overrides: Partial<CtoRecord> = {}, env: Record<string, strin
       // The acp-cto relay names the conversation too, but is not the conversation's process.
       { pid: 16970, ppid: CLAUDE, command: `/node agentctl.js attach resident-cto --claimed-session-id ${CONVERSATION} --project-id ${P}` },
     ],
-    openRuns: [],
+    openRuns: [], switchovers: [], rotateCalls: [], rotate: { answer: "ok" },
     record: {
       projectId: P, name: P, retiredAt: null, kind: "resident",
       repositories: [{ repositoryId: "repo_1", identity: `github:${REPO}`, checkoutPath: WORKER }],
@@ -169,10 +173,16 @@ const makeWorld = (overrides: Partial<CtoRecord> = {}, env: Record<string, strin
     // A launch: tmux starts the launcher, which resumes the conversation with its channel; the conversation claims the role.
     if (bin === "tmux" && (args[0] === "new-session" || args[0] === "new-window")) {
       w.changes.push(line);
+      if (w.launched.fails) return answer(1, "", "no server running");
       if (args[0] === "new-session") w.tmux.add(args[args.indexOf("-s") + 1]!);
       w.launched.command = args[args.length - 1]!;
-      w.procs.push({ pid: 30000, ppid: 1, command: `${LOCAL_CLAUDE} --mcp-config {} ${CHANNEL} --resume ${w.record.conversation}` });
-      if (w.launched.claims) w.record = { ...w.record, generation: 4, session: { pid: 30000, startedAt: "start-30000", workdir: null } };
+      // The conversation the launcher starts: --resume or --session-id, as its script says.
+      const started = /'--(?:resume|session-id)' '([0-9a-f-]{36})'/.exec(files.get(w.launched.command) ?? "")?.[1] ?? w.record.conversation;
+      w.procs.push({ pid: 30000, ppid: 1, command: `${LOCAL_CLAUDE} --mcp-config {} ${CHANNEL} --resume ${started}`, argv: [LOCAL_CLAUDE, "--mcp-config", "{}", ...CHANNEL.split(" "), "--resume", started!] });
+      if (w.launched.claims) {
+        w.record = { ...w.record, conversation: started, generation: 4, session: { pid: 30000, startedAt: "start-30000", workdir: null } };
+        for (const one of w.switchovers) if (one.toSessionUuid === started) one.state = "ACKED";
+      }
       return answer(0, "%9\n");
     }
     if (bin === "tmux" && args[0] === "display-message") return answer(0, args[4] === "#{pane_id}" ? "%9\n" : `${w.launched.command}\n`);
@@ -250,6 +260,15 @@ const makeWorld = (overrides: Partial<CtoRecord> = {}, env: Record<string, strin
       request: async (method: string, params: Record<string, unknown> = {}, idempotencyKey?: string) => {
         if (w.daemonRejects) return deny(ReasonCode.OPERATOR_UNAUTHENTICATED, "operator authentication failed");
         if (method === "daemon.status") return allow(ReasonCode.OK, { mode: "RUNNING" });
+        if (method === "canonicalCto.status") return allow(ReasonCode.OK, { holderSessionUuid: w.record.conversation, generation: w.record.generation, rotations: structuredClone(w.switchovers) });
+        if (method === "canonicalCto.rotate") {
+          w.changes.push(`operator ${method}`);
+          w.rotateCalls.push({ params, handoffFile: files.get(`${STATE}/cto-refresh/handoff-${P}.json`) });
+          if (w.rotate.answer === "denied") return deny(ReasonCode.CONFLICT, "the switchover is refused");
+          w.switchovers.push({ toSessionUuid: params["toSessionUuid"] as string, state: "PENDING" });
+          if (w.rotate.answer === "lost") throw new Error("operator socket closed before the answer");
+          return allow(ReasonCode.OK, { outcome: "SWITCHOVER_PENDING" });
+        }
         const key = idempotencyKey ?? `operator:${JSON.stringify({ method, params })}`;
         const cached = daemonCache.get(key);
         if (cached) return cached;
@@ -742,66 +761,146 @@ describe("a canonical relaunch resumes the role's bound conversation", () => {
     expect(w.changes).toEqual([]);
   });
 
-  describe("relaunch --fresh", () => {
-    const FRESH_STEPS = ["no-live-run", "handoff", ...RESUME_STEPS];
-    const launcherOf = (w: World): { resume: string[] } => JSON.parse(w.files.get(`${STATE}/cto-launch-${P}.sh`)!.split("\n").find((l) => l.startsWith("# cto-launch: "))!.slice("# cto-launch: ".length)) as { resume: string[] };
+  describe("relaunch --fresh: the daemon's switchover, then the new conversation, rolling forward only", () => {
+    const FRESH_STEPS = ["no-live-run", "handoff", "idle", "trust", "channel", "switchover", "one-cto", "launcher", "mcp", "stop", "launch", "claimed", "complete"];
+    const handoffFile = (w: World): { conversation: string; source: string; text: string; next?: string; completed?: boolean } => JSON.parse(w.files.get(`${STATE}/cto-refresh/handoff-${P}.json`)!);
+    const launched = (w: World): string[] => (w.out.find((l) => l["step"] === "launch" && l["result"] === "done")!["detail"] as { argv: string[] }).argv;
 
-    it("starts a new conversation with --session-id and the stored handoff as its first prompt, not --resume", async () => {
+    it("with no pending switchover: prepares one (old to U, the current generation, the handoff as package, U already in the handoff file) and launches U with --session-id and the handoff", async () => {
       const { w } = canonicalWorld();
       w.files.set(`${STATE}/cto-refresh/handoff-${P}.json`, JSON.stringify({ schema: "acp.cto-handoff.v1", projectId: P, conversation: CONVERSATION, source: "cto", text: "Finish run_3 first.", writtenAt: "2026-11-20T00:00:00Z" }));
       expect(await runCtoCommand(["relaunch", P, "--fresh", "--apply"], w.ports)).toBe(0);
       expect(results(w).map(([step]) => step)).toEqual(FRESH_STEPS);
-      const launch = w.out.find((l) => l["step"] === "launch" && l["result"] === "done")!["detail"] as { argv: string[] };
-      const id = launch.argv[launch.argv.indexOf("--session-id") + 1]!;
-      expect(id).toMatch(/^99999999-/);
-      expect(launch.argv).not.toContain("--resume");
-      expect(launch.argv.at(-1)).toContain("Finish run_3 first.");
-      expect(launch.argv.at(-1)).toContain(CONVERSATION);
-      expect(w.changes).toContain(`${LOCAL_CLAUDE} mcp add --scope local acp-cto -- ${STATE}/current/dist/bin/node ${STATE}/current/dist/cli/agentctl.js attach canonical-cto --claimed-session-id ${id} --project-id ${P} --expected-binding-generation auto`);
+      expect(w.rotateCalls).toHaveLength(1);
+      const U = w.rotateCalls[0]!.params["toSessionUuid"] as string;
+      expect(w.rotateCalls[0]!.params).toMatchObject({ projectId: P, expectedGeneration: 3, handoff: { projectStatus: "Finish run_3 first." } });
+      // U was written down before the daemon was asked, and the swap was seen through.
+      expect(JSON.parse(w.rotateCalls[0]!.handoffFile!)).toMatchObject({ conversation: CONVERSATION, next: U });
+      expect(handoffFile(w)).toMatchObject({ next: U, completed: true });
+      const argv = launched(w);
+      expect(argv.slice(argv.indexOf("--session-id"), argv.indexOf("--session-id") + 2)).toEqual(["--session-id", U]);
+      expect(argv).not.toContain("--resume");
+      expect(argv.at(-1)).toContain("Finish run_3 first.");
+      expect(w.changes).toContain(`${LOCAL_CLAUDE} mcp add --scope local acp-cto -- ${STATE}/current/dist/bin/node ${STATE}/current/dist/cli/agentctl.js attach canonical-cto --claimed-session-id ${U} --project-id ${P} --expected-binding-generation auto`);
       expect(w.changes).toContain(`SIGTERM ${CLAUDE}`);
-      expect(w.rotateRuns).toEqual([]);
+      expect(w.record).toMatchObject({ conversation: U, generation: 4 });
     });
 
-    it("writes a short ACP handoff from the binding and open runs when none is stored, and records the old conversation", async () => {
+    it("with a pending switchover to U: prepare is not called and U is reused", async () => {
       const { w } = canonicalWorld();
-      w.openRuns = [{ runId: "run_9", state: "BLOCKED", kind: "IMPLEMENT" }];
+      const U = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+      w.switchovers = [{ toSessionUuid: U, state: "PENDING" }];
       expect(await runCtoCommand(["relaunch", P, "--fresh", "--apply"], w.ports)).toBe(0);
-      const stored = JSON.parse(w.files.get(`${STATE}/cto-refresh/handoff-${P}.json`)!) as { conversation: string; source: string; text: string };
-      expect(stored).toMatchObject({ conversation: CONVERSATION, source: "acp" });
-      expect(Buffer.byteLength(stored.text)).toBeLessThanOrEqual(2048);
-      expect(stored.text).toContain("run_9 BLOCKED");
-      expect(launcherOf(w).resume.at(-1)).toContain("run_9 BLOCKED");
+      expect(w.rotateCalls).toEqual([]);
+      expect(results(w).find(([step]) => step === "switchover")).toEqual(["switchover", "skipped"]);
+      const argv = launched(w);
+      expect(argv.slice(argv.indexOf("--session-id"), argv.indexOf("--session-id") + 2)).toEqual(["--session-id", U]);
+      expect(w.record.conversation).toBe(U);
     });
 
-    it("refuses while the project has running work, before anything is written or stopped", async () => {
+    it("never signals a process whose argv names U, and starts no second one", async () => {
+      const { w } = canonicalWorld();
+      const U = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+      w.switchovers = [{ toSessionUuid: U, state: "PENDING" }];
+      // The role's recorded process is the one running U (it has not claimed yet).
+      const argv = [LOCAL_CLAUDE, "--session-id", U, ...CHANNEL.split(" ")];
+      w.procs = [{ pid: CLAUDE, ppid: 1, command: argv.join(" "), argv }];
+      expect(await runCtoCommand(["relaunch", P, "--fresh", "--apply"], w.ports)).toBe(1);
+      expect(w.changes.filter((c) => c.startsWith("SIGTERM"))).toEqual([]);
+      expect(w.changes.some((c) => c.startsWith("tmux new-"))).toBe(false);
+      expect(w.procs.map((p) => p.pid)).toEqual([CLAUDE]);
+      expect(results(w).find(([step]) => step === "stop")).toEqual(["stop", "skipped"]);
+      expect(results(w).at(-1)).toEqual(["claimed", "failed"]);
+    });
+
+    it("a re-run after a launch failure relaunches the same U, and asks the daemon for nothing more", async () => {
+      const { w } = canonicalWorld();
+      w.launched.fails = true;
+      expect(await runCtoCommand(["relaunch", P, "--fresh", "--apply"], w.ports)).toBe(1);
+      expect(results(w).at(-1)).toEqual(["launch", "failed"]);
+      const U = w.rotateCalls[0]!.params["toSessionUuid"] as string;
+      expect(w.switchovers).toEqual([{ toSessionUuid: U, state: "PENDING" }]);
+      expect(w.changes).toContain(`SIGTERM ${CLAUDE}`);
+      w.launched.fails = false;
+      w.out.length = 0; w.changes.length = 0;
+      expect(await runCtoCommand(["relaunch", P, "--fresh", "--apply"], w.ports)).toBe(0);
+      expect(w.rotateCalls).toHaveLength(1);
+      expect(w.changes.filter((c) => c.startsWith("SIGTERM"))).toEqual([]);
+      const argv = launched(w);
+      expect(argv.slice(argv.indexOf("--session-id"), argv.indexOf("--session-id") + 2)).toEqual(["--session-id", U]);
+      expect(w.record).toMatchObject({ conversation: U, generation: 4 });
+    });
+
+    it("a new conversation whose transcript exists is resumed, with no second first prompt", async () => {
+      const { w, cwd } = canonicalWorld();
+      const U = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+      w.switchovers = [{ toSessionUuid: U, state: "PENDING" }];
+      w.files.set(`${HOME}/.claude/projects/${cwd.replace(/[^A-Za-z0-9]/g, "-")}/${U}.jsonl`, "{}");
+      expect(await runCtoCommand(["relaunch", P, "--fresh", "--apply"], w.ports)).toBe(0);
+      const argv = launched(w);
+      expect(argv.slice(argv.indexOf("--resume"), argv.indexOf("--resume") + 2)).toEqual(["--resume", U]);
+      expect(argv).not.toContain("--session-id");
+      expect(argv.join(" ")).not.toContain("--- handoff ---");
+    });
+
+    it("a lost rotate answer is followed by a status read-back, not a second rotate", async () => {
+      const { w } = canonicalWorld();
+      w.rotate.answer = "lost";
+      expect(await runCtoCommand(["relaunch", P, "--fresh", "--apply"], w.ports)).toBe(0);
+      expect(w.rotateCalls).toHaveLength(1);
+      expect(w.record.conversation).toBe(w.rotateCalls[0]!.params["toSessionUuid"]);
+      expect(w.out.find((l) => l["step"] === "switchover" && l["result"] === "done")!["detail"]).toMatchObject({ rotateAnswer: expect.stringContaining("closed before the answer") });
+    });
+
+    it("a refused rotate that left nothing pending stops before anything is stopped, and says the old conversation is unchanged", async () => {
+      const { w } = canonicalWorld();
+      w.rotate.answer = "denied";
+      expect(await runCtoCommand(["relaunch", P, "--fresh", "--apply"], w.ports)).toBe(1);
+      expect(results(w).at(-1)).toEqual(["switchover", "failed"]);
+      expect(JSON.stringify(w.out)).toContain("the old conversation is unchanged");
+      expect(w.changes.filter((c) => c.startsWith("SIGTERM") || c.startsWith("tmux new-"))).toEqual([]);
+    });
+
+    it("refuses while the project has running work, before anything is written or asked of the daemon", async () => {
       const { w } = canonicalWorld();
       w.openRuns = [{ runId: "run_1", state: "ACTIVE", kind: "IMPLEMENT" }];
       expect(await runCtoCommand(["relaunch", P, "--fresh", "--apply"], w.ports)).toBe(1);
       expect(results(w)).toEqual([["no-live-run", "failed"]]);
       expect(w.changes).toEqual([]);
+      expect(w.rotateCalls).toEqual([]);
     });
 
-    it("on failure rolls nothing back and prints the one command that resumes the old conversation", async () => {
+    it("on failure prints the one recovery command, --fresh --apply, which never goes back to the old conversation", async () => {
       const { w } = canonicalWorld();
       w.launched.claims = false;
       expect(await runCtoCommand(["relaunch", P, "--fresh", "--apply"], w.ports)).toBe(1);
-      expect(last(w)).toEqual({ oldConversation: CONVERSATION, recovery: `agentctl cto relaunch ${P} --conversation ${CONVERSATION} --apply` });
+      expect(last(w)).toEqual({ result: "stopped", at: "claimed", rerun: `agentctl cto relaunch ${P} --fresh --apply` });
+      expect(JSON.stringify(w.out)).not.toContain("--conversation");
       expect(w.out.find((l) => l["command"] === "relaunch")).toMatchObject({ fresh: true, oldConversation: CONVERSATION });
-      expect(w.changes.some((c) => c.includes(" mcp remove "))).toBe(true);
-      // The recovery command is a plain relaunch of the named conversation: --resume, no prompt, no handoff step.
-      w.launched.claims = true;
-      w.procs = w.procs.filter((p) => p.pid !== 30000);
-      w.changes.length = 0; w.out.length = 0;
-      expect(await runCtoCommand(["relaunch", P, "--conversation", CONVERSATION, "--apply"], w.ports)).toBe(0);
-      expect(launcherOf(w).resume.slice(0, 2)).toEqual(["--resume", CONVERSATION]);
-      expect(results(w).map(([step]) => step)).toEqual(RESUME_STEPS.slice(0, -1).map((step) => step).concat("claimed"));
+      // The claim comes late; running the same command again only confirms it: nothing is stopped, started or asked.
+      const U = w.rotateCalls[0]!.params["toSessionUuid"] as string;
+      w.record = { ...w.record, conversation: U, generation: 4 };
+      w.switchovers[0]!.state = "ACKED";
+      w.out.length = 0; w.changes.length = 0;
+      expect(await runCtoCommand(["relaunch", P, "--fresh", "--apply"], w.ports)).toBe(0);
+      // Only the record that the swap was seen through is written.
+      expect(w.changes).toEqual([`replace ${STATE}/cto-refresh/handoff-${P}.json`]);
+      expect(w.rotateCalls).toHaveLength(1);
+      expect(handoffFile(w).completed).toBe(true);
     });
 
-    it("takes a canonical CTO only, and --conversation not with --fresh", async () => {
+    it("a dry run prints the plan and asks the daemon for nothing but a read", async () => {
       const { w } = canonicalWorld();
-      expect(await runCtoCommand(["relaunch", P, "--fresh", "--conversation", CONVERSATION], w.ports)).toBe(2);
+      expect(await runCtoCommand(["relaunch", P, "--fresh"], w.ports)).toBe(0);
+      expect(w.out.find((l) => l["command"] === "relaunch")!["steps"]).toEqual(FRESH_STEPS);
+      expect(w.rotateCalls).toEqual([]);
+      expect(w.changes).toEqual([]);
+    });
+
+    it("takes a canonical CTO only, and no --conversation", async () => {
       const resident = makeWorld({}, { ACP_OPERATOR_TOKEN: "operator-test-credential" });
       expect(await runCtoCommand(["relaunch", P, "--fresh"], resident.ports)).toBe(2);
+      expect(await runCtoCommand(["relaunch", P, "--conversation", CONVERSATION], resident.ports)).toBe(2);
     });
   });
 });

@@ -63,7 +63,13 @@ export const hostStoreFiles: StoreFiles = {
   },
 };
 
-export interface StoredHandoff { schema: "acp.cto-handoff.v1"; projectId: string; /** The conversation being replaced. */ conversation: string; source: "cto" | "acp"; text: string; writtenAt: string }
+export interface StoredHandoff {
+  schema: "acp.cto-handoff.v1"; projectId: string;
+  /** The conversation being replaced. */
+  conversation: string; source: "cto" | "acp"; text: string; writtenAt: string;
+  /** The new conversation the swap goes to, written before the switchover is prepared; and whether the swap was seen through. */
+  next?: string; completed?: boolean;
+}
 
 export const handoffPathOf = (stateDir: string, projectId: string): string => {
   if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u.test(projectId)) throw new Error("project id is not a file-safe name");
@@ -84,7 +90,10 @@ export const writeHandoff = (
   const text = input.text.trim();
   if (text.length === 0) return { ok: false, reason: "the handoff is empty" };
   if (utf8Bytes(text) > CTO_HANDOFF_MAX_BYTES) return { ok: false, reason: `the handoff is ${utf8Bytes(text)} bytes; at most ${CTO_HANDOFF_MAX_BYTES} are kept, so write a shorter one` };
-  const handoff: StoredHandoff = { schema: "acp.cto-handoff.v1", projectId: input.projectId, conversation: input.conversation, source: input.source, text, writtenAt: input.now };
+  // A rewrite for the same conversation (the CTO's own, after the switchover was prepared) keeps where the swap goes.
+  const prior = readHandoff(files, stateDir, input.projectId);
+  const kept = prior?.conversation === input.conversation ? { ...(prior.next ? { next: prior.next } : {}), ...(prior.completed ? { completed: true } : {}) } : {};
+  const handoff: StoredHandoff = { schema: "acp.cto-handoff.v1", projectId: input.projectId, conversation: input.conversation, source: input.source, text, writtenAt: input.now, ...kept };
   files.replace(handoffPathOf(stateDir, input.projectId), `${JSON.stringify(handoff)}\n`);
   return { ok: true, handoff };
 };
@@ -95,9 +104,22 @@ export const readHandoff = (files: StoreFiles, stateDir: string, projectId: stri
     if (!files.exists(path)) return null;
     const v = JSON.parse(files.read(path)) as Partial<StoredHandoff>;
     return v.schema === "acp.cto-handoff.v1" && v.projectId === projectId && typeof v.conversation === "string" && (v.source === "cto" || v.source === "acp") &&
-      typeof v.text === "string" && v.text.length > 0 && utf8Bytes(v.text) <= CTO_HANDOFF_MAX_BYTES && typeof v.writtenAt === "string" ? v as StoredHandoff : null;
+      typeof v.text === "string" && v.text.length > 0 && utf8Bytes(v.text) <= CTO_HANDOFF_MAX_BYTES && typeof v.writtenAt === "string" && (v.next === undefined || typeof v.next === "string") ? v as StoredHandoff : null;
   } catch { return null; }
 };
+
+/** Records the swap's target (before the switchover is prepared) or that it was seen through, keeping the rest. */
+export const markHandoff = (files: StoreFiles, stateDir: string, projectId: string, patch: { next?: string; completed?: boolean }): void => {
+  const stored = readHandoff(files, stateDir, projectId);
+  if (stored) files.replace(handoffPathOf(stateDir, projectId), `${JSON.stringify({ ...stored, ...patch })}\n`);
+};
+
+/** The package the daemon's switchover records for the outgoing holder: the handoff text as the project status. */
+export const handoffPackageOf = (text: string) => ({
+  projectStatus: text, activeManifestDigest: null, recentDecisions: [] as string[], openBlockers: [] as string[], queuedWork: [] as string[],
+  repositoryFacts: [] as Array<{ identity: string; branch: string | null; head: string | null }>, knownRisks: [] as string[],
+  recommendedNextAction: "Continue from the handoff in projectStatus: read role_dispatch_pending first.",
+});
 
 /** What ACP writes when the CTO wrote none: the binding and the open runs, facts only, under 2 KB. */
 export const fallbackHandoff = (facts: { projectId: string; conversation: string; generation: number | null; openRuns: Array<{ runId: string; state: string; kind: string }> }): string =>
