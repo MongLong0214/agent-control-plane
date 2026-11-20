@@ -388,6 +388,14 @@ describe("task_worker_provision mints a task's first WORKER binding (#512)", () 
     });
   });
 
+  it("does not list the removed blind_review_request or role_wake_endpoint_register", async () => {
+    await withFixture(async (f) => {
+      const tools = await f.cto.listTools();
+      expect(tools).not.toContain("blind_review_request");
+      expect(tools).not.toContain("role_wake_endpoint_register");
+    });
+  });
+
   it("W1: binds WORKER:<task> at generation 1 on its own READY Claude Opus session, and the started receipt runs the task", async () => {
     await withFixture(async (f) => {
       const provisioned = await f.provision();

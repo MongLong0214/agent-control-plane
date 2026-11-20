@@ -274,7 +274,7 @@ describe("outbox delivery is claimed, not merely selected", () => {
       bindingGeneration: 1,
       targetSessionId: core.seeded.sessionId,
       runId: core.seeded.runId,
-      kind: "REVIEW_REQUEST",
+      kind: "HANDOFF_PACKAGE",
       payload: { runId: core.seeded.runId },
     });
     if (!message.allowed) throw new Error(message.message);
@@ -337,7 +337,7 @@ describe("an ACK from a revoked generation changes nothing", () => {
       roleKey: core.seeded.roleKey,
       bindingGeneration: 1,
       targetSessionId: core.seeded.sessionId,
-      kind: "REVIEW_REQUEST",
+      kind: "HANDOFF_PACKAGE",
       payload: {},
     });
     if (!message.allowed) throw new Error(message.message);

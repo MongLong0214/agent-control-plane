@@ -12,7 +12,7 @@ import type { Decision } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { startDaemonMcpListeners, type LocalMcpListeners } from "../../src/daemon/agentcpd.ts";
 import { Daemon } from "../../src/daemon/daemon.ts";
-import { Role, SessionLifecycle } from "../../src/domain/types.ts";
+import { Role, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
 import { spawnUnderClaude } from "../helpers/claude-parent.ts";
 import { cleanupTempDirs } from "../helpers/fixtures.ts";
 import { fixtureManifest, makeHarness, type Harness } from "../helpers/harness.ts";
@@ -234,8 +234,8 @@ describe("the attach relay as the process Claude Code spawns", () => {
     child.stdin!.write(`${JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" })}\n`);
 
     const registered = await request(2, "tools/call", {
-      name: "role_wake_endpoint_register",
-      arguments: { endpoint },
+      name: "role_owner_message_claim",
+      arguments: { roleKey: roleKeyFor(Role.PRIMARY_CTO, { projectId: manifest.projectId }) },
     });
     const body = (registered["result"] as { structuredContent?: Record<string, unknown> }).structuredContent!;
     expect(body["ok"]).toBe(true);

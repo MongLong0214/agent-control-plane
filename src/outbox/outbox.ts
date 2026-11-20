@@ -348,16 +348,14 @@ export const handOverEligibleSql = (alias: string): string =>
  * Every outward kind that can be addressed to a PRIMARY_CTO's bound session is here, so no message
  * to a canonical CTO depends on that send: `RUN_DISPATCH` (run engine, owner-decision resume),
  * `REVISION_REQUEST` (candidate pipeline, candidate invalidation), `ESCALATION_REPLY` (the CEO's
- * resolution), `DRAIN_REQUEST` (replacement) and `CANCEL_REQUEST`. All are settled by `run_ack`,
+ * resolution), and `DRAIN_REQUEST` (replacement). All are settled by `run_ack`,
  * the only generic acknowledgement there is. A `HANDOFF_PACKAGE` is also in band when addressed
  * to its role's current holder (bootstrap); a switchover's unbound recipient keeps its Buzz route.
  * It is settled by `handoff_ack`. Left out: `CEO_NOTIFICATION`,
- * addressed to the CEO; and `TASK_ASSIGN`, `REVIEW_REQUEST` and `RECOVERY_PACKAGE`, which nothing
- * enqueues. Disjoint from `HOLDER_CLAIMED_KINDS`, which never reach the sweep at all.
+ * addressed to the CEO. Disjoint from `HOLDER_CLAIMED_KINDS`, which never reach the sweep at all.
  */
 export const IN_BAND_KINDS: ReadonlySet<MessageKind> = new Set<MessageKind>([
   MessageKind.RUN_DISPATCH,
-  MessageKind.CANCEL_REQUEST,
   MessageKind.REVISION_REQUEST,
   MessageKind.ESCALATION_REPLY,
   MessageKind.RESUME_REVIEW,
