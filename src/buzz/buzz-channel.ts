@@ -36,6 +36,12 @@ export const MAX_REPLY_CHARACTERS = 16_000;
 /** How long a published reply waits for the relay's verdict. */
 export const PUBLISH_TIMEOUT_MS = 10_000;
 
+/** How long a reply waits for the relay to show the event it answers, before it threads under the root it remembers. */
+export const PARENT_LOOKUP_TIMEOUT_MS = 5_000;
+
+/** The most of the relay's own refusal text a tool result carries. */
+const MAX_RELAY_REASON_CHARACTERS = 200;
+
 /** How often an idle connection proves it is still answered, and how long it has to answer. */
 export const KEEPALIVE_INTERVAL_MS = 45_000;
 export const KEEPALIVE_ANSWER_MS = 15_000;
@@ -279,6 +285,41 @@ export const replyToOf = (event: { tags: readonly (readonly string[])[] }): stri
   return all.length === 0 ? "" : (all[all.length - 1]?.[1] ?? "");
 };
 
+const EVENT_ID_SHAPE = /^[0-9a-fA-F]{64}$/u;
+
+/**
+ * The `root` and `reply` markers of an event's NIP-10 `e` tags, read as the relay reads them: only a tag with four parts,
+ * a marker and a 64-hex id counts, and the last valid one of each marker wins.
+ */
+const threadMarkers = (tags: readonly (readonly string[])[]): { root: string | null; reply: string | null } => {
+  let root: string | null = null;
+  let reply: string | null = null;
+  for (const tag of tags) {
+    if (tag.length < 4 || tag[0] !== "e" || !EVENT_ID_SHAPE.test(tag[1] ?? "")) continue;
+    if (tag[3] === "root") root = tag[1]!;
+    else if (tag[3] === "reply") reply = tag[1]!;
+  }
+  return { root, reply };
+};
+
+/**
+ * The root of the thread an event is in, by the relay's whole marker resolution (buzz-core `ThreadMarkers::resolve`): a
+ * `root` and a `reply` marker name the root and the parent; a `reply` marker alone names a parent that is itself the root;
+ * anything else, a lone `root` marker included, is top-level, and a top-level event is the root of its own thread. A lone
+ * `root` marker never anchors a reply, so it is not read as one.
+ */
+const threadRootOf = (event: { readonly id: string; readonly tags: readonly (readonly string[])[] }): string => {
+  const { root, reply } = threadMarkers(event.tags);
+  return reply === null ? event.id : (root ?? reply);
+};
+
+/**
+ * What the relay says refused a publish, as one short line: its own text, control characters made spaces, cut at a bound.
+ * The text is the relay's and is shown as data, never as an instruction.
+ */
+const relayReason = (message: string): string =>
+  message.replace(/[\u0000-\u001f\u007f]+/gu, " ").replace(/\s+/gu, " ").trim().slice(0, MAX_RELAY_REASON_CHARACTERS);
+
 /**
  * The channel body is untrusted data inside a `<channel>` tag. A literal closing tag in it would end
  * the element early and let the rest read as the session's own text, so it is broken, not escaped
@@ -316,6 +357,9 @@ export class BuzzChannelRelay {
   #chain: Promise<void> = Promise.resolve();
   #backlogDone = false;
   readonly #pending = new Map<string, { generation: number; settle: (ack: ReplyAckResult) => void; timer: unknown }>();
+  /** One-shot questions to the relay about an event a reply is built on: subscription id -> what is asked and heard so far. */
+  readonly #lookups = new Map<string, ParentLookup>();
+  #lookupSeq = 0;
 
   constructor(options: BuzzChannelOptions) {
     this.#o = options;
@@ -337,7 +381,7 @@ export class BuzzChannelRelay {
     if (saved !== null) {
       this.#cursor = saved.cursor;
       for (const [id, at] of saved.failed) this.#retry.set(id, at);
-      for (const [id, at, author, room, root, delivered] of saved.events) this.#events.set(id, { at, author, room, root, delivered });
+      for (const [id, at, author, room, root, delivered] of saved.events) this.#events.set(id, { at, author, room, root, exactRoot: false, delivered });
     }
   }
 
@@ -429,13 +473,26 @@ export class BuzzChannelRelay {
     if (parent.room !== input.room) return { ok: false, reason: "that event was written in another room" };
     const recipient = parent.author;
     if (recipient === this.pubkey) return { ok: false, reason: "that event is this CTO's own" };
+    if (this.#socket === null || !this.#subscribed) return { ok: false, reason: "the relay connection is not up" };
+    // The relay holds a thread under its real root, and a reply to a reply must name it. A root read from the event's own
+    // markers is that root; one read back from a saved state may be a guess, so the relay is asked what the event says.
+    let root = parent.root;
+    if (!parent.exactRoot) {
+      const shown = await this.#askRelayForParent(input.eventId, input.room);
+      if (shown !== null) {
+        root = threadRootOf(shown);
+        this.#events.set(input.eventId, { ...parent, root, exactRoot: true });
+      }
+    }
     const socket = this.#socket;
     if (socket === null || !this.#subscribed) return { ok: false, reason: "the relay connection is not up" };
+    // NIP-10: a direct answer to the thread's root names it once, as the reply; anything deeper names the root and the parent.
+    const thread = root === input.eventId ? [["e", input.eventId, "", "reply"]] : [["e", root, "", "root"], ["e", input.eventId, "", "reply"]];
     const event = finalizeEvent(
       {
         kind: BUZZ_MENTION_KIND,
         created_at: this.#sched.nowSeconds(),
-        tags: [["h", input.room], ["e", input.eventId, "", "reply"], ["p", recipient], [REPLY_KIND_TAG, input.kind]],
+        tags: [["h", input.room], ...thread, ["p", recipient], [REPLY_KIND_TAG, input.kind]],
         content: input.text,
       },
       this.#o.secretKey,
@@ -451,10 +508,13 @@ export class BuzzChannelRelay {
       socket.send(JSON.stringify(["EVENT", event]));
     });
     if (ack.status !== "ACCEPTED" && ack.status !== "DUPLICATE") {
-      return { ok: false, reason: `the relay did not accept the reply (${ack.status})` };
+      // Its own words, so a refusal can be told from a timeout and acted on, not guessed at.
+      const said = ack.status === "REFUSED" ? relayReason(ack.message) : "";
+      if (said !== "") this.#o.onDiagnostic?.(`the relay refused a reply: ${said}`);
+      return { ok: false, reason: `the relay did not accept the reply (${ack.status})${said === "" ? "" : `: ${said}`}` };
     }
-    this.#events.set(event.id, { at: event.created_at, author: this.pubkey, room: input.room, root: parent.root, delivered: false });
-    this.#touchThread(parent.root, input.room, Math.min(event.created_at, this.#sched.nowSeconds()));
+    this.#events.set(event.id, { at: event.created_at, author: this.pubkey, room: input.room, root, exactRoot: true, delivered: false });
+    this.#touchThread(root, input.room, Math.min(event.created_at, this.#sched.nowSeconds()));
     this.#persist();
     this.#o.onReceipt?.({
       type: "replied",
@@ -510,6 +570,7 @@ export class BuzzChannelRelay {
       pending.settle({ status: "UNAVAILABLE" });
       this.#pending.delete(id);
     }
+    for (const subId of [...this.#lookups.keys()]) this.#lookupDone(subId);
     try {
       socket?.close();
     } catch {
@@ -570,18 +631,62 @@ export class BuzzChannelRelay {
       case "OK":
         return this.#ok(frame, generation);
       case "EVENT":
+        if (typeof frame[1] === "string" && this.#lookups.has(frame[1])) return this.#lookupHeard(frame[1], frame[2]);
         return await this.#event(frame);
       case "EOSE":
         if (frame[1] === this.#subId) this.#attempt = 0;
         if (typeof frame[1] === "string" && frame[1] === this.#probeId) this.#probeAnswered();
+        if (typeof frame[1] === "string") this.#lookupDone(frame[1]);
         return;
       case "CLOSED":
         if (frame[1] === this.#probeId) return this.#probeAnswered();
+        if (typeof frame[1] === "string" && this.#lookups.has(frame[1])) return this.#lookupDone(frame[1]);
         if (frame[1] === this.#subId) this.#lost();
         return;
       default:
         return;
     }
+  }
+
+  /**
+   * Asks the relay for one event by id, in its room, and answers with it, or `null` when the relay does not show it, shows
+   * something else, or does not answer in time. Only the event asked for, whole and validly signed, is believed.
+   */
+  #askRelayForParent(eventId: string, room: string): Promise<RelayEvent | null> {
+    const socket = this.#socket;
+    if (socket === null) return Promise.resolve(null);
+    const subId = `${this.#subId}-at-${++this.#lookupSeq}`;
+    return new Promise<RelayEvent | null>((settle) => {
+      const timer = this.#sched.setTimeout(() => this.#lookupDone(subId), PARENT_LOOKUP_TIMEOUT_MS);
+      this.#lookups.set(subId, { generation: this.#generation, eventId, room, heard: null, settle, timer });
+      socket.send(JSON.stringify(["REQ", subId, { ids: [eventId], "#h": [room], limit: 1 }]));
+    });
+  }
+
+  #lookupHeard(subId: string, raw: unknown): void {
+    const lookup = this.#lookups.get(subId);
+    if (lookup === undefined || lookup.generation !== this.#generation) return;
+    const event = plainEventOf(raw);
+    if (event === null || event.id !== lookup.eventId || !validateEvent(event) || !verifyEvent(event)) return;
+    const rooms = tagValues(event, "h");
+    if (rooms.length !== 1 || rooms[0] !== lookup.room) return;
+    lookup.heard = event;
+  }
+
+  /** The relay has said all it will (end of stored events, a refusal), or the wait is over: hand over what was heard. */
+  #lookupDone(subId: string): void {
+    const lookup = this.#lookups.get(subId);
+    if (lookup === undefined) return;
+    this.#lookups.delete(subId);
+    this.#sched.clearTimeout(lookup.timer);
+    if (lookup.generation === this.#generation) {
+      try {
+        this.#socket?.send(JSON.stringify(["CLOSE", subId]));
+      } catch {
+        /* the connection is going away; the question went with it */
+      }
+    }
+    lookup.settle(lookup.heard);
   }
 
   async #ok(frame: readonly unknown[], generation: number): Promise<void> {
@@ -607,7 +712,7 @@ export class BuzzChannelRelay {
     this.#sched.clearTimeout(pending.timer);
     const message = frame[3];
     pending.settle(
-      message.startsWith("duplicate:") ? { status: "DUPLICATE" } : frame[2] ? { status: "ACCEPTED" } : { status: "REFUSED" },
+      message.startsWith("duplicate:") ? { status: "DUPLICATE" } : frame[2] ? { status: "ACCEPTED" } : { status: "REFUSED", message },
     );
   }
 
@@ -660,12 +765,14 @@ export class BuzzChannelRelay {
       return false;
     }
     this.#retry.delete(event.id);
-    const parent = verdict.replyTo === "" ? undefined : this.#events.get(verdict.replyTo);
+    // The thread's root as the relay holds it, read from the event's own markers and from nothing the channel happens to
+    // know: an event the relay reads as top-level is the root of its own thread, whoever it names.
     this.#events.set(event.id, {
       at: event.created_at,
       author: event.pubkey,
       room: verdict.room,
-      root: parent !== undefined && parent.room === verdict.room ? parent.root : event.id,
+      root: threadRootOf(event),
+      exactRoot: true,
       delivered: true,
     });
     this.#touchThread(this.#events.get(event.id)!.root, verdict.room, claimed);
@@ -777,13 +884,30 @@ export class BuzzChannelRelay {
   }
 }
 
+interface ParentLookup {
+  readonly generation: number;
+  readonly eventId: string;
+  readonly room: string;
+  heard: RelayEvent | null;
+  readonly settle: (event: RelayEvent | null) => void;
+  readonly timer: unknown;
+}
+
 interface KnownEvent {
   /** When it was last written or last built on: the time retention counts from, so an active thread stays. */
   at: number;
   readonly author: string;
   readonly room: string;
   readonly root: string;
+  /**
+   * Whether `root` was read from the event's own thread markers (or built on a root that was): the root the relay holds
+   * the thread under. An entry read back from a saved state is not: an earlier version took an event whose parent it
+   * had not received for its own thread's root, so such a root is asked of the relay before a reply is built on it.
+   */
+  readonly exactRoot: boolean;
   readonly delivered: boolean;
 }
 
-type ReplyAckResult = { status: "ACCEPTED" | "DUPLICATE" | "REFUSED" | "TIMEOUT" | "UNAVAILABLE" };
+type ReplyAckResult =
+  | { status: "ACCEPTED" | "DUPLICATE" | "TIMEOUT" | "UNAVAILABLE" }
+  | { status: "REFUSED"; message: string };

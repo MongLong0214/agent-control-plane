@@ -172,6 +172,17 @@ const harness = (options: {
   return { relay, connections, notifications, receipts, scheduler, connect, deliver };
 };
 
+/**
+ * A parent restored from a saved state has a root an earlier version may have guessed, so a reply to it first asks the
+ * relay for the event; here the relay has nothing to show, and the reply goes out under the root that was remembered.
+ */
+const relayShowsNothing = async (relay: BuzzChannelRelay, connection: FakeConnection) => {
+  const ask = connection.sent.find((f) => f[0] === "REQ" && Array.isArray((f[2] as { ids?: unknown }).ids));
+  expect(ask).toBeDefined();
+  connection.push(["EOSE", ask![1]]);
+  await relay.settled();
+};
+
 describe("a mention of this CTO reaches its session once, as untrusted data", () => {
   it("emits exactly one notification with the sender role, room, event id and parent, however often the relay repeats it", async () => {
     const h = harness();
@@ -648,6 +659,7 @@ describe("what a restart remembers having shown, and what it can still answer", 
     const again = await two.connect();
     // The very first parent is still answerable after the restart, and a follow-up to it is still in its thread.
     const pending = two.relay.reply({ room: ROOM, eventId: events[0]!.id, kind: "report", text: "answering the oldest" });
+    await relayShowsNothing(two.relay, again);
     const sent = again.sent.find((f) => f[0] === "EVENT") as [string, { id: string; tags: string[][] }];
     expect(sent[1].tags).toContainEqual(["p", ceoPub]);
     again.push(["OK", sent[1].id, true, ""]);
@@ -699,6 +711,7 @@ describe("repros from the final review", () => {
     expect(h.notifications).toEqual([]);
     // Merged, not overwritten: it is also still a parent that can be answered.
     const pending = h.relay.reply({ room: ROOM, eventId: shown.id, kind: "report", text: "answering it" });
+    await relayShowsNothing(h.relay, connection);
     const sent = connection.sent.find((f) => f[0] === "EVENT") as [string, { id: string }];
     connection.push(["OK", sent[1].id, true, ""]);
     await expect(pending).resolves.toMatchObject({ ok: true });
@@ -737,6 +750,7 @@ describe("repros from the final review", () => {
     const two = harness({ store, now: now + day + 3_600 });
     const again = await two.connect();
     const pending = two.relay.reply({ room: ROOM, eventId: root.id, kind: "report", text: "answering the root" });
+    await relayShowsNothing(two.relay, again);
     const sent = again.sent.find((f) => f[0] === "EVENT") as [string, { id: string }];
     again.push(["OK", sent[1].id, true, ""]);
     await expect(pending).resolves.toMatchObject({ ok: true });
