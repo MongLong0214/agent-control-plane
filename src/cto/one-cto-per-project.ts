@@ -394,17 +394,26 @@ export const parseLsofCwds = (text: string): Map<number, string> => {
 const ARGV_TRIES = 8;
 const ARGV_RETRY_MS = 25;
 
-/** Whether a pid is a live process. Signal 0 says a pid exists; a process that has exited and not yet been reaped exists to it too, so `ps` is asked its state. */
-const processExists = async (pid: number): Promise<boolean> => {
-  try { process.kill(pid, 0); } catch (error) { return (error as { code?: unknown }).code === "EPERM"; }
+/**
+ * Whether a pid is a live process. Not alive only on the kernel's word, or on `ps`'s own answer: signal 0 failing with
+ * ESRCH (the kernel has no such pid), or `ps` reporting the state of a zombie (exited, only waiting to be reaped). A
+ * `ps` that fails, with any status or output (exit 1 with diagnostics included), is no answer, and no answer is alive.
+ */
+export const processExistsWith = async (
+  pid: number,
+  kill: (pid: number) => void,
+  ps: (pid: number) => Promise<{ stdout: string }>,
+): Promise<boolean> => {
+  try { kill(pid); } catch (error) { return (error as { code?: unknown }).code !== "ESRCH"; }
   try {
-    const { stdout } = await run("ps", "/bin/ps", ["-o", "stat=", "-p", String(pid)], PS_BUDGET_MS, 64 * 1024);
-    return stdout.trim() !== "" && !stdout.trim().startsWith("Z");
-  } catch (error) {
-    // `ps -p` exits 1 for a pid that is not there; any other failure is no answer, and no answer is alive.
-    return (error as { code?: unknown }).code !== 1;
+    const { stdout } = await ps(pid);
+    return !stdout.trim().startsWith("Z");
+  } catch {
+    return true;
   }
 };
+const processExists = (pid: number): Promise<boolean> => processExistsWith(pid, (one) => { process.kill(one, 0); },
+  (one) => run("ps", "/bin/ps", ["-o", "stat=", "-p", String(one)], PS_BUDGET_MS, 64 * 1024));
 
 export const systemCtoProcessReader = (): CtoProcessReader => ({
   async table() {
