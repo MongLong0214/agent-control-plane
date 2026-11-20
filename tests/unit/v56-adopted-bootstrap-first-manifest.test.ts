@@ -108,7 +108,7 @@ const world = () => {
 
 describe("#1234 v56 — an adopting bootstrap's first manifest, and nothing else", () => {
   it("v55 → v56 replaces exactly the manifest-pointer guard, keeps every row, and matches a fresh v56 database", () => {
-    expect(SCHEMA_VERSION).toBe(59);
+    expect(SCHEMA_VERSION).toBe(60);
     expect(MIGRATIONS.find((step) => step.toVersion === 56)).toMatchObject({ id: "v56-adopted-bootstrap-first-manifest", fromVersion: 55, toVersion: 56 });
     const path = releasedChainImage(privateStatePath("acp-v56-from-v55-"), 55);
     const v55Rows = schemaRowsOf(path);
