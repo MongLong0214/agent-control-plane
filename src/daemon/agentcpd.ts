@@ -925,7 +925,10 @@ export const startSessionLaunchChannel = async (
         // under the daemon lock. A losing daemon can therefore never unlink the winner's
         // live launch socket while it is merely attempting startup.
         removeStaleSocket(socketPath);
-        candidate = createServer((socket) => serveSessionLaunchCredential(socket, pending, options.mcpToken, options.audit));
+        candidate = createServer((socket) => {
+          ignorePeerSocketErrors(socket);
+          serveSessionLaunchCredential(socket, pending, options.mcpToken, options.audit);
+        });
         await listenSocket(candidate, socketPath);
         if (closed) {
           await closeSocketServer(candidate);
@@ -1754,7 +1757,10 @@ export const startBuzzActorIngressListener = async (
   const ingress = new BuzzActorIngress(guard, cp.sessions);
   const socketPath = join(stateDir, "buzz-actor.ingress.sock");
   removeStaleSocket(socketPath);
-  const server = createServer((socket) => serveBuzzActorBinding(socket, ingress));
+  const server = createServer((socket) => {
+    ignorePeerSocketErrors(socket);
+    serveBuzzActorBinding(socket, ingress);
+  });
 
   try {
     await listenSocket(server, socketPath);
@@ -1794,6 +1800,7 @@ export const startTelegramExternalIngress = async (
   const socketPath = join(stateDir, TELEGRAM_EXTERNAL_SOCKET_NAME);
   removeStaleSocket(socketPath);
   const server = createServer((socket) => {
+    ignorePeerSocketErrors(socket);
     trackConnection(server, socket);
     serveTelegramExternalUpdate(socket, lane);
   });
@@ -1968,7 +1975,10 @@ export const startBuzzMessageIngressListener = async (
   const { ingress, port } = seam;
   const socketPath = join(stateDir, "buzz-message.ingress.sock");
   removeStaleSocket(socketPath);
-  const server = createServer((socket) => serveBuzzMessageTurn(cp, socket, ingress, port));
+  const server = createServer((socket) => {
+    ignorePeerSocketErrors(socket);
+    serveBuzzMessageTurn(cp, socket, ingress, port);
+  });
 
   try {
     await listenSocket(server, socketPath);
@@ -2942,7 +2952,8 @@ export const startDaemonBuzzMentionSubscriber = (
   const baseSink = createDaemonBuzzMentionSink(cp, policy, messageIngress, options);
   // A CTO session's Buzz channel reports what it showed its session in files beside this daemon's
   // state; the queue below moves those messages. A receipt can land before the mention is admitted,
-  // so every admission asks for the receipts to be applied again.
+  // so every admission asks for the receipts to be applied again; a start replays every mention it
+  // missed, and that burst is one pass, not one per mention.
   const channelQueue = watchChannelReceipts(
     stateDir,
     (projectId) => roleKeyFor(Role.PRIMARY_CTO, { projectId }),
@@ -2954,7 +2965,7 @@ export const startDaemonBuzzMentionSubscriber = (
     ...baseSink,
     admit: async (request) => {
       const verdict = await baseSink.admit(request);
-      channelQueue.apply();
+      channelQueue.request();
       return verdict;
     },
   };
@@ -4107,9 +4118,10 @@ export const startOperatorSocket = async (
   };
   const socketPath = join(stateDir, "agentcpd.operator.sock");
   removeStaleSocket(socketPath);
-  const server = createServer((socket) =>
-    serveOperatorRequest(socket, daemon, binding, handshakeTimeoutMs, requestTimeoutMs, options),
-  );
+  const server = createServer((socket) => {
+    ignorePeerSocketErrors(socket);
+    serveOperatorRequest(socket, daemon, binding, handshakeTimeoutMs, requestTimeoutMs, options);
+  });
   try {
     await listenSocket(server, socketPath);
   } catch (err) {
@@ -4161,6 +4173,7 @@ const startMcpSocket = async (
 ): Promise<Server> => {
   removeStaleSocket(path);
   const server = createServer((socket) => {
+    ignorePeerSocketErrors(socket);
     trackConnection(server, socket);
     void authenticateSocket(socket, token, handshakeTimeoutMs).then(async (accepted) => {
       if (!accepted) return;
@@ -4239,6 +4252,15 @@ const removeStaleSocket = (path: string): void => {
  * lock release. Closing a tracked server ends its connections as well.
  */
 const TRACKED_CONNECTIONS = new WeakMap<Server, Set<Socket>>();
+
+/**
+ * An error on one accepted connection (EPIPE writing to a peer that already closed, ECONNRESET) is that peer's
+ * and never the daemon's: with no `error` listener Node rethrows it as an uncaught exception and the daemon exits.
+ * Every accepted socket gets this first, before any handler can write; the handlers' own `error` listeners still run.
+ */
+const ignorePeerSocketErrors = (socket: Socket): void => {
+  socket.on("error", () => undefined);
+};
 
 const trackConnection = (server: Server, socket: Socket): void => {
   const open = TRACKED_CONNECTIONS.get(server) ?? new Set<Socket>();

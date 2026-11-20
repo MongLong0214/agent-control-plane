@@ -336,9 +336,10 @@ export const tmuxChannelDriver = (input: {
 };
 
 /**
- * Whether this launch's channel server has taken a message into the session: an `emitted` receipt carrying this
- * launch's id (`ChannelLaunchInput.launchId`). The server writes one only once Claude Code took a channel notification
- * (`src/buzz/buzz-channel.ts`), so it proves the channel registered whatever the screen shows. Time never counts: an
+ * Whether this launch's channel server is up in the session: a `registered` receipt (written when Claude Code completes
+ * the MCP handshake, so a CTO with nothing queued has one) or an `emitted` receipt (a message taken into the session),
+ * carrying this launch's id (`ChannelLaunchInput.launchId`). Either proves the channel registered whatever the screen
+ * shows, because a backlog scrolls the startup line away. Time never counts: an
  * older channel process still appending while this one starts writes no id, or another launch's. The file is
  * `channelReceiptPath`'s (`src/buzz/buzz-channel-files.ts`), named here because that module cannot load under the type
  * stripping the host provisioner runs with. An unreadable file or line is no proof.
@@ -358,7 +359,7 @@ export const channelEmittedBy = (
   return text.split("\n").some((line) => {
     try {
       const receipt = JSON.parse(line) as { type?: unknown; launchId?: unknown };
-      return receipt.type === "emitted" && receipt.launchId === launchId;
+      return (receipt.type === "emitted" || receipt.type === "registered") && receipt.launchId === launchId;
     } catch {
       return false;
     }

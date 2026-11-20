@@ -60,6 +60,34 @@ describe("the channel server over stdio", () => {
     }
   }, 30_000);
 
+  it("writes a registered receipt with the launch id once the handshake completes, with nothing queued", async () => {
+    // freshreadme-2: a CTO with an empty queue emits nothing, so `emitted` can never prove the channel registered.
+    const f = files();
+    const client = new Client({ name: "claude-code-stand-in", version: "0" }, { capabilities: {} });
+    const transport = new StdioClientTransport({
+      command: process.execPath,
+      args: args(f, ["--ceo-pubkey", getPublicKey(generateSecretKey()), "--launch-id", "launch-0001"]),
+      env: { PATH: process.env["PATH"] ?? "", HOME: process.env["HOME"] ?? "" },
+      stderr: "pipe",
+    });
+    const receipts = join(f.state, "buzz-channel", "demo.receipts.jsonl");
+    const lines = (): { type?: string; launchId?: string }[] => {
+      try {
+        return readFileSync(receipts, "utf8").split("\n").filter((l) => l.length > 0).map((l) => JSON.parse(l) as { type?: string; launchId?: string });
+      } catch {
+        return [];
+      }
+    };
+    await client.connect(transport);
+    try {
+      const deadline = Date.now() + 10_000;
+      while (!lines().some((r) => r.type === "registered") && Date.now() < deadline) await new Promise((r) => setTimeout(r, 50));
+      expect(lines()).toEqual([expect.objectContaining({ type: "registered", launchId: "launch-0001" })]);
+    } finally {
+      await client.close();
+    }
+  }, 30_000);
+
   it("answers initialize when it is started through a symlinked path, as a runtime's current link starts it", async () => {
     // The resident launcher names the entry as `<state>/current/dist/cli/buzz-channel.js`, and `current` is a link to the
     // generation in use. `import.meta.url` is the realpath and `process.argv[1]` is the link, so an entry that compares

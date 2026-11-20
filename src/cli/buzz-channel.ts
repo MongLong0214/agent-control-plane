@@ -89,7 +89,15 @@ export const runBuzzChannel = async (argv: readonly string[]): Promise<number> =
   }
 
   let relay!: BuzzChannelRelay;
-  const server = buildChannelMcpServer((input) => relay.reply(input));
+  // Claude Code completing the MCP handshake is the moment it has the server and its channel capability. A CTO with nothing
+  // queued emits no message, so this receipt, carrying the launch id, is what lets the launcher tell the channel came up.
+  const server = buildChannelMcpServer((input) => relay.reply(input), () => {
+    try {
+      appendChannelReceipt(args.stateDir, args.projectId, { type: "registered", registeredAt: Math.floor(Date.now() / 1000) }, args.launchId ?? undefined);
+    } catch {
+      log("the registration receipt could not be written");
+    }
+  });
 
   try {
     const relayUrl = args.relayUrl ?? readBuzzSubscriberConfig(args.stateDir)?.relayUrl ?? process.env["ACP_BUZZ_RELAY_URL"];
