@@ -100,6 +100,22 @@ describe("the channel server meets Claude Code's channel contract", () => {
     w.relay.close();
   });
 
+  it("gives the session the relay's own words when the relay refuses a reply", async () => {
+    const w = await wired();
+    const mention = finalizeEvent({ kind: 9, created_at: Math.floor(Date.now() / 1000), tags: [["h", ROOM], ["p", ctoPub]], content: "please confirm" }, ceo);
+    w.push(["EVENT", `acp-channel-${ctoPub.slice(0, 12)}`, mention]);
+    await w.relay.settled();
+
+    const call = w.client.callTool({ name: "reply", arguments: { room: ROOM, event_id: mention.id, kind: "report", text: "@ceo 수신 확인." } });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    const published = w.sent.find((f) => f[0] === "EVENT") as [string, { id: string }];
+    w.push(["OK", published[1].id, false, "invalid: root tag does not match thread ancestry"]);
+    const result = await call;
+    expect(result.isError).toBe(true);
+    expect(JSON.stringify(result.content)).toContain("the relay did not accept the reply (REFUSED): invalid: root tag does not match thread ancestry");
+    w.relay.close();
+  });
+
   it("sends a mention as notifications/claude/channel with content and identifier-keyed meta, and a reply goes back through the tool", async () => {
     const w = await wired();
     const mention = finalizeEvent({ kind: 9, created_at: Math.floor(Date.now() / 1000), tags: [["h", ROOM], ["p", ctoPub]], content: "hello CTO" }, ceo);
