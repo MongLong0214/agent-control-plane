@@ -65,6 +65,9 @@ interface World {
   switchovers: Array<{ toSessionUuid: string; state: "PENDING" | "ACKED" }>;
   rotateCalls: Array<{ params: Record<string, unknown>; handoffFile: string | undefined }>;
   rotate: { answer: "ok" | "lost" | "denied" };
+  /** Interleavings: what another run does to the world right after a process-table reading, or just before the daemon answers a status read. */
+  onTable?: () => void;
+  onStatus?: () => void;
   files: Map<string, string>;
   procs: FakeProcess[];
   tmux: Set<string>;
@@ -260,6 +263,7 @@ const makeWorld = (overrides: Partial<CtoRecord> = {}, env: Record<string, strin
       request: async (method: string, params: Record<string, unknown> = {}, idempotencyKey?: string) => {
         if (w.daemonRejects) return deny(ReasonCode.OPERATOR_UNAUTHENTICATED, "operator authentication failed");
         if (method === "daemon.status") return allow(ReasonCode.OK, { mode: "RUNNING" });
+        if (method === "canonicalCto.status") w.onStatus?.();
         if (method === "canonicalCto.status") return allow(ReasonCode.OK, { holderSessionUuid: w.record.conversation, generation: w.record.generation, rotations: structuredClone(w.switchovers) });
         if (method === "canonicalCto.rotate") {
           w.changes.push(`operator ${method}`);
@@ -296,8 +300,11 @@ const makeWorld = (overrides: Partial<CtoRecord> = {}, env: Record<string, strin
     ctoProcesses: {
       table: async () => {
         if (w.psFails) throw Object.assign(new Error("spawn /bin/ps ENOENT"), { code: "ENOENT" });
-        return [{ pid: process.pid, ppid: 1, uid: process.getuid?.() ?? 0, startedAt: "Fri Jan  1 00:00:00 2027", command: "node vitest" },
+        const rows = [{ pid: process.pid, ppid: 1, uid: process.getuid?.() ?? 0, startedAt: "Fri Jan  1 00:00:00 2027", command: "node vitest" },
           ...w.procs.filter((p) => !w.hiddenFromPs.has(p.pid)).map((p) => ({ pid: p.pid, ppid: p.ppid, uid: process.getuid?.() ?? 0, startedAt: `lstart-${p.pid}`, command: p.command }))];
+        // A concurrent run acts right after this reading was taken.
+        w.onTable?.();
+        return rows;
       },
       argv: (pid: number) => { const p = w.procs.find((x) => x.pid === pid); return p ? (p.argv ?? p.command.split(" ")) : null; },
       cwds: async (pids: readonly number[]) => new Map(pids.flatMap((pid) => { const p = w.procs.find((x) => x.pid === pid); return p ? [[pid, p.cwd ?? "/"] as [number, string]] : []; })),
@@ -792,8 +799,9 @@ describe("a canonical relaunch resumes the role's bound conversation", () => {
       w.switchovers = [{ toSessionUuid: U, state: "PENDING" }];
       expect(await runCtoCommand(["relaunch", P, "--fresh", "--apply"], w.ports)).toBe(0);
       expect(w.rotateCalls).toEqual([]);
-      // Prepare is skipped, but the reused conversation is written down: the step records it and asks for nothing.
-      expect(w.out.find((l) => l["step"] === "switchover" && l["result"] === "done")!["detail"]).toMatchObject({ newConversation: U, reused: true });
+      // Prepare is skipped: the reused conversation was written down by the very first step, which read the daemon's record.
+      expect(results(w).find(([step]) => step === "switchover")).toEqual(["switchover", "skipped"]);
+      expect(w.out.find((l) => l["step"] === "handoff" && l["result"] === "done")!["detail"]).toMatchObject({ newConversation: U });
       expect(handoffFile(w)).toMatchObject({ next: U });
       const argv = launched(w);
       expect(argv.slice(argv.indexOf("--session-id"), argv.indexOf("--session-id") + 2)).toEqual(["--session-id", U]);
@@ -930,20 +938,62 @@ describe("a canonical relaunch resumes the role's bound conversation", () => {
       expect(handoffFile(w).completed).toBe(true);
     });
 
-    it("never stops a process of a conversation that claimed the role after this run began", async () => {
+    /** What U's claim looks like to everything else: the old process gone, U's running with the channel, the role bound to U at the next generation. */
+    const claimByNew = (w: World, U: string): void => {
+      const argv = [LOCAL_CLAUDE, "--session-id", U, ...CHANNEL.split(" ")];
+      w.procs = [{ pid: 30000, ppid: 1, command: argv.join(" "), argv }];
+      w.record = { ...w.record, conversation: U, generation: 4, session: { pid: 30000, startedAt: "start-30000", workdir: null } };
+      for (const one of w.switchovers) if (one.toSessionUuid === U) one.state = "ACKED";
+    };
+    const U1 = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+    const mutations = (w: World): string[] => w.changes.filter((c) => c.startsWith("SIGTERM") || c.startsWith("tmux new-") || c.includes(" mcp ") || c.startsWith("operator canonicalCto.rotate"));
+
+    it("A: signals only the identity it checked: another run stops the old process and U claims right after the stop's reading, and U is not signalled", async () => {
       const { w } = canonicalWorld();
-      // The daemon's answer to rotate is followed at once by another conversation's claim: the bound session is no longer the old one's.
+      w.switchovers = [{ toSessionUuid: U1, state: "PENDING" }];
+      let reads = 0;
+      // The third process-table reading after the mcp step is the stop's own selection.
+      w.onTable = () => { if (w.out.some((l) => l["step"] === "mcp" && l["result"]) && ++reads === 3) claimByNew(w, U1); };
+      expect(await runCtoCommand(["relaunch", P, "--fresh", "--apply"], w.ports)).toBe(0);
+      expect(reads).toBeGreaterThanOrEqual(3);
+      expect(w.changes.filter((c) => c.startsWith("SIGTERM"))).toEqual([]);
+      expect(w.procs.map((p) => p.pid)).toEqual([30000]);
+      expect(handoffFile(w)).toMatchObject({ next: U1, completed: true });
+    });
+
+    it("B: a pending switchover with no handoff whose U claims after the channel step is a finished swap: nothing is prepared, stopped or started, and the run exits 0", async () => {
+      const { w } = canonicalWorld();
+      w.switchovers = [{ toSessionUuid: U1, state: "PENDING" }];
+      let fired = false;
+      w.onStatus = () => { if (!fired && w.out.some((l) => l["step"] === "channel" && l["result"])) { fired = true; claimByNew(w, U1); } };
+      expect(await runCtoCommand(["relaunch", P, "--fresh", "--apply"], w.ports)).toBe(0);
+      expect(fired).toBe(true);
+      expect(mutations(w)).toEqual([]);
+      expect(w.rotateCalls).toEqual([]);
+      expect(handoffFile(w)).toMatchObject({ conversation: CONVERSATION, next: U1, completed: true });
+      expect(w.record.conversation).toBe(U1);
+    });
+
+    it("C: a role that another, unknown conversation holds after this run began changes nothing and exits non-zero, before rotate and again after it", async () => {
       const OTHER = "cccccccc-bbbb-4ccc-8ddd-eeeeeeeeeeee";
-      const rotate = w.ports.operator.request;
-      w.ports.operator.request = async (method, params, key) => {
+      const before = canonicalWorld().w;
+      let fired = false;
+      before.onStatus = () => { if (!fired && before.out.some((l) => l["step"] === "channel" && l["result"])) { fired = true; before.record = { ...before.record, conversation: OTHER, generation: 4 }; } };
+      expect(await runCtoCommand(["relaunch", P, "--fresh", "--apply"], before.ports)).toBe(1);
+      expect(fired).toBe(true);
+      expect(mutations(before)).toEqual([]);
+      expect(JSON.stringify(before.out)).toContain(`the bound conversation is ${OTHER}`);
+      // The same, right after the daemon accepted rotate.
+      const after = canonicalWorld().w;
+      const rotate = after.ports.operator.request;
+      after.ports.operator.request = async (method, params, key) => {
         const answer = await rotate(method, params, key);
-        if (method === "canonicalCto.rotate") w.record = { ...w.record, conversation: OTHER };
+        if (method === "canonicalCto.rotate") after.record = { ...after.record, conversation: OTHER };
         return answer;
       };
-      expect(await runCtoCommand(["relaunch", P, "--fresh", "--apply"], w.ports)).toBe(1);
-      expect(w.changes.filter((c) => c.startsWith("SIGTERM") || c.startsWith("tmux new-"))).toEqual([]);
-      expect(w.procs.some((p) => p.pid === CLAUDE)).toBe(true);
-      expect(results(w).find(([step]) => step === "stop")).toEqual(["stop", "skipped"]);
+      expect(await runCtoCommand(["relaunch", P, "--fresh", "--apply"], after.ports)).toBe(1);
+      expect(mutations(after).filter((c) => !c.startsWith("operator canonicalCto.rotate"))).toEqual([]);
+      expect(after.procs.some((p) => p.pid === CLAUDE)).toBe(true);
     });
 
     it("a dry run prints the plan and asks the daemon for nothing but a read", async () => {
