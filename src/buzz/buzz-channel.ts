@@ -93,6 +93,14 @@ export type ChannelReceipt = (
       readonly ack: "ACCEPTED" | "DUPLICATE";
       readonly repliedAt: number;
     }
+  | {
+      /**
+       * Claude Code finished the MCP handshake with this server, which declared `claude/channel`. Written whether or not
+       * a message ever follows, so a CTO with an empty queue can still prove its launch's channel came up. Moves no message.
+       */
+      readonly type: "registered";
+      readonly registeredAt: number;
+    }
 ) & { readonly launchId?: string };
 
 export interface SignedEvent {
@@ -120,6 +128,7 @@ export const isChannelReceipt = (value: unknown): value is ChannelReceipt => {
   if (r["type"] === "emitted") {
     return isString(r["eventId"]) && isString(r["room"]) && isString(r["senderPubkey"]) && isCount(r["emittedAt"]);
   }
+  if (r["type"] === "registered") return isCount(r["registeredAt"]);
   if (r["type"] !== "replied") return false;
   const e = r["event"];
   if (typeof e !== "object" || e === null || Array.isArray(e)) return false;

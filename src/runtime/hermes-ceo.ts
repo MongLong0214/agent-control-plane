@@ -235,6 +235,8 @@ const openToolSocket = (path: string, upstream: Socket, clientName: string): { c
   readLines(upstream, routeUpstream);
 
   const server: Server = createServer((client) => {
+    // A peer that closed before it was answered must not end this process with an unhandled EPIPE.
+    client.on("error", () => undefined);
     readLines(client, (value) => {
       const method = String(value["method"] ?? "");
       const theirId = value["id"];

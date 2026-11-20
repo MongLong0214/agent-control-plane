@@ -19,11 +19,24 @@ export const CHANNEL_INSTRUCTIONS =
  * The MCP surface of a CTO's Buzz channel: the channel capability, its instructions, and the one
  * `reply` tool. Transport-agnostic; the stdio entry connects it, a test connects it in memory.
  */
-export const buildChannelMcpServer = (reply: (input: ReplyInput) => Promise<ReplyOutcome>): Server<Request, Notification, Result> => {
+export const buildChannelMcpServer = (
+  reply: (input: ReplyInput) => Promise<ReplyOutcome>,
+  /** Called once the client has completed the MCP initialize handshake with this server: the channel is connected and listed. */
+  onInitialized?: () => void,
+): Server<Request, Notification, Result> => {
   const server = new Server<Request, Notification, Result>(
     { name: BUZZ_CHANNEL_SERVER_NAME, version: "1.0.0" },
     { capabilities: { experimental: { "claude/channel": {} }, tools: {} }, instructions: CHANNEL_INSTRUCTIONS },
   );
+  if (onInitialized !== undefined) {
+    server.oninitialized = () => {
+      try {
+        onInitialized();
+      } catch {
+        // A callback that fails must not take the handshake with it.
+      }
+    };
+  }
   server.setRequestHandler(ListToolsRequestSchema, () => ({
     tools: [
       {
