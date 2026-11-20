@@ -672,6 +672,8 @@ export class Daemon {
   #bootstrapAbandoned = false;
   #bootstrapWaiter: (() => void) | null = null;
   #timerFailures = new Map<string, TimerFailure>();
+  /** The last failure message recorded for each role whose dead-holder release threw, until it succeeds. */
+  #sweepReleaseFailures = new Map<string, string>();
   // Unset until `main`'s composition root reports Telegram's outcome — `null` renders in
   // `health.json` as "this daemon has no opinion yet", distinct from `configured: false`.
   #telegramIngress: IngressChannelStatus | null = null;
@@ -1708,33 +1710,74 @@ export class Daemon {
    * real probe answers: it re-probes and refuses unless DEAD (EPERM stays ALIVE, anything it cannot
    * decide is UNKNOWN), compares generation and incarnation, and refuses a binding that still owns
    * live runs (REVOCATION_BLOCKED_ACTIVE_RUNS), which continuity's pause and revoke handles. A
-   * refusal changes nothing and is read again on the next tick.
+   * refusal changes nothing and is read again on the next tick. A release that throws is recorded
+   * (DAEMON_TIMER_FAILED, once per role and message) and does not stop the other bindings or the caller.
+   *
+   * The release is the plain one: it neither holds the role's queued peer mail for a successor nor takes
+   * over live runs, because it binds no successor. Queued role mail stays PENDING at the released generation
+   * and the next holder is handed it (`a-canonical-restart-keeps-the-ceo-peer-message.test.ts`); a holder
+   * that owns live runs is left to continuity's pause and revoke.
    */
   private releaseDeadCanonicalBindings(): void {
     const bindings = [
       ...this.cp.bindings.activePrimaryCtos(),
       this.cp.bindings.active(roleKeyFor(Role.CEO)),
     ];
+    const attempted = new Set<string>();
     for (const binding of bindings) {
       if (binding === null || (binding.role !== Role.CEO && binding.projectId === null)) continue;
       const session = this.cp.sessions.get(binding.boundSessionId);
       if (session?.lifecycle !== SessionLifecycle.ERROR && session?.lifecycle !== SessionLifecycle.STOPPED) continue;
-      recoverDeadCanonicalBinding(
-        DEAD_BINDING_SWEEP_ACTOR,
-        {
-          projectId: binding.role === Role.CEO ? null : binding.projectId,
-          role: binding.role,
-          sessionId: binding.boundSessionId,
-          sessionIncarnation: binding.boundSessionIncarnation,
-          expectedBindingGeneration: binding.bindingGeneration,
-        },
-        {
-          db: this.cp.db,
-          audit: this.cp.audit,
-          sessions: this.cp.sessions,
-          bindings: this.cp.bindings,
-        },
-      );
+      attempted.add(binding.roleKey);
+      // One binding's failure must not starve the others or `reconcile()`: the release is its own
+      // transaction, so a throw leaves that binding exactly as it was, and the next sweep reads it again.
+      try {
+        recoverDeadCanonicalBinding(
+          DEAD_BINDING_SWEEP_ACTOR,
+          {
+            projectId: binding.role === Role.CEO ? null : binding.projectId,
+            role: binding.role,
+            sessionId: binding.boundSessionId,
+            sessionIncarnation: binding.boundSessionIncarnation,
+            expectedBindingGeneration: binding.bindingGeneration,
+          },
+          {
+            db: this.cp.db,
+            audit: this.cp.audit,
+            sessions: this.cp.sessions,
+            bindings: this.cp.bindings,
+          },
+        );
+        this.#sweepReleaseFailures.delete(binding.roleKey);
+      } catch (error) {
+        this.#recordSweepReleaseFailure(binding.roleKey, error);
+      }
+    }
+    // A binding no longer in the sweep's reach (released, replaced, or its holder alive again) owes no retry.
+    for (const roleKey of this.#sweepReleaseFailures.keys()) {
+      if (!attempted.has(roleKey)) this.#sweepReleaseFailures.delete(roleKey);
+    }
+  }
+
+  /**
+   * Records a release that threw, once per role and message until it succeeds or leaves the sweep's reach, so a
+   * persistent fault is visible without writing a row every tick. Recording is itself guarded: the audit log is
+   * a likely cause of the failure, and the sweep still has to reach the next binding.
+   */
+  #recordSweepReleaseFailure(roleKey: string, error: unknown): void {
+    const message = safeErrorMessage(error);
+    if (this.#sweepReleaseFailures.get(roleKey) === message) return;
+    this.#sweepReleaseFailures.set(roleKey, message);
+    try {
+      this.cp.audit.record({
+        kind: "DAEMON_TIMER_FAILED",
+        reasonCode: ReasonCode.DAEMON_TIMER_FAILED,
+        roleKey,
+        // `role`, not `roleKey`: the audit log redacts evidence keys that read as secrets.
+        evidence: { timer: "liveness-sweep", role: roleKey, error: message },
+      });
+    } catch {
+      // The reporting channel is the thing that failed; the next tick reads the binding again.
     }
   }
 

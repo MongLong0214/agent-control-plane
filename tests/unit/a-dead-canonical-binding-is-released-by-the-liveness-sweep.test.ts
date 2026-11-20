@@ -8,6 +8,7 @@ import {
   DEAD_BINDING_SWEEP_ACTOR,
   DEAD_CANONICAL_BINDING_RECOVERY_REASON_PREFIX,
 } from "../../src/daemon/dead-binding-recovery.ts";
+import { MessageKind } from "../../src/outbox/envelope.ts";
 import { ExecutionMode, Role, RunState, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
 import type { TaskContract } from "../../src/run/run-engine.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
@@ -225,6 +226,80 @@ describe("the sweep at a watchdog tick", () => {
     } finally {
       await daemon.stop();
     }
+  });
+});
+
+describe("what a dead holder's release does to the role's queued mail", () => {
+  it("keeps a queued CEO notification PENDING, and the next CEO holder is addressed it", async () => {
+    const fixture = await holder({ role: "CEO", osPid: deadPid() });
+    const { harness } = fixture;
+    const queued = harness.cp.outbox.enqueue({
+      idempotencyKey: "ceo-notification-across-the-sweep",
+      roleKey: fixture.roleKey,
+      targetSessionId: fixture.sessionId,
+      bindingGeneration: fixture.generation,
+      kind: MessageKind.CEO_NOTIFICATION,
+      payload: { intent: "queued while the CEO was alive" },
+    });
+    if (!queued.allowed) throw new Error(queued.message);
+    const row = () => harness.cp.db.get<{ status: string; binding_generation: number; target_session_id: string; reason_code: string | null }>(
+      `SELECT status, binding_generation, target_session_id, reason_code FROM outbox WHERE message_id = ?`,
+      [queued.value.messageId],
+    );
+
+    await reconcile(fixture);
+    expectReleasedBySweep(fixture);
+    expect(row()).toMatchObject({ status: "PENDING", binding_generation: fixture.generation, target_session_id: fixture.sessionId });
+
+    const successor = bindCeo(harness);
+    expect(harness.cp.bindings.require(fixture.roleKey).bindingGeneration).toBe(fixture.generation + 1);
+    expect(row()).toMatchObject({ status: "PENDING", binding_generation: fixture.generation + 1, target_session_id: successor });
+  });
+});
+
+describe("a release that throws", () => {
+  it("does not block the other binding or reconcile(), is recorded once, and is retried on the next sweep", async () => {
+    const fixture = await holder({ role: "PRIMARY_CTO", osPid: deadPid() });
+    const { harness } = fixture;
+    // The CTO is swept before the CEO, so a throw while releasing it is what could starve the CEO.
+    const ceoSessionId = bindCeo(harness);
+    setProcess(harness, ceoSessionId, deadPid(), null);
+    const ceoRoleKey = roleKeyFor(Role.CEO);
+    const ceo = harness.cp.bindings.require(ceoRoleKey);
+
+    const record = harness.cp.audit.record.bind(harness.cp.audit);
+    const audit = vi.spyOn(harness.cp.audit, "record").mockImplementation((event: Parameters<typeof record>[0]) => {
+      if (event.kind === "DEAD_BINDING_RECOVERED" && event.roleKey === fixture.roleKey) {
+        throw new Error("simulated storage failure while recording the CTO release");
+      }
+      return record(event);
+    });
+    const daemon = new Daemon(harness.cp, { stateDir: tempDir("acp-liveness-throw-") });
+    try {
+      await expect(daemon.reconcile()).resolves.toBeDefined();
+      // A second sweep with the same failure writes no second record.
+      await expect(daemon.reconcile()).resolves.toBeDefined();
+    } finally {
+      audit.mockRestore();
+    }
+
+    // The CTO release rolled back whole; the CEO's went through.
+    expect(harness.cp.bindings.active(fixture.roleKey)?.assignmentId).toBe(fixture.assignmentId);
+    expect(assignment(fixture)).toMatchObject({ status: "ACTIVE", revoked_reason: null });
+    expect(harness.cp.audit.byKind("DEAD_BINDING_RECOVERED").map((event) => event.roleKey)).toEqual([ceoRoleKey]);
+    expect(harness.cp.bindings.active(ceoRoleKey)).toBeNull();
+    expect(harness.cp.db.get<{ status: string }>(`SELECT status FROM assignments WHERE assignment_id = ?`, [ceo.assignmentId])?.status)
+      .toBe("REVOKED");
+    expect(harness.cp.audit.byKind("DAEMON_TIMER_FAILED")).toMatchObject([
+      { roleKey: fixture.roleKey, evidence: { timer: "liveness-sweep", role: fixture.roleKey, error: expect.stringContaining("simulated storage failure") } },
+    ]);
+
+    // The failure is gone: the next sweep releases it.
+    await daemon.reconcile();
+    expect(harness.cp.bindings.active(fixture.roleKey)).toBeNull();
+    expect(assignment(fixture)).toMatchObject({ status: "REVOKED" });
+    expect(harness.cp.audit.byKind("DEAD_BINDING_RECOVERED").map((event) => event.roleKey).sort())
+      .toEqual([ceoRoleKey, fixture.roleKey].sort());
   });
 });
 

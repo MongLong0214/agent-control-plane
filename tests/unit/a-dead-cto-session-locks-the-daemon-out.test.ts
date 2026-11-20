@@ -418,7 +418,7 @@ describe("a canonical CTO whose process is gone", () => {
    * role, runs and outbox as one value is the point — a rollback that restored the assignment but
    * left the outbox fenced is not a rollback.
    */
-  it("leaves no partial change when the release fails mid-flight, and releases on the next sweep", async () => {
+  it("leaves no partial change when the release fails mid-flight, records it, and releases on the next sweep", async () => {
     const fixture = await deadCanonicalCto({ lifecycle: "ERROR" });
     const before = holderState(fixture.harness);
 
@@ -432,12 +432,16 @@ describe("a canonical CTO whose process is gone", () => {
         return record(event);
       });
     try {
-      await expect(sweep(fixture, "acp-dsr-midflight-")).rejects.toThrow("simulated storage failure");
+      // The sweep answers; a release that throws is recorded, not rethrown into `reconcile()`.
+      await sweep(fixture, "acp-dsr-midflight-");
     } finally {
       audit.mockRestore();
     }
 
     expect(holderState(fixture.harness)).toEqual(before);
+    expect(fixture.harness.cp.audit.byKind("DAEMON_TIMER_FAILED")).toMatchObject([
+      { roleKey: fixture.roleKey, evidence: { timer: "liveness-sweep", role: fixture.roleKey, error: expect.stringContaining("simulated storage failure") } },
+    ]);
     expect(fixture.harness.cp.audit.byKind("DEAD_BINDING_RECOVERED")).toHaveLength(0);
     expect(activeAssignmentIds(fixture.harness)).toContain(fixture.assignmentId);
 
