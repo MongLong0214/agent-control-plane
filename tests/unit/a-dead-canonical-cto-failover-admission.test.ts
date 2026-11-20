@@ -23,7 +23,7 @@ import {
   type ProcessSnapshot,
 } from "../../src/registry/canonical-self-claim.ts";
 import type { CapacityReading } from "../../src/runtime/provider.ts";
-import { DIGEST, LIVE, RUNTIME, adoptedFixture, type AdoptedCeoFixture } from "../helpers/adopted-ceo.ts";
+import { DIGEST, GATEWAY, LIVE, RUNTIME, adoptedFixture, type AdoptedCeoFixture } from "../helpers/adopted-ceo.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 import { fixtureManifest } from "../helpers/harness.ts";
 import { TestProductionAdapter } from "../helpers/production-adapter.ts";
@@ -118,9 +118,31 @@ const bindPlainCto = (f: Plane): string => {
   return session.sessionId;
 };
 
+/**
+ * The daemon's start while each of `pids` still answers `kill(pid, 0)`.
+ *
+ * These cases are about a holder whose process dies while the daemon is up, and continuity's answer to
+ * that. Their fixtures record pids no host process answers on, so a start that read them for real would
+ * find every holder already dead and, since #1448, release its binding in the start's own sweep, before
+ * the death the case describes. The holders are therefore alive for the start and gone after it
+ * (`processDied`), the order production has; nothing else about the probe is replaced.
+ */
+const startWhileHoldersAnswer = async (daemon: Daemon, pids: readonly number[]) => {
+  const realKill = process.kill.bind(process);
+  const signal = vi.spyOn(process, "kill").mockImplementation((pid, sig) => {
+    if (sig === 0 && pids.includes(pid)) return true;
+    return realKill(pid, sig);
+  });
+  try {
+    return await daemon.start();
+  } finally {
+    signal.mockRestore();
+  }
+};
+
 const withDaemon = async (f: Plane, body: (daemon: Daemon) => Promise<void>): Promise<void> => {
   const daemon = new Daemon(f.cp, { stateDir: join(f.root, "daemon") });
-  const started = await daemon.start();
+  const started = await startWhileHoldersAnswer(daemon, [CLAUDE_PID]);
   if (!started.allowed) throw new Error(started.message);
   try {
     await body(daemon);
@@ -354,7 +376,7 @@ describe("no adopted runtime is failed over, whatever its role", () => {
       claude.setCapacity(healthy(h.clock));
       h.cp.credentials.install({ token: "test-token", creatorIdentity: "acme-bot" });
       const daemon = new Daemon(h.cp, { stateDir: join(h.root, "daemon") });
-      const started = await daemon.start();
+      const started = await startWhileHoldersAnswer(daemon, [GATEWAY]);
       if (!started.allowed) throw new Error(started.message);
       try {
         const before = h.cp.db.all<{ session_id: string }>(`SELECT session_id FROM sessions ORDER BY session_id`);

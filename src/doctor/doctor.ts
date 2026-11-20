@@ -854,7 +854,7 @@ export class Doctor {
           blocking: !systemReport,
           confidence: "HIGH",
           observedEvidence: { sessionId: binding.sessionId, lifecycle: session?.lifecycle ?? "missing" },
-          recommendedAction: "run a recovery takeover for this project",
+          recommendedAction: "nothing is requested of anyone: the daemon releases this binding itself once its process is proven gone; a holder that owns live runs stays until continuity pauses and revokes it",
         });
       }
       // O4 — a live-looking holder whose credential nobody holds: interactive, pinless, spawned by an earlier
@@ -1196,8 +1196,8 @@ export class Doctor {
         const terminal = session.lifecycle === SessionLifecycle.ERROR || session.lifecycle === SessionLifecycle.STOPPED;
         if (!sessionId && terminal && !activeBinding && !unfinishedWork) continue;
         // Match checkBindings' project-availability policy: a settled PRIMARY_CTO with no unfinished
-        // work can be released through the operator door after startup, and so can a settled CEO,
-        // whose binding is the door's other role (`DEAD_BINDING_RECOVERY_ROLES`). A settled
+        // work is released by the daemon's liveness sweep, and so is a settled CEO's binding
+        // (`DEAD_BINDING_RECOVERY_ROLES`). A settled
         // session's project PRIMARY_CTO runs do not hold the daemon down either, whether its binding is
         // still ACTIVE or already revoked: blocking on them keeps shut the claim socket its same actor
         // reattaches through, whose self-claim moves those runs to the next generation
@@ -1220,7 +1220,7 @@ export class Doctor {
           confidence: "HIGH",
           observedEvidence: { pid: session.osPid, lifecycle: session.lifecycle },
           // #1189 (CEO msg_390e287c) — the resolving command is information, not an instruction; under 200 characters.
-          recommendedAction: "nothing is requested of anyone: this session's process is gone; releasing its binding is an operator-socket action (agentctl binding recover-dead[-ceo]), and work it owns is an open decision",
+          recommendedAction: "nothing is requested of anyone: this session's process is gone; the daemon releases its binding itself once that is proven, and work it owns is an open decision",
         });
       }
     }

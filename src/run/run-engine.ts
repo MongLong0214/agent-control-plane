@@ -2586,7 +2586,7 @@ export class RunEngine {
    * runtime-lost revocation; `owner` is a higher generation of the same conversational actor; and that
    * actor is a canonical (self-claimed) conversation. Every generation between the two must be that same
    * actor, also released as a lost runtime: by continuity's runtime-lost revocation, or as proven dead by
-   * `recoverDeadCanonicalBinding` (the next self-claim's release, or the operator door's, both after a
+   * `recoverDeadCanonicalBinding` (the next self-claim's release, or the daemon's liveness sweep, both after a
    * DEAD probe). A conversation that crashed again is still the one continuity paused for, whether a pass
    * or its own next claim saw it first; a deliberate revocation in between (a CEO release or replacement,
    * a suspension, a retirement), a coverage or failover revocation, or another actor ends the chain, and

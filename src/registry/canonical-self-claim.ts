@@ -204,7 +204,7 @@ export const isAdoptedCanonicalRuntime = (
   )?.held === 1;
 
 /**
- * The `actor` the dead-predecessor recovery records when this claim, not the operator door, made
+ * The `actor` the dead-predecessor recovery records when this claim, not the daemon's liveness sweep, made
  * it: this prefix and the conversational actor's id. An audit row's `actor` is text any statement
  * can write, so it is a label here and never evidence: what a peer-message carry rests on is the
  * recovery row's exact `event_id`, bound into the carry record by the transaction that wrote both.
@@ -2468,10 +2468,10 @@ export class CanonicalSelfClaim {
         }
         // Policy change (2026-10-02): the dead predecessor may still hold the role ACTIVE, because
         // nothing revokes an assignment when its process dies, and `bind` below then refused the
-        // restarted canonical session BINDING_ALREADY_ACTIVE — locked out of its own role until an
-        // operator ran `binding recover-dead`. Keeping that refusal and leaving the release to the
-        // operator door was rejected: a restarted canonical session must recover its own role
-        // without owner authority, and the proof that bounds it is the one that door applies.
+        // restarted canonical session BINDING_ALREADY_ACTIVE — locked out of its own role until
+        // the daemon's liveness sweep released it. Keeping that refusal and leaving the release to
+        // the sweep alone was rejected: a restarted canonical session must recover its own role
+        // without owner authority, and the proof that bounds it is the one the sweep applies.
         // When the holder is this same actor (the UUID derived and verified above), the release is
         // made here by `recoverDeadCanonicalBinding` itself, not a copy of its rule: the same
         // DEAD-only proof over this claim's own seam, the same revoke and the same
