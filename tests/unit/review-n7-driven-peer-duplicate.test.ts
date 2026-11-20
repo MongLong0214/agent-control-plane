@@ -29,7 +29,7 @@ afterAll(cleanupTempDirs);
  * Adapted from the closure review's witness. The original 1080-N5 note for this fixture follows.
  *
  * 1080-N5, the mixed turn. While a driven PRIMARY_CTO's ordinary turn is held, a verified mention
- * and an ordinary CANCEL_REQUEST coalesce; then the holder's room is lost or moved, or its identity
+ * and an ordinary REVISION_REQUEST coalesce; then the holder's room is lost or moved, or its identity
  * is made ineligible. The follow-up turn runs for the ordinary trigger, as it should. The mention's
  * message is not claimed (the claim is gated on the message's own verified provenance), stays
  * PENDING, and its trigger is released rather than marked handled. Real driven holder through the
@@ -97,7 +97,7 @@ for (const variant of ["claimed-peer"] as readonly Variant[]) {
           bindingGeneration: binding.bindingGeneration,
           targetSessionId: binding.sessionId,
           runId: null,
-          kind: MessageKind.CANCEL_REQUEST,
+          kind: MessageKind.REVISION_REQUEST,
           payload: { reason: key },
         });
       let eventId = "";
@@ -118,7 +118,7 @@ for (const variant of ["claimed-peer"] as readonly Variant[]) {
           if (workTurns === 2) {
             const pending = await callMcpToolOverSocket(f.ctoSocket, as, "role_dispatch_pending", {});
             const messages = (pending.value as { messages?: { messageId: string; kind: string }[] })?.messages ?? [];
-            for (const message of messages.filter((one) => one.kind === MessageKind.CANCEL_REQUEST)) {
+            for (const message of messages.filter((one) => one.kind === MessageKind.REVISION_REQUEST)) {
               expect((await callMcpToolOverSocket(f.ctoSocket, as, "role_dispatch_ack", { messageId: message.messageId })).ok).toBe(true);
             }
             if (variant === "wrong-event-row") {

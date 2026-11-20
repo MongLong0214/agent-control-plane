@@ -231,8 +231,8 @@ describe("the canonical CTO attach relay", () => {
 
   const register = async (relay: Relay): Promise<Record<string, unknown>> =>
     (await relay.request("tools/call", {
-      name: "role_wake_endpoint_register",
-      arguments: { endpoint },
+      name: "role_owner_message_claim",
+      arguments: { roleKey },
     })).result!.structuredContent!;
 
   beforeEach(async () => {

@@ -198,7 +198,7 @@ describe("round-2 outbox fencing", () => {
     // A message addressed to this runtime itself, not an instruction to the role.
     const review = core.outbox.enqueue({ idempotencyKey: "outbox:terminal-review", roleKey: seeded.roleKey,
       bindingGeneration: seeded.generation, targetSessionId: seeded.sessionId, runId: seeded.runId,
-      kind: MessageKind.REVIEW_REQUEST, payload: { runId: seeded.runId } });
+      kind: MessageKind.HANDOFF_PACKAGE, payload: { runId: seeded.runId } });
     expect(review.allowed).toBe(true);
     if (!review.allowed) return;
 
@@ -325,7 +325,7 @@ describe("round-2 outbox fencing", () => {
   // every other outward kind, so the row here is one of those.
   it("#51 terminally rejects a non-retryable delivery with its durable classification", () => {
     const { core, seeded } = seededCore();
-    const message = enqueue(core, seeded, "outbox:permanent-failure", undefined, MessageKind.REVIEW_REQUEST);
+    const message = enqueue(core, seeded, "outbox:permanent-failure", undefined, MessageKind.HANDOFF_PACKAGE);
     expect(message.allowed).toBe(true);
     if (!message.allowed) return;
     const claimed = core.outbox.claimDeliverable()[0]!;
@@ -361,7 +361,7 @@ describe("round-2 outbox fencing", () => {
 
   it("#174 defers only retryable failures, then terminates at the bounded attempt policy", () => {
     const { core, seeded } = seededCore();
-    const retryMessage = enqueue(core, seeded, "outbox:bounded-retry", 3 * 60 * 60 * 1000, MessageKind.REVIEW_REQUEST);
+    const retryMessage = enqueue(core, seeded, "outbox:bounded-retry", 3 * 60 * 60 * 1000, MessageKind.HANDOFF_PACKAGE);
     expect(retryMessage.allowed).toBe(true);
     if (!retryMessage.allowed) return;
     core.db.run(
@@ -429,7 +429,7 @@ describe("round-2 outbox fencing", () => {
       reason_code: ReasonCode.OUTBOX_DELIVERY_REJECTED,
     });
 
-    const zeroBackoff = enqueue(core, seeded, "outbox:zero-backoff", undefined, MessageKind.REVIEW_REQUEST);
+    const zeroBackoff = enqueue(core, seeded, "outbox:zero-backoff", undefined, MessageKind.HANDOFF_PACKAGE);
     expect(zeroBackoff.allowed).toBe(true);
     if (!zeroBackoff.allowed) return;
     core.db.run(`UPDATE outbox SET retry_backoff_ms = 0 WHERE message_id = ?`, [

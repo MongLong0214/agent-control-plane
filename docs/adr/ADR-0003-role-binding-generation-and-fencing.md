@@ -29,8 +29,8 @@ revoke the old binding, retarget-or-reject pending outbox messages. Anything arr
 afterwards under the old generation is written to the audit log and dropped.
 
 Retargeting is by message kind rather than case-by-case judgement: role-level intent
-(dispatch, task assignment, cancel, CEO notification) moves to the new incarnation;
-anything addressed to a specific incarnation (handoff package, recovery package, reply to
+(dispatch, CEO notification) moves to the new incarnation;
+anything addressed to a specific incarnation (handoff package, reply to
 that session's question) is rejected as stale.
 
 ## Alternatives rejected

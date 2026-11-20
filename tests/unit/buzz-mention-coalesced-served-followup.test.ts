@@ -84,7 +84,7 @@ for (const variant of ["mention only", "mention and ordinary work"] as const) {
           bindingGeneration: binding.bindingGeneration,
           targetSessionId: binding.sessionId,
           runId: null,
-          kind: MessageKind.CANCEL_REQUEST,
+          kind: MessageKind.REVISION_REQUEST,
           payload: { reason: key },
         });
       const external = session.incarnation.split("#")[0];

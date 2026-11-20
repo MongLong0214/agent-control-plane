@@ -26,7 +26,7 @@ afterAll(cleanupTempDirs);
  * Adapted from the closure review's witness. The original 1080-N5 note for this fixture follows.
  *
  * 1080-N5, the mixed turn. While a driven PRIMARY_CTO's ordinary turn is held, a verified mention
- * and an ordinary CANCEL_REQUEST coalesce; then the holder's room is lost or moved, or its identity
+ * and an ordinary REVISION_REQUEST coalesce; then the holder's room is lost or moved, or its identity
  * is made ineligible. The follow-up turn runs for the ordinary trigger, as it should. The mention's
  * message is not claimed (the claim is gated on the message's own verified provenance), stays
  * PENDING, and its trigger is released rather than marked handled. Real driven holder through the
@@ -87,7 +87,7 @@ for (const change of ["room lost", "room moved", "identity excluded"] as const) 
           bindingGeneration: binding.bindingGeneration,
           targetSessionId: binding.sessionId,
           runId: null,
-          kind: MessageKind.CANCEL_REQUEST,
+          kind: MessageKind.REVISION_REQUEST,
           payload: { reason: key },
         });
       const ineligible = (): void => {
@@ -110,7 +110,7 @@ for (const change of ["room lost", "room moved", "identity excluded"] as const) 
       const providerCalls = (): number =>
         f.claude.turns.filter((turn) => turn.handle.externalSessionId === external && turn.relay !== null && !/session_attest/.test(turn.prompt)).length;
       const ownerMessages = () => cp.db.all<{ status: string }>(`SELECT status FROM outbox WHERE kind = 'OWNER_MESSAGE'`);
-      const cancelRequests = () => cp.db.all<{ status: string }>(`SELECT status FROM outbox WHERE kind = 'CANCEL_REQUEST'`);
+      const cancelRequests = () => cp.db.all<{ status: string }>(`SELECT status FROM outbox WHERE kind = 'REVISION_REQUEST'`);
       try {
         await relay.drain(subscriber);
         expect(subscriber.admission().identities[0]?.state).toBe("ADMITTED");
@@ -126,7 +126,7 @@ for (const change of ["room lost", "room moved", "identity excluded"] as const) 
             // The mixed turn: the ordinary work first, then the mention turns ineligible, then the claim.
             const pending = await callMcpToolOverSocket(f.ctoSocket, as, "role_dispatch_pending", {});
             const messages = (pending.value as { messages?: { messageId: string; kind: string }[] })?.messages ?? [];
-            for (const message of messages.filter((one) => one.kind === MessageKind.CANCEL_REQUEST)) {
+            for (const message of messages.filter((one) => one.kind === MessageKind.REVISION_REQUEST)) {
               expect((await callMcpToolOverSocket(f.ctoSocket, as, "role_dispatch_ack", { messageId: message.messageId })).ok).toBe(true);
             }
             ineligible();

@@ -1831,8 +1831,7 @@ export function verifyClaudeIdentity(
   // and version and no byte of the image, and the delegated CTO binding passes the hashing one,
   // because its attestation digest is the only reader of the image's `sha256`.
   //
-  // It used to have to equal a deployment-wide triple (`ACP_CANONICAL_REQUIRED_EXECUTOR_VERSION`,
-  // `ACP_CANONICAL_EXPECTED_EXECUTOR_REALPATH`, `ACP_CANONICAL_EXPECTED_EXECUTOR_SHA256`) while the
+  // It used to have to equal a deployment-wide version, realpath and sha256 while the
   // deployment runs one session per project, each on whichever build it was started with. On
   // 2026-09-27, with three such sessions live, one matched the triple, one ran the previous patch
   // release and was refused CONFLICT, and one ran a build the updater had already deleted from

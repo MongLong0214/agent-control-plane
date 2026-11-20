@@ -282,7 +282,7 @@ describe("retry_outbox resets only its target's rows", () => {
     const { harness, ctoRoleKey, cto, generation, peerMessageId } = await ctoWithPeerMessage();
     const task = harness.cp.outbox.enqueue({
       idempotencyKey: "short-lived-task", roleKey: ctoRoleKey, bindingGeneration: generation, targetSessionId: cto.sessionId,
-      runId: null, kind: MessageKind.TASK_ASSIGN, payload: { note: "short-lived" }, ttlMs: 60_000,
+      runId: null, kind: MessageKind.HANDOFF_PACKAGE, payload: { note: "short-lived" }, ttlMs: 60_000,
     });
     if (!task.allowed) throw new Error(`enqueue failed: ${task.message}`);
     harness.clock.advance(2 * 60 * 1000);
@@ -310,7 +310,7 @@ describe("retry_outbox resets only its target's rows", () => {
     const toCeo = (key: string, ttlMs?: number): string => {
       const queued = harness.cp.outbox.enqueue({
         idempotencyKey: key, roleKey: ceo.roleKey, bindingGeneration: ceo.bindingGeneration, targetSessionId: ceo.sessionId,
-        runId: null, kind: MessageKind.TASK_ASSIGN, payload: { key }, ...(ttlMs !== undefined ? { ttlMs } : {}),
+        runId: null, kind: MessageKind.HANDOFF_PACKAGE, payload: { key }, ...(ttlMs !== undefined ? { ttlMs } : {}),
       });
       if (!queued.allowed) throw new Error(`enqueue failed: ${queued.message}`);
       return queued.value.messageId;

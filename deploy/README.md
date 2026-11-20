@@ -110,19 +110,7 @@ be expressed and the project a claimant asked for was compared against nothing (
 `ACP_CANONICAL_SESSIONS_JSON` replaces both, and a deployment that still provisions either of the
 old two is not refused — they are simply ignored.
 
-`ACP_CANONICAL_REQUIRED_EXECUTOR_VERSION`, `ACP_CANONICAL_EXPECTED_EXECUTOR_REALPATH` and
-`ACP_CANONICAL_EXPECTED_EXECUTOR_SHA256` used to be three of the six. They pinned one CLI build —
-its version, its resolved path and the sha256 of its bytes — that every claimant's executing image
-had to equal, while each project's session runs whichever build it was started with; a session on
-an earlier build was refused, and one whose build the updater had since deleted from disk could
-never be admitted at all. The claim now records the executing image and requires nothing of it.
-That also withdraws what the realpath and sha256 comparison defended against: a same-user process
-exec'd from a binary renamed `claude` is no longer told apart by its bytes, and what bounds a claim
-is the kernel peer credential on the claim socket, the session UUID derived from the claimant's
-ancestor, and the project that UUID's entry names. A deployment that still provisions any of the three is not
-refused — they are simply ignored.
-
-The generated launcher clears all six inherited variables together before its first Keychain
+The generated launcher clears all three inherited variables together before its first Keychain
 lookup, then reads each through the existing optional-account loop. These values are not written
 to the plist. Installation does not create `buzz-nostr-subscriber.json`; that separately provisioned
 subscriber config retains its existing authentication contract. Without it, an otherwise configured
