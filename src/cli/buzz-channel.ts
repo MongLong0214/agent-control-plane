@@ -6,7 +6,7 @@ import { fileURLToPath } from "node:url";
 
 import { BuzzChannelRelay, type ChannelNotification } from "../buzz/buzz-channel.ts";
 import { buildChannelMcpServer, emitChannelNotification } from "../buzz/buzz-channel-mcp.ts";
-import { ceoPubkeysFromDb, openDaemonReads, queuedBuzzBacklog, type DaemonReads } from "../buzz/buzz-channel-daemon-reads.ts";
+import { backlogReader, ceoPubkeyResolver } from "../buzz/buzz-channel-daemon-reads.ts";
 import {
   appendChannelReceipt,
   fileChannelStateStore,
@@ -78,27 +78,6 @@ const log = (line: string): void => {
   process.stderr.write(`buzz-channel: ${line}\n`);
 };
 
-/**
- * The bound CEO actor, read from the daemon's database when a message arrives rather than copied at launch, so a CEO
- * re-claim is followed, and by the daemon's own rule (see `ceoPubkeysFromDb`). Cached for a few seconds; nobody is heard
- * while the database cannot be read.
- */
-const canonicalCeoResolver = (reads: () => DaemonReads | null): (() => readonly string[]) => {
-  let cachedAt = 0;
-  let cached: readonly string[] = [];
-  return () => {
-    const now = Date.now();
-    if (now - cachedAt < 5_000) return cached;
-    cachedAt = now;
-    try {
-      const db = reads();
-      return (cached = db === null ? [] : ceoPubkeysFromDb(db));
-    } catch {
-      return (cached = []);
-    }
-  };
-};
-
 export const runBuzzChannel = async (argv: readonly string[]): Promise<number> => {
   let args: Args;
   try {
@@ -116,10 +95,10 @@ export const runBuzzChannel = async (argv: readonly string[]): Promise<number> =
     if (!relayUrl?.startsWith("wss://")) throw new Error("no wss relay url: pass --relay-url or configure the daemon's relay");
     const key = loadBuzzSubscriberKey({ privateKeyFile: args.keyFile, encoding: args.keyEncoding, rooms: args.rooms }, "channel identity");
     trimChannelReceipts(args.stateDir, args.projectId);
-    // One read-only handle on the daemon's database, opened when first needed and again if it could not be.
-    let daemon: DaemonReads | null = null;
-    const reads = (): DaemonReads | null => (daemon ??= openDaemonReads(args.stateDir));
-    const ceoPubkeys = args.ceoPubkeys.length > 0 ? (): readonly string[] => args.ceoPubkeys : canonicalCeoResolver(reads);
+    // The bound CEO is read from the daemon's database when a message arrives, not copied at launch, so a CEO re-claim is
+    // followed, and by the daemon's own rule. The database is opened for each read and closed again: this process holds
+    // nothing of the daemon's between reads, so a deploy that stops the daemon finds no holder.
+    const ceoPubkeys = args.ceoPubkeys.length > 0 ? (): readonly string[] => args.ceoPubkeys : ceoPubkeyResolver(args.stateDir);
     relay = new BuzzChannelRelay({
       relayUrl,
       projectId: args.projectId,
@@ -129,10 +108,7 @@ export const runBuzzChannel = async (argv: readonly string[]): Promise<number> =
       ownerPubkeys: readBuzzOwnerPubkeys(args.stateDir),
       store: fileChannelStateStore(args.stateDir, args.projectId),
       // What the daemon's queue still holds for this role: delivered once, oldest first, when the relay first accepts the channel.
-      backlog: () => {
-        const db = reads();
-        return db === null ? [] : queuedBuzzBacklog(db, args.projectId);
-      },
+      backlog: backlogReader(args.stateDir, args.projectId),
       onNotification: (n: ChannelNotification) => emitChannelNotification(server, n),
       onReceipt: (receipt) => {
         try {
