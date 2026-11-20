@@ -235,6 +235,24 @@ const boundedClose = (server: Server, boundMs = 5_000): Promise<void> =>
     }
   });
 
+/**
+ * Ends a connection with one last line, only when the peer is still there to read it. A peer that gave up
+ * and closed (a caller timing out while the daemon was busy) leaves a socket whose writes fail with EPIPE;
+ * writing to it is skipped, and a write that fails anyway is swallowed by the error handler every accepted
+ * socket carries (`listenPeerCredentialSocket`), because nobody is left to tell.
+ */
+const endOpenSocket = (socket: Socket, line: string): void => {
+  if (socket.destroyed || socket.writableEnded || !socket.writable) return;
+  socket.end(line);
+};
+
+/** `endOpenSocket` for a refusal: the request the peer may already have sent is drained and discarded first. */
+const refuseOpenSocket = (socket: Socket, line: string): void => {
+  if (socket.destroyed) return;
+  socket.resume();
+  endOpenSocket(socket, line);
+};
+
 const serveCanonicalSelfClaimConnection = (
   socket: Socket,
   daemon: { lock: { held(): boolean } },
@@ -256,8 +274,7 @@ const serveCanonicalSelfClaimConnection = (
     // daemon's own graceful-shutdown path) then waits on it forever. `.resume()` drains and
     // discards whatever the peer already sent or still sends; nothing here was ever going to read
     // it for its content.
-    socket.resume();
-    socket.end(`${JSON.stringify(publicClaimResponse(authenticated))}\n`);
+    refuseOpenSocket(socket, `${JSON.stringify(publicClaimResponse(authenticated))}\n`);
     return;
   }
 
@@ -268,7 +285,7 @@ const serveCanonicalSelfClaimConnection = (
     settled = true;
     if (timeout) clearTimeout(timeout);
     frame.dispose();
-    if (!socket.destroyed) socket.end(`${JSON.stringify(publicClaimResponse(decision))}\n`);
+    endOpenSocket(socket, `${JSON.stringify(publicClaimResponse(decision))}\n`);
   };
   const frame = readOneJsonLineRequest(
     socket,
@@ -417,11 +434,7 @@ const servePeerAdmittedConnection = <T>(
   door: PeerAdmittedDoor<T>,
 ): void => {
   let settled = false;
-  const refuse = (decision: Decision<unknown>): void => {
-    if (socket.destroyed) return;
-    socket.resume();
-    socket.end(publicToolRefusal(decision));
-  };
+  const refuse = (decision: Decision<unknown>): void => refuseOpenSocket(socket, publicToolRefusal(decision));
   const authenticated = authenticateClaimPeer(socket);
   if (!authenticated.allowed) return refuse(authenticated);
   if (!daemon.lock.held()) {
@@ -534,6 +547,8 @@ const listenPeerCredentialSocket = async (
       socket.destroy();
       return;
     }
+    // First, before anything can write: an error on a connection (EPIPE, ECONNRESET) is that peer's, never the daemon's.
+    socket.on("error", () => undefined);
     connections.add(socket);
     socket.once("close", () => connections.delete(socket));
     onConnection(socket);

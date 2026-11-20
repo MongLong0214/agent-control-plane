@@ -72,4 +72,30 @@ describe("a channel whose backlog floods the screen", () => {
     appendChannelReceipt(state, "logic", { type: "emitted", eventId: "e", room: "room", senderPubkey: "p", emittedAt: 1 }, "this-launch");
     expect(readChannelReceipts(channelReceiptPath(state, "logic")).receipts).toEqual([expect.objectContaining({ type: "emitted", launchId: "this-launch" })]);
   });
+
+  it("freshreadme-2: a launch with nothing queued registers through the channel's own registered receipt", async () => {
+    // Claude Code accepted the channel (its MCP log said so) and the queue was empty: no message, so no `emitted` receipt,
+    // and the one startup line had scrolled away. The server writes `registered` once the handshake completes.
+    const state = tempDir("acp-channel-registered-");
+    const registered = channelEmittedBy(state, "logic", "this-launch");
+    expect(registered()).toBe(false);
+    let reads = 0;
+    const t = terminal(() => {
+      // The server's handshake completes a moment after the keypress; the flood is all the screen shows.
+      if (t.presses.length > 0 && ++reads === 2) appendChannelReceipt(state, "logic", { type: "registered", registeredAt: 1 }, "this-launch");
+      return registered();
+    });
+    expect(await confirmChannelStartup(t.driver, BOUNDS)).toEqual({ ok: true, confirmed: true });
+    expect(t.presses).toEqual(["Enter"]);
+  });
+
+  it("counts a registered receipt only when it carries this launch's id", () => {
+    const state = tempDir("acp-channel-registered-id-");
+    appendChannelReceipt(state, "logic", { type: "registered", registeredAt: 9_999_999_999 });
+    appendChannelReceipt(state, "logic", { type: "registered", registeredAt: 9_999_999_999 }, "an-earlier-launch");
+    expect(channelEmittedBy(state, "logic", "this-launch")()).toBe(false);
+    appendChannelReceipt(state, "logic", { type: "registered", registeredAt: 1 }, "this-launch");
+    expect(channelEmittedBy(state, "logic", "this-launch")()).toBe(true);
+    expect(readChannelReceipts(channelReceiptPath(state, "logic")).skipped).toEqual([]);
+  });
 });
