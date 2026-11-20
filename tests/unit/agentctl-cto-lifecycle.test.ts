@@ -102,6 +102,10 @@ interface World {
   /** Pids whose token read answers null this many times once they have been signalled. */
   tokenGlitchAfterSignal: Map<number, number>;
   signalled: Set<number>;
+  /** The shared reader's alive() answers false for every pid: the old reading of `ps -o stat= -p` exiting 1. */
+  psStatFails: boolean;
+  /** Per pid, what each token read answers once the plan's first step has reported: by read number, from 1. */
+  tokenAfterIdle: Map<number, (read: number) => string | null>;
 }
 
 const results = (w: World): Array<[string, string]> => w.out.filter((l) => typeof l["result"] === "string" && typeof l["step"] === "string").map((l) => [l["step"] as string, l["result"] as string]);
@@ -120,6 +124,7 @@ const makeWorld = (overrides: Partial<CtoRecord> = {}, env: Record<string, strin
     dirty: new Set<string>(), archiveUnpublished: false, daemonRejects: false, retireExecutions: 0, rotateRuns: [],
     argv: new Map<number, string[]>(), panes: new Map([[100, TMUX]]), launched: { command: null, claims: true }, pane: "registered", oldReceiptDuringLaunch: false, hiddenFromPs: new Set<number>(), psFails: false, roleConversations: [],
     tokenUnavailable: new Set<number>(), survivesSigterm: new Set<number>(), tokenGlitchAfterSignal: new Map<number, number>(), signalled: new Set<number>(),
+    psStatFails: false, tokenAfterIdle: new Map<number, (read: number) => string | null>(),
     procs: [
       { pid: 100, ppid: 1, command: "/bin/sh /state/resident-e2e-sort-fixture.sh" },
       { pid: CLAUDE, ppid: 100, command: `/bin/claude --model opus ${CHANNEL} --resume ${CONVERSATION} --name e2e CTO` },
@@ -150,6 +155,7 @@ const makeWorld = (overrides: Partial<CtoRecord> = {}, env: Record<string, strin
     return allow(ReasonCode.OK, { projectId: P });
   };
   const daemonCache = new Map<string, Decision<unknown>>();
+  const tokenReads = new Map<number, number>();
   const tempRefs = new Set<string>();
   let clock = NOW;
   let uuids = 0;
@@ -274,11 +280,18 @@ const makeWorld = (overrides: Partial<CtoRecord> = {}, env: Record<string, strin
       argv: (pid: number) => { const p = w.procs.find((x) => x.pid === pid); return p ? (p.argv ?? p.command.split(" ")) : null; },
       cwds: async (pids: readonly number[]) => new Map(pids.flatMap((pid) => { const p = w.procs.find((x) => x.pid === pid); return p ? [[pid, p.cwd ?? "/"] as [number, string]] : []; })),
       tmuxPanes: async () => new Map(w.panes),
-      alive: (pid: number) => w.procs.some((p) => p.pid === pid),
+      alive: (pid: number) => !w.psStatFails && w.procs.some((p) => p.pid === pid),
       startToken: (pid: number) => (w.procs.some((p) => p.pid === pid) ? `start-${pid}` : null),
     } satisfies CtoProcessReader,
+    // The kernel: a pid it no longer has (kill(pid, 0) would throw ESRCH).
+    kernelGone: (pid: number) => !w.procs.some((p) => p.pid === pid),
     startToken: (pid: number) => {
       if (!w.procs.some((p) => p.pid === pid) || w.tokenUnavailable.has(pid)) return null;
+      const script = w.tokenAfterIdle.get(pid);
+      if (script && w.out.some((l) => l["step"] === "idle" && l["result"] === "done")) {
+        tokenReads.set(pid, (tokenReads.get(pid) ?? 0) + 1);
+        return script(tokenReads.get(pid)!);
+      }
       const glitches = w.signalled.has(pid) ? w.tokenGlitchAfterSignal.get(pid) ?? 0 : 0;
       if (glitches > 0) { w.tokenGlitchAfterSignal.set(pid, glitches - 1); return null; }
       return `start-${pid}`;
@@ -926,6 +939,52 @@ describe("#1463 r2: gone, alive and unavailable are three states", () => {
     const launch = w.out.find((l) => l["step"] === "launch" && l["result"] === "done")!["detail"] as { argv: string[]; tmux: string };
     expect(launch.argv.slice(launch.argv.indexOf("--name"), launch.argv.indexOf("--name") + 2)).toEqual(["--name", "Logic CTO"]);
     expect(launch.tmux).toBe("logic-claude-handoff");
+  });
+});
+
+/** #1463 final review: the reviewer's two repros, by name. */
+describe("#1463 final review repros", () => {
+  const canonicalBound = (): World => {
+    const cwd = realpathSync(tempDir("acp-cto-final-"));
+    const config = tempDir("acp-cto-final-config-");
+    writeFileSync(join(config, ".claude.json"), JSON.stringify({ projects: { [cwd]: { hasTrustDialogAccepted: true } } }));
+    const w = makeWorld({ kind: "canonical", resident: null, generation: 3, session: { pid: CLAUDE, startedAt: `start-${CLAUDE}`, workdir: cwd },
+      repositories: [{ repositoryId: "repo_1", identity: `github:${REPO}`, checkoutPath: cwd }] }, { ACP_OPERATOR_TOKEN: "operator-test-credential", CLAUDE_CONFIG_DIR: config });
+    w.procs = [{ pid: CLAUDE, ppid: 1, command: `${LOCAL_CLAUDE} --resume ${CONVERSATION}`, argv: [LOCAL_CLAUDE, "--resume", CONVERSATION], cwd }];
+    const transcript = `${HOME}/.claude/projects/${cwd.replace(/[^A-Za-z0-9]/g, "-")}/${CONVERSATION}.jsonl`;
+    w.files.set(transcript, "{}");
+    w.mtimes.set(transcript, NOW - (IDLE_SECONDS + 60) * 1000);
+    return w;
+  };
+  const launchesOrSignals = (w: World): string[] => w.changes.filter((c) => /^tmux new-(session|window)|^SIGTERM|^provisioner ensure-resident/.test(c));
+
+  it("a surviving CTO with one null token after SIGTERM while ps -o stat exits 1 is not exited, and pid 30000 never launches beside it", async () => {
+    const w = canonicalBound();
+    w.survivesSigterm.add(CLAUDE);
+    w.tokenGlitchAfterSignal.set(CLAUDE, 1);
+    w.psStatFails = true;
+    expect(await runCtoCommand(["relaunch", P, "--apply"], w.ports)).toBe(1);
+    expect(results(w).at(-1)).toEqual(["stop", "failed"]);
+    expect(w.changes.filter((c) => /^tmux new-/.test(c))).toEqual([]);
+    expect(w.procs.some((p) => p.pid === 30000)).toBe(false);
+  });
+
+  // After the plan's first step, the stop's done() and its target selection read the token once each; the read right
+  // before the signal is the 3rd.
+  it("pid 16590 replaced after its selection, with the last token read unavailable: the replacement is never signalled", async () => {
+    const w = makeWorld();
+    w.tokenAfterIdle.set(CLAUDE, (read) => (read <= 2 ? `start-${CLAUDE}` : null));
+    expect(await runCtoCommand(["relaunch", P, "--apply"], w.ports)).toBe(1);
+    expect(results(w).at(-1)).toEqual(["stop", "failed"]);
+    expect(launchesOrSignals(w)).toEqual([]);
+  });
+
+  it("pid 16590 replaced after its selection, with a different token read right before the signal: refused, nothing signalled", async () => {
+    const w = makeWorld();
+    w.tokenAfterIdle.set(CLAUDE, (read) => (read <= 2 ? `start-${CLAUDE}` : "start-of-the-replacement"));
+    expect(await runCtoCommand(["relaunch", P, "--apply"], w.ports)).toBe(1);
+    expect(results(w).at(-1)).toEqual(["stop", "failed"]);
+    expect(launchesOrSignals(w)).toEqual([]);
   });
 });
 

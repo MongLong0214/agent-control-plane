@@ -133,6 +133,8 @@ export interface CtoPorts {
   /** The shared one-CTO process reader (`systemCtoProcessReader`): kernel argv, a table that fails closed. */
   ctoProcesses: CtoProcessReader;
   startToken(pid: number): string | null;
+  /** Whether the kernel has no such pid (`kill(pid, 0)` throws ESRCH): the one proof that a process is gone. */
+  kernelGone(pid: number): boolean;
   signal(pid: number, signal: "SIGTERM"): void;
   files: CtoFiles;
   /** The Buzz public key of a key file, never its contents; null when it cannot be read. */
@@ -235,10 +237,11 @@ interface StopTarget { pid: number; startToken: string; tmux: string | null }
  * taken as exited.
  */
 type Liveness = { state: "gone" } | { state: "alive"; token: string } | { state: "unavailable" };
+// GONE is the kernel's word alone (ESRCH): a failing `ps`, whatever it printed, never makes a pid gone.
 const livenessOf = async (ports: CtoPorts, pid: number): Promise<Liveness> => {
   const token = ports.startToken(pid);
   if (token !== null) return { state: "alive", token };
-  return (await ports.ctoProcesses.alive(pid)) ? { state: "unavailable" } : { state: "gone" };
+  return ports.kernelGone(pid) ? { state: "gone" } : { state: "unavailable" };
 };
 
 const stopTargetOf = async (ports: CtoPorts, record: CtoRecord | null, role: RoleProcesses): Promise<StopTarget | null | { refused: string }> => {
@@ -365,7 +368,15 @@ const stopStep = (ports: CtoPorts, projectId: string, id = "stop", keepChanneled
       const live = await livenessOf(ports, target.pid);
       return live.state === "gone" || (live.state === "alive" && live.token !== target.startToken) ? true : live.state === "unavailable" ? null : false;
     };
-    if ((await exited()) === true) return ok({ pid: target.pid, alreadyGone: true });
+    // Immediately before the signal the token is read again: only the very identity selected is signalled. A pid the
+    // kernel no longer has is already stopped; a token that cannot be read, or that is another process's, refuses.
+    const now = ports.startToken(target.pid);
+    if (now === null && ports.kernelGone(target.pid)) return ok({ pid: target.pid, alreadyGone: true });
+    if (now !== target.startToken) {
+      return refused(now === null
+        ? `pid ${target.pid}'s start cannot be read right before the signal, so it cannot be confirmed as the process selected; nothing was signalled or launched`
+        : `pid ${target.pid} is another process than the one selected (its start changed); nothing was signalled or launched`);
+    }
     try { ports.signal(target.pid, "SIGTERM"); } catch (error) {
       // Gone between the read and the signal is the outcome this step wants; anything else is reported.
       if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
@@ -1210,6 +1221,9 @@ export const createCtoPorts = async (input: {
     state: await openCtoState(input.databasePath),
     ctoProcesses: systemCtoProcessReader(),
     startToken: readProcessStartToken,
+    kernelGone: (pid) => {
+      try { process.kill(pid, 0); return false; } catch (error) { return (error as NodeJS.ErrnoException).code === "ESRCH"; }
+    },
     signal: (pid, signal) => { process.kill(pid, signal); },
     files: {
       exists: existsSync,
