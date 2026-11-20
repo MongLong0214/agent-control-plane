@@ -89,7 +89,7 @@ export type CtoExec = (bin: string, args: readonly string[], options?: CtoExecOp
 export interface CtoFiles {
   exists(path: string): boolean;
   read(path: string): string;
-  /** Replaces the file whole (written beside it, then renamed into place), 0600 unless `mode` says otherwise. */
+  /** Replaces the file whole (written beside it, then renamed into place, its directory made if need be), 0600 unless `mode` says otherwise. */
   replace(path: string, body: string, mode?: number): void;
   /** Renames a file or a directory tree to a path that does not exist yet, creating its parent. */
   move(from: string, to: string): void;
@@ -521,7 +521,7 @@ const readLegacyLauncher = (ports: CtoPorts, projectId: string): { tmux: string 
 const canonicalResumeSteps = (
   ports: CtoPorts, projectId: string, restart: boolean,
   // --fresh: the conversation to start is the switchover's (`uuid`, known once `prepare` ran or found it), never the bound one.
-  options: { fresh?: { uuid: string | null; prepare: CtoStep; prepared: () => Promise<boolean> } } = {},
+  options: { fresh?: { uuid: string | null; old: string; prepare: CtoStep; prepared: () => Promise<boolean> } } = {},
 ): CtoStep[] => {
   const planned = fresh(ports, projectId);
   const wanted = (record: CtoRecord | null): string | null => (options.fresh ? options.fresh.uuid : record?.conversation ?? null);
@@ -544,6 +544,8 @@ const canonicalResumeSteps = (
     if (options.fresh && record!.conversation !== options.fresh.uuid) return false;
     return argvCarriesChannel(await ports.ctoProcesses.argv(pid));
   };
+  /** A new conversation starts with --session-id and the handoff; once its transcript exists it is only ever resumed. */
+  const freshFlag = (at: { cwd: string; uuid: string }): "--session-id" | "--resume" => (ports.files.exists(transcriptOf(ports, at.cwd, at.uuid)) ? "--resume" : "--session-id");
   /** --fresh: the new conversation's own live processes, by argv; never the old conversation's, whatever else they share. */
   const namesNew = (role: RoleProcesses, pid: number): boolean => options.fresh?.uuid != null && (role.snapshot.claude.get(pid)?.argv ?? []).includes(options.fresh.uuid);
   const newRunning = async (): Promise<boolean> => {
@@ -554,12 +556,15 @@ const canonicalResumeSteps = (
   const stopOldStep = (): CtoStep => {
     const stop = stopStep(ports, projectId, "stop", !restart, stopped);
     if (!options.fresh) return stop;
-    const isNew = async (): Promise<boolean> => {
+    // Not the old conversation's: a process whose argv names the new one, or a bound session whose conversation is no longer the old
+    // one (another conversation claimed the role since this run began). Neither is ever signalled.
+    const notOld = async (): Promise<boolean> => {
+      const record = fresh(ports, projectId);
       const role = await roleProcesses(ports, projectId);
-      const target = await stopTargetOf(ports, fresh(ports, projectId), role);
-      return target !== null && !("refused" in target) && namesNew(role, target.pid);
+      const target = await stopTargetOf(ports, record, role);
+      return target !== null && !("refused" in target) && (namesNew(role, target.pid) || record?.conversation !== options.fresh!.old);
     };
-    return { ...stop, done: async () => (await isNew()) || stop.done!(), run: async () => ((await isNew()) ? ok({ skipped: "the bound process runs the new conversation" }) : stop.run()) };
+    return { ...stop, done: async () => (await notOld()) || stop.done!(), run: async () => ((await notOld()) ? ok({ skipped: "the bound process is not the old conversation's" }) : stop.run()) };
   };
   return [options.fresh ? { ...idleStep(ports, projectId), done: options.fresh.prepared } : idleStep(ports, projectId), {
     id: "trust",
@@ -601,7 +606,11 @@ const canonicalResumeSteps = (
       const record = fresh(ports, projectId);
       if (options.fresh && await newRunning()) return true;
       const role = await roleProcesses(ports, projectId);
-      return role.matches.length === 0 && readCanonicalLauncher(ports, projectId)?.resume.includes(wanted(record) ?? "\0") === true;
+      const written = readCanonicalLauncher(ports, projectId)?.resume;
+      // --fresh: a launcher written for the other mode (the transcript has appeared, or vanished, since) is not the one to start.
+      const at = bound();
+      const mode = options.fresh && typeof at !== "string" ? freshFlag(at) : "--resume";
+      return role.matches.length === 0 && written?.[0] === mode && written.includes(wanted(record) ?? "\0");
     },
     run: async () => {
       const at = bound();
@@ -622,8 +631,7 @@ const canonicalResumeSteps = (
       const kept = argv ? carriedOptions(argv) : earlier ? carriedOptions([earlier.claude, ...earlier.resume]) : legacy ? carriedOptions(legacy.argv) : [];
       const perm = kept.includes("--permission-mode") ? [] : ["--permission-mode", "bypassPermissions"];
       let resume = ["--resume", at.uuid, ...kept, ...perm];
-      // A new conversation starts with --session-id and the handoff; once its transcript exists it is only ever resumed.
-      if (options.fresh && !ports.files.exists(transcriptOf(ports, at.cwd, at.uuid))) {
+      if (options.fresh && freshFlag(at) === "--session-id") {
         const stored = readHandoff(ports.files, ports.stateDir, projectId);
         if (!stored) return refused("the handoff is not stored; nothing was written");
         resume = ["--session-id", at.uuid, ...kept, ...perm, firstPromptOf({ projectId, previousConversation: stored.conversation, text: stored.text })];
@@ -845,7 +853,7 @@ interface SwitchoverStatus { holderSessionUuid: string | null; generation: numbe
 const freshSteps = (ports: CtoPorts, record: CtoRecord, next: string): CtoStep[] => {
   const projectId = record.projectId;
   const old = record.conversation!;
-  const target: { uuid: string | null; prepare: CtoStep; prepared: () => Promise<boolean> } = { uuid: null, prepare: undefined as unknown as CtoStep, prepared: async () => false };
+  const target: { uuid: string | null; old: string; prepare: CtoStep; prepared: () => Promise<boolean> } = { uuid: null, old, prepare: undefined as unknown as CtoStep, prepared: async () => false };
   const readStatus = async (): Promise<SwitchoverStatus | null> => {
     try {
       const answer = await ports.operator.request("canonicalCto.status", { projectId });
@@ -866,12 +874,20 @@ const freshSteps = (ports: CtoPorts, record: CtoRecord, next: string): CtoStep[]
   target.prepare = {
     id: "switchover",
     plan: "ask the daemon for the switchover old -> a new conversation (canonicalCto.rotate, with the handoff as its package) unless one is pending, whose conversation is then reused; the new conversation is written into the handoff file first, and a lost answer is followed by a status read, never a blind retry",
-    done: target.prepared,
+    // Prepared and written down: a pending switchover whose conversation the handoff file does not name yet is not done.
+    done: async () => (await target.prepared()) && readHandoff(ports.files, ports.stateDir, projectId)?.next === target.uuid,
     run: async () => {
       const before = await readStatus();
       if (before === null) return refused("canonicalCto.status could not be read; no switchover was prepared");
       const stored = readHandoff(ports.files, ports.stateDir, projectId);
       if (!stored) return refused("the handoff is not stored; no switchover was prepared");
+      // A pending switchover is reused with its conversation, which is written down before any later step can stop or start anything.
+      const reused = pendingOf(before);
+      if (reused !== null) {
+        markHandoff(ports.files, ports.stateDir, projectId, { next: reused });
+        target.uuid = reused;
+        return ok({ oldConversation: old, newConversation: reused, reused: true });
+      }
       // A conversation an earlier attempt wrote down and the daemon never recorded is used again; one it recorded is not.
       const used = new Set(before.rotations.map((r) => r.toSessionUuid));
       const to = stored.next && !used.has(stored.next) ? stored.next : next;
@@ -1374,7 +1390,8 @@ export const createCtoPorts = async (input: {
     files: {
       exists: existsSync,
       read: (path) => readFileSync(path, "utf8"),
-      replace: (path, body, mode = 0o600) => { const tmp = `${path}.${process.pid}.${randomUUID()}.tmp`; writeFileSync(tmp, body, { mode }); renameSync(tmp, path); },
+      // The directory is made first: <state>/cto-refresh does not exist until a handoff is first written, by ACP or by the CTO.
+      replace: (path, body, mode = 0o600) => { mkdirSync(dirname(path), { recursive: true, mode: 0o700 }); const tmp = `${path}.${process.pid}.${randomUUID()}.tmp`; writeFileSync(tmp, body, { mode }); renameSync(tmp, path); },
       move: (from, to) => { mkdirSync(dirname(to), { recursive: true, mode: 0o700 }); renameSync(from, to); },
       remove: (path) => rmSync(path, { recursive: true, force: true }),
       mtimeMs: (path) => { try { return statSync(path).mtimeMs; } catch { return null; } },

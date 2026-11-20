@@ -4,7 +4,7 @@ import { afterAll, describe, expect, it, vi } from "vitest";
 
 import { main } from "../../src/cli/agentctl.ts";
 import {
-  CTO_SUBCOMMANDS, IDLE_SECONDS, checkoutHeldWork, hostRunner, runCtoCommand, workerHeldWork,
+  CTO_SUBCOMMANDS, IDLE_SECONDS, checkoutHeldWork, createCtoPorts, hostRunner, runCtoCommand, workerHeldWork,
   type CtoExec, type CtoExecOptions, type CtoExecResult, type CtoPorts, type CtoRecord,
 } from "../../src/cli/cto-command.ts";
 import { allow, deny, type Decision } from "../../src/core/errors.ts";
@@ -792,7 +792,9 @@ describe("a canonical relaunch resumes the role's bound conversation", () => {
       w.switchovers = [{ toSessionUuid: U, state: "PENDING" }];
       expect(await runCtoCommand(["relaunch", P, "--fresh", "--apply"], w.ports)).toBe(0);
       expect(w.rotateCalls).toEqual([]);
-      expect(results(w).find(([step]) => step === "switchover")).toEqual(["switchover", "skipped"]);
+      // Prepare is skipped, but the reused conversation is written down: the step records it and asks for nothing.
+      expect(w.out.find((l) => l["step"] === "switchover" && l["result"] === "done")!["detail"]).toMatchObject({ newConversation: U, reused: true });
+      expect(handoffFile(w)).toMatchObject({ next: U });
       const argv = launched(w);
       expect(argv.slice(argv.indexOf("--session-id"), argv.indexOf("--session-id") + 2)).toEqual(["--session-id", U]);
       expect(w.record.conversation).toBe(U);
@@ -889,6 +891,61 @@ describe("a canonical relaunch resumes the role's bound conversation", () => {
       expect(handoffFile(w).completed).toBe(true);
     });
 
+    it("a conversation that wrote its transcript and exited unclaimed is resumed on the rerun, not started again with --session-id and the handoff", async () => {
+      const { w, cwd } = canonicalWorld();
+      w.launched.claims = false;
+      expect(await runCtoCommand(["relaunch", P, "--fresh", "--apply"], w.ports)).toBe(1);
+      const U = w.rotateCalls[0]!.params["toSessionUuid"] as string;
+      expect(launched(w)).toContain("--session-id");
+      // U ran, wrote its transcript and exited without a claim.
+      w.procs = w.procs.filter((p) => p.pid !== 30000);
+      w.files.set(`${HOME}/.claude/projects/${cwd.replace(/[^A-Za-z0-9]/g, "-")}/${U}.jsonl`, "{}");
+      w.launched.claims = true;
+      w.out.length = 0; w.changes.length = 0;
+      expect(await runCtoCommand(["relaunch", P, "--fresh", "--apply"], w.ports)).toBe(0);
+      expect(results(w).find(([step]) => step === "launcher")).toEqual(["launcher", "done"]);
+      const argv = launched(w);
+      expect(argv.slice(argv.indexOf("--resume"), argv.indexOf("--resume") + 2)).toEqual(["--resume", U]);
+      expect(argv).not.toContain("--session-id");
+      expect(argv.join(" ")).not.toContain("--- handoff ---");
+      expect(w.rotateCalls).toHaveLength(1);
+    });
+
+    it("a pending switchover found with no local handoff is written down at once: U's late claim is then recognized, and nothing is prepared or stopped again", async () => {
+      const { w } = canonicalWorld();
+      const U = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+      w.switchovers = [{ toSessionUuid: U, state: "PENDING" }];
+      w.launched.claims = false;
+      expect(w.files.has(`${STATE}/cto-refresh/handoff-${P}.json`)).toBe(false);
+      expect(await runCtoCommand(["relaunch", P, "--fresh", "--apply"], w.ports)).toBe(1);
+      expect(w.rotateCalls).toEqual([]);
+      expect(handoffFile(w)).toMatchObject({ conversation: CONVERSATION, source: "acp", next: U });
+      // U claims late, as the process the role is bound to.
+      w.record = { ...w.record, conversation: U, generation: 4 };
+      w.switchovers[0]!.state = "ACKED";
+      w.out.length = 0; w.changes.length = 0;
+      expect(await runCtoCommand(["relaunch", P, "--fresh", "--apply"], w.ports)).toBe(0);
+      expect(w.rotateCalls).toEqual([]);
+      expect(w.changes.filter((c) => c.startsWith("SIGTERM") || c.startsWith("tmux new-"))).toEqual([]);
+      expect(handoffFile(w).completed).toBe(true);
+    });
+
+    it("never stops a process of a conversation that claimed the role after this run began", async () => {
+      const { w } = canonicalWorld();
+      // The daemon's answer to rotate is followed at once by another conversation's claim: the bound session is no longer the old one's.
+      const OTHER = "cccccccc-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+      const rotate = w.ports.operator.request;
+      w.ports.operator.request = async (method, params, key) => {
+        const answer = await rotate(method, params, key);
+        if (method === "canonicalCto.rotate") w.record = { ...w.record, conversation: OTHER };
+        return answer;
+      };
+      expect(await runCtoCommand(["relaunch", P, "--fresh", "--apply"], w.ports)).toBe(1);
+      expect(w.changes.filter((c) => c.startsWith("SIGTERM") || c.startsWith("tmux new-"))).toEqual([]);
+      expect(w.procs.some((p) => p.pid === CLAUDE)).toBe(true);
+      expect(results(w).find(([step]) => step === "stop")).toEqual(["stop", "skipped"]);
+    });
+
     it("a dry run prints the plan and asks the daemon for nothing but a read", async () => {
       const { w } = canonicalWorld();
       expect(await runCtoCommand(["relaunch", P, "--fresh"], w.ports)).toBe(0);
@@ -902,6 +959,17 @@ describe("a canonical relaunch resumes the role's bound conversation", () => {
       expect(await runCtoCommand(["relaunch", P, "--fresh"], resident.ports)).toBe(2);
       expect(await runCtoCommand(["relaunch", P, "--conversation", CONVERSATION], resident.ports)).toBe(2);
     });
+  });
+});
+
+describe("the production file port", () => {
+  it("makes the directory of a file it replaces: the first handoff, written by ACP, is the first thing in <state>/cto-refresh", async () => {
+    const dir = tempDir("acp-cto-state-");
+    const ports = await createCtoPorts({ databasePath: join(dir, "state.sqlite"), operator: { request: async () => allow(ReasonCode.OK, {}) }, env: { HOME: dir } });
+    const path = join(dir, "cto-refresh", `handoff-${P}.json`);
+    expect(ports.files.exists(join(dir, "cto-refresh"))).toBe(false);
+    ports.files.replace(path, "{}\n");
+    expect(ports.files.read(path)).toBe("{}\n");
   });
 });
 
