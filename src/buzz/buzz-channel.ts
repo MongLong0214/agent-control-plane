@@ -297,6 +297,17 @@ const threadMarkers = (tags: readonly (readonly string[])[]): { root: string | n
 };
 
 /**
+ * The root of the thread an event is in, by the relay's whole marker resolution (buzz-core `ThreadMarkers::resolve`): a
+ * `root` and a `reply` marker name the root and the parent; a `reply` marker alone names a parent that is itself the root;
+ * anything else, a lone `root` marker included, is top-level, and a top-level event is the root of its own thread. A lone
+ * `root` marker never anchors a reply, so it is not read as one.
+ */
+const threadRootOf = (event: { readonly id: string; readonly tags: readonly (readonly string[])[] }): string => {
+  const { root, reply } = threadMarkers(event.tags);
+  return reply === null ? event.id : (root ?? reply);
+};
+
+/**
  * What the relay says refused a publish, as one short line: its own text, control characters made spaces, cut at a bound.
  * The text is the relay's and is shown as data, never as an instruction.
  */
@@ -463,8 +474,7 @@ export class BuzzChannelRelay {
     if (!parent.exactRoot) {
       const shown = await this.#askRelayForParent(input.eventId, input.room);
       if (shown !== null) {
-        const markers = threadMarkers(shown.tags);
-        root = markers.root ?? markers.reply ?? shown.id;
+        root = threadRootOf(shown);
         this.#events.set(input.eventId, { ...parent, root, exactRoot: true });
       }
     }
@@ -749,19 +759,16 @@ export class BuzzChannelRelay {
       return false;
     }
     this.#retry.delete(event.id);
-    const parent = verdict.replyTo === "" ? undefined : this.#events.get(verdict.replyTo);
-    // The thread's root as the relay holds it: the event's own `root` marker; else, as before, the root of the parent
-    // this channel knows; else, for a reply to something it never received, that thing (a lone `reply` marker names the
-    // root); else the event itself.
-    const markers = threadMarkers(event.tags);
-    const known = parent !== undefined && parent.room === verdict.room ? parent : undefined;
-    const rooted =
-      markers.root !== null
-        ? { root: markers.root, exactRoot: true }
-        : known !== undefined
-          ? { root: known.root, exactRoot: known.exactRoot }
-          : { root: markers.reply ?? event.id, exactRoot: true };
-    this.#events.set(event.id, { at: event.created_at, author: event.pubkey, room: verdict.room, ...rooted, delivered: true });
+    // The thread's root as the relay holds it, read from the event's own markers and from nothing the channel happens to
+    // know: an event the relay reads as top-level is the root of its own thread, whoever it names.
+    this.#events.set(event.id, {
+      at: event.created_at,
+      author: event.pubkey,
+      room: verdict.room,
+      root: threadRootOf(event),
+      exactRoot: true,
+      delivered: true,
+    });
     this.#touchThread(this.#events.get(event.id)!.root, verdict.room, claimed);
     this.#delivered += 1;
     this.#o.onReceipt?.({

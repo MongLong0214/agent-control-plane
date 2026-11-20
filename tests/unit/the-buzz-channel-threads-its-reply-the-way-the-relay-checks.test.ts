@@ -298,6 +298,45 @@ describe("a reply carries the thread markers the relay requires", () => {
   });
 });
 
+/**
+ * A lone `root` marker never anchors a reply: with no `reply` marker the relay reads the event as top-level, so the thread
+ * that event starts has its own id as root, whatever its `root` tag names (`ThreadMarkers::resolve`, buzz-core nip10.rs).
+ */
+describe("an event that carries only a root marker starts its own thread", () => {
+  const loneRoot = () => {
+    const model = new RelayModel();
+    const named = sign(ceo, [["h", ROOM], ["p", ctoPub]], "the thread a stray root marker names", 1_970);
+    model.seed(named);
+    const lone = sign(ceo, [["h", ROOM], ["e", named.id, "", "root"], ["p", ctoPub]], "a message whose only marker is a root", 1_990);
+    model.seed(lone);
+    return { model, named, lone };
+  };
+
+  it("is answered with the reply marker alone when it is delivered here, even though the channel knows the root it names", async () => {
+    const { model, named, lone } = loneRoot();
+    const h = await harness({ relayModel: model });
+    await h.deliver(named);
+    await h.deliver(lone);
+
+    const pending = h.relay.reply({ room: ROOM, eventId: lone.id, kind: "report", text: "acknowledged" });
+    const published = h.sent.filter((f) => f[0] === "EVENT").at(-1) as [string, Signed];
+    expect(published[1].tags).toEqual([["h", ROOM], ["e", lone.id, "", "reply"], ["p", ceoPub], ["acp-kind", "report"]]);
+    await expect(pending).resolves.toMatchObject({ ok: true, ack: "ACCEPTED" });
+  });
+
+  it("is answered with the reply marker alone when it is restored from a saved state and the relay is asked for it", async () => {
+    const { model, lone } = loneRoot();
+    const state: ChannelState = { cursor: 1_990, failed: [], events: [[lone.id, 1_990, ceoPub, ROOM, lone.id, true]] };
+    const h = await harness({ relayModel: model, state });
+
+    const result = await h.relay.reply({ room: ROOM, eventId: lone.id, kind: "report", text: "acknowledged" });
+    expect(result).toMatchObject({ ok: true, ack: "ACCEPTED" });
+    expect(h.lookups()).toHaveLength(1);
+    expect(model.accepted.at(-1)!.tags.filter((t) => t[0] === "e")).toEqual([["e", lone.id, "", "reply"]]);
+    expect(h.saved.at(-1)!.events.find((e) => e[0] === lone.id)![4]).toBe(lone.id);
+  });
+});
+
 describe("the relay's own words reach the session", () => {
   it("says why the relay refused: the relay's text, on one bounded line", async () => {
     const { model, ceoAnswer } = liveThread();
