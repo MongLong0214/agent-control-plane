@@ -32,7 +32,7 @@ import { OWNER_ONLY_REASONS } from "../ceo/owner-decision-reason.ts";
 import type { Db } from "../db/database.ts";
 import type { Doctor } from "../doctor/doctor.ts";
 import type { GitHubKernel } from "../github/github-kernel.ts";
-import { PR_EVIDENCE_DIFF_PAGE_MAX_CHARS, type PrEvidenceInput, readPrEvidence } from "../github/pr-evidence.ts";
+import { PR_EVIDENCE_DIFF_PAGE_MAX_CHARS, type PrEvidence, type PrEvidenceInput, prEvidenceHeader, readPrEvidence } from "../github/pr-evidence.ts";
 import type { ExecutionMode, RunPriority } from "../domain/types.ts";
 import { Role, roleKeyFor, RunKind, RunState } from "../domain/types.ts";
 import { isTerminal } from "../domain/run-state.ts";
@@ -832,11 +832,14 @@ const createHermesServerFromPort = (
         "changed files with additions and deletions, the whole diff built from GitHub's file patches, the check runs and " +
         "statuses at exactly headSha with URLs, and the base branch's required checks with whether each is green there. " +
         "A head other than expectedHead is MERGE_HEAD_STALE with both SHAs and nothing else. The diff comes in pages of at " +
-        `most ${PR_EVIDENCE_DIFF_PAGE_MAX_CHARS} characters, fewer when that keeps the whole answer inline (on the first ` +
-        "page the file list gives way first; filesNotListed counts what the diff alone carries): every page carries " +
-        "compared {baseSha, headSha}, the diff's sha256 and total size, offset, done and nextCursor; pass nextCursor back " +
-        "as cursor with the same expectedHead until done, and join the pages' text in order. complete is true only on the " +
-        "last page of a read that named nothing incomplete. A " +
+        `most ${PR_EVIDENCE_DIFF_PAGE_MAX_CHARS} characters (pageChars), fewer when that keeps the whole answer inline; a ` +
+        "page never splits a character, and takes one whole two-unit character past pageChars only when it would otherwise " +
+        "be empty. The answer's first line is its brief: pageIndex, done, complete, nextCursor, reasonCode, the compared " +
+        "SHAs and counts. Pass nextCursor back as cursor with the same expectedHead until done, and join the pages' " +
+        "diff.text in order; the pages hash to diff.sha256. On the first page the files, then the gaps, then the checks " +
+        "give way to keep it inline, counted in brief.notListed; a continuation page lists no gaps, one SNAPSHOT_INCOMPLETE " +
+        "entry counts every gap the read named. complete is true only on the last page of a read no page of which named a " +
+        "gap. A " +
         "cursor issued against another head, base or diff is refused SNAPSHOT_STALE; start again without one. Anything " +
         "not read (a failed or missing page, a patch GitHub omitted, mergeability not yet computed) is named in incomplete, " +
         "and the answer is then COVERAGE_INCOMPLETE with what was read as its evidence: incomplete data is never a pass. " +
@@ -860,7 +863,13 @@ const createHermesServerFromPort = (
         return respond(deny(ceo.reasonCode,
           "pr_evidence_get answers only the current CEO's authenticated Hermes owner or peer turn", ceo.evidence));
       }
-      return respond(await port.prEvidence(args));
+      const answer = await port.prEvidence(args);
+      const result = respond(answer);
+      // A page's brief is also its first text block, so a reader of only the start still has the cursor.
+      const paged = (answer.allowed ? answer.value : answer.evidence) as Partial<PrEvidence> | undefined;
+      return paged?.schema === "acp.pr-evidence.v1" && paged.brief
+        ? { ...result, content: [{ type: "text" as const, text: prEvidenceHeader(paged.brief) }, ...result.content] }
+        : result;
     }),
   );
 

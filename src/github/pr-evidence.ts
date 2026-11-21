@@ -29,9 +29,10 @@ import type { RepositoryRecord } from "../registry/repository-registry.ts";
  * and nothing in it says "ok". A continuation page carries the first page's gaps in its signed cursor,
  * so a snapshot that was incomplete stays incomplete on every page of it.
  *
- * Read in a prefix: Hermes shows its model only the first 2048 characters of a tool error, and the
- * refusal's text is the whole answer. So `brief` comes first and is bounded whatever the gaps, cursor
- * or diff hold, and `diff` comes last, its page text at the very end.
+ * Read in a prefix: Hermes shows its model only the first 2048 characters of a tool error, and only a
+ * 1,500-character preview of an answer it moves to a spillover file. So `brief` is bounded whatever the
+ * gaps, checks or diff hold, opens with done, complete and nextCursor, and is also the answer's first text
+ * block (`prEvidenceHeader`); `diff` comes last, its page text at the very end.
  */
 
 /** GET only, over the kernel's App client and credential (`GitHubKernel.readOnlyGitHub`). */
@@ -123,6 +124,8 @@ export interface PrEvidenceRequiredCheck {
   sources: Array<"branch-protection" | "ruleset">;
   satisfied: boolean;
   observed: Array<{ kind: "check_run" | "status"; state: string | null; url: string | null }>;
+  /** Observations left out of `observed` to keep the first page inline; `satisfied` was judged on all of them. */
+  observedNotListed: number;
 }
 
 /**
@@ -154,6 +157,8 @@ export interface PrEvidenceSummary {
   /** Files left out of `files` so the first page stays inline; each one is in the diff under its own `diff --git` header. */
   filesNotListed: number;
   checks: { headSha: string; checkRuns: PrEvidenceCheckRun[]; statuses: PrEvidenceStatus[]; combinedState: string | null };
+  /** Check runs and statuses left out of `checks` to keep the first page inline; `requiredChecks` was judged on all of them. */
+  checksNotListed: number;
   requiredChecks: {
     /** Whether GitHub declares any required check for the base branch (branch protection or rulesets). */
     declared: boolean;
@@ -179,14 +184,23 @@ const BRIEF_GAP_CHARS = 200;
 const BRIEF_WHERE_CHARS = 60;
 
 /**
- * The answer's state in under 2048 characters as `respond` writes it, so a reader that sees only the start
- * (a Hermes tool error) still has it. Each value is a copy of what the fields below carry in full.
+ * The answer's state in under 2048 characters, done, complete and nextCursor first, so a reader that sees only
+ * the start (a Hermes tool error, a spillover preview) still has it and can ask for the next page. It is the
+ * answer's first text block as well as a field. Each value is a copy of what the fields below carry in full.
  */
 export interface PrEvidenceBrief {
+  /** 1 on the first page of a read, one more on each page a cursor opens. */
+  pageIndex: number;
+  done: boolean;
+  /** true only on the last page of a read no page of which named a gap. */
   complete: boolean;
+  nextCursor: string | null;
+  reasonCode: string;
   baseSha: string;
   headSha: string;
-  page: { offset: number; chars: number; totalChars: number; done: boolean; hasNextCursor: boolean; textAt: string };
+  page: { offset: number; chars: number; totalChars: number; textAt: string };
+  /** What this answer counts but does not list, to stay inline: files, check runs and statuses, gaps. */
+  notListed: { files: number; checks: number; gaps: number };
   /** On the first page only, null on a continuation page, as `summary` is. */
   pull: { state: string; merged: boolean | null; mergeability: PrEvidenceMergeability } | null;
   /** Every gap counted by kind, and the first BRIEF_GAPS_QUOTED as one bounded line each. */
@@ -202,9 +216,15 @@ export interface PrEvidence {
   prNumber: number;
   /** The SHAs the diff is between; every page of one read carries the same pair. */
   compared: { baseSha: string; headSha: string };
-  /** true only on the last page (`diff.done`) of a read that named nothing in `incomplete`. */
+  /** true only on the last page (`diff.done`) of a read no page of which named a gap. */
   complete: boolean;
+  /**
+   * The gaps this page names. A continuation page lists none of its own: one SNAPSHOT_INCOMPLETE entry counts
+   * every gap the read has named so far, and the first page lists as many as stay inline.
+   */
   incomplete: PrEvidenceIncomplete[];
+  /** Gaps this page counted but left out of `incomplete`. */
+  incompleteNotListed: number;
   /** The PR, files, checks and required checks; on the first page only, null on a continuation page. */
   summary: PrEvidenceSummary | null;
   /** Last, so a cut through the answer falls in the page's text, never ahead of the state. */
@@ -233,7 +253,9 @@ const cursorSchema = z.object({
   h: z.string().regex(SHA),
   d: z.string(),
   o: z.number().int().min(0),
-  /** How many gaps the first page of this snapshot named, and their digest. */
+  /** The index of the page this cursor opens. */
+  i: z.number().int().min(2),
+  /** How many gaps the pages before this one named, and a digest chained over them page by page. */
   g: z.number().int().min(0),
   gd: z.string(),
 }).strict();
@@ -241,7 +263,7 @@ type Cursor = z.infer<typeof cursorSchema>;
 
 /**
  * Signs the page cursors this process issues, so a cursor cannot be edited into another offset or into
- * a first page that had no gaps. Not a credential: it authorizes nothing, and a daemon restart only
+ * a read whose earlier pages had no gaps. Not a credential: it authorizes nothing, and a daemon restart only
  * makes earlier cursors unknown, which a fresh read without a cursor answers.
  */
 const CURSOR_KEY = randomBytes(32);
@@ -311,14 +333,36 @@ const quoteGap = (entry: PrEvidenceIncomplete, root: string): string => {
   return clip(`${entry.kind}${entry.status === undefined ? "" : ` ${entry.status}`} ${where}: ${entry.detail}`, BRIEF_GAP_CHARS);
 };
 
+/** The answer's first text block: `brief` on one line, ahead of everything else the answer says. */
+export const prEvidenceHeader = (brief: PrEvidenceBrief): string => JSON.stringify(brief);
+
 /**
- * What an answer costs as Hermes counts it, never less: the text block as `respond` writes it (pretty, the
- * evidence one level deep), escaped again by Hermes, plus structuredContent, counted here pretty as well.
+ * What an answer costs as Hermes counts it, never less: the header and the text block as `respond` writes it
+ * (pretty, the evidence one level deep), joined and escaped again by Hermes, plus structuredContent, counted
+ * here pretty as well.
  */
 const answerCost = (evidence: PrEvidence): number => {
-  const text = JSON.stringify({ evidence }, null, 2);
-  return text.length + JSON.stringify(text).length + ENVELOPE_ALLOWANCE;
+  const body = JSON.stringify({ evidence }, null, 2);
+  return JSON.stringify(`${prEvidenceHeader(evidence.brief)}\n${body}`).length + body.length + ENVELOPE_ALLOWANCE;
 };
+
+/** The largest n ≤ total for which `fits` holds once `apply(n)` ran (0 when none does), left applied. */
+const fitPrefix = (total: number, apply: (n: number) => void, fits: () => boolean): number => {
+  apply(total);
+  if (fits()) return total;
+  let lo = 0;
+  let hi = total - 1;
+  while (lo < hi) {
+    const mid = Math.ceil((lo + hi) / 2);
+    apply(mid);
+    if (fits()) lo = mid; else hi = mid - 1;
+  }
+  apply(lo);
+  return lo;
+};
+
+const isHighSurrogate = (code: number): boolean => code >= 0xd800 && code <= 0xdbff;
+const isLowSurrogate = (code: number): boolean => code >= 0xdc00 && code <= 0xdfff;
 
 /** What one diff character adds to `answerCost`: its JSON escape in structuredContent plus that escape escaped again. */
 const textCostOf = (code: number): number =>
@@ -327,21 +371,31 @@ const textCostOf = (code: number): number =>
   : code < 0x20 || (code >= 0xd800 && code <= 0xdfff) ? 13
   : 2;
 
+/** `gaps` is every gap this page counts, listed or not. */
 const briefOf = (
-  incomplete: PrEvidenceIncomplete[], root: string, compared: PrEvidence["compared"], page: PrEvidence["diff"],
-  pull: PrEvidenceSummary["pull"] | null,
+  gaps: PrEvidenceIncomplete[], root: string, pageIndex: number, evidence: PrEvidence,
 ): PrEvidenceBrief => {
   const kinds: PrEvidenceBrief["gaps"]["kinds"] = {};
-  for (const entry of incomplete) kinds[entry.kind] = (kinds[entry.kind] ?? 0) + 1;
+  for (const entry of gaps) kinds[entry.kind] = (kinds[entry.kind] ?? 0) + 1;
+  const { compared, diff: page, summary } = evidence;
+  const pull = summary?.pull ?? null;
   return {
-    complete: incomplete.length === 0 && page.done,
+    pageIndex,
+    done: page.done,
+    complete: gaps.length === 0 && page.done,
+    nextCursor: page.nextCursor,
+    reasonCode: gaps.length === 0 ? ReasonCode.OK : ReasonCode.COVERAGE_INCOMPLETE,
     baseSha: compared.baseSha,
     headSha: compared.headSha,
-    page: { offset: page.offset, chars: page.chars, totalChars: page.totalChars, done: page.done,
-      hasNextCursor: page.nextCursor !== null, textAt: "diff.text, the last field of this answer" },
+    page: { offset: page.offset, chars: page.chars, totalChars: page.totalChars, textAt: "diff.text, the last field of the JSON below" },
+    notListed: {
+      files: summary?.filesNotListed ?? 0,
+      checks: summary?.checksNotListed ?? 0,
+      gaps: evidence.incompleteNotListed,
+    },
     pull: pull === null ? null : { state: clip(pull.state, 20), merged: pull.merged, mergeability: pull.mergeability },
     // Last: a quote holds GitHub's text, so whatever it grows to downstream it cannot push the state above out.
-    gaps: { count: incomplete.length, kinds, first: incomplete.slice(0, BRIEF_GAPS_QUOTED).map((entry) => quoteGap(entry, root)) },
+    gaps: { count: gaps.length, kinds, first: gaps.slice(0, BRIEF_GAPS_QUOTED).map((entry) => quoteGap(entry, root)) },
   };
 };
 
@@ -619,7 +673,7 @@ const evaluateRequired = (
   const satisfied = observed.length > 0
     && runs.every((run) => run.status === "completed" && run.conclusion !== null && PASSING_CONCLUSIONS.has(run.conclusion))
     && states.every((status) => status.state === "success");
-  return { context, appId, sources: [...sources], satisfied, observed };
+  return { context, appId, sources: [...sources], satisfied, observed, observedNotListed: 0 };
 });
 
 /** The registered GitHub repository of the project the caller names; never one the caller describes. */
@@ -738,17 +792,23 @@ export const readPrEvidence = async (source: PrEvidenceSource, input: PrEvidence
   const diffSha256 = sha256(diff);
   if (cursor && cursor.d !== diffSha256) {
     return deny(ReasonCode.SNAPSHOT_STALE, "the diff GitHub returns is not the one this cursor was issued for; start again without a cursor", {
-      headSha, baseSha, tokenDiffSha256: cursor.d, diffSha256, incomplete,
+      headSha, baseSha, tokenDiffSha256: cursor.d, diffSha256, gaps: incomplete.length,
     });
   }
   const offset = cursor?.o ?? 0;
   if (offset > diff.length) return deny(ReasonCode.INVALID_ARGUMENT, "cursor points past the end of the diff", {});
 
   let summary: PrEvidenceSummary | null = null;
+  // What the next cursor carries: every gap the read has named up to and including this page.
+  let carried = { g: 0, gd: "" };
   if (cursor) {
-    if (cursor.g > 0) {
-      incomplete.unshift({ kind: "SNAPSHOT_INCOMPLETE", lookup: pullLookup,
-        detail: `the first page of this read named ${cursor.g} gap(s) (digest ${cursor.gd}); every page of it is incomplete` });
+    // A continuation page counts its own gaps into the read's and lists none of them.
+    const own = incomplete.splice(0);
+    carried = { g: cursor.g + own.length, gd: own.length === 0 ? cursor.gd : digestOf({ before: cursor.gd, gaps: own }) };
+    if (carried.g > 0) {
+      incomplete.push({ kind: "SNAPSHOT_INCOMPLETE", lookup: pullLookup,
+        detail: `this read has named ${carried.g} gap(s), ${cursor.g} before this page and ${own.length} on it `
+          + `(digest ${carried.gd}); every page of it is incomplete` });
     }
   } else {
     const state = text(pull["state"]);
@@ -783,6 +843,7 @@ export const readPrEvidence = async (source: PrEvidenceSource, input: PrEvidence
       })),
       filesNotListed: 0,
       checks: { headSha, checkRuns: checks.checkRuns, statuses: checks.statuses, combinedState: checks.combinedState },
+      checksNotListed: 0,
       requiredChecks: { declared: contexts.length > 0, contexts, allSatisfied },
       urls: {
         pull: html, files: html === null ? null : `${html}/files`, checks: html === null ? null : `${html}/checks`,
@@ -796,10 +857,12 @@ export const readPrEvidence = async (source: PrEvidenceSource, input: PrEvidence
   }
 
   // Sliced after every read of the snapshot, so the next cursor carries the first page's whole gap list.
+  if (!cursor) carried = { g: incomplete.length, gd: digestOf(incomplete) };
+  const gaps = [...incomplete];
+  const pageIndex = cursor?.i ?? 1;
   const pageChars = input.pageChars ?? PR_EVIDENCE_DIFF_PAGE_MAX_CHARS;
-  const carried = cursor ? { g: cursor.g, gd: cursor.gd } : { g: incomplete.length, gd: digestOf(incomplete) };
   const cursorAt = (o: number): string => encodeCursor({
-    v: 1, p: input.projectId, r: identity, n: input.prNumber, b: baseSha, h: headSha, d: diffSha256, o, ...carried,
+    v: 1, p: input.projectId, r: identity, n: input.prNumber, b: baseSha, h: headSha, d: diffSha256, o, i: pageIndex + 1, ...carried,
   });
   const compared = { baseSha, headSha };
   const page: PrEvidence["diff"] = {
@@ -816,36 +879,40 @@ export const readPrEvidence = async (source: PrEvidenceSource, input: PrEvidence
   // Key order is the order a reader of a prefix sees: see the module comment.
   const evidence: PrEvidence = {
     schema: "acp.pr-evidence.v1",
-    brief: briefOf(incomplete, root, compared, page, summary?.pull ?? null),
+    brief: undefined as unknown as PrEvidenceBrief,
     projectId: input.projectId,
     repositoryIdentity: identity,
     repositoryRole: repository.value.repositoryRole,
     prNumber: input.prNumber,
     compared,
     complete: false,
-    incomplete,
+    incomplete: gaps,
+    incompleteNotListed: 0,
     summary,
     diff: page,
   };
+  evidence.brief = briefOf(gaps, root, pageIndex, evidence);
 
   // The page is as much as keeps the whole answer inline in Hermes: see PR_EVIDENCE_ANSWER_MAX_CHARS. Measured
-  // with the page text empty and the longest cursor; the first page's file list gives way first, then the text.
+  // with the page text empty and the longest cursor. On the first page the lists give way first, each to the
+  // longest prefix that fits and counted in notListed: the files (each one is in the diff anyway), then the
+  // gaps (the brief counts them by kind), then the check runs, statuses and required-check observations.
   if (summary) {
-    const all = summary.files;
-    let listed = all.length;
-    while (listed > 0 && answerCost(evidence) > PR_EVIDENCE_ANSWER_MAX_CHARS) {
-      listed = Math.floor(listed / 2);
-      summary.files = all.slice(0, listed);
-    }
-    if (listed < all.length) {
-      // The halving overshot: add the files back one at a time while they still fit.
-      while (listed < all.length) {
-        summary.files = all.slice(0, listed + 1);
-        if (answerCost(evidence) > PR_EVIDENCE_ANSWER_MAX_CHARS) { summary.files = all.slice(0, listed); break; }
-        listed += 1;
-      }
-    }
-    summary.filesNotListed = all.length - listed;
+    const fits = (): boolean => answerCost(evidence) <= PR_EVIDENCE_ANSWER_MAX_CHARS;
+    const { files } = summary;
+    const { checkRuns, statuses } = summary.checks;
+    const observed = summary.requiredChecks.contexts.map((context) => context.observed);
+    const listedFiles = fitPrefix(files.length, (n) => { summary.files = files.slice(0, n); }, fits);
+    summary.filesNotListed = files.length - listedFiles;
+    const listedGaps = fitPrefix(gaps.length, (n) => { evidence.incomplete = gaps.slice(0, n); }, fits);
+    evidence.incompleteNotListed = gaps.length - listedGaps;
+    const perList = fitPrefix(Math.max(0, checkRuns.length, statuses.length, ...observed.map((list) => list.length)), (n) => {
+      summary.checks.checkRuns = checkRuns.slice(0, n);
+      summary.checks.statuses = statuses.slice(0, n);
+      summary.requiredChecks.contexts.forEach((context, i) => { context.observed = observed[i]!.slice(0, n); });
+    }, fits);
+    summary.checksNotListed = Math.max(0, checkRuns.length - perList) + Math.max(0, statuses.length - perList);
+    summary.requiredChecks.contexts.forEach((context, i) => { context.observedNotListed = Math.max(0, observed[i]!.length - perList); });
   }
   let room = PR_EVIDENCE_ANSWER_MAX_CHARS - answerCost(evidence);
   let end = offset;
@@ -857,19 +924,22 @@ export const readPrEvidence = async (source: PrEvidenceSource, input: PrEvidence
   }
   // A continuation page always moves on, so a read cannot stall on a page with no room.
   if (cursor && end === offset && end < diff.length) end += 1;
-  // A cut between the halves of a surrogate pair would leave half a character in each page.
-  const last = diff.charCodeAt(end - 1);
-  if (end < diff.length && last >= 0xd800 && last <= 0xdbff) end += end - offset > 1 ? -1 : 1;
+  // A page never ends between the halves of a surrogate pair: the cut steps back to where that character
+  // starts. Only when that leaves the page empty does it take the one whole character instead, two UTF-16
+  // units where pageChars or the budget allowed one, so that a read always moves on.
+  if (end > offset && end < diff.length && isHighSurrogate(diff.charCodeAt(end - 1)) && isLowSurrogate(diff.charCodeAt(end))) {
+    end = end - 1 > offset ? end - 1 : end + 1;
+  }
   const done = end >= diff.length;
   page.chars = end - offset;
   page.nextCursor = done ? null : cursorAt(end);
   page.done = done;
   page.text = diff.slice(offset, end);
-  evidence.brief = briefOf(incomplete, root, compared, page, summary?.pull ?? null);
-  evidence.complete = incomplete.length === 0 && done;
-  return incomplete.length === 0
+  evidence.complete = gaps.length === 0 && done;
+  evidence.brief = briefOf(gaps, root, pageIndex, evidence);
+  return gaps.length === 0
     ? allow(ReasonCode.OK, evidence)
     : deny(ReasonCode.COVERAGE_INCOMPLETE,
-      `this read of the pull request is incomplete (${incomplete.length} gap(s) named in incomplete); it is not evidence that anything passes`,
+      `this read of the pull request is incomplete (${gaps.length} gap(s) counted in brief.gaps); it is not evidence that anything passes`,
       evidence as unknown as Evidence);
 };
