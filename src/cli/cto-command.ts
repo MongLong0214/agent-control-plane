@@ -397,6 +397,9 @@ const stopStep = (
       const live = await livenessOf(ports, target.pid);
       return live.state === "gone" || (live.state === "alive" && live.token !== target.startToken) ? true : live.state === "unavailable" ? null : false;
     };
+    // The hold is verified first: that await takes event-loop turns in which the pid may be reused, so the token is read after it.
+    const gated = await gate?.();
+    if (gated) return gated;
     // Immediately before the signal the token is read again: only the very identity selected is signalled. A pid the
     // kernel no longer has is already stopped; a token that cannot be read, or that is another process's, refuses.
     const now = ports.startToken(target.pid);
@@ -406,8 +409,6 @@ const stopStep = (
         ? `pid ${target.pid}'s start cannot be read right before the signal, so it cannot be confirmed as the process selected; nothing was signalled or launched`
         : `pid ${target.pid} is another process than the one selected (its start changed); nothing was signalled or launched`);
     }
-    const gated = await gate?.();
-    if (gated) return gated;
     try { ports.signal(target.pid, "SIGTERM"); } catch (error) {
       // Gone between the read and the signal is the outcome this step wants; anything else is reported.
       if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;

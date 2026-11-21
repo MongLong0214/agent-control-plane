@@ -110,6 +110,8 @@ interface World {
   tokenUnavailable: Set<number>;
   /** Pids that outlive SIGTERM. */
   survivesSigterm: Set<number>;
+  /** Pids the kernel now reports under another start token (a reused pid), whatever else is scripted. */
+  tokenOverride: Map<number, string>;
   /** Pids whose token read answers null this many times once they have been signalled. */
   tokenGlitchAfterSignal: Map<number, number>;
   signalled: Set<number>;
@@ -136,7 +138,7 @@ const makeWorld = (overrides: Partial<CtoRecord> = {}, env: Record<string, strin
     out: [], changes: [], ran: [], mcpCalls: [], files, mtimes, tmux: new Set([TMUX]), repo: { exists: true }, worker: { unpublished: false, fetchFails: false }, operatorAnswers: [], provisionerAnswers: [],
     dirty: new Set<string>(), archiveUnpublished: false, daemonRejects: false, retireExecutions: 0, rotateRuns: [],
     argv: new Map<number, string[]>(), panes: new Map([[100, TMUX]]), launched: { command: null, claims: true }, pane: "registered", oldReceiptDuringLaunch: false, hiddenFromPs: new Set<number>(), psFails: false, roleConversations: [],
-    tokenUnavailable: new Set<number>(), survivesSigterm: new Set<number>(), tokenGlitchAfterSignal: new Map<number, number>(), signalled: new Set<number>(),
+    tokenUnavailable: new Set<number>(), tokenOverride: new Map<number, string>(), survivesSigterm: new Set<number>(), tokenGlitchAfterSignal: new Map<number, number>(), signalled: new Set<number>(),
     psStatFails: false, tokenAfterIdle: new Map<number, (read: number) => string | null>(),
     procs: [
       { pid: 100, ppid: 1, command: "/bin/sh /state/resident-e2e-sort-fixture.sh" },
@@ -329,6 +331,8 @@ const makeWorld = (overrides: Partial<CtoRecord> = {}, env: Record<string, strin
     kernelGone: (pid: number) => !w.procs.some((p) => p.pid === pid),
     startToken: (pid: number) => {
       if (!w.procs.some((p) => p.pid === pid) || w.tokenUnavailable.has(pid)) return null;
+      const forced = w.tokenOverride.get(pid);
+      if (forced !== undefined) return forced;
       const script = w.tokenAfterIdle.get(pid);
       if (script && w.out.some((l) => l["step"] === "idle" && l["result"] === "done")) {
         tokenReads.set(pid, (tokenReads.get(pid) ?? 0) + 1);
@@ -1163,6 +1167,41 @@ describe("a canonical relaunch resumes the role's bound conversation", () => {
       };
       const stopped = (w: World): boolean => w.out.some((l) => l["step"] === "stop" && l["result"] === "done");
 
+      // The fake hold, with `during` run inside its n-th verify (the awaited wait a gate takes), the hold itself staying open.
+      const duringVerify = (w: World, when: () => boolean, during: () => void): void => {
+        const hold = w.ports.operator.hold!;
+        let fired = false;
+        w.ports.operator.hold = async (method, params) => {
+          const held = await hold(method, params);
+          return { ...held, verify: async () => { if (!fired && when()) { fired = true; during(); } return held.verify(); } };
+        };
+      };
+
+      it("O: the pid is reused during the stop's awaited hold check: the replacement is not signalled", async () => {
+        const { w } = canonicalWorld();
+        w.switchovers = [{ toSessionUuid: U1, state: "PENDING" }];
+        let reused = false;
+        // The first verify after the mcp step is the stop's entry gate, the second is the stop's own, right before its signal.
+        let verifies = 0;
+        duringVerify(w, () => w.out.some((l) => l["step"] === "mcp" && l["result"]) && ++verifies === 2, () => { reused = true; w.tokenOverride.set(CLAUDE, "start-of-the-replacement"); });
+        expect(await runCtoCommand(["relaunch", P, "--fresh", "--apply"], w.ports)).toBe(1);
+        expect(reused).toBe(true);
+        expect(w.changes.filter((c) => c.startsWith("SIGTERM"))).toEqual([]);
+        expect(JSON.stringify(w.out)).toContain("another process than the one selected");
+      });
+
+      it("P: the pane changes during the awaited hold check before Enter: nothing is pressed", async () => {
+        const { w } = canonicalWorld();
+        w.pane = "flood";
+        w.launched.claims = false;
+        w.switchovers = [{ toSessionUuid: U1, state: "PENDING" }];
+        // Once tmux started the launch the only verify is the one right before the keystroke.
+        duringVerify(w, () => w.changes.some((c) => c.startsWith("tmux new-")), () => { w.pane = "loading"; });
+        expect(await runCtoCommand(["relaunch", P, "--fresh", "--apply"], w.ports)).toBe(1);
+        expect(w.pane).toBe("loading");
+        expect(w.changes.filter((c) => c.startsWith("tmux send-keys"))).toEqual([]);
+      });
+
       it("J: between claude mcp remove and claude mcp add, mcp add is not run", async () => {
         const { w } = canonicalWorld();
         w.switchovers = [{ toSessionUuid: U1, state: "PENDING" }];
@@ -1204,10 +1243,11 @@ describe("a canonical relaunch resumes the role's bound conversation", () => {
         w.switchovers = [{ toSessionUuid: U1, state: "PENDING" }];
         await withRealHold(w, async (cut) => {
           let captures = 0;
-          onRun(w, (bin, args) => bin === "tmux" && args[0] === "capture-pane" && ++captures === before, cut);
-          // onRun fires once, on the capture that is `before`-th: `when` is only true there.
+          // The `before`-th capture is the extra read taken after the hold check, whose own window is a documented limit; the one before
+          // it is the final read the hold check follows.
+          onRun(w, (bin, args) => bin === "tmux" && args[0] === "capture-pane" && ++captures === before - 1, cut);
           expect(await runCtoCommand(["relaunch", P, "--fresh", "--apply"], w.ports)).toBe(1);
-          expect(captures).toBeGreaterThanOrEqual(before);
+          expect(captures).toBe(before - 1);
         });
         expect(w.changes.filter((c) => c.startsWith("tmux send-keys"))).toEqual([]);
         expect(JSON.stringify(w.out)).toContain("nothing was pressed");

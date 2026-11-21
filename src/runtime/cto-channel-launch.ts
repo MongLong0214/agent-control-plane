@@ -288,7 +288,16 @@ export const confirmChannelStartup = async (
   if (last.raw !== exactBefore) {
     return { ok: false, failure: last.verdict === "OTHER_DIALOG" ? "UNRECOGNIZED_SCREEN" : "WARNING_DIFFERS", screen: last.verdict, confirmed: false };
   }
-  if (driver.proceed && !(await driver.proceed())) return { ok: false, failure: "ABORTED", screen: last.verdict, confirmed: false };
+  if (driver.proceed) {
+    if (!(await driver.proceed())) return { ok: false, failure: "ABORTED", screen: last.verdict, confirmed: false };
+    // The wait above took turns of the event loop, in which the pane may have changed: one more read, the same bytes or nothing is pressed.
+    const after = await look();
+    if (after.verdict === "REGISTERED") return { ok: true, confirmed: false };
+    if (after.raw === null) return { ok: false, failure: "UNRECOGNIZED_SCREEN", screen: after.verdict, confirmed: false };
+    if (after.raw !== exactBefore) {
+      return { ok: false, failure: after.verdict === "OTHER_DIALOG" ? "UNRECOGNIZED_SCREEN" : "WARNING_DIFFERS", screen: after.verdict, confirmed: false };
+    }
+  }
   await driver.press();
   lastRefusable = null;
   const pressed = driver.now();
