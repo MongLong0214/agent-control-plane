@@ -59,7 +59,7 @@ class ProviderDouble extends HeadlessRuntimeDouble {
       value: Object.freeze({
         ...(provider === "claude"
           ? { cto: "opus", reviewer: "opus", worker: "sonnet", ceo: "opus" }
-          : { cto: "gpt-6.1-sol", reviewer: "gpt-6.1-sol", worker: "gpt-5.6-luna-max", ceo: "gpt-6.1-sol" }),
+          : { cto: "gpt-6.2-sol", reviewer: "gpt-6.2-sol", worker: "gpt-5.6-luna-max", ceo: "gpt-6.2-sol" }),
         ...defaults,
       }),
     });

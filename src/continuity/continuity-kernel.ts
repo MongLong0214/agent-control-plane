@@ -429,7 +429,7 @@ export class ContinuityKernel {
     // session for a role that is merely expected to become active later.
     for (const role of [...requiredRoles].sort((left, right) => Number(right.inFlight) - Number(left.inFlight))) {
       // #246 — a role with a fixed runtime is planned only onto a provider in that table.
-      // BOOTSTRAP_CTO has Claude Opus. WORKER has Claude Opus or GPT 6.1 Sol (CEO decision
+      // BOOTSTRAP_CTO has Claude Opus. WORKER has Claude Opus or GPT 6.2 Sol (CEO decision
       // 129edfa1; owner instruction of 2026-10-19). A running execution is pinned to a later
       // entry only when its provider and model are that entry; a Claude worker stays on Claude,
       // the candidate the single-entry table used. One listed runtime is not swapped for the

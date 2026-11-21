@@ -200,6 +200,12 @@ export interface ControlPlaneConfig {
   commitlore?: CommitLorePort;
 }
 
+/** The blind reviewer a deployment gets without naming one: gpt-6.2-sol at xhigh, with Claude Opus behind it (§18.1). */
+const DEFAULT_REVIEWER: { preferred: ReviewerPreference; fallbacks: ReviewerPreference[] } = {
+  preferred: { provider: "gpt", model: "gpt-6.2-sol", effort: "xhigh" },
+  fallbacks: [{ provider: "claude", model: "opus", effort: null }],
+};
+
 export const defaultConfig = (root = join(homedir(), ".agent-control-plane")): ControlPlaneConfig => ({
   databasePath: join(root, "state.sqlite"),
   worktreeRoot: join(root, "worktrees"),
@@ -650,14 +656,21 @@ export class ControlPlane {
           evidence,
         });
       }
+      // An entry naming a reviewer other than gpt-6.2-sol is ignored, not refused: its project reviews on
+      // the global preferred reviewer. Recorded, so the file that still names it can be fixed.
+      const globalReviewer = (config.reviewer ?? DEFAULT_REVIEWER).preferred;
+      for (const [projectId, ignored] of projectReviewers.ignored ?? []) {
+        this.audit.record({
+          kind: "REVIEWER_PREFERENCES_REFUSED",
+          reasonCode: ReasonCode.REVIEWER_PREFERENCES_INVALID,
+          evidence: { path: reviewerFile.path, projectId, ...ignored, reviewerModel: globalReviewer.model },
+        });
+      }
       this.review = new BlindReviewGate(
         this.clock, this.db, this.audit, this.artifacts, this.#evidenceWriters.BLIND_REVIEW,
         this.sessions, this.bindings, this.providers, this.repositories, this.telemetry,
         {
-          ...(config.reviewer ?? {
-            preferred: { provider: "gpt", model: "gpt-6.1-sol", effort: "xhigh" },
-            fallbacks: [{ provider: "claude", model: "opus", effort: null }],
-          }),
+          ...(config.reviewer ?? DEFAULT_REVIEWER),
           // Absent unless an entry applies, so the default preferences are exactly what they were.
           ...(projectReviewers.byProject.size === 0 ? {} : { projects: projectReviewers.byProject }),
           ...(projectReviewers.refusedProjects.size === 0 ? {} : { refusedProjects: projectReviewers.refusedProjects }),
