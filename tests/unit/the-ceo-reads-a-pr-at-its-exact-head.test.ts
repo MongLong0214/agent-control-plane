@@ -142,7 +142,8 @@ interface Page {
     baseSha: string;
     headSha: string;
     page: { offset: number; chars: number; totalChars: number; textAt: string };
-    notListed: { files: number; checks: number; gaps: number };
+    ok: boolean;
+    notListed: { files: number; checks: number; requiredContexts: number; gaps: number };
     pull: { state: string; merged: boolean | null; mergeability: string } | null;
     gaps: { count: number; kinds: Record<string, number>; first: string[] };
   };
@@ -161,6 +162,7 @@ interface Page {
       statuses: Array<{ context: string; state: string; url: string | null }>;
     };
     checksNotListed: number;
+    requiredContextsNotListed: number;
     requiredChecks: { declared: boolean; allSatisfied: boolean | null; contexts: Array<{ context: string; satisfied: boolean; observed: Array<{ state: string | null }> }> };
     urls: Record<string, unknown>;
   };
@@ -207,6 +209,8 @@ const channel = async (peer: AuthenticatedMcpPeer, withProvenance = true) => {
 const HERMES_TOOL_ERROR_CAP = 2048;
 const textOf = (content: unknown): string => (content as Array<{ type: string; text?: string }>).map((block) => block.text ?? "").join("\n");
 const hermesView = (content: unknown): string => textOf(content).slice(0, HERMES_TOOL_ERROR_CAP);
+/** All of an ordinary result's text, and of a tool error only what hermesView shows. */
+const hermesKept = (result: Row): string => result.isError ? hermesView(result.content) : textOf(result.content);
 /** What a spilled answer leaves inline: the first 1,500 characters (tools/budget_config.py DEFAULT_PREVIEW_SIZE_CHARS). */
 const HERMES_SPILL_PREVIEW_CHARS = 1_500;
 
@@ -605,10 +609,12 @@ describe("pr_evidence_get", () => {
 
     const { raw } = await channel(ceoPeer);
     const result = await raw({ projectId, prNumber: 30, expectedHead: HEAD_A, pageChars: PR_EVIDENCE_DIFF_PAGE_MAX_CHARS - 1 });
-    expect(result.isError).toBe(true);
-    const body = result.structuredContent as { reasonCode: string; message: string; evidence: Row };
-    expect(body.reasonCode).toBe(ReasonCode.COVERAGE_INCOMPLETE);
+    // An incomplete page is an ordinary result that still says ok false and COVERAGE_INCOMPLETE.
+    expect(result.isError).toBeFalsy();
+    const body = result.structuredContent as { ok: boolean; reasonCode: string; message: string; evidence: Row };
+    expect(body).toMatchObject({ ok: false, reasonCode: ReasonCode.COVERAGE_INCOMPLETE });
     const page = body.evidence as unknown as Page;
+    expect(page.brief).toMatchObject({ ok: false, reasonCode: ReasonCode.COVERAGE_INCOMPLETE });
     expect(page.brief.gaps.count).toBeGreaterThanOrEqual(25);
     expect(Object.keys(page.brief.gaps.kinds)).toHaveLength(8);
     // The listed gaps and the ones only counted add up; the whole answer stays inline.
@@ -650,7 +656,7 @@ describe("pr_evidence_get", () => {
     expect(page.summary!.requiredChecks).toMatchObject({ allSatisfied: true });
   });
 
-  it("lists no gaps on a continuation page and keeps it inline, counting the read's gaps in one entry", async () => {
+  it("lists a continuation page's own gaps after one entry counting the read's, and keeps it inline", async () => {
     // Forty files GitHub gave no patch for: the first page names forty gaps, a continuation re-reads all forty.
     const omitted = Array.from({ length: 40 }, (_, i) => {
       const row: Row = { ...fileRow(i, 900), filename: `assets/${"generated-".repeat(8)}${i}.bin` };
@@ -667,17 +673,64 @@ describe("pr_evidence_get", () => {
     let continuations = 0;
     while (cursor) {
       result = await raw({ projectId, prNumber: 33, expectedHead: HEAD_A, cursor });
-      expect(result.isError).toBe(true);
+      expect(result.isError).toBeFalsy();
       const page = (result.structuredContent as { evidence: Page }).evidence;
       expect(hermesInlineChars(result)).toBeLessThanOrEqual(HERMES_MCP_INLINE_CHARS);
-      expect(page.incomplete).toEqual([expect.objectContaining({ kind: "SNAPSHOT_INCOMPLETE",
-        detail: expect.stringContaining(`${40 * (continuations + 2)} gap(s)`) })]);
+      expect(page.incomplete[0]).toMatchObject({ kind: "SNAPSHOT_INCOMPLETE",
+        detail: expect.stringContaining(`${40 * (continuations + 2)} gap(s)`) });
+      expect(page.incomplete.slice(1).every((entry) => entry.kind === "PATCH_OMITTED")).toBe(true);
+      expect(page.incomplete.length + page.incompleteNotListed).toBe(41);
       expect(page.complete).toBe(false);
       if (page.diff.nextCursor) expectCursorUpFront(result, page.diff.nextCursor);
       cursor = page.diff.nextCursor;
       continuations += 1;
     }
     expect(continuations).toBeGreaterThan(1);
+  });
+
+  it("returns every page of a PR with a binary file as an ordinary result whose diff text is visible to the end", async () => {
+    // GitHub gives no patch for the binary file, so every page of the read is COVERAGE_INCOMPLETE.
+    const binary: Row = { ...fileRow(0), filename: "assets/logo.png" };
+    delete binary["patch"];
+    gh.pulls.push(pullRow(36, HEAD_A, 151));
+    gh.filesByHead.set(HEAD_A, [binary, ...Array.from({ length: 150 }, (_, i) => fileRow(1 + i))]);
+    gh.checkRuns.push({ id: 10, name: "ci", head_sha: HEAD_A, status: "completed", conclusion: "success" });
+    const { raw } = await channel(ceoPeer);
+    const pages: Page[] = [];
+    let cursor: string | null = null;
+    do {
+      const result = await raw({ projectId, prNumber: 36, expectedHead: HEAD_A, ...(cursor ? { cursor } : {}) });
+      const body = result.structuredContent as { ok: boolean; reasonCode: string; evidence: Page };
+      expect(body).toMatchObject({ ok: false, reasonCode: ReasonCode.COVERAGE_INCOMPLETE });
+      const page = body.evidence;
+      expect(hermesInlineChars(result)).toBeLessThanOrEqual(HERMES_MCP_INLINE_CHARS);
+      // The page's whole text, as the JSON block writes it, is in what Hermes keeps of the answer.
+      expect(page.diff.chars).toBeGreaterThan(0);
+      expect(hermesKept(result), `page ${pages.length + 1}`).toContain(JSON.stringify(page.diff.text).slice(1, -1));
+      pages.push(page);
+      cursor = page.diff.nextCursor;
+      expect(pages.length).toBeLessThan(200);
+    } while (cursor);
+    expect(pages.length).toBeGreaterThan(2);
+    expect(sha256(pages.map((page) => page.diff.text).join(""))).toBe(pages[0]!.diff.sha256);
+    expect(pages.every((page) => page.complete === false)).toBe(true);
+  });
+
+  it("keeps a first page with 240 required contexts inline, listing what fits and judging all of them", async () => {
+    seedNormalPull(37);
+    const required = Array.from({ length: 240 }, (_, i) => `required/${"integration-suite-".repeat(2)}${String(i).padStart(3, "0")}`);
+    gh.branchBodies.set("main", { name: "main", protected: true, protection: { enabled: true,
+      required_status_checks: { enforcement_level: "everyone", contexts: required, checks: required.map((context) => ({ context, app_id: null })) } } });
+    const { raw } = await channel(ceoPeer);
+    const result = await raw({ projectId, prNumber: 37, expectedHead: HEAD_A });
+    const page = pageOf(result.structuredContent as Answer);
+    expect(hermesInlineChars(result)).toBeLessThanOrEqual(HERMES_MCP_INLINE_CHARS);
+    const { requiredChecks, requiredContextsNotListed } = page.summary!;
+    expect(requiredContextsNotListed).toBeGreaterThan(0);
+    // The 240 from branch protection and lint from the ruleset.
+    expect(requiredChecks.contexts.length + requiredContextsNotListed).toBe(241);
+    expect(page.brief.notListed).toMatchObject({ requiredContexts: requiredContextsNotListed });
+    expect(requiredChecks).toMatchObject({ declared: true, allSatisfied: false });
   });
 
   it("keeps a read incomplete to its last page once any continuation page named a gap", async () => {
@@ -689,6 +742,11 @@ describe("pr_evidence_get", () => {
     const second = await ceoCall({ projectId, prNumber: 34, expectedHead: HEAD_A, pageChars: 30_000, cursor: first.diff.nextCursor });
     expect(second).toMatchObject({ ok: false, reasonCode: ReasonCode.COVERAGE_INCOMPLETE });
     if (second.ok) throw new Error("unreachable");
+    // What failed on page 2 is named on page 2, after the entry that counts the read's gaps.
+    expect((second.evidence as unknown as Page).incomplete).toEqual([
+      expect.objectContaining({ kind: "SNAPSHOT_INCOMPLETE", detail: expect.stringContaining("1 gap(s), 0 before this page and 1 on it") }),
+      expect.objectContaining({ kind: "MALFORMED_RESPONSE", lookup: expect.stringContaining("/compare/") }),
+    ]);
     let cursor = (second.evidence as unknown as Page).diff.nextCursor;
     expect(cursor).toEqual(expect.any(String));
     // GitHub recovers; every later page, the last included, stays incomplete.

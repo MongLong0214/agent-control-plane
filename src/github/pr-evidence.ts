@@ -159,6 +159,8 @@ export interface PrEvidenceSummary {
   checks: { headSha: string; checkRuns: PrEvidenceCheckRun[]; statuses: PrEvidenceStatus[]; combinedState: string | null };
   /** Check runs and statuses left out of `checks` to keep the first page inline; `requiredChecks` was judged on all of them. */
   checksNotListed: number;
+  /** Required-check contexts left out of `requiredChecks.contexts` to keep the first page inline; `allSatisfied` was judged on all of them. */
+  requiredContextsNotListed: number;
   requiredChecks: {
     /** Whether GitHub declares any required check for the base branch (branch protection or rulesets). */
     declared: boolean;
@@ -195,12 +197,14 @@ export interface PrEvidenceBrief {
   /** true only on the last page of a read no page of which named a gap. */
   complete: boolean;
   nextCursor: string | null;
+  /** As the answer's body says: false with COVERAGE_INCOMPLETE while any page of the read named a gap. */
+  ok: boolean;
   reasonCode: string;
   baseSha: string;
   headSha: string;
   page: { offset: number; chars: number; totalChars: number; textAt: string };
-  /** What this answer counts but does not list, to stay inline: files, check runs and statuses, gaps. */
-  notListed: { files: number; checks: number; gaps: number };
+  /** What this answer counts but does not list, to stay inline: files, check runs and statuses, required contexts, gaps. */
+  notListed: { files: number; checks: number; requiredContexts: number; gaps: number };
   /** On the first page only, null on a continuation page, as `summary` is. */
   pull: { state: string; merged: boolean | null; mergeability: PrEvidenceMergeability } | null;
   /** Every gap counted by kind, and the first BRIEF_GAPS_QUOTED as one bounded line each. */
@@ -384,6 +388,7 @@ const briefOf = (
     done: page.done,
     complete: gaps.length === 0 && page.done,
     nextCursor: page.nextCursor,
+    ok: gaps.length === 0,
     reasonCode: gaps.length === 0 ? ReasonCode.OK : ReasonCode.COVERAGE_INCOMPLETE,
     baseSha: compared.baseSha,
     headSha: compared.headSha,
@@ -391,6 +396,7 @@ const briefOf = (
     notListed: {
       files: summary?.filesNotListed ?? 0,
       checks: summary?.checksNotListed ?? 0,
+      requiredContexts: summary?.requiredContextsNotListed ?? 0,
       gaps: evidence.incompleteNotListed,
     },
     pull: pull === null ? null : { state: clip(pull.state, 20), merged: pull.merged, mergeability: pull.mergeability },
@@ -802,13 +808,13 @@ export const readPrEvidence = async (source: PrEvidenceSource, input: PrEvidence
   // What the next cursor carries: every gap the read has named up to and including this page.
   let carried = { g: 0, gd: "" };
   if (cursor) {
-    // A continuation page counts its own gaps into the read's and lists none of them.
+    // A continuation page counts its own gaps into the read's, and lists them after one entry that counts the read's.
     const own = incomplete.splice(0);
     carried = { g: cursor.g + own.length, gd: own.length === 0 ? cursor.gd : digestOf({ before: cursor.gd, gaps: own }) };
     if (carried.g > 0) {
       incomplete.push({ kind: "SNAPSHOT_INCOMPLETE", lookup: pullLookup,
         detail: `this read has named ${carried.g} gap(s), ${cursor.g} before this page and ${own.length} on it `
-          + `(digest ${carried.gd}); every page of it is incomplete` });
+          + `(digest ${carried.gd}); every page of it is incomplete` }, ...own);
     }
   } else {
     const state = text(pull["state"]);
@@ -844,6 +850,7 @@ export const readPrEvidence = async (source: PrEvidenceSource, input: PrEvidence
       filesNotListed: 0,
       checks: { headSha, checkRuns: checks.checkRuns, statuses: checks.statuses, combinedState: checks.combinedState },
       checksNotListed: 0,
+      requiredContextsNotListed: 0,
       requiredChecks: { declared: contexts.length > 0, contexts, allSatisfied },
       urls: {
         pull: html, files: html === null ? null : `${html}/files`, checks: html === null ? null : `${html}/checks`,
@@ -894,25 +901,32 @@ export const readPrEvidence = async (source: PrEvidenceSource, input: PrEvidence
   evidence.brief = briefOf(gaps, root, pageIndex, evidence);
 
   // The page is as much as keeps the whole answer inline in Hermes: see PR_EVIDENCE_ANSWER_MAX_CHARS. Measured
-  // with the page text empty and the longest cursor. On the first page the lists give way first, each to the
-  // longest prefix that fits and counted in notListed: the files (each one is in the diff anyway), then the
-  // gaps (the brief counts them by kind), then the check runs, statuses and required-check observations.
+  // with the page text empty and the longest cursor. The lists give way first, each to the longest prefix that
+  // fits and counted in notListed: the files (each one is in the diff anyway), then the gaps (the brief counts
+  // them by kind), then the check runs, statuses and required-check observations, then the required contexts.
+  const fits = (): boolean => answerCost(evidence) <= PR_EVIDENCE_ANSWER_MAX_CHARS;
+  const listGaps = (): void => {
+    evidence.incompleteNotListed = gaps.length - fitPrefix(gaps.length, (n) => { evidence.incomplete = gaps.slice(0, n); }, fits);
+  };
   if (summary) {
-    const fits = (): boolean => answerCost(evidence) <= PR_EVIDENCE_ANSWER_MAX_CHARS;
     const { files } = summary;
     const { checkRuns, statuses } = summary.checks;
-    const observed = summary.requiredChecks.contexts.map((context) => context.observed);
+    const { contexts } = summary.requiredChecks;
+    const observed = contexts.map((context) => context.observed);
     const listedFiles = fitPrefix(files.length, (n) => { summary.files = files.slice(0, n); }, fits);
     summary.filesNotListed = files.length - listedFiles;
-    const listedGaps = fitPrefix(gaps.length, (n) => { evidence.incomplete = gaps.slice(0, n); }, fits);
-    evidence.incompleteNotListed = gaps.length - listedGaps;
+    listGaps();
     const perList = fitPrefix(Math.max(0, checkRuns.length, statuses.length, ...observed.map((list) => list.length)), (n) => {
       summary.checks.checkRuns = checkRuns.slice(0, n);
       summary.checks.statuses = statuses.slice(0, n);
       summary.requiredChecks.contexts.forEach((context, i) => { context.observed = observed[i]!.slice(0, n); });
     }, fits);
     summary.checksNotListed = Math.max(0, checkRuns.length - perList) + Math.max(0, statuses.length - perList);
-    summary.requiredChecks.contexts.forEach((context, i) => { context.observedNotListed = Math.max(0, observed[i]!.length - perList); });
+    contexts.forEach((context, i) => { context.observedNotListed = Math.max(0, observed[i]!.length - perList); });
+    const listedContexts = fitPrefix(contexts.length, (n) => { summary.requiredChecks.contexts = contexts.slice(0, n); }, fits);
+    summary.requiredContextsNotListed = contexts.length - listedContexts;
+  } else {
+    listGaps();
   }
   let room = PR_EVIDENCE_ANSWER_MAX_CHARS - answerCost(evidence);
   let end = offset;
