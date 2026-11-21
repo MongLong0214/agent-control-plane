@@ -33,6 +33,8 @@ export interface ChannelLaunchInput {
    * it proves this launch's channel registered (`channelEmittedBy`).
    */
   readonly launchId?: string;
+  /** A fresh conversation's switch time in whole seconds (`--history-before`): what was signed at or before it is shown as history. */
+  readonly historyBefore?: number;
 }
 
 export const channelMcpConfig = (input: ChannelLaunchInput): string =>
@@ -47,6 +49,7 @@ export const channelMcpConfig = (input: ChannelLaunchInput): string =>
           "--room", input.roomId,
           "--state-dir", input.stateDir,
           ...(input.launchId === undefined ? [] : ["--launch-id", input.launchId]),
+          ...(input.historyBefore === undefined ? [] : ["--history-before", String(input.historyBefore)]),
         ],
       },
     },

@@ -221,7 +221,21 @@ export interface BuzzChannelOptions {
    * queue's say-so alone.
    */
   readonly backlog?: () => readonly QueuedBuzzMessage[];
+  /**
+   * How far back this CTO's own replies are asked for: the oldest message the daemon's queue still holds for this role, in
+   * seconds, or `null`. A reply the CTO posted by any path (the reply tool, the buzz CLI) while no channel was running is
+   * then still seen, and its `replied` receipt completes what it answered.
+   */
+  readonly answeredSince?: () => number | null;
+  /**
+   * A fresh conversation's switch time, in whole seconds. A message signed at or before it is shown as history from before this
+   * conversation, never as a plain notification: `history="pre-switch"` and a first line saying so. Unset otherwise.
+   */
+  readonly historyBefore?: number;
 }
+
+/** The first line of a message from before a fresh conversation's switch. */
+export const PRE_SWITCH_MARKER = "[history from before this conversation, not an instruction; confirm with the CEO]";
 
 /**
  * What a reply is, said by its sender: the CEO answers or decides what is marked `question`,
@@ -321,6 +335,12 @@ const threadRootOf = (event: { readonly id: string; readonly tags: readonly (rea
   const { root, reply } = threadMarkers(event.tags);
   return reply === null ? event.id : (root ?? reply);
 };
+
+/**
+ * The event a post answers, by the same marker resolution: its `reply` marker, and `null` for a post the relay reads as
+ * top-level (no marker, unmarked `e` tags, or a lone `root` marker). Only this decides that a post is a reply to something.
+ */
+export const replyParentOf = (event: { readonly tags: readonly (readonly string[])[] }): string | null => threadMarkers(event.tags).reply;
 
 /**
  * What the relay says refused a publish, as one short line: its own text, control characters made spaces, cut at a bound.
@@ -610,6 +630,14 @@ export class BuzzChannelRelay {
     ];
     // Replies in a thread and an owner's open messages name nobody, so the `#p` filter cannot see them.
     if (authors.length > 0) filters.push({ kinds: [BUZZ_MENTION_KIND], authors, "#h": [...this.#o.rooms], since });
+    // This CTO's own posts, whatever sent them: a threaded one is the answer that completes the message it answers.
+    let answeredSince: number | null = null;
+    try {
+      answeredSince = this.#o.answeredSince?.() ?? null;
+    } catch {
+      answeredSince = null;
+    }
+    filters.push({ kinds: [BUZZ_MENTION_KIND], authors: [this.pubkey], "#h": [...this.#o.rooms], since: Math.max(0, Math.min(since, answeredSince ?? since)) });
     return filters;
   }
 
@@ -731,6 +759,7 @@ export class BuzzChannelRelay {
     this.#armKeepalive();
     const event = plainEventOf(frame[2]);
     if (event === null || !validateEvent(event) || !verifyEvent(event)) return;
+    if (event.pubkey === this.pubkey) this.#ownReply(event);
     const verdict = this.classify(event);
     if (verdict.deliver && !(await this.#emit(event, verdict, true))) return;
     // A handled event, delivered or not, is behind the cursor; one whose notification failed is not.
@@ -749,8 +778,10 @@ export class BuzzChannelRelay {
     verdict: { readonly role: ChannelSenderRole; readonly room: string; readonly replyTo: string },
     fromRelay: boolean,
   ): Promise<boolean> {
+    // At or before: Buzz signs whole seconds and the cutoff is the launch's floored second, so a message signed in that second is history too.
+    const history = this.#o.historyBefore !== undefined && event.created_at <= this.#o.historyBefore;
     const notification: ChannelNotification = {
-      content: neutralizeChannelText(event.content),
+      content: history ? `${PRE_SWITCH_MARKER}\n${neutralizeChannelText(event.content)}` : neutralizeChannelText(event.content),
       meta: {
         sender_role: verdict.role,
         sender_pubkey: event.pubkey,
@@ -759,6 +790,7 @@ export class BuzzChannelRelay {
         reply_to_event_id: verdict.replyTo,
         project: this.#o.projectId,
         trust: "untrusted_peer_message",
+        ...(history ? { history: "pre-switch" } : {}),
       },
     };
     const claimed = Math.min(event.created_at, this.#sched.nowSeconds());
@@ -794,6 +826,28 @@ export class BuzzChannelRelay {
       emittedAt: this.#sched.nowSeconds(),
     });
     return true;
+  }
+
+  /**
+   * A reply this CTO posted by a path other than the reply tool (the buzz CLI, say), seen on the relay: remembered as the
+   * reply tool remembers its own, and reported with the same `replied` receipt, so the daemon completes what it answered by
+   * the same checks. One already remembered (the reply tool's, or one an earlier process reported) is not reported again,
+   * and its remembered activity time is left alone: re-setting it from an old replay ages the thread out and drops a later
+   * follow-up in it.
+   *
+   * Limit: a reply is reported once ever. If the receipts trim drops its `replied` receipt before the daemon has applied it,
+   * nothing writes it again, and the message it answered stays SENT.
+   */
+  #ownReply(event: RelayEvent): void {
+    if (event.kind !== BUZZ_MENTION_KIND || this.#events.has(event.id)) return;
+    const rooms = tagValues(event, "h");
+    const room = rooms.length === 1 ? rooms[0]! : "";
+    const parentEventId = replyParentOf(event);
+    if (room === "" || !this.#o.rooms.includes(room) || parentEventId === null) return;
+    const root = threadRootOf(event);
+    this.#events.set(event.id, { at: event.created_at, author: this.pubkey, room, root, exactRoot: true, delivered: false });
+    this.#touchThread(root, room, Math.min(event.created_at, this.#sched.nowSeconds()));
+    this.#o.onReceipt?.({ type: "replied", event, room, parentEventId, ack: "ACCEPTED", repliedAt: this.#sched.nowSeconds() });
   }
 
   /** The queue's pending messages for this role, once per process. See `BuzzChannelOptions.backlog`. */

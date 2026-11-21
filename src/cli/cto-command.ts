@@ -134,6 +134,8 @@ export interface CtoStateReader {
   project(projectId: string): CtoRecord | null;
   /** The project's runs that are not finished, newest first. */
   openRuns(projectId: string): Array<{ runId: string; state: string; kind: string }>;
+  /** The ids of the CTO's Buzz messages still queued (PENDING, or SENT and never completed), oldest first. */
+  queuedMessages?(projectId: string): string[];
   /** The shared one-CTO rule's scope for the role, from the database (`ctoRoleScope`), with what this run adds. */
   roleScope(projectId: string, extra?: { conversationIds?: readonly string[]; checkouts?: readonly string[] }): CtoRoleScope;
 }
@@ -488,9 +490,12 @@ const channelOf = (ports: CtoPorts, record: CtoRecord): { keyFile: string; roomI
 interface CanonicalLauncher { tmux: string; cwd: string; claude: string; keyFile: string; roomId: string; resume: string[] }
 const quoteShell = (v: string): string => `'${v.replaceAll("'", "'\\''")}'`;
 /** The launcher script for one launch: `launchId` is this launch's own, passed to its channel server. */
-const writeCanonicalLauncher = (ports: CtoPorts, projectId: string, plan: CanonicalLauncher, launchId?: string): string[] => {
+const writeCanonicalLauncher = (ports: CtoPorts, projectId: string, plan: CanonicalLauncher, launchId?: string, historyBefore?: number): string[] => {
   const argv = [plan.claude,
-    ...channelLaunchArgs({ runtimeNode: runtimeNodeOf(ports), runtimeCli: runtimeCliOf(ports), projectId, keyFile: plan.keyFile, roomId: plan.roomId, stateDir: ports.stateDir, ...(launchId ? { launchId } : {}) }),
+    ...channelLaunchArgs({
+      runtimeNode: runtimeNodeOf(ports), runtimeCli: runtimeCliOf(ports), projectId, keyFile: plan.keyFile, roomId: plan.roomId, stateDir: ports.stateDir,
+      ...(launchId ? { launchId } : {}), ...(historyBefore !== undefined ? { historyBefore } : {}),
+    }),
     ...plan.resume];
   ports.files.replace(canonicalLauncherOf(ports, projectId), `#!/bin/sh\n# cto-launch: ${JSON.stringify(plan)}\n` +
     "unset ACP_OPERATOR_TOKEN ACP_MCP_TOKEN ACP_BUZZ_INGRESS_SECRET GH_TOKEN GITHUB_TOKEN\n" +
@@ -705,7 +710,17 @@ const canonicalResumeSteps = (
       if (gated) return gated;
       // This launch's own id, in the script tmux is about to start and so in its channel server's every receipt.
       const launchId = ports.newUuid();
-      const argv = writeCanonicalLauncher(ports, projectId, planned, launchId);
+      // A fresh conversation is told that what was signed by its launch's second is history, never a current instruction. Every
+      // --fresh attempt sets the cutoff to its own launch: this step runs in one only while the new conversation has not claimed
+      // (a claimed swap skips every step). Once it has, the cutoff kept with its uuid is frozen, and a resume passes the same one.
+      const uuid = planned.resume[1] ?? "";
+      const stored = readHandoff(ports.files, ports.stateDir, projectId);
+      let historyBefore = !options.fresh && UUID.test(uuid) && stored?.history?.conversation === uuid ? stored.history.before : undefined;
+      if (options.fresh) {
+        historyBefore = Math.floor(ports.now() / 1000);
+        if (UUID.test(uuid)) markHandoff(ports.files, ports.stateDir, projectId, { history: { conversation: uuid, before: historyBefore } });
+      }
+      const argv = writeCanonicalLauncher(ports, projectId, planned, launchId, historyBefore);
       const tmuxRun = (args: string[]): CtoExecResult => ports.run("tmux", args, { timeoutMs: 10_000 });
       const started = tmuxExists(ports, planned.tmux)
         ? tmuxRun(["new-window", "-d", "-P", "-F", "#{pane_id}", "-t", `=${planned.tmux}:`, launcher])
@@ -964,7 +979,7 @@ const freshSteps = (ports: CtoPorts, record: CtoRecord, next: string, hold: { op
     run: async () => {
       let stored = readHandoff(ports.files, ports.stateDir, projectId);
       if (stored?.conversation !== old) {
-        const text = fallbackHandoff({ projectId, conversation: old, generation: record.generation, openRuns: ports.state.openRuns(projectId) });
+        const text = fallbackHandoff({ projectId, conversation: old, generation: record.generation, openRuns: ports.state.openRuns(projectId), queuedMessages: ports.state.queuedMessages?.(projectId) ?? [] });
         const written = writeHandoff(ports.files, ports.stateDir, { projectId, conversation: old, source: "acp", text, now: new Date(ports.now()).toISOString() });
         if (!written.ok) return refused(written.reason);
         stored = written.handoff;
@@ -1431,6 +1446,9 @@ export const openCtoState = async (databasePath: string): Promise<CtoStateReader
     openRuns: (projectId) => withDb((db) => (db.prepare(
       `SELECT run_id AS runId, state, kind FROM runs WHERE (project_id = ? OR owner_role_key = ?) AND state NOT IN ('COMPLETED','FAILED','CANCELLED') ORDER BY created_at DESC, run_id LIMIT 10`)
       .all(projectId, `PRIMARY_CTO:${projectId}`) as Array<{ runId: string; state: string; kind: string }>)),
+    queuedMessages: (projectId) => withDb((db) => (db.prepare(
+      `SELECT message_id AS id FROM outbox WHERE role_key = ? AND kind IN ('OWNER_MESSAGE','PEER_MESSAGE') AND status IN ('PENDING','SENT') ORDER BY created_at, rowid`)
+      .all(`PRIMARY_CTO:${projectId}`) as Array<{ id: string }>).map((row) => row.id)),
     roleScope: (projectId, extra) => withDb((db) => ctoRoleScope(<T>(sql: string, params: readonly unknown[]) => db.prepare(sql).all(...params) as T[], projectId, extra)),
   };
 };
