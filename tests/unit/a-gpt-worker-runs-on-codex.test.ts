@@ -288,6 +288,54 @@ describe("provisioning replaces a worker bound to a retired model (#1477)", () =
     }
   });
 
+  it("a refused replacement bind leaves the retired binding ACTIVE and its session READY", async () => {
+    const harness = makeHarness();
+    try {
+      const run = await activeRun(harness);
+      const retiredSessionId = bindWorker(harness, run.taskId, { provider: "gpt", model: "gpt-6.1-sol" });
+      const roleKey = roleKeyFor(Role.WORKER, { taskId: run.taskId });
+      const root = tempDir("acp-codex-refused-bind-");
+      const runtime = tempDir("acp-codex-refused-bind-runtime-");
+      mkdirSync(runtime, { recursive: true });
+      const codex = new CodexCliAdapter({
+        clock: harness.clock,
+        capacityFile: join(root, "capacity.json"),
+        binary: stubCodex(root, "ok", runtime),
+      });
+      const staffing = new WorkerStaffing(harness.cp.db, harness.clock, harness.cp.audit, {
+        runs: harness.cp.runs,
+        tasks: {
+          get: (taskId) => harness.cp.tasks.get(taskId),
+          admitWorkerFanout: async () => allow(ReasonCode.OK, undefined),
+        },
+        // The real registry revokes, and the replacement's bind is then refused: the revocation must not stand.
+        bindings: {
+          active: (key) => harness.cp.bindings.active(key),
+          history: (key) => harness.cp.bindings.history(key),
+          revoke: (key, reason, options) => harness.cp.bindings.revoke(key, reason, options),
+          bind: () => deny(ReasonCode.CONFLICT, "test: the replacement's bind is refused"),
+        },
+        sessions: harness.cp.sessions,
+        providers: { requireForRole: () => codex },
+        readiness: { checkSession: async () => allow(ReasonCode.OK, undefined) },
+      }, runtime);
+      const provisioned = await staffing.provision({
+        runId: run.runId,
+        taskId: run.taskId,
+        provider: "gpt",
+        ownerBindingGeneration: run.ownerBindingGeneration,
+        fence: () => allow(ReasonCode.OK, { sessionId: run.ownerSessionId, bindingGeneration: run.ownerBindingGeneration }),
+      });
+      expect(provisioned).toMatchObject({ allowed: false, reasonCode: ReasonCode.CONFLICT });
+      expect(harness.cp.bindings.active(roleKey)).toMatchObject({ sessionId: retiredSessionId, bindingGeneration: 1, status: "ACTIVE" });
+      expect(harness.cp.bindings.history(roleKey)).toHaveLength(1);
+      expect(harness.cp.sessions.get(retiredSessionId)?.lifecycle).toBe(SessionLifecycle.READY);
+      expect(harness.cp.audit.byKind("BINDING_REVOKED").filter((row) => row.roleKey === roleKey)).toEqual([]);
+    } finally {
+      harness.cp.close();
+    }
+  });
+
   it("the BINDING_REVOKED record names the replacement actually bound: a claude worker is opus, never gpt-6.2-sol", async () => {
     const harness = makeHarness();
     try {

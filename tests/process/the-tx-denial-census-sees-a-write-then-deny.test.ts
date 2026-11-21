@@ -343,6 +343,14 @@ const CONVERTED_SITES: Array<{ label: string; file: string; anchor: string; witn
     anchor: "        const decision = this.ports.db.txDecision(() => {",
   },
   {
+    // #1477: the retired binding's revocation and its session's DRAINING move are one write with the replacement's bind.
+    label: "WorkerStaffing.provision (retire, then bind)",
+    file: "run/worker-staffing.ts",
+    anchor: "      bound = this.db.txDecision(() => {",
+    witnesses: [{ file: "tests/unit/a-gpt-worker-runs-on-codex.test.ts",
+      title: "a refused replacement bind leaves the retired binding ACTIVE and its session READY" }],
+  },
+  {
     // S-HOLD (#1162): a release whose conditional UPDATE matched no row is refused after its RUN_TRANSITION.
     label: "RunEngine.releaseContinuityHold",
     file: "run/run-engine.ts",
