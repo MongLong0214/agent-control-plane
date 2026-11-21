@@ -832,8 +832,11 @@ const createHermesServerFromPort = (
         "changed files with additions and deletions, the whole diff built from GitHub's file patches, the check runs and " +
         "statuses at exactly headSha with URLs, and the base branch's required checks with whether each is green there. " +
         "A head other than expectedHead is MERGE_HEAD_STALE with both SHAs and nothing else. The diff comes in pages of at " +
-        `most ${PR_EVIDENCE_DIFF_PAGE_MAX_CHARS} characters: every page carries compared {baseSha, headSha}, the diff's ` +
-        "sha256 and total size, offset, done and nextCursor; pass nextCursor back as cursor with the same expectedHead. A " +
+        `most ${PR_EVIDENCE_DIFF_PAGE_MAX_CHARS} characters, fewer when that keeps the whole answer inline (on the first ` +
+        "page the file list gives way first; filesNotListed counts what the diff alone carries): every page carries " +
+        "compared {baseSha, headSha}, the diff's sha256 and total size, offset, done and nextCursor; pass nextCursor back " +
+        "as cursor with the same expectedHead until done, and join the pages' text in order. complete is true only on the " +
+        "last page of a read that named nothing incomplete. A " +
         "cursor issued against another head, base or diff is refused SNAPSHOT_STALE; start again without one. Anything " +
         "not read (a failed or missing page, a patch GitHub omitted, mergeability not yet computed) is named in incomplete, " +
         "and the answer is then COVERAGE_INCOMPLETE with what was read as its evidence: incomplete data is never a pass. " +

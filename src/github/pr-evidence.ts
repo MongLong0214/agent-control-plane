@@ -57,6 +57,15 @@ export interface PrEvidenceInput {
 /** The most diff characters one answer carries; a longer diff is read in pages. */
 export const PR_EVIDENCE_DIFF_PAGE_MAX_CHARS = 100_000;
 
+/**
+ * The most characters one answer may cost as Hermes counts it before moving it to a local spillover file
+ * the CEO's turn cannot read: the text block (escaped once more by Hermes) plus structuredContent, against
+ * DEFAULT_MCP_RESULT_SIZE_CHARS (50,000) in hermes-agent tools/budget_config.py, with room to spare.
+ */
+export const PR_EVIDENCE_ANSWER_MAX_CHARS = 45_000;
+/** The answer's ok, reasonCode and message around the evidence, as `respond` adds them. */
+const ENVELOPE_ALLOWANCE = 1_000;
+
 const PER_PAGE = 100;
 /** GitHub's compare lists at most this many files; a larger diff is named incomplete. */
 const COMPARE_FILE_LIMIT = 300;
@@ -142,6 +151,8 @@ export interface PrEvidenceSummary {
   };
   mergeBase: { sha: string; compareStatus: string | null; aheadBy: number | null; behindBy: number | null } | null;
   files: PrEvidenceFile[];
+  /** Files left out of `files` so the first page stays inline; each one is in the diff under its own `diff --git` header. */
+  filesNotListed: number;
   checks: { headSha: string; checkRuns: PrEvidenceCheckRun[]; statuses: PrEvidenceStatus[]; combinedState: string | null };
   requiredChecks: {
     /** Whether GitHub declares any required check for the base branch (branch protection or rulesets). */
@@ -191,6 +202,7 @@ export interface PrEvidence {
   prNumber: number;
   /** The SHAs the diff is between; every page of one read carries the same pair. */
   compared: { baseSha: string; headSha: string };
+  /** true only on the last page (`diff.done`) of a read that named nothing in `incomplete`. */
   complete: boolean;
   incomplete: PrEvidenceIncomplete[];
   /** The PR, files, checks and required checks; on the first page only, null on a continuation page. */
@@ -299,6 +311,22 @@ const quoteGap = (entry: PrEvidenceIncomplete, root: string): string => {
   return clip(`${entry.kind}${entry.status === undefined ? "" : ` ${entry.status}`} ${where}: ${entry.detail}`, BRIEF_GAP_CHARS);
 };
 
+/**
+ * What an answer costs as Hermes counts it, never less: the text block as `respond` writes it (pretty, the
+ * evidence one level deep), escaped again by Hermes, plus structuredContent, counted here pretty as well.
+ */
+const answerCost = (evidence: PrEvidence): number => {
+  const text = JSON.stringify({ evidence }, null, 2);
+  return text.length + JSON.stringify(text).length + ENVELOPE_ALLOWANCE;
+};
+
+/** What one diff character adds to `answerCost`: its JSON escape in structuredContent plus that escape escaped again. */
+const textCostOf = (code: number): number =>
+  code === 0x22 || code === 0x5c ? 6
+  : code === 0x0a || code === 0x0d || code === 0x09 || code === 0x08 || code === 0x0c ? 5
+  : code < 0x20 || (code >= 0xd800 && code <= 0xdfff) ? 13
+  : 2;
+
 const briefOf = (
   incomplete: PrEvidenceIncomplete[], root: string, compared: PrEvidence["compared"], page: PrEvidence["diff"],
   pull: PrEvidenceSummary["pull"] | null,
@@ -306,7 +334,7 @@ const briefOf = (
   const kinds: PrEvidenceBrief["gaps"]["kinds"] = {};
   for (const entry of incomplete) kinds[entry.kind] = (kinds[entry.kind] ?? 0) + 1;
   return {
-    complete: incomplete.length === 0,
+    complete: incomplete.length === 0 && page.done,
     baseSha: compared.baseSha,
     headSha: compared.headSha,
     page: { offset: page.offset, chars: page.chars, totalChars: page.totalChars, done: page.done,
@@ -753,6 +781,7 @@ export const readPrEvidence = async (source: PrEvidenceSource, input: PrEvidence
         filename: file.filename, previousFilename: file.previousFilename, status: file.status, additions: file.additions,
         deletions: file.deletions, changes: file.changes, patchOmitted: file.patchOmitted, blobUrl: file.blobUrl,
       })),
+      filesNotListed: 0,
       checks: { headSha, checkRuns: checks.checkRuns, statuses: checks.statuses, combinedState: checks.combinedState },
       requiredChecks: { declared: contexts.length > 0, contexts, allSatisfied },
       urls: {
@@ -768,27 +797,22 @@ export const readPrEvidence = async (source: PrEvidenceSource, input: PrEvidence
 
   // Sliced after every read of the snapshot, so the next cursor carries the first page's whole gap list.
   const pageChars = input.pageChars ?? PR_EVIDENCE_DIFF_PAGE_MAX_CHARS;
-  let end = Math.min(offset + pageChars, diff.length);
-  // A cut between the halves of a surrogate pair would leave half a character in each page.
-  const last = diff.charCodeAt(end - 1);
-  if (end < diff.length && end - offset > 1 && last >= 0xd800 && last <= 0xdbff) end -= 1;
-  const done = end >= diff.length;
   const carried = cursor ? { g: cursor.g, gd: cursor.gd } : { g: incomplete.length, gd: digestOf(incomplete) };
-  const page = {
+  const cursorAt = (o: number): string => encodeCursor({
+    v: 1, p: input.projectId, r: identity, n: input.prNumber, b: baseSha, h: headSha, d: diffSha256, o, ...carried,
+  });
+  const compared = { baseSha, headSha };
+  const page: PrEvidence["diff"] = {
     offset,
-    chars: end - offset,
-    nextCursor: done ? null : encodeCursor({
-      v: 1, p: input.projectId, r: identity, n: input.prNumber, b: baseSha, h: headSha, d: diffSha256, o: end, ...carried,
-    }),
-    done,
+    chars: 0,
+    nextCursor: cursorAt(diff.length),
+    done: false,
     totalChars: diff.length,
     totalUtf8Bytes: Buffer.byteLength(diff, "utf8"),
     sha256: diffSha256,
     fileCount: read.files.length,
-    text: diff.slice(offset, end),
+    text: "",
   };
-
-  const compared = { baseSha, headSha };
   // Key order is the order a reader of a prefix sees: see the module comment.
   const evidence: PrEvidence = {
     schema: "acp.pr-evidence.v1",
@@ -798,11 +822,51 @@ export const readPrEvidence = async (source: PrEvidenceSource, input: PrEvidence
     repositoryRole: repository.value.repositoryRole,
     prNumber: input.prNumber,
     compared,
-    complete: incomplete.length === 0,
+    complete: false,
     incomplete,
     summary,
     diff: page,
   };
+
+  // The page is as much as keeps the whole answer inline in Hermes: see PR_EVIDENCE_ANSWER_MAX_CHARS. Measured
+  // with the page text empty and the longest cursor; the first page's file list gives way first, then the text.
+  if (summary) {
+    const all = summary.files;
+    let listed = all.length;
+    while (listed > 0 && answerCost(evidence) > PR_EVIDENCE_ANSWER_MAX_CHARS) {
+      listed = Math.floor(listed / 2);
+      summary.files = all.slice(0, listed);
+    }
+    if (listed < all.length) {
+      // The halving overshot: add the files back one at a time while they still fit.
+      while (listed < all.length) {
+        summary.files = all.slice(0, listed + 1);
+        if (answerCost(evidence) > PR_EVIDENCE_ANSWER_MAX_CHARS) { summary.files = all.slice(0, listed); break; }
+        listed += 1;
+      }
+    }
+    summary.filesNotListed = all.length - listed;
+  }
+  let room = PR_EVIDENCE_ANSWER_MAX_CHARS - answerCost(evidence);
+  let end = offset;
+  while (end < diff.length && end - offset < pageChars) {
+    const cost = textCostOf(diff.charCodeAt(end));
+    if (cost > room) break;
+    room -= cost;
+    end += 1;
+  }
+  // A continuation page always moves on, so a read cannot stall on a page with no room.
+  if (cursor && end === offset && end < diff.length) end += 1;
+  // A cut between the halves of a surrogate pair would leave half a character in each page.
+  const last = diff.charCodeAt(end - 1);
+  if (end < diff.length && last >= 0xd800 && last <= 0xdbff) end += end - offset > 1 ? -1 : 1;
+  const done = end >= diff.length;
+  page.chars = end - offset;
+  page.nextCursor = done ? null : cursorAt(end);
+  page.done = done;
+  page.text = diff.slice(offset, end);
+  evidence.brief = briefOf(incomplete, root, compared, page, summary?.pull ?? null);
+  evidence.complete = incomplete.length === 0 && done;
   return incomplete.length === 0
     ? allow(ReasonCode.OK, evidence)
     : deny(ReasonCode.COVERAGE_INCOMPLETE,

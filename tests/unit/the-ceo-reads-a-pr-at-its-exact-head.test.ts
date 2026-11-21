@@ -149,6 +149,7 @@ interface Page {
     pull: { state: string; merged: boolean | null; mergeable: boolean | null; mergeableState: string | null; mergeability: string };
     mergeBase: { sha: string } | null;
     files: Array<{ filename: string; additions: number; deletions: number; patchOmitted: boolean }>;
+    filesNotListed: number;
     checks: {
       checkRuns: Array<{ name: string; headSha: string; conclusion: string | null; url: string | null }>;
       statuses: Array<{ context: string; state: string; url: string | null }>;
@@ -199,6 +200,22 @@ const channel = async (peer: AuthenticatedMcpPeer, withProvenance = true) => {
 const HERMES_TOOL_ERROR_CAP = 2048;
 const hermesView = (content: unknown): string =>
   (content as Array<{ type: string; text?: string }>).map((block) => block.text ?? "").join("").slice(0, HERMES_TOOL_ERROR_CAP);
+
+/**
+ * What Hermes counts of an MCP answer before it moves the answer to a local spillover file the CEO's turn
+ * cannot read (hermes-agent tools/mcp_tool.py, tools/budget_config.py): `json.dumps({"result": text,
+ * "structuredContent": structured}, ensure_ascii=False)`, in code points, against DEFAULT_MCP_RESULT_SIZE_CHARS.
+ */
+const HERMES_MCP_INLINE_CHARS = 50_000;
+const pythonJson = (value: unknown): string => value === null ? "null"
+  : Array.isArray(value) ? `[${value.map(pythonJson).join(", ")}]`
+  : typeof value === "object"
+    ? `{${Object.entries(value as Row).filter(([, v]) => v !== undefined).map(([k, v]) => `${JSON.stringify(k)}: ${pythonJson(v)}`).join(", ")}}`
+    : JSON.stringify(value);
+const hermesInlineChars = (result: Row): number => {
+  const text = (result.content as Array<{ type: string; text?: string }>).map((block) => block.text ?? "").join("\n");
+  return [...pythonJson({ result: text, structuredContent: result.structuredContent })].length;
+};
 
 /** What a reader of `seen` cannot find of an incomplete answer's key state; empty when all of it is there. */
 const missingKeyState = (seen: string, page: Page): string[] => {
@@ -339,11 +356,14 @@ describe("pr_evidence_get", () => {
     expect(gh.calls.some((call) => call.path.includes("/files"))).toBe(false);
 
     const summary = first!.summary!;
-    expect(first!.complete).toBe(true);
+    // Only the page that ends the read is complete.
+    expect(pages.map((page) => page.complete)).toEqual(pages.map((_, i) => i === pages.length - 1));
     expect(first!.incomplete).toEqual([]);
     expect(summary.pull).toMatchObject({ state: "open", mergeable: true, mergeableState: "clean" });
     expect(summary.mergeBase).toMatchObject({ sha: MERGE_BASE });
-    expect(summary.files).toHaveLength(150);
+    // Every file is listed, or counted as carried by the diff alone; this one's list did not fit one inline answer.
+    expect(summary.files.length + summary.filesNotListed).toBe(150);
+    expect(summary.filesNotListed).toBeGreaterThan(0);
     expect(summary.files[0]).toMatchObject({ filename: "src/f000.ts", additions: 2, deletions: 1, patchOmitted: false });
     expect(summary.checks.checkRuns).toEqual([expect.objectContaining({ name: "ci", headSha: HEAD_A, conclusion: "success",
       url: "https://github.com/acme/fixture/actions/runs/1" })]);
@@ -357,6 +377,42 @@ describe("pr_evidence_get", () => {
     const checkReads = gh.calls.filter((call) => /\/check-runs|\/status\?/.test(call.path));
     expect(checkReads.length).toBeGreaterThan(0);
     expect(checkReads.every((call) => call.path.includes(`/commits/${HEAD_A}/`))).toBe(true);
+  });
+
+  it("answers a large diff in pages Hermes keeps inline, each consistent about complete and done, joined to the whole diff", async () => {
+    // 150 files of about 1,000 characters each, twice the size of Hermes's inline limit: the answer the CEO saw
+    // moved to a spillover file it could not read, with complete true over a first page that was not done.
+    seedNormalPull(31);
+    const { raw } = await channel(ceoPeer);
+    const pages: Page[] = [];
+    let cursor: string | null = null;
+    do {
+      const result = await raw({ projectId, prNumber: 31, expectedHead: HEAD_A, ...(cursor ? { cursor } : {}) });
+      expect(hermesInlineChars(result), `page ${pages.length}`).toBeLessThanOrEqual(HERMES_MCP_INLINE_CHARS);
+      const page = pageOf(result.structuredContent as Answer);
+      pages.push(page);
+      cursor = page.diff.nextCursor;
+      expect(pages.length).toBeLessThan(200);
+    } while (cursor);
+    expect(pages.length).toBeGreaterThan(2);
+    const joined = pages.map((page) => page.diff.text).join("");
+    expect(joined.length).toBe(pages[0]!.diff.totalChars);
+    expect(joined.length).toBeGreaterThan(2 * HERMES_MCP_INLINE_CHARS);
+    expect(sha256(joined)).toBe(pages[0]!.diff.sha256);
+    // complete is true only on the page that ends a read with no gaps; every page's done, cursor and brief agree.
+    for (const [i, page] of pages.entries()) {
+      const last = i === pages.length - 1;
+      expect(page.diff.done).toBe(last);
+      expect(page.diff.nextCursor === null).toBe(last);
+      expect(page.complete).toBe(last);
+      expect(page.brief).toMatchObject({ complete: page.complete, page: { done: page.diff.done, hasNextCursor: !last } });
+    }
+    // A cursor the CEO was issued gives no other caller a read: the CTO holding it is refused before GitHub is asked.
+    const issued = pages[0]!.diff.nextCursor!;
+    gh.calls.length = 0;
+    expect(await (await channel(ctoPeer)).call({ projectId, prNumber: 31, expectedHead: HEAD_A, cursor: issued }))
+      .toMatchObject({ ok: false, reasonCode: ReasonCode.MCP_PEER_UNAUTHENTICATED });
+    expect(gh.calls).toEqual([]);
   });
 
   it("reports a required check that is not green at the head as unsatisfied", async () => {
@@ -479,7 +535,8 @@ describe("pr_evidence_get", () => {
     ])("names mergeability as not applying to a %s PR, which alone leaves the answer complete", async (_name, extra, mergeability) => {
       seedNormalPull(23, { ...uncomputed, ...extra });
       const page = pageOf(await ceoCall({ projectId, prNumber: 23, expectedHead: HEAD_A }));
-      expect(page).toMatchObject({ complete: true, incomplete: [] });
+      // No gap: the read is complete once its last page is.
+      expect(page).toMatchObject({ complete: page.diff.done, incomplete: [] });
       const pull = { state: "closed", merged: extra["merged"], mergeability };
       expect(page.summary!.pull).toMatchObject({ ...pull, mergeable: null, mergeableState: "unknown" });
       expect(page.brief.pull).toEqual(pull);
@@ -535,7 +592,9 @@ describe("pr_evidence_get", () => {
     const page = body.evidence as unknown as Page;
     expect(page.incomplete.length).toBeGreaterThanOrEqual(25);
     expect(new Set(page.incomplete.map((entry) => entry.kind)).size).toBe(8);
-    expect(page.diff.chars).toBe(PR_EVIDENCE_DIFF_PAGE_MAX_CHARS - 1);
+    // The page holds what keeps the answer inline, never more than asked for.
+    expect(page.diff.chars).toBeGreaterThan(0);
+    expect(page.diff.chars).toBeLessThan(PR_EVIDENCE_DIFF_PAGE_MAX_CHARS - 1);
     expect(page.diff.nextCursor!.length).toBeGreaterThan(400);
 
     const seen = hermesView(result.content);
@@ -550,7 +609,8 @@ describe("pr_evidence_get", () => {
     // Mutation witnesses, through the same emitter: the field order this tool had before fails the check,
     // and so does moving `incomplete` ahead of the diff without the bounded brief.
     const emitted = (evidence: Row): string => hermesView(respond(deny(ReasonCode.COVERAGE_INCOMPLETE, body.message, evidence as Evidence)).content);
-    const e = body.evidence;
+    // With a page as long as pageChars allows, which the order must survive whatever the inline budget holds.
+    const e: Row = { ...body.evidence, diff: { ...(body.evidence["diff"] as Row), text: "x".repeat(PR_EVIDENCE_DIFF_PAGE_MAX_CHARS - 1) } };
     const before = { schema: e["schema"], projectId: e["projectId"], repositoryIdentity: e["repositoryIdentity"], repositoryRole: e["repositoryRole"],
       prNumber: e["prNumber"], compared: e["compared"], diff: e["diff"], incomplete: e["incomplete"], complete: e["complete"], summary: e["summary"] };
     expect(missingKeyState(emitted(before), page)).toEqual(expect.arrayContaining(["first detail", "count of PATCH_OMITTED"]));
