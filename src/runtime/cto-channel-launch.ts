@@ -33,7 +33,7 @@ export interface ChannelLaunchInput {
    * it proves this launch's channel registered (`channelEmittedBy`).
    */
   readonly launchId?: string;
-  /** A fresh conversation's switch time in seconds (`--history-before`): what was signed before it is shown as history. */
+  /** A fresh conversation's switch time in whole seconds (`--history-before`): what was signed at or before it is shown as history. */
   readonly historyBefore?: number;
 }
 

@@ -69,6 +69,11 @@ export interface StoredHandoff {
   conversation: string; source: "cto" | "acp"; text: string; writtenAt: string;
   /** The new conversation the swap goes to, written before the switchover is prepared; and whether the swap was seen through. */
   next?: string; completed?: boolean;
+  /**
+   * A fresh conversation's cutoff, kept with its uuid: what was signed before `before` (unix seconds) is shown to it as
+   * history. Every launch of that conversation, fresh or resumed, passes the same cutoff to its channel.
+   */
+  history?: { conversation: string; before: number };
 }
 
 export const handoffPathOf = (stateDir: string, projectId: string): string => {
@@ -92,7 +97,11 @@ export const writeHandoff = (
   if (utf8Bytes(text) > CTO_HANDOFF_MAX_BYTES) return { ok: false, reason: `the handoff is ${utf8Bytes(text)} bytes; at most ${CTO_HANDOFF_MAX_BYTES} are kept, so write a shorter one` };
   // A rewrite for the same conversation (the CTO's own, after the switchover was prepared) keeps where the swap goes.
   const prior = readHandoff(files, stateDir, input.projectId);
-  const kept = prior?.conversation === input.conversation ? { ...(prior.next ? { next: prior.next } : {}), ...(prior.completed ? { completed: true } : {}) } : {};
+  const kept = {
+    ...(prior?.conversation === input.conversation ? { ...(prior.next ? { next: prior.next } : {}), ...(prior.completed ? { completed: true } : {}) } : {}),
+    // The cutoff belongs to its conversation, not to this handoff: a later handoff written by that conversation keeps it.
+    ...(prior?.history ? { history: prior.history } : {}),
+  };
   const handoff: StoredHandoff = { schema: "acp.cto-handoff.v1", projectId: input.projectId, conversation: input.conversation, source: input.source, text, writtenAt: input.now, ...kept };
   files.replace(handoffPathOf(stateDir, input.projectId), `${JSON.stringify(handoff)}\n`);
   return { ok: true, handoff };
@@ -104,12 +113,13 @@ export const readHandoff = (files: StoreFiles, stateDir: string, projectId: stri
     if (!files.exists(path)) return null;
     const v = JSON.parse(files.read(path)) as Partial<StoredHandoff>;
     return v.schema === "acp.cto-handoff.v1" && v.projectId === projectId && typeof v.conversation === "string" && (v.source === "cto" || v.source === "acp") &&
-      typeof v.text === "string" && v.text.length > 0 && utf8Bytes(v.text) <= CTO_HANDOFF_MAX_BYTES && typeof v.writtenAt === "string" && (v.next === undefined || typeof v.next === "string") ? v as StoredHandoff : null;
+      typeof v.text === "string" && v.text.length > 0 && utf8Bytes(v.text) <= CTO_HANDOFF_MAX_BYTES && typeof v.writtenAt === "string" && (v.next === undefined || typeof v.next === "string") &&
+      (v.history === undefined || (typeof v.history?.conversation === "string" && Number.isSafeInteger(v.history?.before))) ? v as StoredHandoff : null;
   } catch { return null; }
 };
 
 /** Records the swap's target (before the switchover is prepared) or that it was seen through, keeping the rest. */
-export const markHandoff = (files: StoreFiles, stateDir: string, projectId: string, patch: { next?: string; completed?: boolean }): void => {
+export const markHandoff = (files: StoreFiles, stateDir: string, projectId: string, patch: { next?: string; completed?: boolean; history?: { conversation: string; before: number } }): void => {
   const stored = readHandoff(files, stateDir, projectId);
   if (stored) files.replace(handoffPathOf(stateDir, projectId), `${JSON.stringify({ ...stored, ...patch })}\n`);
 };

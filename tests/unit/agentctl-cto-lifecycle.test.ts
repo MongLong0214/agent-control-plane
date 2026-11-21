@@ -942,6 +942,21 @@ describe("a canonical relaunch resumes the role's bound conversation", () => {
       const config = JSON.parse(launched(w)[launched(w).indexOf("--mcp-config") + 1]!) as { mcpServers: Record<string, { args: string[] }> };
       const args = config.mcpServers["acp-buzz-channel"]!.args;
       expect(args[args.indexOf("--history-before") + 1]).toMatch(/^[0-9]+$/u);
+      // Kept with the new conversation's uuid, for every later launch of it.
+      const U = launched(w)[launched(w).indexOf("--session-id") + 1]!;
+      expect(handoffFile(w)).toMatchObject({ history: { conversation: U, before: Number(args[args.indexOf("--history-before") + 1]) } });
+    });
+
+    it("a later resume of the fresh conversation passes the same cutoff its fresh launch did", async () => {
+      const { w } = canonicalWorld();
+      w.files.set(`${STATE}/cto-refresh/handoff-${P}.json`, JSON.stringify({
+        schema: "acp.cto-handoff.v1", projectId: P, conversation: "00000000-0000-4000-8000-000000000000", source: "acp", text: "t",
+        writtenAt: "2026-11-20T00:00:00Z", next: CONVERSATION, completed: true, history: { conversation: CONVERSATION, before: 1_795_000_000 },
+      }));
+      expect(await runCtoCommand(["relaunch", P, "--apply"], w.ports)).toBe(0);
+      const config = JSON.parse(launched(w)[launched(w).indexOf("--mcp-config") + 1]!) as { mcpServers: Record<string, { args: string[] }> };
+      const args = config.mcpServers["acp-buzz-channel"]!.args;
+      expect(args.slice(args.indexOf("--history-before"), args.indexOf("--history-before") + 2)).toEqual(["--history-before", "1795000000"]);
     });
 
     it("a pending switchover found with no local handoff is written down at once: U's late claim is then recognized, and nothing is prepared or stopped again", async () => {

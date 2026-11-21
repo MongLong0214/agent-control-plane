@@ -228,7 +228,7 @@ export interface BuzzChannelOptions {
    */
   readonly answeredSince?: () => number | null;
   /**
-   * A fresh conversation's switch time, in seconds. A message signed before it is shown as history from before this
+   * A fresh conversation's switch time, in whole seconds. A message signed at or before it is shown as history from before this
    * conversation, never as a plain notification: `history="pre-switch"` and a first line saying so. Unset otherwise.
    */
   readonly historyBefore?: number;
@@ -389,6 +389,11 @@ export class BuzzChannelRelay {
   /** One-shot questions to the relay about an event a reply is built on: subscription id -> what is asked and heard so far. */
   readonly #lookups = new Map<string, ParentLookup>();
   #lookupSeq = 0;
+  /**
+   * This CTO's replies reported in this process. Once per process, not once ever: a `replied` receipt the receipts trim
+   * dropped is written again when the relay replays the reply on the next start, and the daemon settles each row once.
+   */
+  readonly #reportedReplies = new Set<string>();
 
   constructor(options: BuzzChannelOptions) {
     this.#o = options;
@@ -543,6 +548,7 @@ export class BuzzChannelRelay {
       return { ok: false, reason: `the relay did not accept the reply (${ack.status})${said === "" ? "" : `: ${said}`}` };
     }
     this.#events.set(event.id, { at: event.created_at, author: this.pubkey, room: input.room, root, exactRoot: true, delivered: false });
+    this.#reportedReplies.add(event.id);
     this.#touchThread(root, input.room, Math.min(event.created_at, this.#sched.nowSeconds()));
     this.#persist();
     this.#o.onReceipt?.({
@@ -778,7 +784,8 @@ export class BuzzChannelRelay {
     verdict: { readonly role: ChannelSenderRole; readonly room: string; readonly replyTo: string },
     fromRelay: boolean,
   ): Promise<boolean> {
-    const history = this.#o.historyBefore !== undefined && event.created_at < this.#o.historyBefore;
+    // At or before: Buzz signs whole seconds and the cutoff is the launch's floored second, so a message signed in that second is history too.
+    const history = this.#o.historyBefore !== undefined && event.created_at <= this.#o.historyBefore;
     const notification: ChannelNotification = {
       content: history ? `${PRE_SWITCH_MARKER}\n${neutralizeChannelText(event.content)}` : neutralizeChannelText(event.content),
       meta: {
@@ -830,10 +837,11 @@ export class BuzzChannelRelay {
   /**
    * A reply this CTO posted by a path other than the reply tool (the buzz CLI, say), seen on the relay: remembered as the
    * reply tool remembers its own, and reported with the same `replied` receipt, so the daemon completes what it answered by
-   * the same checks. One the reply tool posted is already remembered and is not reported twice.
+   * the same checks. Reported once per process: one the reply tool posted here is not reported twice, and one remembered
+   * from an earlier process is reported again, so a receipt the trim dropped is not lost.
    */
   #ownReply(event: RelayEvent): void {
-    if (event.kind !== BUZZ_MENTION_KIND || this.#events.has(event.id)) return;
+    if (event.kind !== BUZZ_MENTION_KIND || this.#reportedReplies.has(event.id)) return;
     const rooms = tagValues(event, "h");
     const room = rooms.length === 1 ? rooms[0]! : "";
     const parentEventId = replyParentOf(event);
@@ -841,6 +849,7 @@ export class BuzzChannelRelay {
     const root = threadRootOf(event);
     this.#events.set(event.id, { at: event.created_at, author: this.pubkey, room, root, exactRoot: true, delivered: false });
     this.#touchThread(root, room, Math.min(event.created_at, this.#sched.nowSeconds()));
+    this.#reportedReplies.add(event.id);
     this.#o.onReceipt?.({ type: "replied", event, room, parentEventId, ack: "ACCEPTED", repliedAt: this.#sched.nowSeconds() });
   }
 

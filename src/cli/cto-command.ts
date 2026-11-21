@@ -710,8 +710,16 @@ const canonicalResumeSteps = (
       if (gated) return gated;
       // This launch's own id, in the script tmux is about to start and so in its channel server's every receipt.
       const launchId = ports.newUuid();
-      // A fresh conversation is told that what was signed before this launch is history, never a current instruction.
-      const argv = writeCanonicalLauncher(ports, projectId, planned, launchId, options.fresh ? Math.floor(ports.now() / 1000) : undefined);
+      // A fresh conversation is told that what was signed by its first launch's second is history, never a current instruction.
+      // The cutoff is kept with its uuid, so a later resume of the same conversation passes the same one.
+      const uuid = planned.resume[1] ?? "";
+      const stored = readHandoff(ports.files, ports.stateDir, projectId);
+      let historyBefore = UUID.test(uuid) && stored?.history?.conversation === uuid ? stored.history.before : undefined;
+      if (options.fresh && historyBefore === undefined) {
+        historyBefore = Math.floor(ports.now() / 1000);
+        if (UUID.test(uuid)) markHandoff(ports.files, ports.stateDir, projectId, { history: { conversation: uuid, before: historyBefore } });
+      }
+      const argv = writeCanonicalLauncher(ports, projectId, planned, launchId, historyBefore);
       const tmuxRun = (args: string[]): CtoExecResult => ports.run("tmux", args, { timeoutMs: 10_000 });
       const started = tmuxExists(ports, planned.tmux)
         ? tmuxRun(["new-window", "-d", "-P", "-F", "#{pane_id}", "-t", `=${planned.tmux}:`, launcher])
