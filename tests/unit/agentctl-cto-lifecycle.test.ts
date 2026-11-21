@@ -2,7 +2,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { afterAll, describe, expect, it, vi } from "vitest";
 
-import { main } from "../../src/cli/agentctl.ts";
+import { createOperatorClient, main } from "../../src/cli/agentctl.ts";
 import {
   CTO_SUBCOMMANDS, IDLE_SECONDS, checkoutHeldWork, createCtoPorts, hostRunner, runCtoCommand, workerHeldWork,
   type CtoExec, type CtoExecOptions, type CtoExecResult, type CtoPorts, type CtoRecord,
@@ -17,6 +17,7 @@ import type { CtoProcessReader, CtoRoleScope } from "../../src/cto/one-cto-per-p
 interface FakeProcess { pid: number; ppid: number; command: string; argv?: string[]; cwd?: string }
 import { formatHostProvisionerReason, hostProvisionerReason, hostReasonKind, hostRefusalText } from "../../src/runtime/host-provisioner-reason.ts";
 import { cleanupTempDirs, commitAll, gitSync, tempDir } from "../helpers/fixtures.ts";
+import { createServer, type Server, type Socket } from "node:net";
 import { mkdirSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { makeHarness } from "../helpers/harness.ts";
@@ -265,9 +266,9 @@ const makeWorld = (overrides: Partial<CtoRecord> = {}, env: Record<string, strin
     operator: {
       hold: async (_method: string, params: Record<string, unknown> = {}) => {
         w.hold.calls.push(params);
-        if (w.hold.refused) return { decision: deny(ReasonCode.CTO_REFRESH_IN_PROGRESS, "another cto relaunch --fresh holds project e2e-sort-fixture (pid 4242); nothing was changed"), open: () => false, release: () => undefined };
+        if (w.hold.refused) return { decision: deny(ReasonCode.CTO_REFRESH_IN_PROGRESS, "another cto relaunch --fresh holds project e2e-sort-fixture (pid 4242); nothing was changed"), open: () => false, verify: async () => false, release: () => undefined };
         w.hold.open = true;
-        return { decision: allow(ReasonCode.OK, { projectId: params["projectId"] }), open: () => w.hold.open, release: () => { w.hold.open = false; w.hold.released++; } };
+        return { decision: allow(ReasonCode.OK, { projectId: params["projectId"] }), open: () => w.hold.open, verify: async () => w.hold.open, release: () => { w.hold.open = false; w.hold.released++; } };
       },
       // The daemon: it authenticates every request, answers reads, and replays a mutation's answer for a key it has seen.
       request: async (method: string, params: Record<string, unknown> = {}, idempotencyKey?: string) => {
@@ -1138,6 +1139,109 @@ describe("a canonical relaunch resumes the role's bound conversation", () => {
       expect(captures).toBeGreaterThanOrEqual(1);
       expect(w.changes.filter((c) => c.startsWith("tmux send-keys"))).toEqual([]);
       expect(JSON.stringify(w.out)).toContain("nothing was pressed");
+    });
+
+    // The production hold client over a real Unix socket: the daemon's end is destroyed inside a synchronous subprocess call, which is
+    // when the kernel has the close and the event loop (so the socket's close event, and open()) does not.
+    describe("a hold that closes during a synchronous call", () => {
+      const withRealHold = async (w: World, body: (cut: () => void) => Promise<void>): Promise<void> => {
+        let held: Socket | null = null;
+        const server: Server = createServer((socket) => {
+          socket.setEncoding("utf8");
+          socket.on("error", () => undefined);
+          socket.once("data", () => { held = socket; socket.write(`${JSON.stringify(allow(ReasonCode.OK, {}))}\n`); });
+        });
+        const path = join(tempDir("acp-hold-"), "h.sock");
+        await new Promise<void>((done) => server.listen(path, done));
+        w.ports.operator.hold = createOperatorClient({ socketPath: path, token: "operator-test-credential" }).hold!;
+        try { await body(() => { (held as Socket | null)?.destroy(); }); } finally { (held as Socket | null)?.destroy(); await new Promise<void>((done) => server.close(() => done())); }
+      };
+      const onRun = (w: World, when: (bin: string, args: readonly string[]) => boolean, then: () => void): void => {
+        const run = w.ports.run;
+        let done = false;
+        w.ports.run = (bin, args, options) => { if (!done && when(bin, args)) { done = true; then(); } return run(bin, args, options); };
+      };
+      const stopped = (w: World): boolean => w.out.some((l) => l["step"] === "stop" && l["result"] === "done");
+
+      it("J: between claude mcp remove and claude mcp add, mcp add is not run", async () => {
+        const { w } = canonicalWorld();
+        w.switchovers = [{ toSessionUuid: U1, state: "PENDING" }];
+        await withRealHold(w, async (cut) => {
+          onRun(w, (bin, args) => bin === LOCAL_CLAUDE && args[0] === "mcp" && args[1] === "remove", cut);
+          expect(await runCtoCommand(["relaunch", P, "--fresh", "--apply"], w.ports)).toBe(1);
+        });
+        expect(w.mcpCalls.filter((c) => c.endsWith(" remove"))).toHaveLength(1);
+        expect(w.mcpCalls.filter((c) => c.endsWith(" add"))).toEqual([]);
+        expect(mutations(w).filter((c) => c.startsWith("SIGTERM") || c.startsWith("tmux new-"))).toEqual([]);
+      });
+
+      it("K: right before the tmux start, after has-session, nothing is started", async () => {
+        const { w } = canonicalWorld();
+        w.switchovers = [{ toSessionUuid: U1, state: "PENDING" }];
+        await withRealHold(w, async (cut) => {
+          onRun(w, (bin, args) => bin === "tmux" && args[0] === "has-session" && stopped(w), cut);
+          expect(await runCtoCommand(["relaunch", P, "--fresh", "--apply"], w.ports)).toBe(1);
+        });
+        expect(w.changes.filter((c) => c.startsWith("tmux new-"))).toEqual([]);
+        expect(last(w)["rerun"]).toBeUndefined();
+      });
+
+      it("L: right before send-keys Enter, after the final pane capture, nothing is pressed", async () => {
+        // The dry run counts the pane captures the confirmation makes before it presses; the real run cuts inside the last of them.
+        const dry = canonicalWorld().w;
+        dry.pane = "flood";
+        // The launched conversation does not claim until its warning is accepted, so the role is still the old one at the keystroke.
+        dry.launched.claims = false;
+        dry.switchovers = [{ toSessionUuid: U1, state: "PENDING" }];
+        let before = 0;
+        const dryRun = dry.ports.run;
+        dry.ports.run = (bin, args, options) => { if (bin === "tmux" && args[0] === "capture-pane" && !dry.changes.some((c) => c.startsWith("tmux send-keys"))) before++; return dryRun(bin, args, options); };
+        await runCtoCommand(["relaunch", P, "--fresh", "--apply"], dry.ports);
+        expect(before).toBeGreaterThanOrEqual(3);
+        const { w } = canonicalWorld();
+        w.pane = "flood";
+        w.launched.claims = false;
+        w.switchovers = [{ toSessionUuid: U1, state: "PENDING" }];
+        await withRealHold(w, async (cut) => {
+          let captures = 0;
+          onRun(w, (bin, args) => bin === "tmux" && args[0] === "capture-pane" && ++captures === before, cut);
+          // onRun fires once, on the capture that is `before`-th: `when` is only true there.
+          expect(await runCtoCommand(["relaunch", P, "--fresh", "--apply"], w.ports)).toBe(1);
+          expect(captures).toBeGreaterThanOrEqual(before);
+        });
+        expect(w.changes.filter((c) => c.startsWith("tmux send-keys"))).toEqual([]);
+        expect(JSON.stringify(w.out)).toContain("nothing was pressed");
+      });
+
+      it("M: a run whose hold closed during the synchronous call it then failed on prints no rerun", async () => {
+        const { w } = canonicalWorld();
+        w.switchovers = [{ toSessionUuid: U1, state: "PENDING" }];
+        w.launched.fails = true;
+        await withRealHold(w, async (cut) => {
+          onRun(w, (bin, args) => bin === "tmux" && (args[0] === "new-session" || args[0] === "new-window"), cut);
+          expect(await runCtoCommand(["relaunch", P, "--fresh", "--apply"], w.ports)).toBe(1);
+        });
+        expect(last(w)).toMatchObject({ result: "stopped", at: "launch" });
+        expect(last(w)["rerun"]).toBeUndefined();
+        expect(JSON.stringify(w.out)).not.toContain("--fresh --apply");
+      });
+
+      it("N: between the handoff write and canonicalCto.rotate, rotate is not asked", async () => {
+        const { w } = canonicalWorld();
+        w.files.set(`${STATE}/cto-refresh/handoff-${P}.json`, JSON.stringify({ schema: "acp.cto-handoff.v1", projectId: P, conversation: CONVERSATION, source: "cto", text: "Go on.", writtenAt: "2026-11-20T00:00:00Z" }));
+        await withRealHold(w, async (cut) => {
+          const replace = w.ports.files.replace;
+          let done = false;
+          w.ports.files.replace = (path, body) => {
+            replace(path, body);
+            if (!done && path.includes("handoff-") && w.out.some((l) => l["step"] === "channel" && l["result"])) { done = true; cut(); }
+          };
+          expect(await runCtoCommand(["relaunch", P, "--fresh", "--apply"], w.ports)).toBe(1);
+          expect(done).toBe(true);
+        });
+        expect(w.rotateCalls).toHaveLength(0);
+        expect(mutations(w)).toEqual([]);
+      });
     });
 
     describe("--cwd: the new conversation starts in another folder", () => {

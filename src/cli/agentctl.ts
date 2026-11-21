@@ -120,6 +120,13 @@ export interface OperatorHold {
   decision: Decision<unknown>;
   /** The connection is still open, so the hold is still held. */
   open(): boolean;
+  /**
+   * Whether the hold is still held, read now. `open()` is a flag the socket's close, end and error events set, and those run only when
+   * the event loop does: a synchronous subprocess call (execFileSync) blocks it, and a connection that closed meanwhile still reads as
+   * open. The kernel already has the close by then; two turns of the loop (a turn's poll phase is what reads it, and a turn already
+   * past its poll can run an immediate before it) deliver the events, and `open()` is read after them.
+   */
+  verify(): Promise<boolean>;
   release(): void;
 }
 
@@ -148,7 +155,9 @@ export const createOperatorClient = (options: OperatorClientOptions): OperatorCl
       held = socket;
       for (const event of ["close", "end", "error"] as const) socket.once(event, () => { closed = true; });
     });
-    return { decision, open: () => held !== null && !closed && !(held as Socket).destroyed, release: () => { closed = true; (held as Socket | null)?.destroy(); } };
+    const open = (): boolean => held !== null && !closed && !(held as Socket).destroyed;
+    const turn = (): Promise<void> => new Promise((done) => setImmediate(done));
+    return { decision, open, verify: async () => { await turn(); await turn(); return open(); }, release: () => { closed = true; (held as Socket | null)?.destroy(); } };
   },
   request: (method, params = {}, idempotencyKey) =>
     exchangeOperatorRequest(options, {
