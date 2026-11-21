@@ -342,7 +342,7 @@ export interface ProjectReviewerFile {
 
 /**
  * CEO msg_e91da929 — the projects that name their own preferred Blind Reviewer. An entry replaces the
- * global preferred reviewer for that project's runs and has no fallback. `refused` names why a file was
+ * global preferred reviewer for that project's runs; the global fallbacks still follow it. `refused` names why a file was
  * not applied; a refused file applies no entry at all.
  *
  * `refusedProjects` holds the entries of an applied file that name a provider which cannot review: one
@@ -816,7 +816,7 @@ export class BlindReviewGate {
     private readonly preferences: {
       preferred: ReviewerPreference;
       fallbacks: ReviewerPreference[];
-      /** A project's own preferred reviewer, which replaces `preferred` for its runs and has no fallback. */
+      /** A project's own preferred reviewer, which replaces `preferred` for its runs; the fallbacks still follow it. */
       projects?: ReadonlyMap<string, ReviewerPreference>;
       /** Projects whose own reviewer names a provider that cannot review: their reviews are refused. */
       refusedProjects?: ReadonlyMap<string, RefusedProjectReviewer>;
@@ -1465,7 +1465,8 @@ export class BlindReviewGate {
    * ends the selection with no fallback. This replaces the earlier measured-outage fallback.
    *
    * CEO msg_e91da929: a run whose project has an entry in `preferences.projects` gets that reviewer as
-   * its preferred one, with no fallback; every check below applies to it unchanged.
+   * its preferred one; every check below applies to it unchanged. The project entry changes only the first
+   * choice: the global fallbacks (Claude Opus) stay behind it on the same one condition (#1477).
    */
   private async constituteReviewer(
     request: ReviewSubject,
@@ -1504,7 +1505,7 @@ export class BlindReviewGate {
     const preferred = projectPreferred ?? this.preferences.preferred;
     const source = projectPreferred === undefined ? {} : { reviewerSource: "PROJECT_PREFERENCE", projectId };
 
-    for (const preference of projectPreferred === undefined ? [preferred, ...this.preferences.fallbacks] : [preferred]) {
+    for (const preference of [preferred, ...this.preferences.fallbacks]) {
       const isPreferred = preference === preferred;
       // Unknown registry scope is not an availability proof authorizing fallback.
       const scope = this.reviewerScope(preference.provider);
@@ -1681,7 +1682,7 @@ export class BlindReviewGate {
       }
 
       if (!isPreferred) {
-        const preferredAttempt = attempts.find((attempt) => attempt.preference === this.preferences.preferred);
+        const preferredAttempt = attempts.find((attempt) => attempt.preference === preferred);
         this.audit.record({
           kind: "BLIND_REVIEW_FALLBACK",
           runId,
@@ -1689,8 +1690,8 @@ export class BlindReviewGate {
           roleKey,
           reasonCode: ReasonCode.OK,
           evidence: {
-            from: this.preferences.preferred.provider,
-            preferredModel: this.preferences.preferred.model,
+            from: preferred.provider,
+            preferredModel: preferred.model,
             provider: preference.provider,
             model: preference.model,
             reason: preferredAttempt?.reason ?? "preferred provider unavailable",
@@ -1704,7 +1705,7 @@ export class BlindReviewGate {
         externalSessionId: handle.externalSessionId,
         generation: bound.value.bindingGeneration,
         preference,
-        ...(projectPreferred === undefined || projectId === null ? {} : { projectPreference: projectId }),
+        ...(projectPreferred === undefined || projectId === null || !isPreferred ? {} : { projectPreference: projectId }),
         roleKey,
         workdir,
       });
