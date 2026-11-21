@@ -202,13 +202,25 @@ export class WorkerStaffing {
         if (!fenced.allowed) return fenced as Decision<RoleBinding>;
         const scope = this.#unstaffed(request, roleKey);
         if (!scope.allowed) return scope as Decision<RoleBinding>;
-        // #1477 — a binding to a retired model is released here, so a refused bind restores it.
-        if (scope.value.retired !== null) {
-          const released = this.ports.bindings.revoke(roleKey, "the worker's model is retired; replaced by a gpt-6.2-sol worker", {
-            expectedCurrent: scope.value.retired,
-            evidence: { model: scope.value.retiredModel },
-          });
+        // #1477 — a binding to a retired model is released here, so a refused bind restores it. The record
+        // names the model this call binds, not the retired one's usual successor: a claude worker is opus.
+        const retired = scope.value.retired;
+        if (retired !== null) {
+          const released = this.ports.bindings.revoke(
+            roleKey,
+            `the worker's model ${scope.value.retiredModel} is retired; replaced by a ${request.provider} ${model.value} worker`,
+            {
+              expectedCurrent: retired,
+              evidence: { retiredModel: scope.value.retiredModel, replacementProvider: request.provider, replacementModel: model.value },
+            },
+          );
           if (!released.allowed) return released as Decision<RoleBinding>;
+          // The released session leaves READY in the same transaction, so it no longer passes the readiness
+          // gate; DRAINING is the state the retirement sweep reserves it in, and it stops it once the run ends.
+          if (this.ports.sessions.get(retired.sessionId)?.lifecycle === SessionLifecycle.READY) {
+            const drained = this.ports.sessions.transition(retired.sessionId, SessionLifecycle.DRAINING, "worker retired: its model is retired and replaced");
+            if (!drained.allowed) return drained as Decision<RoleBinding>;
+          }
         }
         // `run_id` is recorded on the WORKER row: the managed write guard reads it.
         return this.ports.bindings.bind({

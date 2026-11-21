@@ -5,7 +5,7 @@ import { afterAll, describe, expect, it, vi } from "vitest";
 import { ManualClock } from "../../src/core/clock.ts";
 import { allow, deny } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
-import { ExecutionMode, Role, roleKeyFor } from "../../src/domain/types.ts";
+import { ExecutionMode, Role, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
 import type { TaskContract } from "../../src/run/run-engine.ts";
 import { WorkerTurnRunner } from "../../src/run/worker-turn.ts";
 import { WorkerStaffing } from "../../src/run/worker-staffing.ts";
@@ -13,6 +13,7 @@ import { CodexCliAdapter } from "../../src/runtime/cli-adapters.ts";
 import type { InvocationRequest, ProviderAdapter } from "../../src/runtime/provider.ts";
 import { cleanupTempDirs, gitSync, makeCore, tempDir } from "../helpers/fixtures.ts";
 import { bindCeo, bindWorker, makeHarness, registerFixtureProject, type Harness } from "../helpers/harness.ts";
+import { TestProductionAdapter } from "../helpers/production-adapter.ts";
 import { FakeWorkerAdapter, admittingCapacity, seedWorkerWorld } from "../helpers/worker-turn-fixture.ts";
 
 afterAll(cleanupTempDirs);
@@ -277,6 +278,47 @@ describe("provisioning replaces a worker bound to a retired model (#1477)", () =
         [retiredSessionId, "REVOKED"],
         [provisioned.value.workerSessionId, "ACTIVE"],
       ]);
+      // The retired session is no longer ready: it leaves READY in the transaction that revokes it, for the
+      // retirement sweep to stop once the run ends.
+      expect(harness.cp.sessions.get(retiredSessionId)?.lifecycle).toBe(SessionLifecycle.DRAINING);
+      expect(await harness.cp.doctor.sessionReadiness(retiredSessionId)).toMatchObject({ allowed: false, reasonCode: ReasonCode.SESSION_NOT_READY });
+      expect(await harness.cp.doctor.sessionReadiness(provisioned.value.workerSessionId)).toMatchObject({ allowed: true });
+    } finally {
+      harness.cp.close();
+    }
+  });
+
+  it("the BINDING_REVOKED record names the replacement actually bound: a claude worker is opus, never gpt-6.2-sol", async () => {
+    const harness = makeHarness();
+    try {
+      const run = await activeRun(harness);
+      bindWorker(harness, run.taskId, { provider: "gpt", model: "gpt-6.1-sol" });
+      const roleKey = roleKeyFor(Role.WORKER, { taskId: run.taskId });
+      const claude = new TestProductionAdapter(harness.clock, "claude");
+      const staffing = new WorkerStaffing(harness.cp.db, harness.clock, harness.cp.audit, {
+        runs: harness.cp.runs,
+        tasks: {
+          get: (taskId) => harness.cp.tasks.get(taskId),
+          admitWorkerFanout: async () => allow(ReasonCode.OK, undefined),
+        },
+        bindings: harness.cp.bindings,
+        sessions: harness.cp.sessions,
+        providers: { requireForRole: () => claude },
+        readiness: { checkSession: async () => allow(ReasonCode.OK, undefined) },
+      }, tempDir("acp-claude-replace-runtime-"));
+      const provisioned = await staffing.provision({
+        runId: run.runId,
+        taskId: run.taskId,
+        provider: "claude",
+        ownerBindingGeneration: run.ownerBindingGeneration,
+        fence: () => allow(ReasonCode.OK, { sessionId: run.ownerSessionId, bindingGeneration: run.ownerBindingGeneration }),
+      });
+      expect(provisioned, JSON.stringify(provisioned)).toMatchObject({ allowed: true, value: { generation: 2 } });
+      expect(harness.cp.sessions.get(harness.cp.bindings.active(roleKey)!.sessionId)).toMatchObject({ provider: "claude", model: "opus" });
+      const revoked = harness.cp.audit.byKind("BINDING_REVOKED").filter((row) => row.roleKey === roleKey);
+      expect(revoked).toHaveLength(1);
+      expect(revoked[0]!.evidence).toMatchObject({ generation: 1, retiredModel: "gpt-6.1-sol", replacementProvider: "claude", replacementModel: "opus" });
+      expect(JSON.stringify(revoked[0]!.evidence)).not.toContain("gpt-6.2-sol");
     } finally {
       harness.cp.close();
     }

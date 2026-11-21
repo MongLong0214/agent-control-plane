@@ -106,6 +106,8 @@ const CLAUSE = {
   firstExecution: "Only a READY task with no execution gets a first execution",
   reuseWorker: "reuse its worker if it has one and never provision another",
   inactiveWorker: "a worker whose state is not ACTIVE is reported with mcp__acp-cto__escalation_open",
+  /** #1477 — a worker on a retired model is replaced by provisioning, not reused and not escalated. */
+  replaceRetired: "a worker contract_get marks replacementRequired runs a retired model and is not reused: staff its task with mcp__acp-cto__task_worker_provision",
   provision: "otherwise staff it with mcp__acp-cto__task_worker_provision",
   claim: "exactly as its spec's writeTarget names it",
   missingTarget: "when the spec names no writeTarget, report it with mcp__acp-cto__escalation_open",
@@ -136,7 +138,7 @@ interface RecordTask {
   taskId: string;
   state: string;
   spec: { writeTarget?: { repositoryIdentity: string; branch: string; paths: string[] } };
-  worker: { sessionId: string; state: string } | null;
+  worker: { sessionId: string; state: string; model?: string; replacementRequired?: boolean } | null;
   executions: Array<{ executionId: string; state: string }>;
 }
 
@@ -265,9 +267,11 @@ const scriptStandardOwner = (
             if (says(CLAUSE.inactiveWorker)) await escalate(runId, task.taskId, "the task's worker is no longer ACTIVE");
             return;
           }
-          if (!says(CLAUSE.reuseWorker)) return;
-        } else {
-          if (!says(CLAUSE.provision) || provider === null) return;
+          if (task.worker.replacementRequired !== true && !says(CLAUSE.reuseWorker)) return;
+        }
+        if (task.worker === null || task.worker.replacementRequired === true) {
+          if (task.worker === null ? !says(CLAUSE.provision) : !says(CLAUSE.replaceRetired)) return;
+          if (provider === null) return;
           const provisioned = await call("task_worker_provision", runId, task.taskId, {
             idempotencyKey: `std-owner-${++keys}`, runId, taskId: task.taskId, provider,
           });
@@ -488,9 +492,14 @@ const moveOwnerGeneration = (f: BootstrapRuntimeFixture, runId: string, roleKey:
 };
 
 /** A WORKER bound the way staffing binds one: its own READY Claude/Opus session, scoped to the run, task and project. */
-const bindRunWorker = (f: BootstrapRuntimeFixture, runId: string, taskId: string) => {
+const bindRunWorker = (
+  f: BootstrapRuntimeFixture,
+  runId: string,
+  taskId: string,
+  runtime: { provider: string; model: string } = { provider: "claude", model: "opus" },
+) => {
   const cp = f.harness.cp;
-  const session = cp.sessions.create({ provider: "claude", model: "opus" });
+  const session = cp.sessions.create(runtime);
   expect(cp.sessions.transition(session.sessionId, SessionLifecycle.READY, "test worker").allowed).toBe(true);
   const bound = cp.bindings.bind({ role: Role.WORKER, sessionId: session.sessionId, runId, taskId, projectId: cp.runs.require(runId).projectId });
   if (!bound.allowed) throw new Error(bound.message);
@@ -913,6 +922,43 @@ describe("R1-01 (a), CEO e64aa10b — contract_get gives a STANDARD_WORK run's c
       expect(stale["ok"]).toBe(false);
       expect(JSON.stringify(stale)).not.toContain(taskId);
       expect(JSON.stringify(stale)).not.toContain(opened.value.executionId);
+    });
+  });
+});
+
+describe("#1477 — a READY task whose ACTIVE worker runs a retired model is replaced by the owner, not reused and not escalated", () => {
+  it("contract_get marks the binding replacementRequired and names its model; the woken owner provisions, and the replacement binds as generation 2 on opus", async () => {
+    await withBootstrapRuntime(async (f) => {
+      const cp = f.harness.cp;
+      const real = realWorkerRuntime(f);
+      const { owner, runId, sessionId, taskId } = await stalledAfterPlan(f, "std-retired", "follow-prompt");
+      const retired = bindRunWorker(f, runId, taskId, { provider: "gpt", model: "gpt-6.1-sol" });
+      const workerRole = roleKeyFor(Role.WORKER, { taskId });
+
+      const record = await f.cto(sessionId, "contract_get", { runId });
+      expect((record["value"] as { tasks: unknown[] }).tasks).toEqual([expect.objectContaining({
+        taskId,
+        worker: { sessionId: retired.sessionId, generation: 1, state: "ACTIVE", sessionLifecycle: "READY", model: "gpt-6.1-sol", replacementRequired: true },
+        executions: [],
+      })]);
+
+      const calls = owner.calls.length;
+      const turns = f.finishedTurns(sessionId);
+      expect(f.daemon.wakeStandardWorkContinuation().woken).toHaveLength(1);
+      await f.awaitFinishedTurns(sessionId, turns + 1);
+      await vi.waitFor(() => expect(cp.sessionRuntime.turnInProgress(sessionId)).toBe(false), { timeout: 10_000, interval: 25 });
+      // The woken turn reads the record, then provisions; it never escalates before it has tried to replace the worker.
+      expect(owner.calls.slice(calls).slice(0, 2).map((call) => [call.tool, call.ok])).toEqual([
+        ["contract_get", true],
+        ["task_worker_provision", true],
+      ]);
+      expect(real.provision).toHaveBeenCalledTimes(1);
+      expect(cp.bindings.active(workerRole)).toMatchObject({ bindingGeneration: 2 });
+      expect(cp.sessions.get(cp.bindings.active(workerRole)!.sessionId)).toMatchObject({ provider: "claude", model: "opus", lifecycle: "READY" });
+      expect(cp.bindings.history(workerRole).map((binding) => [binding.sessionId, binding.status])).toEqual([
+        [retired.sessionId, "REVOKED"],
+        [cp.bindings.active(workerRole)!.sessionId, "ACTIVE"],
+      ]);
     });
   });
 });

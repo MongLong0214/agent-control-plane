@@ -24,6 +24,7 @@ import type { ArtifactStore } from "../db/artifacts.ts";
 import type { AuditLog } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
 import type { Doctor } from "../doctor/doctor.ts";
+import { isRetiredModel } from "../domain/fixed-role-runtime.ts";
 import { ArtifactKind, Role, RunKind, roleKeyFor } from "../domain/types.ts";
 import type { Outbox } from "../outbox/outbox.ts";
 import { ContractChangeRefusal, contractChangePlanForSubmission, isContractChangeRun } from "../registry/contract-change-plan.ts";
@@ -108,6 +109,9 @@ const standardWorkTasks = (source: CtoMcpSource, runId: string) => {
   const executions = source.tasks.executions(runId);
   return source.tasks.list(runId).map((task) => {
     const worker = source.bindings.history(roleKeyFor(Role.WORKER, { taskId: task.taskId })).at(-1) ?? null;
+    const workerSession = worker === null ? null : source.sessions.get(worker.sessionId);
+    // #1477 — an ACTIVE worker on a retired model is not reused: its replacement is provisioned.
+    const retiredModel = worker?.status === "ACTIVE" && workerSession && isRetiredModel(workerSession.model) ? workerSession.model : null;
     return {
       taskId: task.taskId,
       title: task.title,
@@ -123,7 +127,8 @@ const standardWorkTasks = (source: CtoMcpSource, runId: string) => {
             sessionId: worker.sessionId,
             generation: worker.bindingGeneration,
             state: worker.status,
-            sessionLifecycle: source.sessions.get(worker.sessionId)?.lifecycle ?? null,
+            sessionLifecycle: workerSession?.lifecycle ?? null,
+            ...(retiredModel === null ? {} : { model: retiredModel, replacementRequired: true }),
           },
       executions: executions
         .filter((execution) => execution.taskId === task.taskId)
