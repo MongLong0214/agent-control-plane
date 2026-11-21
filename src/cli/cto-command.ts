@@ -490,9 +490,12 @@ const channelOf = (ports: CtoPorts, record: CtoRecord): { keyFile: string; roomI
 interface CanonicalLauncher { tmux: string; cwd: string; claude: string; keyFile: string; roomId: string; resume: string[] }
 const quoteShell = (v: string): string => `'${v.replaceAll("'", "'\\''")}'`;
 /** The launcher script for one launch: `launchId` is this launch's own, passed to its channel server. */
-const writeCanonicalLauncher = (ports: CtoPorts, projectId: string, plan: CanonicalLauncher, launchId?: string): string[] => {
+const writeCanonicalLauncher = (ports: CtoPorts, projectId: string, plan: CanonicalLauncher, launchId?: string, historyBefore?: number): string[] => {
   const argv = [plan.claude,
-    ...channelLaunchArgs({ runtimeNode: runtimeNodeOf(ports), runtimeCli: runtimeCliOf(ports), projectId, keyFile: plan.keyFile, roomId: plan.roomId, stateDir: ports.stateDir, ...(launchId ? { launchId } : {}) }),
+    ...channelLaunchArgs({
+      runtimeNode: runtimeNodeOf(ports), runtimeCli: runtimeCliOf(ports), projectId, keyFile: plan.keyFile, roomId: plan.roomId, stateDir: ports.stateDir,
+      ...(launchId ? { launchId } : {}), ...(historyBefore !== undefined ? { historyBefore } : {}),
+    }),
     ...plan.resume];
   ports.files.replace(canonicalLauncherOf(ports, projectId), `#!/bin/sh\n# cto-launch: ${JSON.stringify(plan)}\n` +
     "unset ACP_OPERATOR_TOKEN ACP_MCP_TOKEN ACP_BUZZ_INGRESS_SECRET GH_TOKEN GITHUB_TOKEN\n" +
@@ -707,7 +710,8 @@ const canonicalResumeSteps = (
       if (gated) return gated;
       // This launch's own id, in the script tmux is about to start and so in its channel server's every receipt.
       const launchId = ports.newUuid();
-      const argv = writeCanonicalLauncher(ports, projectId, planned, launchId);
+      // A fresh conversation is told that what was signed before this launch is history, never a current instruction.
+      const argv = writeCanonicalLauncher(ports, projectId, planned, launchId, options.fresh ? Math.floor(ports.now() / 1000) : undefined);
       const tmuxRun = (args: string[]): CtoExecResult => ports.run("tmux", args, { timeoutMs: 10_000 });
       const started = tmuxExists(ports, planned.tmux)
         ? tmuxRun(["new-window", "-d", "-P", "-F", "#{pane_id}", "-t", `=${planned.tmux}:`, launcher])

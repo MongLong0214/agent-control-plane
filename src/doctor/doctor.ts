@@ -755,9 +755,23 @@ export class Doctor {
     const missedCutoff = new Date(Date.parse(this.clock.nowIso()) - BUZZ_CHANNEL_MISSED_AFTER_MS).toISOString();
     for (const scope of scopes) {
       const processes = ctoProcessesFor(scope, read.snapshot);
-      // Messages for this CTO that waited past the bound while no live CTO process of the project loads the Buzz channel: nothing
-      // delivers them to a session or completes them on its reply, so they are being missed, not merely slow.
-      const channelled = processes.some((one) => read.snapshot.claude.get(one.pid)?.argv.some((arg) => arg.includes(`server:${BUZZ_CHANNEL_SERVER_NAME}`)) === true);
+      // Messages for this CTO that waited past the bound while no CTO claude process of the project has a live buzz-channel
+      // server child (`buzz-channel.js --project-id <project>`): nothing delivers them to a session or completes them on its
+      // reply, so they are being missed, not merely slow. A claude argv that only names the channel is not a running server.
+      let channelled = false;
+      for (const parent of processes) {
+        if (channelled || !read.snapshot.claude.has(parent.pid)) continue;
+        for (const child of read.snapshot.rows) {
+          if (child.ppid !== parent.pid || !/buzz-channel\.js/u.test(child.command)) continue;
+          const argv = await this.#ctoProcessReader.argv(child.pid);
+          const server = argv?.findIndex((arg) => arg.endsWith("/buzz-channel.js")) ?? -1;
+          const project = argv?.indexOf("--project-id") ?? -1;
+          if (argv && server >= 0 && project > server && argv[project + 1] === scope.projectId && await this.#ctoProcessReader.alive(child.pid)) {
+            channelled = true;
+            break;
+          }
+        }
+      }
       const missed = channelled ? [] : this.db.all<{ message_id: string; status: string; created_at: string }>(
         `SELECT message_id, status, created_at FROM outbox
           WHERE role_key = ? AND kind IN ('OWNER_MESSAGE','PEER_MESSAGE') AND status IN ('PENDING','SENT') AND created_at <= ?

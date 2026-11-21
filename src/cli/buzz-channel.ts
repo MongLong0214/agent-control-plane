@@ -31,7 +31,7 @@ import { loadBuzzSubscriberKey, readBuzzSubscriberConfig } from "../buzz/buzz-me
 
 const USAGE =
   "usage: buzz-channel --project-id <id> --key-file <absolute path> --room <room id> [--room <room id>] " +
-  "--state-dir <dir> [--relay-url <wss url>] [--ceo-pubkey <hex>] [--key-encoding hex|nsec] [--launch-id <id>]";
+  "--state-dir <dir> [--relay-url <wss url>] [--ceo-pubkey <hex>] [--key-encoding hex|nsec] [--launch-id <id>] [--history-before <unix seconds>]";
 
 interface Args {
   projectId: string;
@@ -43,10 +43,12 @@ interface Args {
   ceoPubkeys: string[];
   /** The launch that started this server, written into every receipt so the launcher can tell its own. */
   launchId: string | null;
+  /** A fresh conversation's switch time: a message signed before it is shown as history. */
+  historyBefore: number | null;
 }
 
 export const parseBuzzChannelArgs = (argv: readonly string[]): Args => {
-  const out: Args = { projectId: "", keyFile: "", keyEncoding: "hex", rooms: [], stateDir: "", relayUrl: null, ceoPubkeys: [], launchId: null };
+  const out: Args = { projectId: "", keyFile: "", keyEncoding: "hex", rooms: [], stateDir: "", relayUrl: null, ceoPubkeys: [], launchId: null, historyBefore: null };
   for (let i = 0; i < argv.length; i += 2) {
     const flag = argv[i];
     const value = argv[i + 1];
@@ -63,6 +65,9 @@ export const parseBuzzChannelArgs = (argv: readonly string[]): Args => {
     else if (flag === "--launch-id") {
       if (!/^[A-Za-z0-9][A-Za-z0-9-]{3,63}$/u.test(value)) throw new Error("--launch-id must be 4 to 64 letters, digits or dashes");
       out.launchId = value;
+    } else if (flag === "--history-before") {
+      if (!/^[0-9]{1,12}$/u.test(value)) throw new Error("--history-before must be unix seconds");
+      out.historyBefore = Number(value);
     }
     else throw new Error(`unknown argument ${flag}`);
   }
@@ -119,6 +124,7 @@ export const runBuzzChannel = async (argv: readonly string[]): Promise<number> =
       backlog: backlogReader(args.stateDir, args.projectId),
       // This CTO's own replies are asked for back to the oldest message still queued, so one posted by any path completes it.
       answeredSince: answeredSinceReader(args.stateDir, args.projectId),
+      ...(args.historyBefore === null ? {} : { historyBefore: args.historyBefore }),
       onNotification: (n: ChannelNotification) => emitChannelNotification(server, n),
       onReceipt: (receipt) => {
         try {
