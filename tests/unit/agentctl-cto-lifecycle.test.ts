@@ -1086,6 +1086,60 @@ describe("a canonical relaunch resumes the role's bound conversation", () => {
       expect(JSON.stringify(w.out)).toContain("the hold on this swap was lost");
     });
 
+    const handoffWrites = (w: World): number => w.changes.filter((c) => c === `replace ${STATE}/cto-refresh/handoff-${P}.json`).length;
+
+    it("F: a run that lost the hold to a successor prints no recovery command that would replace the successor's conversation", async () => {
+      const { w } = canonicalWorld();
+      const OTHER = "cccccccc-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+      let reads = 0;
+      // The hold closes during the switchover's own status read; the successor then holds the role.
+      w.onStatus = () => { if (w.out.some((l) => l["step"] === "channel" && l["result"]) && ++reads === 2) { w.hold.open = false; w.record = { ...w.record, conversation: OTHER, generation: 4 }; } };
+      expect(await runCtoCommand(["relaunch", P, "--fresh", "--apply"], w.ports)).toBe(1);
+      expect(reads).toBeGreaterThanOrEqual(2);
+      expect(last(w)).toMatchObject({ result: "stopped", at: "switchover" });
+      expect(last(w)["rerun"]).toBeUndefined();
+      expect(JSON.stringify(w.out)).not.toContain("--fresh --apply");
+      expect(mutations(w)).toEqual([]);
+    });
+
+    it("G: a hold lost during the status read after rotate: the handoff file is not replaced again", async () => {
+      const { w } = canonicalWorld();
+      w.files.set(`${STATE}/cto-refresh/handoff-${P}.json`, JSON.stringify({ schema: "acp.cto-handoff.v1", projectId: P, conversation: CONVERSATION, source: "cto", text: "Go on.", writtenAt: "2026-11-20T00:00:00Z" }));
+      let writes = -1;
+      const status = w.onStatus;
+      w.onStatus = () => { status?.(); if (writes < 0 && w.rotateCalls.length > 0) { writes = handoffWrites(w); w.hold.open = false; } };
+      expect(await runCtoCommand(["relaunch", P, "--fresh", "--apply"], w.ports)).toBe(1);
+      expect(w.rotateCalls).toHaveLength(1);
+      expect(writes).toBeGreaterThanOrEqual(0);
+      expect(handoffWrites(w)).toBe(writes);
+      expect(mutations(w).filter((c) => !c.startsWith("operator canonicalCto.rotate"))).toEqual([]);
+    });
+
+    it("H: a hold lost during the launcher step's process-table read: cto-launch-<project>.sh is not replaced", async () => {
+      const { w } = canonicalWorld();
+      w.switchovers = [{ toSessionUuid: U1, state: "PENDING" }];
+      let reads = 0;
+      // After one-cto: the launcher's done reads the table twice, its run's own read is the third.
+      w.onTable = () => { if (w.out.some((l) => l["step"] === "one-cto" && l["result"]) && !w.out.some((l) => l["step"] === "launcher" && l["result"]) && ++reads === 3) w.hold.open = false; };
+      expect(await runCtoCommand(["relaunch", P, "--fresh", "--apply"], w.ports)).toBe(1);
+      expect(reads).toBeGreaterThanOrEqual(3);
+      expect(w.changes.filter((c) => c.includes(`cto-launch-${P}.sh`))).toEqual([]);
+      expect(mutations(w)).toEqual([]);
+    });
+
+    it("I: a hold lost during the first pane capture of the launch: Enter is not sent to the startup warning", async () => {
+      const { w } = canonicalWorld();
+      w.pane = "flood";
+      w.switchovers = [{ toSessionUuid: U1, state: "PENDING" }];
+      const run = w.ports.run;
+      let captures = 0;
+      w.ports.run = (bin, args, options) => { if (bin === "tmux" && args[0] === "capture-pane" && ++captures === 1) w.hold.open = false; return run(bin, args, options); };
+      expect(await runCtoCommand(["relaunch", P, "--fresh", "--apply"], w.ports)).toBe(1);
+      expect(captures).toBeGreaterThanOrEqual(1);
+      expect(w.changes.filter((c) => c.startsWith("tmux send-keys"))).toEqual([]);
+      expect(JSON.stringify(w.out)).toContain("nothing was pressed");
+    });
+
     describe("--cwd: the new conversation starts in another folder", () => {
       const withFolder = (): { w: World; cwd: string; dir: string } => {
         const { w, cwd } = canonicalWorld();
@@ -1246,7 +1300,7 @@ describe("a canonical relaunch resumes the role's bound conversation", () => {
       expect(w.files.has(`${STATE}/cto-refresh/handoff-${P}.json`)).toBe(false);
     });
 
-    it("a hold lost mid-run aborts before the next mutation and prints the rerun command", async () => {
+    it("a hold lost mid-run aborts before the next mutation and prints no rerun command, which could replace a successor", async () => {
       const { w } = canonicalWorld();
       let fired = false;
       // The connection closes (the daemon restarted, say) right after the channel step.
@@ -1254,7 +1308,9 @@ describe("a canonical relaunch resumes the role's bound conversation", () => {
       expect(await runCtoCommand(["relaunch", P, "--fresh", "--apply"], w.ports)).toBe(1);
       expect(fired).toBe(true);
       expect(mutations(w)).toEqual([]);
-      expect(last(w)).toEqual({ result: "stopped", at: "switchover", rerun: `agentctl cto relaunch ${P} --fresh --apply` });
+      expect(last(w)).toMatchObject({ result: "stopped", at: "switchover" });
+      expect(last(w)["rerun"]).toBeUndefined();
+      expect(String(last(w)["note"])).toContain("no recovery command is printed");
     });
 
     it("(a) a conversation that claims during the launch preflight is not launched a second time", async () => {

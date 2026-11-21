@@ -190,7 +190,7 @@ export const classifyScreen = (screen: string): ScreenVerdict => {
   return "OTHER";
 };
 
-export type ChannelStartupFailure = "UNRECOGNIZED_SCREEN" | "WARNING_DIFFERS" | "NOT_REGISTERED";
+export type ChannelStartupFailure = "UNRECOGNIZED_SCREEN" | "WARNING_DIFFERS" | "NOT_REGISTERED" | "ABORTED";
 
 export type ChannelStartupResult =
   | { readonly ok: true; readonly confirmed: boolean }
@@ -206,6 +206,8 @@ export interface ChannelScreenDriver {
    * cannot show it: a backlog flood scrolls the one registered line away. Never a reason to press anything.
    */
   registered?(): boolean | Promise<boolean>;
+  /** Asked once, immediately before the keystroke and after the last screen read; false presses nothing (ABORTED). */
+  proceed?(): boolean;
   now(): number;
   sleep(ms: number): Promise<void>;
 }
@@ -286,6 +288,7 @@ export const confirmChannelStartup = async (
   if (last.raw !== exactBefore) {
     return { ok: false, failure: last.verdict === "OTHER_DIALOG" ? "UNRECOGNIZED_SCREEN" : "WARNING_DIFFERS", screen: last.verdict, confirmed: false };
   }
+  if (driver.proceed && !driver.proceed()) return { ok: false, failure: "ABORTED", screen: last.verdict, confirmed: false };
   await driver.press();
   lastRefusable = null;
   const pressed = driver.now();

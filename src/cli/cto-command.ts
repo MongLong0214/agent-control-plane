@@ -694,6 +694,9 @@ const canonicalResumeSteps = (
         resume = ["--session-id", at.uuid, ...kept, ...perm, firstPromptOf({ projectId, previousConversation: stored.conversation, text: stored.text })];
       }
       const tmux = target?.tmux ?? earlier?.tmux ?? legacy?.tmux ?? `cto-${projectId}`;
+      // The reads above awaited: nothing is written once the hold is lost.
+      const gatedLauncher = options.fresh?.gate();
+      if (gatedLauncher) return gatedLauncher;
       // The launch writes its own id into this script before tmux starts it; this one is the plan a rerun starts from.
       writeCanonicalLauncher(ports, projectId, { tmux, cwd: at.cwd, claude, keyFile: channel.keyFile, roomId: channel.roomId, resume });
       return ok({ launcher, tmux });
@@ -766,7 +769,12 @@ const canonicalResumeSteps = (
       };
       // A backlog flood can scroll the registered line away; a receipt carrying this launch's id proves it too, and nothing older does.
       const registered = channelEmittedBy(ports.stateDir, projectId, launchId, (path) => ports.files.read(path));
-      const startup = await confirmChannelStartup(tmuxChannelDriver({ tmux: "tmux", target: pane, startCommand: launcher, run, registered }));
+      // Immediately before the one keystroke (after the pane reads awaited), a lost hold or a changed role presses nothing.
+      const driver = { ...tmuxChannelDriver({ tmux: "tmux", target: pane, startCommand: launcher, run, registered }), ...(options.fresh ? { proceed: () => options.fresh!.gate() === null } : {}) };
+      const startup = await confirmChannelStartup(driver);
+      if (!startup.ok && startup.failure === "ABORTED") {
+        return refused(`the hold on this swap was lost or the role changed before the channel's startup warning was confirmed (${planned.tmux}, ${pane}); nothing was pressed and the launched session was left as it is`, { tmux: planned.tmux, pane });
+      }
       if (!startup.ok) {
         return refused(`the resumed conversation was started in tmux ${planned.tmux} (${pane}) and its channel did not come up (${startup.failure}, screen ${startup.screen}); it was left running there`, { tmux: planned.tmux, pane });
       }
@@ -998,6 +1006,9 @@ const freshSteps = (ports: CtoPorts, record: CtoRecord, next: string, hold: { op
       // Whatever came back, only the daemon's own record says whether it was prepared.
       const pending = pendingOf(await readStatus());
       if (pending === null) return refused(`the switchover was not prepared${said ? ` (${said})` : ""}; the old conversation is unchanged`);
+      // The status read awaited: the hold may have been lost, and a successor may hold the role, since rotate was asked.
+      const gatedAfter = target.gate();
+      if (gatedAfter) return gatedAfter;
       // The daemon's record names the target, whoever asked for it: that, and not what this run asked for, is written down.
       markHandoff(ports.files, ports.stateDir, projectId, { next: pending });
       target.uuid = pending;
@@ -1286,7 +1297,7 @@ const retirePlan = (ports: CtoPorts, record: CtoRecord, options: { reason: strin
 };
 
 /** Prints the plan; applied, runs it in order, stopping at the first failure. */
-export const executeCtoPlan = async (ports: CtoPorts, header: Record<string, unknown>, steps: CtoStep[], apply: boolean, rerun: string): Promise<number> => {
+export const executeCtoPlan = async (ports: CtoPorts, header: Record<string, unknown>, steps: CtoStep[], apply: boolean, rerun: string | (() => string | null)): Promise<number> => {
   ports.write({ ...header, mode: apply ? "apply" : "dry-run", steps: steps.map((s) => s.id) });
   if (!apply) {
     for (const step of steps) {
@@ -1307,7 +1318,10 @@ export const executeCtoPlan = async (ports: CtoPorts, header: Record<string, unk
     }
     if (!outcome.ok) {
       ports.write({ step: step.id, result: "failed", reason: outcome.reason, ...(outcome.detail ? { detail: outcome.detail } : {}) });
-      ports.write({ result: "stopped", at: step.id, rerun });
+      // A recovery command that may replace a successor's conversation is not printed: a null rerun says why instead.
+      const again = typeof rerun === "function" ? rerun() : rerun;
+      ports.write(again !== null ? { result: "stopped", at: step.id, rerun: again }
+        : { result: "stopped", at: step.id, note: "the hold on this swap was lost, so another run may have taken over; no recovery command is printed, because running it could replace that run's conversation. Read the role's bound conversation (agentctl cto status) and start a new --fresh only if it is still the one this run began with" });
       return 1;
     }
     ports.write({ step: step.id, result: "done", ...(outcome.detail ? { detail: outcome.detail } : {}) });
@@ -1409,7 +1423,7 @@ export const runCtoCommand = async (args: readonly string[], ports: CtoPorts): P
         const current = fresh(ports, projectId);
         if (current?.kind !== "canonical" || !current.conversation) return refuse(ports, "--fresh needs a canonical CTO with a bound conversation");
         return await executeCtoPlan(ports, { command: "relaunch", project: projectId, kind: current.kind, fresh: true, oldConversation: current.conversation },
-          freshSteps(ports, current, ports.newUuid(), hold, cwdReal), apply, again);
+          freshSteps(ports, current, ports.newUuid(), hold, cwdReal), apply, () => (hold !== null && !hold.open() ? null : again));
       } finally { hold?.release(); }
     }
     return executeCtoPlan(ports, { command: "relaunch", project: projectId, kind: record.kind }, relaunchPlan(ports, record), apply, rerun);
