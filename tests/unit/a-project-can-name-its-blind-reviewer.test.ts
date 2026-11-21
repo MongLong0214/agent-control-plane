@@ -32,6 +32,9 @@ import { TestProductionAdapter } from "../helpers/production-adapter.ts";
  * CEO msg_e91da929 (2026-10-31): a project the daemon's state file names gets that reviewer as its
  * preferred Blind Reviewer, with no fallback. Every other project keeps the global preference and its
  * fallbacks. A file that cannot be applied whole applies nothing and says so.
+ *
+ * Owner rule of 2026-11-21: a project may name only gpt-6.2-sol. Claude Opus is the fallback when it is
+ * unavailable, never a project's choice, so any other entry is ignored and recorded.
  */
 
 afterAll(cleanupTempDirs);
@@ -48,6 +51,8 @@ const CONTRACT: TaskContract = {
 };
 
 const OPUS: ReviewerPreference = { provider: "claude", model: "opus", effort: null };
+/** The one reviewer a project may name: gpt-6.2-sol, here at an effort of its own. */
+const GPT_HIGH: ReviewerPreference = { provider: "gpt", model: "gpt-6.2-sol", effort: "high" };
 
 const persistPassingVerification = (
   harness: ReturnType<typeof makeHarness>,
@@ -132,14 +137,14 @@ class NoIsolationAdapter extends TestProductionAdapter {
   readonly supportsReviewerIsolation = false;
 }
 
-/** The production default (gpt-6.1-sol preferred, Claude Opus fallback) plus the given project entries. */
+/** The production default (gpt-6.2-sol preferred, Claude Opus fallback) plus the given project entries. */
 const gateFor = (setup: Prepared, projects: Record<string, ReviewerPreference>) => {
   const cp = setup.harness.cp;
   return new BlindReviewGate(
     cp.clock, cp.db, cp.audit, cp.artifacts, cp.evidenceWritersForTests().BLIND_REVIEW, cp.sessions, cp.bindings,
     cp.providers, cp.repositories, cp.telemetry,
     {
-      preferred: { provider: "gpt", model: "gpt-6.1-sol", effort: "xhigh" },
+      preferred: { provider: "gpt", model: "gpt-6.2-sol", effort: "xhigh" },
       fallbacks: [{ provider: "claude", model: "opus", effort: null }],
       projects: new Map(Object.entries(projects)),
     },
@@ -163,21 +168,54 @@ const completed = (setup: Prepared) =>
   setup.harness.cp.audit.byKind("BLIND_REVIEW_COMPLETED").filter((row) => row.runId === setup.run.runId);
 
 describe("a project's own Blind Reviewer", () => {
-  it("1: a project with an entry gets Claude Opus as its PREFERRED reviewer, and the completion receipt names the project preference", async () => {
+  it("1: a project naming Claude Opus is ignored and recorded; its run reviews on gpt-6.2-sol as PREFERRED, and Opus is only the normal fallback", async () => {
     const setup = await prepared();
     try {
-      const result = await review(gateFor(setup, { [setup.projectId]: OPUS }), setup);
+      // The file's own resolution, then the production default gate (gpt-6.2-sol, Claude Opus behind it) given what it applied.
+      const resolved = resolveProjectReviewerPreferences(
+        { path: "/state/reviewer-preferences.json", text: JSON.stringify({ [setup.projectId]: OPUS }) },
+        () => true,
+      );
+      expect(resolved.byProject.size).toBe(0);
+      expect(resolved.ignored).toEqual(new Map([[setup.projectId, expect.objectContaining({ provider: "claude", model: "opus" })]]));
+      const gate = gateFor(setup, Object.fromEntries(resolved.byProject));
+
+      const result = await review(gate, setup);
+      expect(result.allowed, JSON.stringify(result)).toBe(true);
+      if (!result.allowed) return;
+      expect(result.value).toMatchObject({ provider: "gpt", model: "gpt-6.2-sol", effort: "xhigh" });
+      expect(setup.claude.invocations).toHaveLength(0);
+      expect(reviewerMode(setup, result.value.reviewerSessionId)).toBe("PREFERRED");
+      expect(completed(setup)[0]?.evidence).not.toHaveProperty("reviewerSource");
+
+      // Opus is the normal fallback, on exactly its one condition, and a project entry did not change that.
+      gate.attach({ packetReviewerScope: (provider) => provider === "gpt" ? { state: "UNCONFIGURED", root: "/fixture/no-codex-home" } : null });
+      const fallback = await review(gate, setup);
+      expect(fallback.allowed, JSON.stringify(fallback)).toBe(true);
+      if (!fallback.allowed) return;
+      expect(fallback.value.provider).toBe("claude");
+      expect(reviewerMode(setup, fallback.value.reviewerSessionId)).toBe("FALLBACK");
+      expect(setup.harness.cp.audit.byKind("BLIND_REVIEW_FALLBACK")).toHaveLength(1);
+    } finally {
+      setup.harness.cp.close();
+    }
+  });
+
+  it("1b: a project naming gpt-6.2-sol at its own effort gets it as its PREFERRED reviewer, and the completion receipt names the project preference", async () => {
+    const setup = await prepared();
+    try {
+      const result = await review(gateFor(setup, { [setup.projectId]: GPT_HIGH }), setup);
 
       expect(result.allowed, JSON.stringify(result)).toBe(true);
       if (!result.allowed) return;
-      expect(result.value).toMatchObject({ provider: "claude", model: "opus", effort: null });
-      expect(setup.gpt.invocations).toHaveLength(0);
+      expect(result.value).toMatchObject({ provider: "gpt", model: "gpt-6.2-sol", effort: "high" });
+      expect(setup.claude.invocations).toHaveLength(0);
       expect(reviewerMode(setup, result.value.reviewerSessionId)).toBe("PREFERRED");
       expect(setup.harness.cp.audit.byKind("BLIND_REVIEW_FALLBACK")).toHaveLength(0);
       expect(completed(setup)).toEqual([expect.objectContaining({
         sessionId: result.value.reviewerSessionId,
         evidence: expect.objectContaining({
-          provider: "claude", model: "opus", reviewerSource: "PROJECT_PREFERENCE", projectId: setup.projectId,
+          provider: "gpt", model: "gpt-6.2-sol", reviewerSource: "PROJECT_PREFERENCE", projectId: setup.projectId,
         }),
       })]);
     } finally {
@@ -185,14 +223,14 @@ describe("a project's own Blind Reviewer", () => {
     }
   });
 
-  it("2 (control): a project without an entry keeps gpt-6.1-sol preferred and its Claude fallback, unchanged", async () => {
+  it("2 (control): a project without an entry keeps gpt-6.2-sol preferred and its Claude fallback, unchanged", async () => {
     const setup = await prepared();
     try {
-      const gate = gateFor(setup, { "some-other-project": OPUS });
+      const gate = gateFor(setup, { "some-other-project": GPT_HIGH });
       const preferred = await review(gate, setup);
       expect(preferred.allowed, JSON.stringify(preferred)).toBe(true);
       if (!preferred.allowed) return;
-      expect(preferred.value).toMatchObject({ provider: "gpt", model: "gpt-6.1-sol", effort: "xhigh" });
+      expect(preferred.value).toMatchObject({ provider: "gpt", model: "gpt-6.2-sol", effort: "xhigh" });
       expect(setup.claude.invocations).toHaveLength(0);
       expect(completed(setup)[0]?.evidence).not.toHaveProperty("reviewerSource");
 
@@ -213,22 +251,22 @@ describe("a project's own Blind Reviewer", () => {
     }
   });
 
-  it("3: a capacity refusal on the project's Claude reviewer ends selection, with no fallback to gpt", async () => {
+  it("3: a capacity refusal on the project's GPT reviewer ends selection, with no fallback to claude", async () => {
     const setup = await prepared();
     try {
-      const gate = gateFor(setup, { [setup.projectId]: OPUS });
+      const gate = gateFor(setup, { [setup.projectId]: GPT_HIGH });
       const admitted: string[] = [];
       gate.attach({
         capacity: {
           refreshForBlindReview: async (target) => {
             admitted.push(target?.provider ?? "none");
-            return target?.provider === "claude"
-              ? deny(ReasonCode.CAPACITY_ADMISSION_SUSPENDED, "claude reviewer capacity exhausted", {})
+            return target?.provider === "gpt"
+              ? deny(ReasonCode.CAPACITY_ADMISSION_SUSPENDED, "gpt reviewer capacity exhausted", {})
               : allow(ReasonCode.OK, undefined);
           },
         },
       });
-      const gptStart = vi.spyOn(setup.gpt, "startSession");
+      const claudeStart = vi.spyOn(setup.claude, "startSession");
 
       const result = await review(gate, setup);
 
@@ -237,8 +275,8 @@ describe("a project's own Blind Reviewer", () => {
         reasonCode: ReasonCode.CAPACITY_ADMISSION_SUSPENDED,
         evidence: { reviewerSource: "PROJECT_PREFERENCE", projectId: setup.projectId },
       });
-      expect(admitted).toEqual(["claude"]);
-      expect(gptStart).not.toHaveBeenCalled();
+      expect(admitted).toEqual(["gpt"]);
+      expect(claudeStart).not.toHaveBeenCalled();
       expect(setup.gpt.invocations).toHaveLength(0);
       expect(setup.claude.invocations).toHaveLength(0);
       expect(setup.harness.cp.audit.byKind("BLIND_REVIEW_FALLBACK")).toHaveLength(0);
@@ -248,17 +286,17 @@ describe("a project's own Blind Reviewer", () => {
     }
   });
 
-  it("5: the project's Claude reviewer is a session distinct from the run's Claude producer", async () => {
+  it("5: the project's GPT reviewer is a session distinct from the run's Claude producer", async () => {
     const setup = await prepared();
     try {
-      const result = await review(gateFor(setup, { [setup.projectId]: OPUS }), setup);
+      const result = await review(gateFor(setup, { [setup.projectId]: GPT_HIGH }), setup);
       expect(result.allowed, JSON.stringify(result)).toBe(true);
       if (!result.allowed) return;
       const { cp } = setup.harness;
       const reviewer = cp.sessions.get(result.value.reviewerSessionId)!;
       const producer = cp.sessions.get(setup.workerSessionId)!;
 
-      expect(reviewer.provider).toBe("claude");
+      expect(reviewer.provider).toBe("gpt");
       expect(producer.provider).toBe("claude");
       expect(reviewer.sessionId).not.toBe(producer.sessionId);
       expect(reviewer.incarnation).not.toBe(producer.incarnation);
@@ -280,7 +318,7 @@ describe("a project whose reviewer entry names a provider ACP does not support",
     const setup = await prepared({
       reviewerPreferencesFile: readProjectReviewerFile(file),
       reviewer: {
-        preferred: { provider: "gpt", model: "gpt-6.1-sol", effort: "xhigh" },
+        preferred: { provider: "gpt", model: "gpt-6.2-sol", effort: "xhigh" },
         fallbacks: [{ provider: "claude", model: "opus", effort: null }],
       },
     });
@@ -332,9 +370,9 @@ describe("the daemon's reviewer preference file", () => {
     expect(resolveProjectReviewerPreferences(defaultConfig(root).reviewerPreferencesFile!, registered))
       .toEqual({ byProject: new Map(), refused: null, refusedProjects: new Map() });
 
-    writeFileSync(join(root, "reviewer-preferences.json"), JSON.stringify({ "e2e-1": OPUS }));
+    writeFileSync(join(root, "reviewer-preferences.json"), JSON.stringify({ "e2e-1": GPT_HIGH }));
     expect(resolveProjectReviewerPreferences(defaultConfig(root).reviewerPreferencesFile!, registered))
-      .toEqual({ byProject: new Map([["e2e-1", OPUS]]), refused: null, refusedProjects: new Map() });
+      .toEqual({ byProject: new Map([["e2e-1", GPT_HIGH]]), refused: null, refusedProjects: new Map() });
   });
 
   it.each([
@@ -359,9 +397,9 @@ describe("the daemon's reviewer preference file", () => {
   });
 
   it.each([["grok"], ["nonesuch"]])("4: an entry naming %s beside a valid entry refuses that project alone; the valid entry applies", (provider) => {
-    const text = JSON.stringify({ "e2e-1": OPUS, "e2e-2": { provider, model: "x", effort: null } });
+    const text = JSON.stringify({ "e2e-1": GPT_HIGH, "e2e-2": { provider, model: "x", effort: null } });
     expect(resolveProjectReviewerPreferences({ path: "/state/reviewer-preferences.json", text }, registered)).toEqual({
-      byProject: new Map([["e2e-1", OPUS]]),
+      byProject: new Map([["e2e-1", GPT_HIGH]]),
       refused: null,
       refusedProjects: new Map([["e2e-2", {
         provider,
@@ -371,12 +409,76 @@ describe("the daemon's reviewer preference file", () => {
   });
 
   it.each([
+    ["Claude Opus", OPUS],
+    ["the retired gpt-6.1-sol", { provider: "gpt", model: "gpt-6.1-sol", effort: "xhigh" }],
+    ["the retired gpt-6.1-terra", { provider: "gpt", model: "gpt-6.1-terra", effort: "xhigh" }],
+  ])("4: an entry naming %s is ignored, so that project reviews on the global preferred reviewer; the gpt-6.2-sol entry applies", (_label, named) => {
+    const text = JSON.stringify({ "e2e-1": GPT_HIGH, "e2e-2": named });
+    expect(resolveProjectReviewerPreferences({ path: "/state/reviewer-preferences.json", text }, registered)).toEqual({
+      byProject: new Map([["e2e-1", GPT_HIGH]]),
+      refused: null,
+      refusedProjects: new Map(),
+      ignored: new Map([["e2e-2", {
+        provider: named.provider,
+        model: named.model,
+        reason: `project e2e-2 names ${named.provider} ${named.model}, but a project may name only gpt gpt-6.2-sol; ` +
+          "the entry is ignored and the project reviews on the global preferred reviewer",
+      }]]),
+    });
+  });
+
+  it("4: a control plane given Opus and retired gpt-6.1 entries launches neither, audits each ignored entry, and leaves the global gpt-6.2-sol preference", () => {
+    const root = tempDir("acp-reviewer-pref-ignored-");
+    const file = join(root, "reviewer-preferences.json");
+    writeFileSync(file, JSON.stringify({
+      "e2e-1": GPT_HIGH,
+      "e2e-2": { provider: "gpt", model: "gpt-6.1-sol", effort: "xhigh" },
+      "e2e-3": OPUS,
+    }));
+    const clock = new ManualClock("2026-11-21T00:00:00.000Z");
+    const cp = new ControlPlane({
+      databasePath: join(root, "state.sqlite"),
+      worktreeRoot: join(root, "worktrees"),
+      capacityDir: join(root, "capacity"),
+      secretsDir: join(root, "secrets"),
+      clock,
+      adapters: [new TestProductionAdapter(clock, "gpt"), new TestProductionAdapter(clock, "claude")],
+      allowNonProductionAdapters: true,
+      reviewerPreferencesFile: readProjectReviewerFile(file),
+    });
+    try {
+      const preferences = cp.review["preferences"];
+      // e2e-2 and e2e-3 have no entry of their own now, so their runs take the global preferred reviewer; they are not refused.
+      expect(preferences.projects).toEqual(new Map([["e2e-1", GPT_HIGH]]));
+      expect(preferences.refusedProjects).toBeUndefined();
+      expect(preferences.preferred).toEqual({ provider: "gpt", model: "gpt-6.2-sol", effort: "xhigh" });
+      expect(cp.audit.byKind("REVIEWER_PREFERENCES_REFUSED")).toEqual([
+        expect.objectContaining({
+          reasonCode: ReasonCode.REVIEWER_PREFERENCES_INVALID,
+          evidence: expect.objectContaining({
+            path: file, projectId: "e2e-2", provider: "gpt", model: "gpt-6.1-sol", reviewerModel: "gpt-6.2-sol",
+            reason: expect.stringContaining("may name only gpt gpt-6.2-sol"),
+          }),
+        }),
+        expect.objectContaining({
+          reasonCode: ReasonCode.REVIEWER_PREFERENCES_INVALID,
+          evidence: expect.objectContaining({ path: file, projectId: "e2e-3", provider: "claude", model: "opus", reviewerModel: "gpt-6.2-sol" }),
+        }),
+      ]);
+      // Not projects whose reviews are refused, so no doctor finding says they are.
+      expect(cp.doctor["checkReviewerPreferences"]()).toEqual([]);
+    } finally {
+      cp.close();
+    }
+  });
+
+  it.each([
     ["a provider no adapter is registered for", "nonesuch"],
     ["a registered provider that cannot isolate a reviewer", "no-isolation"],
   ])("4: a control plane given %s refuses that project's reviewer, keeps the others, audits the refusal and reports a doctor finding", (_label, provider) => {
     const root = tempDir("acp-reviewer-pref-cp-");
     const file = join(root, "reviewer-preferences.json");
-    writeFileSync(file, JSON.stringify({ "e2e-1": OPUS, "e2e-2": { provider, model: "some-model", effort: null } }));
+    writeFileSync(file, JSON.stringify({ "e2e-1": GPT_HIGH, "e2e-2": { provider, model: "some-model", effort: null } }));
     const clock = new ManualClock("2026-11-01T00:00:00.000Z");
     const open = () => new ControlPlane({
       databasePath: join(root, "state.sqlite"),
@@ -396,9 +498,9 @@ describe("the daemon's reviewer preference file", () => {
       // e2e-2's reviews are refused, never moved onto the global reviewer. e2e-1's entry still applies,
       // and the global preferred and fallbacks are as they were for every other project.
       const preferences = refused.review["preferences"];
-      expect(preferences.projects).toEqual(new Map([["e2e-1", OPUS]]));
+      expect(preferences.projects).toEqual(new Map([["e2e-1", GPT_HIGH]]));
       expect(preferences.refusedProjects).toEqual(new Map([["e2e-2", expect.objectContaining({ provider })]]));
-      expect(preferences.preferred).toEqual({ provider: "gpt", model: "gpt-6.1-sol", effort: "xhigh" });
+      expect(preferences.preferred).toEqual({ provider: "gpt", model: "gpt-6.2-sol", effort: "xhigh" });
       expect(preferences.fallbacks).toEqual([{ provider: "claude", model: "opus", effort: null }]);
       expect(refused.audit.byKind("REVIEWER_PREFERENCES_REFUSED")).toEqual([expect.objectContaining({
         reasonCode: ReasonCode.REVIEWER_PREFERENCES_INVALID,
@@ -414,10 +516,10 @@ describe("the daemon's reviewer preference file", () => {
       refused.close();
     }
 
-    writeFileSync(file, JSON.stringify({ "e2e-1": OPUS }));
+    writeFileSync(file, JSON.stringify({ "e2e-1": GPT_HIGH }));
     const applied = open();
     try {
-      expect(applied.review["preferences"].projects).toEqual(new Map([["e2e-1", OPUS]]));
+      expect(applied.review["preferences"].projects).toEqual(new Map([["e2e-1", GPT_HIGH]]));
       expect(applied.audit.byKind("REVIEWER_PREFERENCES_REFUSED")).toHaveLength(1);
       expect(applied.doctor["checkReviewerPreferences"]()).toEqual([]);
     } finally {

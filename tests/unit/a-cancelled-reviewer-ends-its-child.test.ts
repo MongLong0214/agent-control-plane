@@ -74,10 +74,10 @@ describe("an aborted Codex packet review ends its child", () => {
   it("the resumed review: the child is ended and the invocation settles at once", async () => {
     const { adapter, packetRoot, isolation } = setup();
     const { seen, running } = stubRunCli("review");
-    const handle = await adapter.startSession({ model: "gpt-6.1-sol", effort: "xhigh", workdir: packetRoot, purpose: "blind-review", isolation });
+    const handle = await adapter.startSession({ model: "gpt-6.2-sol", effort: "xhigh", workdir: packetRoot, purpose: "blind-review", isolation });
     const controller = new AbortController();
     const review = adapter.invoke({
-      prompt: "Return the packet verdict.", workdir: packetRoot, timeoutMs: 20 * 60_000, model: "gpt-6.1-sol", effort: "xhigh",
+      prompt: "Return the packet verdict.", workdir: packetRoot, timeoutMs: 20 * 60_000, model: "gpt-6.2-sol", effort: "xhigh",
       readOnly: true, correlationId: "aborted-review", externalSessionId: handle.externalSessionId, isolation, signal: controller.signal,
     });
     await running;
@@ -93,7 +93,7 @@ describe("an aborted Codex packet review ends its child", () => {
     const { seen, running } = stubRunCli("handshake");
     const controller = new AbortController();
     const handshake = adapter.startSession({
-      model: "gpt-6.1-sol", effort: "xhigh", workdir: packetRoot, purpose: "blind-review", isolation, signal: controller.signal,
+      model: "gpt-6.2-sol", effort: "xhigh", workdir: packetRoot, purpose: "blind-review", isolation, signal: controller.signal,
     });
     await running;
     controller.abort();

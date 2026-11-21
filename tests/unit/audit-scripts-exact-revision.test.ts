@@ -880,7 +880,7 @@ describe.each(SCRIPTS)("%s", (script) => {
     TEST_TIMEOUT_MS,
   );
 
-  const REQUESTED: Record<Script, string> = { "production-review.mjs": "gpt-6.1-sol" };
+  const REQUESTED: Record<Script, string> = { "production-review.mjs": "gpt-6.2-sol" };
   it.each([
     ["names no model", "none", null],
     ["names a different model", "some-other-model", "some-other-model"],
@@ -976,16 +976,16 @@ describe("the reviewer model", () => {
       expect(refused.status).toBe(2);
       expect(callsOf(fixture)).toEqual([]);
       const result = await run(fixture, "production-review.mjs", ["core"]);
-      expect(callsOf(fixture).map((call) => call.model)).toEqual(["gpt-6.1-sol"]);
+      expect(callsOf(fixture).map((call) => call.model)).toEqual(["gpt-6.2-sol"]);
       const dir = runDirectoryOf(fixture, "production-review.mjs", result);
-      expect(summaryIn(dir)).toMatchObject({ requestedModel: "gpt-6.1-sol", modelIdentity: "ESTABLISHED" });
+      expect(summaryIn(dir)).toMatchObject({ requestedModel: "gpt-6.2-sol", modelIdentity: "ESTABLISHED" });
 
       setPlan(fixture, { default: "pass", observedModel: "gpt-somebody-else" });
       const other = await run(fixture, "production-review.mjs", ["core"]);
       const otherDir = runDirectoryOf(fixture, "production-review.mjs", other);
       const manifest = manifestIn(otherDir);
       expect(manifest.results["core"]?.observedModel).toBe("gpt-somebody-else");
-      expect(manifest.reviewer).toMatchObject({ requestedModel: "gpt-6.1-sol", modelIdentity: "UNKNOWN" });
+      expect(manifest.reviewer).toMatchObject({ requestedModel: "gpt-6.2-sol", modelIdentity: "UNKNOWN" });
       const summary = summaryIn(otherDir);
       expect(summary?.modelIdentity).toBe("UNKNOWN");
       expect(summary?.modelNote).toMatch(/gpt-somebody-else/);
