@@ -546,25 +546,27 @@ const canonicalResumeSteps = (
   const wanted = (record: CtoRecord | null): string | null => (options.fresh ? options.fresh.uuid : record?.conversation ?? null);
   const uuid = wanted(planned);
   const cwd = options.fresh?.cwd() ?? (planned ? cwdOf(planned) : null);
-  const oldCwd = planned ? cwdOf(planned) : null;
   const launcher = canonicalLauncherOf(ports, projectId);
-  const realOf = (path: string): string => ports.files.real?.(path)?.path ?? path;
   type McpEntry = { command?: string; args?: string[] };
-  /** The acp-cto entry Claude Code keeps for a folder, or undefined. */
+  /** The acp-cto entry Claude Code keeps for a folder: in `$CLAUDE_CONFIG_DIR/.claude.json` when set, else `~/.claude.json`, under the folder's realpath. */
   const entryAt = (folder: string): McpEntry | undefined => {
-    const config = join(ports.home, ".claude.json");
+    const dir = ports.env["CLAUDE_CONFIG_DIR"] ?? "";
+    const config = join(dir === "" ? ports.home : dir, ".claude.json");
     if (!ports.files.exists(config)) return undefined;
-    try { return (JSON.parse(ports.files.read(config)) as { projects?: Record<string, { mcpServers?: Record<string, McpEntry> }> }).projects?.[folder]?.mcpServers?.["acp-cto"]; } catch { return undefined; }
+    const key = ports.files.real?.(folder)?.path ?? folder;
+    try { return (JSON.parse(ports.files.read(config)) as { projects?: Record<string, { mcpServers?: Record<string, McpEntry> }> }).projects?.[key]?.mcpServers?.["acp-cto"]; } catch { return undefined; }
   };
-  /** --fresh in another folder: the folder whose entry for this CTO moves. The same folder by realpath is no move at all. */
-  const movesFrom = (target: string): string | null => (options.fresh && oldCwd && realOf(oldCwd) !== realOf(target) ? oldCwd : null);
-  /** The destination already holds an acp-cto entry that is not this project's: moving over it would break the other project. */
+  /**
+   * --fresh: the destination's acp-cto entry names another project, which this run must not repoint. Only the new folder's entry is ever
+   * written; the old folder's is left alone (it may be shared with a git root or subfolder, or be another project's). It names the old,
+   * now fenced conversation, so an attach through it is refused, which is harmless.
+   */
   const mcpConflict = (target: string): string | null => {
-    const entry = movesFrom(target) ? entryAt(target) : undefined;
+    const entry = options.fresh ? entryAt(target) : undefined;
     if (!entry) return null;
     const args = entry.args ?? [];
-    const owner = args[args.indexOf("--project-id") + 1];
-    return args.includes("--project-id") && owner === projectId ? null : `${target} already has an acp-cto entry that belongs to ${owner && args.includes("--project-id") ? owner : "another project"}; nothing was changed`;
+    const owner = args.includes("--project-id") ? args[args.indexOf("--project-id") + 1] : undefined;
+    return owner === projectId ? null : `${target} already has an acp-cto entry that belongs to ${owner ?? "another project"}; nothing was changed`;
   };
   const bound = (): { record: CtoRecord; uuid: string; cwd: string } | string => {
     const record = fresh(ports, projectId);
@@ -700,9 +702,6 @@ const canonicalResumeSteps = (
       const at = bound();
       if (typeof at === "string") return false;
       const entry = entryAt(at.cwd);
-      // A fresh conversation in another folder: the old folder's entry for this CTO must be gone, so only one exists.
-      const from = movesFrom(at.cwd);
-      if (from && entryAt(from) !== undefined) return false;
       return entry?.command === runtimeNodeOf(ports) && JSON.stringify(entry.args ?? []) === JSON.stringify(acpCtoEntryArgs(ports, projectId, at.uuid));
     },
     run: () => {
@@ -718,11 +717,6 @@ const canonicalResumeSteps = (
       ports.run(claude, ["mcp", "remove", "--scope", "local", "acp-cto"], { cwd: at.cwd, timeoutMs: 30_000 });
       const added = ports.run(claude, ["mcp", "add", "--scope", "local", "acp-cto", "--", runtimeNodeOf(ports), ...acpCtoEntryArgs(ports, projectId, at.uuid)], { cwd: at.cwd, timeoutMs: 30_000 });
       if (added.status !== 0) return refused(`claude mcp add acp-cto failed: ${firstLine(added.stderr)}`);
-      const from = movesFrom(at.cwd);
-      if (from) {
-        ports.run(claude, ["mcp", "remove", "--scope", "local", "acp-cto"], { cwd: from, timeoutMs: 30_000 });
-        if (entryAt(from) !== undefined) return refused(`claude mcp remove acp-cto left ${from}'s entry in place, so two entries would exist; run this again`);
-      }
       return ok();
     },
   }, stopOldStep(), {
@@ -1387,7 +1381,12 @@ export const runCtoCommand = async (args: readonly string[], ports: CtoPorts): P
     if (flags.has("--fresh")) {
       if (record.kind !== "canonical" || !record.conversation) return refuse(ports, "--fresh needs a canonical CTO with a bound conversation");
       // The folder is named in the retry until the handoff file keeps it, which is after the first steps; naming it after is the same folder.
-      const again = `agentctl cto relaunch ${projectId} --fresh${cwdReal !== null ? ` --cwd ${/^[A-Za-z0-9._/:=@-]+$/.test(cwdReal) ? cwdReal : JSON.stringify(cwdReal)}` : ""} --apply`;
+      // A swap already started in a folder is never moved to another: the stored folder is the one to rerun with.
+      const started = readHandoff(ports.files, ports.stateDir, projectId);
+      if (cwdReal !== null && started?.conversation === record.conversation && started.completed !== true && started.next && started.cwd && started.cwd !== cwdReal) {
+        return refuse(ports, `swap to ${started.next} already started in ${started.cwd}; rerun without --cwd or with --cwd ${started.cwd}; nothing was changed`);
+      }
+      const again = `agentctl cto relaunch ${projectId} --fresh${cwdReal !== null ? ` --cwd ${/^[A-Za-z0-9._/:=@-]+$/.test(cwdReal) ? cwdReal : `'${cwdReal.replaceAll("'", "'\\''")}'`}` : ""} --apply`;
       // A second run at the same time cannot exist: --apply takes the daemon's hold on this project first and keeps that connection
       // open for the whole run (the daemon releases it when the connection closes). Nothing is rolled back; the recovery is this command again.
       let hold: { decision: Decision<unknown>; open(): boolean; release(): void } | null = null;

@@ -17,7 +17,7 @@ import type { CtoProcessReader, CtoRoleScope } from "../../src/cto/one-cto-per-p
 interface FakeProcess { pid: number; ppid: number; command: string; argv?: string[]; cwd?: string }
 import { formatHostProvisionerReason, hostProvisionerReason, hostReasonKind, hostRefusalText } from "../../src/runtime/host-provisioner-reason.ts";
 import { cleanupTempDirs, commitAll, gitSync, tempDir } from "../helpers/fixtures.ts";
-import { realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { makeHarness } from "../helpers/harness.ts";
 
@@ -114,8 +114,6 @@ interface World {
   signalled: Set<number>;
   /** The folder each `claude mcp` call ran in, with its line. */
   mcpCalls: string[];
-  /** `claude mcp remove` leaves the entry in place (and exits 1). */
-  mcpRemoveFails?: boolean;
   /** The shared reader's alive() answers false for every pid: the old reading of `ps -o stat= -p` exiting 1. */
   psStatFails: boolean;
   /** Per pid, what each token read answers once the plan's first step has reported: by read number, from 1. */
@@ -207,26 +205,7 @@ const makeWorld = (overrides: Partial<CtoRecord> = {}, env: Record<string, strin
       files.set(`${STATE}/buzz-channel/${P}.receipts.jsonl`, `${JSON.stringify({ type: "emitted", eventId: "e1", room: ROOM, senderPubkey: "p", emittedAt: 1, ...(launchId ? { launchId } : {}) })}\n`);
       return answer(0);
     }
-    if (bin === LOCAL_CLAUDE && args[0] === "mcp") {
-      w.changes.push(line); w.mcpCalls.push(`${options.cwd} ${args[1]}`);
-      // With a ~/.claude.json in the world, remove and add edit it as Claude Code does: the entry per folder.
-      const config = `${HOME}/.claude.json`;
-      if (files.has(config) && options.cwd) {
-        const json = JSON.parse(files.get(config)!) as { projects: Record<string, { mcpServers?: Record<string, unknown> }> };
-        const project = (json.projects[options.cwd] ??= {});
-        if (args[1] === "remove") {
-          if (w.mcpRemoveFails) return answer(1);
-          const had = project.mcpServers?.["acp-cto"] !== undefined;
-          if (had) delete project.mcpServers!["acp-cto"];
-          files.set(config, JSON.stringify(json));
-          return answer(had ? 0 : 1);
-        }
-        const at = args.indexOf("--");
-        (project.mcpServers ??= {})["acp-cto"] = { command: args[at + 1], args: args.slice(at + 2) };
-        files.set(config, JSON.stringify(json));
-      }
-      return answer(args[1] === "remove" ? 1 : 0);
-    }
+    if (bin === LOCAL_CLAUDE && args[0] === "mcp") { w.changes.push(line); w.mcpCalls.push(`${options.cwd} ${args[1]}`); return answer(args[1] === "remove" ? 1 : 0); }
     if (bin === "tmux" && args[0] === "has-session") {
       if (w.oldReceiptDuringLaunch) {
         const file = `${STATE}/buzz-channel/${P}.receipts.jsonl`;
@@ -1100,7 +1079,8 @@ describe("a canonical relaunch resumes the role's bound conversation", () => {
         expect(w.out.find((l) => l["step"] === "trust" && l["result"] === "done")!["detail"]).toMatchObject({ folder: dir });
         expect(w.files.get(w.launched.command!)).toContain(dir);
         expect(w.files.get(w.launched.command!)).not.toContain(cwd);
-        expect(w.mcpCalls).toEqual([`${dir} remove`, `${dir} add`, `${cwd} remove`]);
+        // Only the new folder's entry is written; the old folder's is never touched.
+        expect(w.mcpCalls).toEqual([`${dir} remove`, `${dir} add`]);
         expect(JSON.parse(w.files.get(`${STATE}/cto-refresh/handoff-${P}.json`)!)).toMatchObject({ cwd: dir });
       });
 
@@ -1133,47 +1113,36 @@ describe("a canonical relaunch resumes the role's bound conversation", () => {
         expect(w.hold.calls).toEqual([]);
       });
 
-      const entryOf = (w: World, folder: string): { args?: string[] } | undefined => (JSON.parse(w.files.get(`${HOME}/.claude.json`)!) as { projects: Record<string, { mcpServers?: Record<string, { args?: string[] }> }> }).projects[folder]?.mcpServers?.["acp-cto"];
-      const seed = (w: World, projects: Record<string, unknown>): void => { w.files.set(`${HOME}/.claude.json`, JSON.stringify({ projects })); };
-      const ourEntry = { command: "node", args: ["cli.js", "attach", "canonical-cto", "--claimed-session-id", CONVERSATION, "--project-id", P] };
+      const seed = (w: World, projects: Record<string, unknown>, at: string): void => { w.files.set(`${at}/.claude.json`, JSON.stringify({ projects })); };
+      const theirs = { command: "node", args: ["cli.js", "attach", "canonical-cto", "--claimed-session-id", CONVERSATION, "--project-id", "prj_other"] };
 
-      it("the entry moves: the new folder holds this project's, the old folder's is gone", async () => {
-        const { w, cwd, dir } = withFolder();
-        seed(w, { [cwd]: { mcpServers: { "acp-cto": ourEntry } } });
-        expect(await runCtoCommand(["relaunch", P, "--fresh", "--cwd", dir, "--apply"], w.ports)).toBe(0);
-        expect(entryOf(w, cwd)).toBeUndefined();
-        expect(entryOf(w, dir)?.args).toContain(w.rotateCalls[0]!.params["toSessionUuid"]);
-      });
-
-      it("a folder that is the old one by realpath (a symlink to it) moves nothing: the entry stays", async () => {
-        const { w, cwd } = withFolder();
-        const alias = join(realpathSync(tempDir("acp-cto-alias-")), "alias");
-        symlinkSync(cwd, alias);
-        w.files.set(`${alias}/.keep`, "");
-        seed(w, { [cwd]: { mcpServers: { "acp-cto": ourEntry } } });
-        expect(await runCtoCommand(["relaunch", P, "--fresh", "--cwd", alias, "--apply"], w.ports)).toBe(0);
-        expect(w.mcpCalls).toEqual([`${cwd} remove`, `${cwd} add`]);
-        expect(entryOf(w, cwd)?.args).toContain(w.rotateCalls[0]!.params["toSessionUuid"]);
-      });
-
-      it("another project's entry in the new folder is never overwritten: refused, nothing stopped or written", async () => {
-        const { w, cwd, dir } = withFolder();
-        const theirs = { command: "node", args: ["cli.js", "attach", "canonical-cto", "--project-id", "prj_other"] };
-        seed(w, { [cwd]: { mcpServers: { "acp-cto": ourEntry } }, [dir]: { mcpServers: { "acp-cto": theirs } } });
+      it("another project's entry in the new folder, read from $CLAUDE_CONFIG_DIR, is never overwritten: refused, nothing stopped or written", async () => {
+        const { w, dir } = withFolder();
+        // ~/.claude.json holds nothing there; Claude reads the config dir's file, so that is where the entry is.
+        seed(w, {}, HOME);
+        seed(w, { [dir]: { mcpServers: { "acp-cto": theirs } } }, w.ports.env["CLAUDE_CONFIG_DIR"]!);
         expect(await runCtoCommand(["relaunch", P, "--fresh", "--cwd", dir, "--apply"], w.ports)).toBe(1);
         expect(w.mcpCalls).toEqual([]);
         expect(w.changes.filter((c) => c.startsWith("SIGTERM") || c.startsWith("tmux new-"))).toEqual([]);
-        expect(entryOf(w, dir)).toEqual(theirs);
-        expect(entryOf(w, cwd)).toEqual(ourEntry);
       });
 
-      it("a source entry that cannot be removed fails the run and prints the rerun command, nothing stopped", async () => {
-        const { w, cwd, dir } = withFolder();
-        seed(w, { [cwd]: { mcpServers: { "acp-cto": ourEntry } } });
-        w.mcpRemoveFails = true;
+      it("an entry in the new folder that already names this project is repointed, not refused", async () => {
+        const { w, dir } = withFolder();
+        seed(w, { [dir]: { mcpServers: { "acp-cto": { ...theirs, args: ["cli.js", "attach", "--project-id", P] } } } }, w.ports.env["CLAUDE_CONFIG_DIR"]!);
+        expect(await runCtoCommand(["relaunch", P, "--fresh", "--cwd", dir, "--apply"], w.ports)).toBe(0);
+        expect(w.mcpCalls).toEqual([`${dir} remove`, `${dir} add`]);
+      });
+
+      it("a --cwd naming another folder than the one a pending swap started in is refused, nothing changed", async () => {
+        const { w, dir } = withFolder();
+        const other = realpathSync(tempDir("acp-cto-newdir2-"));
+        w.launched.claims = false;
         expect(await runCtoCommand(["relaunch", P, "--fresh", "--cwd", dir, "--apply"], w.ports)).toBe(1);
-        expect(last(w)).toEqual({ result: "stopped", at: "mcp", rerun: `agentctl cto relaunch ${P} --fresh --cwd ${dir} --apply` });
-        expect(w.changes).not.toContain(`SIGTERM ${CLAUDE}`);
+        const before = [w.changes.length, w.files.get(`${STATE}/cto-refresh/handoff-${P}.json`)];
+        expect(await runCtoCommand(["relaunch", P, "--fresh", "--cwd", other, "--apply"], w.ports)).toBe(2);
+        const U = JSON.parse(w.files.get(`${STATE}/cto-refresh/handoff-${P}.json`)!).next as string;
+        expect(last(w)).toEqual({ refused: `swap to ${U} already started in ${dir}; rerun without --cwd or with --cwd ${dir}; nothing was changed`, nothingChanged: true });
+        expect([w.changes.length, w.files.get(`${STATE}/cto-refresh/handoff-${P}.json`)]).toEqual(before);
       });
 
       it("home through a symlink, and a regular file, are refused before any write, a dry run included", async () => {
@@ -1199,16 +1168,23 @@ describe("a canonical relaunch resumes the role's bound conversation", () => {
         expect(last(w)).toEqual({ result: "stopped", at: "no-live-run", rerun: `agentctl cto relaunch ${P} --fresh --cwd ${dir} --apply` });
       });
 
+      it("the retry command quotes the folder for sh, so $USER stays literal", async () => {
+        const { w } = withFolder();
+        const odd = join(realpathSync(tempDir("acp-cto-odd-")), "project-$USER's");
+        mkdirSync(odd);
+        w.openRuns = [{ runId: "run_1", state: "ACTIVE", kind: "IMPLEMENT" }];
+        expect(await runCtoCommand(["relaunch", P, "--fresh", "--cwd", odd, "--apply"], w.ports)).toBe(1);
+        expect(last(w)).toMatchObject({ rerun: `agentctl cto relaunch ${P} --fresh --cwd '${odd.replaceAll("'", "'\\''")}' --apply` });
+      });
+
       it("a launcher written for another folder is rewritten, not reused", async () => {
-        const { w, dir } = withFolder();
-        const other = realpathSync(tempDir("acp-cto-newdir2-"));
-        writeFileSync(join(w.ports.env["CLAUDE_CONFIG_DIR"]!, ".claude.json"), JSON.stringify({ projects: { [dir]: { hasTrustDialogAccepted: true }, [other]: { hasTrustDialogAccepted: true } } }));
+        const { w, cwd, dir } = withFolder();
         w.launched.fails = true;
-        expect(await runCtoCommand(["relaunch", P, "--fresh", "--cwd", dir, "--apply"], w.ports)).toBe(1);
+        expect(await runCtoCommand(["relaunch", P, "--fresh", "--apply"], w.ports)).toBe(1);
         w.launched.fails = false;
-        expect(await runCtoCommand(["relaunch", P, "--fresh", "--cwd", other, "--apply"], w.ports)).toBe(0);
-        expect(w.files.get(w.launched.command!)).toContain(`cd '${other}'`);
-        expect(w.files.get(w.launched.command!)).not.toContain(dir);
+        expect(await runCtoCommand(["relaunch", P, "--fresh", "--cwd", dir, "--apply"], w.ports)).toBe(0);
+        expect(w.files.get(w.launched.command!)).toContain(`cd '${dir}'`);
+        expect(w.files.get(w.launched.command!)).not.toContain(cwd);
       });
 
       it("a rerun without --cwd for the same pending conversation uses the stored folder", async () => {
