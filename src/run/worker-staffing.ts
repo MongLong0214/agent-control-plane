@@ -4,7 +4,7 @@ import { ReasonCode } from "../core/reason-codes.ts";
 import { containedWorkdir, probeSessionHealth } from "../cto/cto-lifecycle.ts";
 import type { AuditLog } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
-import { fixedRuntimes, isRetiredModel } from "../domain/fixed-role-runtime.ts";
+import { fixedRuntimes } from "../domain/fixed-role-runtime.ts";
 import { Role, type RoleBinding, RunState, SessionLifecycle, TaskState, roleKeyFor } from "../domain/types.ts";
 import type { ProcessGroupReap } from "../runtime/cli-adapters.ts";
 import type { ProviderAdapter, ProviderRegistry, SessionHandle } from "../runtime/provider.ts";
@@ -53,7 +53,7 @@ export interface WorkerProvisioned {
 export interface WorkerStaffingPorts {
   readonly runs: Pick<RunEngine, "get">;
   readonly tasks: Pick<TaskGraph, "get" | "admitWorkerFanout">;
-  readonly bindings: Pick<BindingRegistry, "active" | "history" | "bind" | "revoke">;
+  readonly bindings: Pick<BindingRegistry, "active" | "history" | "bind">;
   readonly sessions: Pick<SessionRegistry, "createWithPinnedStart" | "transition" | "get">;
   readonly providers: Pick<ProviderRegistry, "requireForRole">;
   /** §9.5 step 3 — the doctor's readiness gate, the same one a fresh CTO passes. */
@@ -64,13 +64,10 @@ export interface WorkerStaffingPorts {
  * PRD §8.3/§14.4 — the CTO routes workers; §8.6 — the control plane owns admission, lifecycle and
  * credentials. This is the production path that mints a task's first `WORKER` binding (#512).
  *
- * It mints a task's first worker only. A task whose WORKER role has any assignment history is refused:
+ * It mints generation 1 only. A task whose WORKER role has any assignment history is refused:
  * an active one as `BINDING_ALREADY_ACTIVE`, a revoked or continuity-owed one as
  * `BINDING_REVOKED`, because replacing a worker belongs to continuity or a claim, not to a second
- * provisioning. One exception, owner directive of 2026-11-21: a binding on a retired model
- * (`isRetiredModel`, every gpt-6.1-*) is no worker at all — its turn is refused, since the session's
- * model is not the fixed one — so provisioning releases it through `bindings.revoke`, in the same
- * transaction that binds the replacement, and the task is staffed again on the fixed model.
+ * provisioning.
  *
  * The worker is its own session, never the CTO's: `BindingRegistry.bind` refuses a WORKER on a
  * session holding another role (`WORKER_SESSION_NOT_INDEPENDENT`), and this path only ever binds
@@ -202,27 +199,14 @@ export class WorkerStaffing {
         if (!fenced.allowed) return fenced as Decision<RoleBinding>;
         const scope = this.#unstaffed(request, roleKey);
         if (!scope.allowed) return scope as Decision<RoleBinding>;
-        const retired = this.ports.bindings.active(roleKey);
-        if (retired) {
-          const released = this.ports.bindings.revoke(roleKey, `worker model retired: ${this.ports.sessions.get(retired.sessionId)?.model ?? "unknown"}`, {
-            expectedCurrent: retired,
-            evidence: { replacementSessionId: sessionId, replacementModel: model.value },
-          });
-          if (!released.allowed) return released as Decision<RoleBinding>;
-        }
         // `run_id` is recorded on the WORKER row: the managed write guard reads it.
-        const rebound = this.ports.bindings.bind({
+        return this.ports.bindings.bind({
           role: Role.WORKER,
           sessionId,
           taskId: request.taskId,
           runId: request.runId,
           projectId: scope.value.projectId,
         });
-        // The released worker's session serves nothing now; leave it STOPPED rather than READY and unbound.
-        if (retired && rebound.allowed) {
-          this.ports.sessions.transition(retired.sessionId, SessionLifecycle.STOPPED, "worker model retired: replaced by a worker on the fixed model");
-        }
-        return rebound;
       });
     } catch (error) {
       await this.#discard(adapter, handle, sessionId, "worker provisioning failed");
@@ -277,12 +261,10 @@ export class WorkerStaffing {
         state: task.state,
       });
     }
-    const active = this.ports.bindings.active(roleKey);
-    if (active && !this.#onRetiredModel(active)) {
+    if (this.ports.bindings.active(roleKey)) {
       return deny(ReasonCode.BINDING_ALREADY_ACTIVE, "the task already has an active worker binding", { roleKey });
     }
-    // A binding on a retired model is not "held before": it is released and replaced by the bind below.
-    const history = this.ports.bindings.history(roleKey).filter((held) => !this.#onRetiredModel(held));
+    const history = this.ports.bindings.history(roleKey);
     if (history.length > 0) {
       return deny(
         ReasonCode.BINDING_REVOKED,
@@ -291,12 +273,6 @@ export class WorkerStaffing {
       );
     }
     return allow(ReasonCode.OK, { projectId: run.projectId });
-  }
-
-  /** The binding's session runs a retired model (`isRetiredModel`). */
-  #onRetiredModel(binding: Pick<RoleBinding, "sessionId">): boolean {
-    const model = this.ports.sessions.get(binding.sessionId)?.model;
-    return model !== undefined && isRetiredModel(model);
   }
 
   /** Stops a session this path constituted and did not bind, through the provider's own handle. */

@@ -49,7 +49,6 @@ import {
   SessionLifecycle,
   roleKeyFor,
 } from "../domain/types.ts";
-import { isRetiredModel } from "../domain/fixed-role-runtime.ts";
 import { PATCH_WITHOUT_PROGRAMS, diffPatch, git, readBlob } from "../git/git.ts";
 import { canonical } from "../guard/workspace-probe.ts";
 import {
@@ -327,6 +326,13 @@ export interface ReviewerPreference {
 /** The daemon's per-project reviewer file, `<stateDir>/reviewer-preferences.json`, as read once at start. */
 export const PROJECT_REVIEWER_FILE = "reviewer-preferences.json";
 
+/**
+ * The one reviewer a project may name (owner rule of 2026-11-21): the GPT reviewer is always gpt-6.2-sol, and
+ * Claude Opus is the global fallback when it is unavailable, never a project's choice.
+ */
+const PROJECT_REVIEWER_PROVIDER = "gpt";
+const PROJECT_REVIEWER_MODEL = "gpt-6.2-sol";
+
 /** That file's bytes: `text` null when it does not exist, `unreadable` when it exists and could not be read. */
 export interface ProjectReviewerFile {
   path: string;
@@ -348,10 +354,10 @@ export interface ProjectReviewerPreferences {
   refused: { path: string; reason: string } | null;
   refusedProjects: ReadonlyMap<string, RefusedProjectReviewer>;
   /**
-   * Entries that named a retired model (`isRetiredModel`), ignored: the project reviews on the global
+   * Entries that named any reviewer but gpt-6.2-sol, ignored: the project reviews on the global
    * preferred reviewer instead, and the caller records that it did. Absent when none did.
    */
-  retiredModels?: ReadonlyMap<string, RefusedProjectReviewer & { model: string }>;
+  ignored?: ReadonlyMap<string, RefusedProjectReviewer & { model: string }>;
 }
 
 /** A project whose reviewer entry names a provider that cannot review, and why. */
@@ -369,13 +375,15 @@ const projectReviewerEntries = z.record(
  * `{ "<projectId>": { provider, model, effort } }`, or nothing when the file is unreadable or not that
  * shape. A missing file is no project preferences, which is the behaviour without this file.
  *
- * An entry naming a retired model (`isRetiredModel`) is ignored and reported in `retiredModels`: that
- * project takes the global preferred reviewer, and no `-m gpt-6.1-*` can reach a reviewer through this file.
- *
  * An entry whose provider is not registered for BLIND_REVIEWER with an adapter that can isolate a
  * reviewer (`registeredForReview`) is refused for its project alone, rather than refusing the whole
  * file: refusing the file let that project's reviews run on the global reviewer — a provider the entry
  * did not name.
+ *
+ * Every other entry that does not name gpt-6.2-sol (Claude Opus, a retired gpt-6.1-*, any other model) is
+ * ignored and reported in `ignored`: that project takes the global preferred reviewer and its normal
+ * fallback, so a project preference can never select Opus while GPT is available, and no `-m gpt-6.1-*`
+ * can reach a reviewer through this file.
  */
 export const resolveProjectReviewerPreferences = (
   file: ProjectReviewerFile,
@@ -398,20 +406,21 @@ export const resolveProjectReviewerPreferences = (
   }
   const byProject = new Map<string, ReviewerPreference>();
   const refusedProjects = new Map<string, RefusedProjectReviewer>();
-  const retiredModels = new Map<string, RefusedProjectReviewer & { model: string }>();
+  const ignored = new Map<string, RefusedProjectReviewer & { model: string }>();
   for (const [projectId, entry] of Object.entries(parsed.data)) {
-    if (isRetiredModel(entry.model)) retiredModels.set(projectId, {
-      provider: entry.provider,
-      model: entry.model,
-      reason: `project ${projectId} names the retired model ${entry.model}; the entry is ignored and the project reviews on the global preferred reviewer`,
-    });
-    else if (registeredForReview(entry.provider)) byProject.set(projectId, entry);
-    else refusedProjects.set(projectId, {
+    if (!registeredForReview(entry.provider)) refusedProjects.set(projectId, {
       provider: entry.provider,
       reason: `project ${projectId} names provider ${entry.provider}, which is not registered for BLIND_REVIEWER with reviewer isolation`,
     });
+    else if (entry.provider !== PROJECT_REVIEWER_PROVIDER || entry.model !== PROJECT_REVIEWER_MODEL) ignored.set(projectId, {
+      provider: entry.provider,
+      model: entry.model,
+      reason: `project ${projectId} names ${entry.provider} ${entry.model}, but a project may name only ${PROJECT_REVIEWER_PROVIDER} ${PROJECT_REVIEWER_MODEL}; ` +
+        "the entry is ignored and the project reviews on the global preferred reviewer",
+    });
+    else byProject.set(projectId, entry);
   }
-  return { byProject, refused: null, refusedProjects, ...(retiredModels.size === 0 ? {} : { retiredModels }) };
+  return { byProject, refused: null, refusedProjects, ...(ignored.size === 0 ? {} : { ignored }) };
 };
 
 /** A real step of a review, on which the submission that asked for it renews its attempt lease. */

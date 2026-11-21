@@ -656,10 +656,10 @@ export class ControlPlane {
           evidence,
         });
       }
-      // An entry naming a retired model is ignored, not refused: its project reviews on the global
-      // preferred reviewer. Recorded, so the file that still names it can be fixed.
+      // An entry naming a reviewer other than gpt-6.2-sol is ignored, not refused: its project reviews on
+      // the global preferred reviewer. Recorded, so the file that still names it can be fixed.
       const globalReviewer = (config.reviewer ?? DEFAULT_REVIEWER).preferred;
-      for (const [projectId, ignored] of projectReviewers.retiredModels ?? []) {
+      for (const [projectId, ignored] of projectReviewers.ignored ?? []) {
         this.audit.record({
           kind: "REVIEWER_PREFERENCES_REFUSED",
           reasonCode: ReasonCode.REVIEWER_PREFERENCES_INVALID,
