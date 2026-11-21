@@ -258,18 +258,23 @@ describe("a mention of this CTO reaches its session once, as untrusted data", ()
     expect(h.notifications.map((n) => n.content)).toEqual(["hold the deploy"]);
   });
 
-  it("reports again, once per process, a reply an earlier process remembered, so a receipt the trim dropped is not lost", async () => {
-    const asked = mention(ceo, "hold the deploy", 1_500);
-    const cli = sign(cto, [["h", ROOM], ["e", asked.id, "", "reply"], ["p", ceoPub]], "held", 1_600);
-    // An earlier process saw and reported this reply; its receipt has since been trimmed from the file.
-    const store: ChannelStateStore = { load: () => ({ cursor: 1_000, failed: [], events: [[cli.id, 1_600, ctoPub, ROOM, asked.id, false]] }), save: () => undefined };
-    const h = harness({ store });
+  it("never lets a replayed old reply drop a later CEO follow-up in its thread", async () => {
+    const NOW = 200_000;
+    const asked = mention(ceo, "hold the deploy", NOW - 100_000);
+    const old = sign(cto, [["h", ROOM], ["e", asked.id, "", "reply"], ["p", ceoPub]], "held", NOW - 99_000);
+    // An earlier process delivered the question and saw the reply; the thread was active an hour ago, so both are remembered.
+    const store: ChannelStateStore = {
+      load: () => ({ cursor: NOW - 3_600, failed: [], events: [[asked.id, NOW - 3_600, ceoPub, ROOM, asked.id, true], [old.id, NOW - 3_600, ctoPub, ROOM, asked.id, false]] }),
+      save: () => undefined,
+    };
+    // The own-posts lookback reaches back past the old reply, so the relay replays it.
+    const h = harness({ store, now: NOW, answeredSince: () => NOW - 200_000 });
     const connection = await h.connect();
-    await h.deliver(connection, cli);
-    await h.deliver(connection, cli);
-    expect(h.receipts.filter((r) => r.type === "replied")).toEqual([
-      { type: "replied", event: cli, room: ROOM, parentEventId: asked.id, ack: "ACCEPTED", repliedAt: 2_000 },
-    ]);
+    await h.deliver(connection, old);
+    // The CEO answers the CTO's reply in the thread, naming nobody: it is for this CTO only because its parent is remembered.
+    const followUp = sign(ceo, [["h", ROOM], ["e", asked.id, "", "root"], ["e", old.id, "", "reply"]], "go ahead after all", NOW - 10);
+    await h.deliver(connection, followUp);
+    expect(h.notifications.map((n) => n.content)).toEqual(["go ahead after all"]);
   });
 
   it("shows a fresh conversation's backlog from before its switch as history, never as a plain notification", async () => {

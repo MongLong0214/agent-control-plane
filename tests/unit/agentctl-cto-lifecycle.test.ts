@@ -782,7 +782,7 @@ describe("a canonical relaunch resumes the role's bound conversation", () => {
 
   describe("relaunch --fresh: the daemon's switchover, then the new conversation, rolling forward only", () => {
     const FRESH_STEPS = ["no-live-run", "handoff", "idle", "trust", "channel", "switchover", "one-cto", "launcher", "mcp", "stop", "launch", "claimed", "complete"];
-    const handoffFile = (w: World): { conversation: string; source: string; text: string; next?: string; completed?: boolean } => JSON.parse(w.files.get(`${STATE}/cto-refresh/handoff-${P}.json`)!);
+    const handoffFile = (w: World): { conversation: string; source: string; text: string; next?: string; completed?: boolean; history?: { conversation: string; before: number } } => JSON.parse(w.files.get(`${STATE}/cto-refresh/handoff-${P}.json`)!);
     const launched = (w: World): string[] => (w.out.find((l) => l["step"] === "launch" && l["result"] === "done")!["detail"] as { argv: string[] }).argv;
 
     it("with no pending switchover: prepares one (old to U, the current generation, the handoff as package, U already in the handoff file) and launches U with --session-id and the handoff", async () => {
@@ -945,6 +945,26 @@ describe("a canonical relaunch resumes the role's bound conversation", () => {
       // Kept with the new conversation's uuid, for every later launch of it.
       const U = launched(w)[launched(w).indexOf("--session-id") + 1]!;
       expect(handoffFile(w)).toMatchObject({ history: { conversation: U, before: Number(args[args.indexOf("--history-before") + 1]) } });
+    });
+
+    it("a --fresh retry after a failed attempt sets the cutoff to the retry's own launch, not the failed one's", async () => {
+      const { w, cwd } = canonicalWorld();
+      w.launched.claims = false;
+      expect(await runCtoCommand(["relaunch", P, "--fresh", "--apply"], w.ports)).toBe(1);
+      const U = w.rotateCalls[0]!.params["toSessionUuid"] as string;
+      const first = handoffFile(w).history!.before;
+      // U exited without claiming; the retry comes two minutes later.
+      w.procs = w.procs.filter((p) => p.pid !== 30000);
+      w.files.set(`${HOME}/.claude/projects/${cwd.replace(/[^A-Za-z0-9]/g, "-")}/${U}.jsonl`, "{}");
+      await w.ports.sleep(120_000);
+      w.launched.claims = true;
+      w.out.length = 0; w.changes.length = 0;
+      expect(await runCtoCommand(["relaunch", P, "--fresh", "--apply"], w.ports)).toBe(0);
+      const config = JSON.parse(launched(w)[launched(w).indexOf("--mcp-config") + 1]!) as { mcpServers: Record<string, { args: string[] }> };
+      const args = config.mcpServers["acp-buzz-channel"]!.args;
+      const retry = Number(args[args.indexOf("--history-before") + 1]);
+      expect(retry).toBeGreaterThanOrEqual(first + 120);
+      expect(handoffFile(w).history).toEqual({ conversation: U, before: retry });
     });
 
     it("a later resume of the fresh conversation passes the same cutoff its fresh launch did", async () => {

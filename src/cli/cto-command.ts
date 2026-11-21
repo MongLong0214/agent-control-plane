@@ -710,12 +710,13 @@ const canonicalResumeSteps = (
       if (gated) return gated;
       // This launch's own id, in the script tmux is about to start and so in its channel server's every receipt.
       const launchId = ports.newUuid();
-      // A fresh conversation is told that what was signed by its first launch's second is history, never a current instruction.
-      // The cutoff is kept with its uuid, so a later resume of the same conversation passes the same one.
+      // A fresh conversation is told that what was signed by its launch's second is history, never a current instruction. Every
+      // --fresh attempt sets the cutoff to its own launch: this step runs in one only while the new conversation has not claimed
+      // (a claimed swap skips every step). Once it has, the cutoff kept with its uuid is frozen, and a resume passes the same one.
       const uuid = planned.resume[1] ?? "";
       const stored = readHandoff(ports.files, ports.stateDir, projectId);
-      let historyBefore = UUID.test(uuid) && stored?.history?.conversation === uuid ? stored.history.before : undefined;
-      if (options.fresh && historyBefore === undefined) {
+      let historyBefore = !options.fresh && UUID.test(uuid) && stored?.history?.conversation === uuid ? stored.history.before : undefined;
+      if (options.fresh) {
         historyBefore = Math.floor(ports.now() / 1000);
         if (UUID.test(uuid)) markHandoff(ports.files, ports.stateDir, projectId, { history: { conversation: uuid, before: historyBefore } });
       }

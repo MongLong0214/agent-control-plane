@@ -389,11 +389,6 @@ export class BuzzChannelRelay {
   /** One-shot questions to the relay about an event a reply is built on: subscription id -> what is asked and heard so far. */
   readonly #lookups = new Map<string, ParentLookup>();
   #lookupSeq = 0;
-  /**
-   * This CTO's replies reported in this process. Once per process, not once ever: a `replied` receipt the receipts trim
-   * dropped is written again when the relay replays the reply on the next start, and the daemon settles each row once.
-   */
-  readonly #reportedReplies = new Set<string>();
 
   constructor(options: BuzzChannelOptions) {
     this.#o = options;
@@ -548,7 +543,6 @@ export class BuzzChannelRelay {
       return { ok: false, reason: `the relay did not accept the reply (${ack.status})${said === "" ? "" : `: ${said}`}` };
     }
     this.#events.set(event.id, { at: event.created_at, author: this.pubkey, room: input.room, root, exactRoot: true, delivered: false });
-    this.#reportedReplies.add(event.id);
     this.#touchThread(root, input.room, Math.min(event.created_at, this.#sched.nowSeconds()));
     this.#persist();
     this.#o.onReceipt?.({
@@ -837,11 +831,15 @@ export class BuzzChannelRelay {
   /**
    * A reply this CTO posted by a path other than the reply tool (the buzz CLI, say), seen on the relay: remembered as the
    * reply tool remembers its own, and reported with the same `replied` receipt, so the daemon completes what it answered by
-   * the same checks. Reported once per process: one the reply tool posted here is not reported twice, and one remembered
-   * from an earlier process is reported again, so a receipt the trim dropped is not lost.
+   * the same checks. One already remembered (the reply tool's, or one an earlier process reported) is not reported again,
+   * and its remembered activity time is left alone: re-setting it from an old replay ages the thread out and drops a later
+   * follow-up in it.
+   *
+   * Limit: a reply is reported once ever. If the receipts trim drops its `replied` receipt before the daemon has applied it,
+   * nothing writes it again, and the message it answered stays SENT.
    */
   #ownReply(event: RelayEvent): void {
-    if (event.kind !== BUZZ_MENTION_KIND || this.#reportedReplies.has(event.id)) return;
+    if (event.kind !== BUZZ_MENTION_KIND || this.#events.has(event.id)) return;
     const rooms = tagValues(event, "h");
     const room = rooms.length === 1 ? rooms[0]! : "";
     const parentEventId = replyParentOf(event);
@@ -849,7 +847,6 @@ export class BuzzChannelRelay {
     const root = threadRootOf(event);
     this.#events.set(event.id, { at: event.created_at, author: this.pubkey, room, root, exactRoot: true, delivered: false });
     this.#touchThread(root, room, Math.min(event.created_at, this.#sched.nowSeconds()));
-    this.#reportedReplies.add(event.id);
     this.#o.onReceipt?.({ type: "replied", event, room, parentEventId, ack: "ACCEPTED", repliedAt: this.#sched.nowSeconds() });
   }
 
