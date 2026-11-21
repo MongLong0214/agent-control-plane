@@ -10,6 +10,7 @@ import { ReasonCode } from "../core/reason-codes.ts";
 import type { CapacityMonitor } from "../capacity/capacity-monitor.ts";
 import { RefreshTrigger } from "../capacity/capacity-monitor.ts";
 import { BUZZ_BIND_CHALLENGE_TTL_MS } from "../buzz/buzz-bind-challenge.ts";
+import { BUZZ_CHANNEL_SERVER_NAME } from "../buzz/buzz-channel.ts";
 import type { ClaimRegistry } from "../claims/claim-registry.ts";
 import {
   CanonicalCtoRestoreCondition,
@@ -99,6 +100,8 @@ const MAX_REPORTED_LOOKUP_ERRORS = 10;
 
 /** How long a Buzz message may stay PENDING for a CTO before the doctor says no channel is delivering it. */
 export const BUZZ_CHANNEL_PENDING_AFTER_MS = 120_000;
+/** How long a Buzz message may stay PENDING or SENT for a CTO that has no live process with the channel before the doctor says it is being missed. */
+export const BUZZ_CHANNEL_MISSED_AFTER_MS = 600_000;
 
 export type Severity = "INFO" | "WARN" | "ERROR" | "CRITICAL";
 
@@ -749,8 +752,41 @@ export class Doctor {
     const read = await snapshotCtoProcesses(this.#ctoProcessReader);
     if (!read.ok) return [this.ctoProcessesUnknown(projectId, read.detail)];
     const findings: Finding[] = [];
+    const missedCutoff = new Date(Date.parse(this.clock.nowIso()) - BUZZ_CHANNEL_MISSED_AFTER_MS).toISOString();
     for (const scope of scopes) {
       const processes = ctoProcessesFor(scope, read.snapshot);
+      // Messages for this CTO that waited past the bound while no live CTO process of the project loads the Buzz channel: nothing
+      // delivers them to a session or completes them on its reply, so they are being missed, not merely slow.
+      const channelled = processes.some((one) => read.snapshot.claude.get(one.pid)?.argv.some((arg) => arg.includes(`server:${BUZZ_CHANNEL_SERVER_NAME}`)) === true);
+      const missed = channelled ? [] : this.db.all<{ message_id: string; status: string; created_at: string }>(
+        `SELECT message_id, status, created_at FROM outbox
+          WHERE role_key = ? AND kind IN ('OWNER_MESSAGE','PEER_MESSAGE') AND status IN ('PENDING','SENT') AND created_at <= ?
+          ORDER BY created_at, rowid`,
+        [`PRIMARY_CTO:${scope.projectId}`, missedCutoff],
+      );
+      if (missed.length > 0) {
+        findings.push({
+          code: "BUZZ_CHANNEL_MESSAGES_PENDING",
+          severity: "ERROR",
+          scope: `project:${scope.projectId}`,
+          blocking: false,
+          confidence: "HIGH",
+          observedEvidence: {
+            condition: "NO_LIVE_CHANNEL_PROCESS",
+            roleKey: `PRIMARY_CTO:${scope.projectId}`,
+            count: missed.length,
+            pending: missed.filter((row) => row.status === "PENDING").length,
+            sent: missed.filter((row) => row.status !== "PENDING").length,
+            oldestCreatedAt: missed[0]!.created_at,
+            messageIds: missed.slice(0, 20).map((row) => row.message_id),
+            liveCtoProcesses: processes.map((one) => one.pid),
+          },
+          recommendedAction:
+            `messages for this CTO are being missed: ${missed.length} Buzz message(s) have waited more than ${BUZZ_CHANNEL_MISSED_AFTER_MS / 60_000} minutes (PENDING or SENT, never completed) ` +
+            `and no live CTO process of this project loads the ${BUZZ_CHANNEL_SERVER_NAME} channel; relaunch the CTO with its channel (agentctl cto relaunch <project> --apply). ` +
+            "The messages stay queued; an old one is history, so confirm current state with the CEO before acting on it",
+        });
+      }
       if (processes.length < 2) continue;
       findings.push({
         code: "CTO_PROCESSES_DUPLICATED",

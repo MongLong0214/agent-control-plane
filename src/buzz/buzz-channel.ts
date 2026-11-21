@@ -221,6 +221,12 @@ export interface BuzzChannelOptions {
    * queue's say-so alone.
    */
   readonly backlog?: () => readonly QueuedBuzzMessage[];
+  /**
+   * How far back this CTO's own replies are asked for: the oldest message the daemon's queue still holds for this role, in
+   * seconds, or `null`. A reply the CTO posted by any path (the reply tool, the buzz CLI) while no channel was running is
+   * then still seen, and its `replied` receipt completes what it answered.
+   */
+  readonly answeredSince?: () => number | null;
 }
 
 /**
@@ -317,7 +323,7 @@ const threadMarkers = (tags: readonly (readonly string[])[]): { root: string | n
  * anything else, a lone `root` marker included, is top-level, and a top-level event is the root of its own thread. A lone
  * `root` marker never anchors a reply, so it is not read as one.
  */
-const threadRootOf = (event: { readonly id: string; readonly tags: readonly (readonly string[])[] }): string => {
+export const threadRootOf = (event: { readonly id: string; readonly tags: readonly (readonly string[])[] }): string => {
   const { root, reply } = threadMarkers(event.tags);
   return reply === null ? event.id : (root ?? reply);
 };
@@ -610,6 +616,14 @@ export class BuzzChannelRelay {
     ];
     // Replies in a thread and an owner's open messages name nobody, so the `#p` filter cannot see them.
     if (authors.length > 0) filters.push({ kinds: [BUZZ_MENTION_KIND], authors, "#h": [...this.#o.rooms], since });
+    // This CTO's own posts, whatever sent them: a threaded one is the answer that completes the message it answers.
+    let answeredSince: number | null = null;
+    try {
+      answeredSince = this.#o.answeredSince?.() ?? null;
+    } catch {
+      answeredSince = null;
+    }
+    filters.push({ kinds: [BUZZ_MENTION_KIND], authors: [this.pubkey], "#h": [...this.#o.rooms], since: Math.max(0, Math.min(since, answeredSince ?? since)) });
     return filters;
   }
 
@@ -731,6 +745,7 @@ export class BuzzChannelRelay {
     this.#armKeepalive();
     const event = plainEventOf(frame[2]);
     if (event === null || !validateEvent(event) || !verifyEvent(event)) return;
+    if (event.pubkey === this.pubkey) this.#ownReply(event);
     const verdict = this.classify(event);
     if (verdict.deliver && !(await this.#emit(event, verdict, true))) return;
     // A handled event, delivered or not, is behind the cursor; one whose notification failed is not.
@@ -794,6 +809,23 @@ export class BuzzChannelRelay {
       emittedAt: this.#sched.nowSeconds(),
     });
     return true;
+  }
+
+  /**
+   * A reply this CTO posted by a path other than the reply tool (the buzz CLI, say), seen on the relay: remembered as the
+   * reply tool remembers its own, and reported with the same `replied` receipt, so the daemon completes what it answered by
+   * the same checks. One the reply tool posted is already remembered and is not reported twice.
+   */
+  #ownReply(event: RelayEvent): void {
+    if (event.kind !== BUZZ_MENTION_KIND || this.#events.has(event.id)) return;
+    const rooms = tagValues(event, "h");
+    const room = rooms.length === 1 ? rooms[0]! : "";
+    const parentEventId = replyToOf(event);
+    if (room === "" || !this.#o.rooms.includes(room) || parentEventId === "") return;
+    const root = threadRootOf(event);
+    this.#events.set(event.id, { at: event.created_at, author: this.pubkey, room, root, exactRoot: true, delivered: false });
+    this.#touchThread(root, room, Math.min(event.created_at, this.#sched.nowSeconds()));
+    this.#o.onReceipt?.({ type: "replied", event, room, parentEventId, ack: "ACCEPTED", repliedAt: this.#sched.nowSeconds() });
   }
 
   /** The queue's pending messages for this role, once per process. See `BuzzChannelOptions.backlog`. */

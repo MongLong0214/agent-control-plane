@@ -2,7 +2,7 @@ import { afterAll, describe, expect, it } from "vitest";
 import { finalizeEvent, generateSecretKey, getPublicKey } from "nostr-tools/pure";
 
 import { BuzzChannelRelay } from "../../src/buzz/buzz-channel.ts";
-import { ceoPubkeysFromDb, queuedBuzzBacklog } from "../../src/buzz/buzz-channel-daemon-reads.ts";
+import { answeredSinceReader, ceoPubkeysFromDb, queuedBuzzBacklog } from "../../src/buzz/buzz-channel-daemon-reads.ts";
 import { Role, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
 import { MessageKind } from "../../src/outbox/envelope.ts";
 import { cleanupTempDirs, makeCore, makeRepo, seedRun } from "../helpers/fixtures.ts";
@@ -144,5 +144,13 @@ describe("the queue's pending Buzz messages for the role, read for the channel",
     queue(core, seeded, signed("after", T0 + 400));
     // Buzz signs whole seconds, so the floor rounds up to the next whole second: T0 + 301.
     expect(queuedBuzzBacklog(core.db, projectId).map((m) => m.event.content)).toEqual(["at the floor", "after"]);
+  });
+});
+
+describe("how far back the channel asks for the CTO's own replies", () => {
+  it("is an hour before the oldest Buzz message still queued for the CTO, and nothing when none is", () => {
+    const opener = (at: string | null) => () => ({ reads: { get: <T>() => ({ at }) as T, all: <T>() => [] as T[] }, close: () => undefined });
+    expect(answeredSinceReader("/unused", "prj_logic", opener("2026-11-18T09:33:09.968Z"))()).toBe(Math.floor(Date.parse("2026-11-18T09:33:09.968Z") / 1000) - 3600);
+    expect(answeredSinceReader("/unused", "prj_logic", opener(null))()).toBeNull();
   });
 });

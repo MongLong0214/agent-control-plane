@@ -1,4 +1,4 @@
-import { appendFileSync, mkdirSync } from "node:fs";
+import { appendFileSync, mkdirSync, realpathSync } from "node:fs";
 import { createConnection } from "node:net";
 import { join } from "node:path";
 
@@ -12,7 +12,8 @@ import { allow, type Decision } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { outboxDeliveryReadback } from "../../src/outbox/outbox.ts";
 import { channelQueueDepsFor, startBuzzMessageIngressListener } from "../../src/daemon/agentcpd.ts";
-import { BUZZ_CHANNEL_PENDING_AFTER_MS } from "../../src/doctor/doctor.ts";
+import type { CtoProcessReader } from "../../src/cto/one-cto-per-project.ts";
+import { BUZZ_CHANNEL_MISSED_AFTER_MS, BUZZ_CHANNEL_PENDING_AFTER_MS } from "../../src/doctor/doctor.ts";
 import { Role, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
 import { buzzMessageSigningRequest } from "../../src/ingress/buzz-message.ts";
 import { ingressSignature } from "../../src/ingress/ingress-guard.ts";
@@ -122,6 +123,46 @@ describe("the rules for what a receipt may move", () => {
     const out = applyChannelReceipts(f.deps, holder.roleKey, [emitted("evt-unknown"), emitted("evt-1", "elsewhere")]);
     expect(out).toEqual({ delivered: [], completed: [], ignored: 2, invalid: 0 });
     expect(f.calls).toEqual([]);
+  });
+});
+
+describe("a CTO's reply in a thread completes what it was shown there, whatever sent the reply", () => {
+  const holder = { roleKey: "PRIMARY_CTO:p", bindingGeneration: 1, targetSessionId: "s", sessionIncarnation: "i" };
+  const hex = (c: string) => c.repeat(64);
+  const [T, U, A, B, C, D, X] = ["1", "2", "a", "b", "c", "d", "e"].map(hex);
+  const queue = () => {
+    const status = new Map<string, "PENDING" | "SENT" | "ACKED">([["m1", "SENT"], ["m2", "SENT"], ["m3", "SENT"], ["m4", "PENDING"]]);
+    const shape: Record<string, { eventId: string; thread: string; createdAt: number }> = {
+      m1: { eventId: A!, thread: T!, createdAt: 100 }, // delivered, in the thread, before the reply: completed
+      m2: { eventId: B!, thread: T!, createdAt: 300 }, // signed after the reply: not answered by it
+      m3: { eventId: C!, thread: U!, createdAt: 100 }, // another thread
+      m4: { eventId: D!, thread: T!, createdAt: 100 }, // never delivered: a thread reply does not complete what the CTO was never shown
+    };
+    const completed: string[] = [];
+    const deps: ChannelQueueDeps = {
+      messages: () => [...status].filter(([, st]) => st !== "ACKED").map(([id, st]) => ({
+        messageId: id, delivery: outboxDeliveryReadback({ status: st as "PENDING" | "SENT", failureClass: null }), holder, room: ROOM, ...shape[id]!,
+      })),
+      boundActor: () => ctoPub,
+      deliver: (m) => { status.set(m.messageId, "SENT"); return allow(ReasonCode.OK, undefined); },
+      complete: (m) => { status.set(m.messageId, "ACKED"); completed.push(m.messageId); return allow(ReasonCode.OK, undefined); },
+    };
+    return { deps, completed, status };
+  };
+  const reply = (key: Uint8Array, parent: string, at = 200) =>
+    finalizeEvent({ kind: 9, created_at: at, tags: [["h", ROOM], ["e", T!, "", "root"], ["e", parent, "", "reply"], ["p", OWNER]], content: "answered by the buzz CLI" }, key);
+
+  it("completes the delivered messages of the thread signed no later than the reply, and nothing else", () => {
+    const q = queue();
+    const out = applyChannelReceipts(q.deps, holder.roleKey, [replied(reply(cto, X!), X!)]);
+    expect(out.completed).toEqual(["m1"]);
+    expect([...q.status]).toEqual([["m1", "ACKED"], ["m2", "SENT"], ["m3", "SENT"], ["m4", "PENDING"]]);
+  });
+
+  it("still completes the exact message answered, delivering it first, and completes nothing for a reply someone else signed", () => {
+    const q = queue();
+    expect(applyChannelReceipts(q.deps, holder.roleKey, [replied(reply(ceo, X!), X!)]).completed).toEqual([]);
+    expect(applyChannelReceipts(q.deps, holder.roleKey, [replied(reply(cto, D!), D!)]).completed.sort()).toEqual(["m1", "m4"]);
   });
 });
 
@@ -267,6 +308,26 @@ describe("over a real admitted message", () => {
     }
   }, 30_000);
 
+  it("drains: a reply the CTO posted in a thread outside the reply tool completes every delivered message of that thread before it, and leaves another thread's", async () => {
+    const s = await setup();
+    try {
+      const [A, B, C] = ["a", "b", "c"].map((c) => c.repeat(64)) as [string, string, string];
+      const retained: Record<string, string[][]> = { [A]: [["h", ROOM]], [B]: [["h", ROOM], ["e", A, "", "root"], ["e", A, "", "reply"]], [C]: [["h", ROOM]] };
+      for (const [id, tags] of Object.entries(retained)) {
+        expect(JSON.parse((await exchange(s.listener.socketPath, envelope(id, `message ${id.slice(0, 1)}`))).trim())).toMatchObject({ ok: true });
+        s.harness.cp.db.run("INSERT OR IGNORE INTO buzz_events (event_id, payload_json) VALUES (?, ?)", [id, JSON.stringify({ id, tags, created_at: 1_699_999_000 })]);
+      }
+      const deps = channelQueueDepsFor(s.harness.cp);
+      expect(applyChannelReceipts(deps, s.roleKey, [emitted(A), emitted(B), emitted(C)]).delivered).toHaveLength(3);
+      // What `buzz messages send --reply-to <B>` posts: the thread's root and the parent, no acp-kind.
+      const cli = signedReply(cto, [["h", ROOM], ["e", A, "", "root"], ["e", B, "", "reply"], ["p", OWNER]]);
+      expect(applyChannelReceipts(deps, s.roleKey, [replied(cli, B)]).completed).toHaveLength(2);
+      expect(s.rows().map((row) => row.status)).toEqual(["ACKED", "ACKED", "SENT"]);
+    } finally {
+      await s.listener.close();
+    }
+  }, 30_000);
+
   it("applies a receipt appended to the state directory without being asked", async () => {
     const s = await setup();
     const stateDir = tempDir("acp-channel-state-");
@@ -282,6 +343,42 @@ describe("over a real admitted message", () => {
       expect(s.status(row!.message_id)).toBe("SENT");
     } finally {
       watcher.close();
+      await s.listener.close();
+    }
+  }, 30_000);
+
+  it("names, as an ERROR, messages a CTO with no live channel process has left PENDING or SENT for more than 10 minutes", async () => {
+    const s = await setup();
+    /** One claude process in the project's checkout, with or without the channel loaded. */
+    const processes = (argv: string[]): CtoProcessReader => {
+      const uid = process.getuid?.() ?? 0;
+      const rows = [{ pid: process.pid, ppid: 1, uid, startedAt: "s", command: "node vitest" }, { pid: 91_001, ppid: 1, uid, startedAt: "s", command: argv.join(" ") }];
+      return {
+        table: async () => rows,
+        argv: (pid) => (pid === 91_001 ? argv : ["node", "vitest"]),
+        cwds: async (pids) => new Map(pids.includes(91_001) ? [[91_001, realpathSync(s.harness.repoPath)]] : []),
+        tmuxPanes: async () => new Map(),
+        alive: (pid) => rows.some((row) => row.pid === pid),
+        startToken: () => null,
+      };
+    };
+    const missed = async () => (await s.harness.cp.doctor.run("system")).findings.filter((f) => f.code === "BUZZ_CHANNEL_MESSAGES_PENDING" && f.severity === "ERROR");
+    try {
+      for (const id of ["evt-m1", "evt-m2"]) await exchange(s.listener.socketPath, envelope(id, `message ${id}`));
+      applyChannelReceipts(channelQueueDepsFor(s.harness.cp), s.roleKey, [emitted("evt-m1")]);
+      s.harness.cp.doctor.useCtoProcessReader(processes(["claude", "--resume", "11111111-1111-4111-8111-111111111111"]));
+      expect(await missed()).toEqual([]);
+      s.harness.clock.advance(BUZZ_CHANNEL_MISSED_AFTER_MS + 1_000);
+      const [finding] = await missed();
+      expect(finding).toMatchObject({
+        blocking: false,
+        observedEvidence: { condition: "NO_LIVE_CHANNEL_PROCESS", roleKey: s.roleKey, count: 2, pending: 1, sent: 1 },
+        recommendedAction: expect.stringContaining("messages for this CTO are being missed"),
+      });
+      // The same CTO running with its channel loaded is not missing them.
+      s.harness.cp.doctor.useCtoProcessReader(processes(["claude", "--resume", "11111111-1111-4111-8111-111111111111", "--dangerously-load-development-channels", "server:acp-buzz-channel"]));
+      expect(await missed()).toEqual([]);
+    } finally {
       await s.listener.close();
     }
   }, 30_000);

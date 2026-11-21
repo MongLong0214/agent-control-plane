@@ -134,6 +134,8 @@ export interface CtoStateReader {
   project(projectId: string): CtoRecord | null;
   /** The project's runs that are not finished, newest first. */
   openRuns(projectId: string): Array<{ runId: string; state: string; kind: string }>;
+  /** The ids of the CTO's Buzz messages still queued (PENDING, or SENT and never completed), oldest first. */
+  queuedMessages?(projectId: string): string[];
   /** The shared one-CTO rule's scope for the role, from the database (`ctoRoleScope`), with what this run adds. */
   roleScope(projectId: string, extra?: { conversationIds?: readonly string[]; checkouts?: readonly string[] }): CtoRoleScope;
 }
@@ -964,7 +966,7 @@ const freshSteps = (ports: CtoPorts, record: CtoRecord, next: string, hold: { op
     run: async () => {
       let stored = readHandoff(ports.files, ports.stateDir, projectId);
       if (stored?.conversation !== old) {
-        const text = fallbackHandoff({ projectId, conversation: old, generation: record.generation, openRuns: ports.state.openRuns(projectId) });
+        const text = fallbackHandoff({ projectId, conversation: old, generation: record.generation, openRuns: ports.state.openRuns(projectId), queuedMessages: ports.state.queuedMessages?.(projectId) ?? [] });
         const written = writeHandoff(ports.files, ports.stateDir, { projectId, conversation: old, source: "acp", text, now: new Date(ports.now()).toISOString() });
         if (!written.ok) return refused(written.reason);
         stored = written.handoff;
@@ -1431,6 +1433,9 @@ export const openCtoState = async (databasePath: string): Promise<CtoStateReader
     openRuns: (projectId) => withDb((db) => (db.prepare(
       `SELECT run_id AS runId, state, kind FROM runs WHERE (project_id = ? OR owner_role_key = ?) AND state NOT IN ('COMPLETED','FAILED','CANCELLED') ORDER BY created_at DESC, run_id LIMIT 10`)
       .all(projectId, `PRIMARY_CTO:${projectId}`) as Array<{ runId: string; state: string; kind: string }>)),
+    queuedMessages: (projectId) => withDb((db) => (db.prepare(
+      `SELECT message_id AS id FROM outbox WHERE role_key = ? AND kind IN ('OWNER_MESSAGE','PEER_MESSAGE') AND status IN ('PENDING','SENT') ORDER BY created_at, rowid`)
+      .all(`PRIMARY_CTO:${projectId}`) as Array<{ id: string }>).map((row) => row.id)),
     roleScope: (projectId, extra) => withDb((db) => ctoRoleScope(<T>(sql: string, params: readonly unknown[]) => db.prepare(sql).all(...params) as T[], projectId, extra)),
   };
 };

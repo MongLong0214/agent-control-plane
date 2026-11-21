@@ -98,6 +98,21 @@ export const backlogReader = (stateDir: string, projectId: string, open?: Daemon
   () => readDaemonDb(stateDir, (db) => queuedBuzzBacklog(db, projectId), open) ?? [];
 
 /**
+ * When the oldest Buzz message still queued for this project's CTO (PENDING, or SENT and never completed) was admitted, in
+ * whole seconds less an hour, since its event may have been signed before the daemon admitted it; `null` when none is. The
+ * channel asks for the CTO's own replies from there, so a reply posted while no channel ran still completes what it answered.
+ */
+export const answeredSinceReader = (stateDir: string, projectId: string, open?: DaemonDbOpener): (() => number | null) =>
+  () => readDaemonDb(stateDir, (db) => {
+    const oldest = db.get<{ at: string | null }>(
+      `SELECT MIN(created_at) AS at FROM outbox WHERE role_key = ? AND kind IN ('PEER_MESSAGE','OWNER_MESSAGE') AND status IN ('PENDING','SENT')`,
+      [roleKeyFor(Role.PRIMARY_CTO, { projectId })],
+    )?.at;
+    const ms = oldest ? Date.parse(oldest) : Number.NaN;
+    return Number.isFinite(ms) ? Math.max(0, Math.floor(ms / 1000) - 3600) : null;
+  }, open) ?? null;
+
+/**
  * The bound CEO's Buzz identity, by the daemon's own rule (`resolveCeoBuzzIdentity`): the live CEO session's identity, and
  * when that session has none, the latest identified CEO binding's. Reading only the live session heard nobody on a CEO
  * whose current session was never bound to an identity, while the daemon admitted that CEO's mail by the fallback.

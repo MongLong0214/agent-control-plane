@@ -7,7 +7,7 @@ import type { Decision } from "../core/errors.ts";
 import { buzzMessageEventId, ownerMessagePointerOf } from "../ingress/buzz-message.ts";
 import { outboxDeliveryReadback, type HolderIdentity, type OutboxMessage } from "../outbox/outbox.ts";
 import type { ChannelReceipt } from "./buzz-channel.ts";
-import { isChannelReceipt, replyToOf } from "./buzz-channel.ts";
+import { isChannelReceipt, replyToOf, threadRootOf } from "./buzz-channel.ts";
 import { BUZZ_CHANNEL_RECEIPT_SUFFIX, channelDir, readChannelReceipts } from "./buzz-channel-files.ts";
 
 /**
@@ -20,9 +20,11 @@ import { BUZZ_CHANNEL_RECEIPT_SUFFIX, channelDir, readChannelReceipts } from "./
  *     same claim every holder-claimed message leaves it by, restricted to that one message, so every
  *     gate a claim applies (the peer proof, the mention gate, the source digest) still applies and a
  *     message those gates refuse is not delivered however the session came to see it.
- *   - `replied`: the CTO's reply was posted. The row is completed only when the reply is a signed
- *     kind-9 by the identity this session is bound to as its Buzz actor, in the room the message came
- *     from, answering that message's own event.
+ *   - `replied`: the CTO's reply was posted, by the reply tool or seen on the relay whatever sent it. The
+ *     reply must be a signed kind-9 by the identity this session is bound to as its Buzz actor, in the
+ *     room the message came from. It completes the message whose event it answers, and every other
+ *     message already delivered in the same thread (room and root) whose event is no later than the
+ *     reply: the CTO answering in a thread has answered what it was shown there.
  *
  * A receipt is a claim by a file anyone running as this user can append to, so none of it is trusted
  * for what it says about itself: the message is found from the daemon's own rows, the reply's
@@ -41,6 +43,9 @@ export interface ChannelQueueMessage {
   readonly eventId: string;
   /** The Buzz room the event was written in; `null` when the stored envelope cannot say. */
   readonly room: string | null;
+  /** The root of the thread the event is in and when it was signed, from the retained signed event; absent when none is retained. */
+  readonly thread?: string | null;
+  readonly createdAt?: number | null;
 }
 
 export interface ChannelQueueDeps {
@@ -118,41 +123,23 @@ const applyOne = (
   result: ChannelApplyResult,
   queue: Map<string, ChannelQueueMessage>,
 ): boolean => {
-  const eventId = receipt.type === "emitted" ? receipt.eventId : receipt.parentEventId;
-  const message = queue.get(eventId);
+  if (receipt.type === "replied") return applyReply(deps, receipt, result, queue);
+  const message = queue.get(receipt.eventId);
   if (message === undefined || message.room === null || message.room !== receipt.room) {
     result.ignored += 1;
     return false;
   }
-  if (receipt.type === "replied") {
-    const event = receipt.event;
-    const actor = deps.boundActor(message.holder);
-    const rooms = event.tags.filter((tag) => tag[0] === "h").map((tag) => tag[1]);
-    if (
-      actor === null ||
-      event.pubkey !== actor ||
-      event.kind !== 9 ||
-      // A fresh seven-field copy: `verifyEvent` caches its verdict on the object it is given, and a
-      // spread of an already-verified event carries that verdict over a body that was changed after.
-      !verifyEvent({
-        id: event.id,
-        pubkey: event.pubkey,
-        created_at: event.created_at,
-        kind: event.kind,
-        tags: event.tags.map((tag) => [...tag]),
-        content: event.content,
-        sig: event.sig,
-      }) ||
-      rooms.length !== 1 ||
-      rooms[0] !== message.room ||
-      replyToOf(event) !== message.eventId ||
-      (receipt.ack !== "ACCEPTED" && receipt.ack !== "DUPLICATE")
-    ) {
-      result.ignored += 1;
-      return false;
-    }
-  }
-  // A message whose outcome is unknown, or held from automatic resend, is not this module's to deliver or to complete.
+  return settleOne(deps, message, false, result, queue);
+};
+
+/** Delivers `message` when it has not been, then completes it when asked to. A message whose outcome is unknown, or held from automatic resend, is not this module's to move. */
+const settleOne = (
+  deps: ChannelQueueDeps,
+  message: ChannelQueueMessage,
+  complete: boolean,
+  result: ChannelApplyResult,
+  queue: Map<string, ChannelQueueMessage>,
+): boolean => {
   let current = message;
   if (current.delivery.automaticResendHeld) {
     result.ignored += 1;
@@ -166,9 +153,9 @@ const applyOne = (
     result.delivered.push(current.messageId);
     // The claim moved the row to SENT, with no failure class: read the same way it will be next time.
     current = { ...current, delivery: outboxDeliveryReadback({ status: "SENT", failureClass: null }) };
-    queue.set(eventId, current);
+    queue.set(current.eventId, current);
   }
-  if (receipt.type === "emitted") return true;
+  if (!complete) return true;
   if (current.delivery.delivered && !current.delivery.completed) {
     if (!deps.complete(current).allowed) {
       result.ignored += 1;
@@ -176,9 +163,60 @@ const applyOne = (
     }
     result.completed.push(current.messageId);
     // A completed row is no longer a pending or handed-over message: the next read would not list it.
-    queue.delete(eventId);
+    queue.delete(current.eventId);
   }
   return true;
+};
+
+/**
+ * A CTO's posted reply: the message whose event it answers (delivered first when it had not been), and each message already
+ * delivered in the same room and thread whose event was signed no later than the reply. Each only for a holder whose bound
+ * Buzz actor signed the reply.
+ */
+const applyReply = (
+  deps: ChannelQueueDeps,
+  receipt: Extract<ChannelReceipt, { type: "replied" }>,
+  result: ChannelApplyResult,
+  queue: Map<string, ChannelQueueMessage>,
+): boolean => {
+  const event = receipt.event;
+  const rooms = event.tags.filter((tag) => tag[0] === "h").map((tag) => tag[1]);
+  const parent = replyToOf(event);
+  if (
+    event.kind !== 9 ||
+    rooms.length !== 1 ||
+    rooms[0] !== receipt.room ||
+    parent === "" ||
+    (receipt.ack !== "ACCEPTED" && receipt.ack !== "DUPLICATE") ||
+    // A fresh seven-field copy: `verifyEvent` caches its verdict on the object it is given, and a
+    // spread of an already-verified event carries that verdict over a body that was changed after.
+    !verifyEvent({
+      id: event.id,
+      pubkey: event.pubkey,
+      created_at: event.created_at,
+      kind: event.kind,
+      tags: event.tags.map((tag) => [...tag]),
+      content: event.content,
+      sig: event.sig,
+    })
+  ) {
+    result.ignored += 1;
+    return false;
+  }
+  const thread = threadRootOf(event);
+  const targets = [...queue.values()].filter((message) =>
+    message.room === receipt.room &&
+    (message.eventId === parent ||
+      (message.delivery.delivered && message.thread != null && message.thread === thread &&
+        message.createdAt != null && message.createdAt <= event.created_at)) &&
+    deps.boundActor(message.holder) === event.pubkey);
+  if (targets.length === 0) {
+    result.ignored += 1;
+    return false;
+  }
+  let moved = false;
+  for (const message of targets) if (settleOne(deps, message, true, result, queue)) moved = true;
+  return moved;
 };
 
 /** Every receipt file beneath the daemon's state directory: its project, its well-formed receipts, and the numbers of the lines skipped. */
@@ -200,7 +238,7 @@ export interface ChannelQueueDatabase {
 const ROOM_CACHE_LIMIT = 10_000;
 
 export const channelQueueMessages = (db: ChannelQueueDatabase, incarnationOf: (sessionId: string) => string | null) => {
-  const rooms = new Map<string, string | null>();
+  const rooms = new Map<string, { room: string | null; signed: { thread: string; createdAt: number } | null }>();
   return (roleKey: string): ChannelQueueMessage[] =>
     db
       .all<{ message_id: string; status: "PENDING" | "SENT"; failure_class: OutboxMessage["failureClass"]; role_key: string; binding_generation: number; target_session_id: string; payload_json: string }>(
@@ -219,12 +257,16 @@ export const channelQueueMessages = (db: ChannelQueueDatabase, incarnationOf: (s
         const incarnation = incarnationOf(row.target_session_id);
         if (pointer === null || incarnation === null) return [];
         const roomKey = `${pointer.sourceChannel}\u0000${pointer.sourceNonce}`;
+        const eventId = buzzMessageEventId(pointer.sourceNonce);
         let room: string | null = null;
-        if (rooms.has(roomKey)) room = rooms.get(roomKey) ?? null;
+        // The signed event it was admitted from, read in the same query: its thread root and when it was signed.
+        let signed: { thread: string; createdAt: number } | null = null;
+        const cached = rooms.get(roomKey);
+        if (cached !== undefined) ({ room, signed } = cached);
         else {
-          const source = db.get<{ payload_json: string | null }>(
-            "SELECT payload_json FROM inbound_messages WHERE channel = ? AND nonce = ?",
-            [pointer.sourceChannel, pointer.sourceNonce],
+          const source = db.get<{ payload_json: string | null; event_json?: string | null }>(
+            "SELECT payload_json, (SELECT payload_json FROM buzz_events WHERE event_id = ?) AS event_json FROM inbound_messages WHERE channel = ? AND nonce = ?",
+            [eventId, pointer.sourceChannel, pointer.sourceNonce],
           );
           try {
             const envelope = source?.payload_json ? (JSON.parse(source.payload_json) as { conversation?: unknown }) : null;
@@ -232,10 +274,18 @@ export const channelQueueMessages = (db: ChannelQueueDatabase, incarnationOf: (s
           } catch {
             room = null;
           }
+          try {
+            const event = source?.event_json ? (JSON.parse(source.event_json) as { id?: unknown; tags?: unknown; created_at?: unknown }) : null;
+            signed = event && event.id === eventId && Array.isArray(event.tags) && typeof event.created_at === "number"
+              ? { thread: threadRootOf({ id: eventId, tags: event.tags as string[][] }), createdAt: event.created_at }
+              : null;
+          } catch {
+            signed = null;
+          }
           // A row that is not there yet is asked for again; one that is there does not change.
           if (source != null) {
             if (rooms.size >= ROOM_CACHE_LIMIT) rooms.clear();
-            rooms.set(roomKey, room);
+            rooms.set(roomKey, { room, signed });
           }
         }
         return [{
@@ -247,8 +297,10 @@ export const channelQueueMessages = (db: ChannelQueueDatabase, incarnationOf: (s
             targetSessionId: row.target_session_id,
             sessionIncarnation: incarnation,
           },
-          eventId: buzzMessageEventId(pointer.sourceNonce),
+          eventId,
           room,
+          thread: signed?.thread ?? null,
+          createdAt: signed?.createdAt ?? null,
         }];
       });
 };

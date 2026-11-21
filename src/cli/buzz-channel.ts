@@ -6,7 +6,7 @@ import { fileURLToPath } from "node:url";
 
 import { BuzzChannelRelay, type ChannelNotification } from "../buzz/buzz-channel.ts";
 import { buildChannelMcpServer, emitChannelNotification } from "../buzz/buzz-channel-mcp.ts";
-import { backlogReader, ceoPubkeyResolver } from "../buzz/buzz-channel-daemon-reads.ts";
+import { answeredSinceReader, backlogReader, ceoPubkeyResolver } from "../buzz/buzz-channel-daemon-reads.ts";
 import {
   appendChannelReceipt,
   fileChannelStateStore,
@@ -117,6 +117,8 @@ export const runBuzzChannel = async (argv: readonly string[]): Promise<number> =
       store: fileChannelStateStore(args.stateDir, args.projectId),
       // What the daemon's queue still holds for this role: delivered once, oldest first, when the relay first accepts the channel.
       backlog: backlogReader(args.stateDir, args.projectId),
+      // This CTO's own replies are asked for back to the oldest message still queued, so one posted by any path completes it.
+      answeredSince: answeredSinceReader(args.stateDir, args.projectId),
       onNotification: (n: ChannelNotification) => emitChannelNotification(server, n),
       onReceipt: (receipt) => {
         try {

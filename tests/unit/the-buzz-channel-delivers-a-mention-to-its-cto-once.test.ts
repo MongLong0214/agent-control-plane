@@ -112,6 +112,7 @@ const harness = (options: {
   failOnce?: Set<string>;
   /** What the daemon's queue holds for this role, asked once when the relay first accepts the channel. */
   backlog?: () => readonly { eventId: string; event: ReturnType<typeof sign> }[];
+  answeredSince?: () => number | null;
 } = {}) => {
   const connections: FakeConnection[] = [];
   const notifications: ChannelNotification[] = [];
@@ -144,6 +145,7 @@ const harness = (options: {
     ceoPubkeys: options.ceoKeys ?? (() => [ceoPub]),
     ownerPubkeys: [ownerPub],
     ...(options.backlog ? { backlog: options.backlog } : {}),
+    ...(options.answeredSince ? { answeredSince: options.answeredSince } : {}),
     onNotification: async (n) => {
       if (options.failOnce?.delete(n.content)) throw new Error("transport closed");
       notifications.push(n);
@@ -230,6 +232,26 @@ describe("a mention of this CTO reaches its session once, as untrusted data", ()
     expect(filters[0]).toMatchObject({ kinds: [9], "#p": [ctoPub], "#h": [ROOM] });
     expect(filters[1]).toMatchObject({ kinds: [9], "#h": [ROOM] });
     expect(new Set(filters[1]!.authors)).toEqual(new Set([ceoPub, ownerPub]));
+  });
+
+  it("hears this CTO's own posts, back to the oldest queued message, and reports a threaded one as a reply whatever sent it", async () => {
+    const h = harness({ answeredSince: () => 500 });
+    const connection = await h.connect();
+    const req = connection.sent.find((f) => f[0] === "REQ") as unknown[];
+    expect(req.slice(2)).toContainEqual({ kinds: [9], authors: [ctoPub], "#h": [ROOM], since: 500 });
+    const asked = mention(ceo, "hold the deploy", 1_500);
+    await h.deliver(connection, asked);
+    // Posted by `buzz messages send --reply-to`, not the reply tool: the relay shows it on the channel's own-author filter.
+    const cli = sign(cto, [["h", ROOM], ["e", asked.id, "", "reply"], ["p", ceoPub]], "held", 1_600);
+    await h.deliver(connection, cli);
+    await h.deliver(connection, cli);
+    // A post that answers nothing, or is in another room, is no reply.
+    await h.deliver(connection, sign(cto, [["h", ROOM], ["p", ceoPub]], "status", 1_601));
+    await h.deliver(connection, sign(cto, [["h", OTHER_ROOM], ["e", asked.id, "", "reply"]], "elsewhere", 1_602));
+    expect(h.receipts.filter((r) => r.type === "replied")).toEqual([
+      { type: "replied", event: cli, room: ROOM, parentEventId: asked.id, ack: "ACCEPTED", repliedAt: 2_000 },
+    ]);
+    expect(h.notifications.map((n) => n.content)).toEqual(["hold the deploy"]);
   });
 
   it("stops a text from closing the channel tag it arrives in", () => {
