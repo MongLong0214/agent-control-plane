@@ -370,6 +370,55 @@ describe("the daemon's reviewer preference file", () => {
     });
   });
 
+  it.each(["gpt-6.1-sol", "gpt-6.1-terra"])("4: an entry naming the retired %s is ignored, so that project reviews on the global gpt-6.2-sol; the other entries apply", (model) => {
+    const text = JSON.stringify({ "e2e-1": OPUS, "e2e-2": { provider: "gpt", model, effort: "xhigh" } });
+    expect(resolveProjectReviewerPreferences({ path: "/state/reviewer-preferences.json", text }, registered)).toEqual({
+      byProject: new Map([["e2e-1", OPUS]]),
+      refused: null,
+      refusedProjects: new Map(),
+      retiredModels: new Map([["e2e-2", {
+        provider: "gpt",
+        model,
+        reason: `project e2e-2 names the retired model ${model}; the entry is ignored and the project reviews on the global preferred reviewer`,
+      }]]),
+    });
+  });
+
+  it("4: a control plane given a retired gpt-6.1 entry never launches it, audits that it ignored it, and leaves the global gpt-6.2-sol preference", () => {
+    const root = tempDir("acp-reviewer-pref-retired-");
+    const file = join(root, "reviewer-preferences.json");
+    writeFileSync(file, JSON.stringify({ "e2e-1": OPUS, "e2e-2": { provider: "gpt", model: "gpt-6.1-sol", effort: "xhigh" } }));
+    const clock = new ManualClock("2026-11-21T00:00:00.000Z");
+    const cp = new ControlPlane({
+      databasePath: join(root, "state.sqlite"),
+      worktreeRoot: join(root, "worktrees"),
+      capacityDir: join(root, "capacity"),
+      secretsDir: join(root, "secrets"),
+      clock,
+      adapters: [new TestProductionAdapter(clock, "gpt"), new TestProductionAdapter(clock, "claude")],
+      allowNonProductionAdapters: true,
+      reviewerPreferencesFile: readProjectReviewerFile(file),
+    });
+    try {
+      const preferences = cp.review["preferences"];
+      // e2e-2 has no entry of its own now, so its runs take the global preferred reviewer; it is not refused.
+      expect(preferences.projects).toEqual(new Map([["e2e-1", OPUS]]));
+      expect(preferences.refusedProjects).toBeUndefined();
+      expect(preferences.preferred).toEqual({ provider: "gpt", model: "gpt-6.2-sol", effort: "xhigh" });
+      expect(cp.audit.byKind("REVIEWER_PREFERENCES_REFUSED")).toEqual([expect.objectContaining({
+        reasonCode: ReasonCode.REVIEWER_PREFERENCES_INVALID,
+        evidence: expect.objectContaining({
+          path: file, projectId: "e2e-2", provider: "gpt", model: "gpt-6.1-sol", reviewerModel: "gpt-6.2-sol",
+          reason: expect.stringContaining("retired model gpt-6.1-sol"),
+        }),
+      })]);
+      // Not a project whose reviews are refused, so no doctor finding says they are.
+      expect(cp.doctor["checkReviewerPreferences"]()).toEqual([]);
+    } finally {
+      cp.close();
+    }
+  });
+
   it.each([
     ["a provider no adapter is registered for", "nonesuch"],
     ["a registered provider that cannot isolate a reviewer", "no-isolation"],

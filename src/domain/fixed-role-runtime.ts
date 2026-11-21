@@ -27,6 +27,12 @@ export const FIXED_ROLE_RUNTIME: Readonly<Partial<Record<Role, readonly FixedRol
   ]),
 });
 
+/**
+ * A model the owner retired (2026-11-21): every `gpt-6.1-*`. Nothing is staffed, reviewed or launched on one;
+ * what still names one is refused or released, and the replacement is `gpt-6.2-sol`.
+ */
+export const isRetiredModel = (model: string): boolean => /^gpt-6\.1-/.test(model);
+
 /** The fixed provider/model pairs for a role. Empty when the role is not fixed. */
 export const fixedRuntimes = (role: Role): readonly FixedRoleRuntime[] => FIXED_ROLE_RUNTIME[role] ?? [];
 
