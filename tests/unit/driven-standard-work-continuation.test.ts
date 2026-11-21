@@ -1,7 +1,7 @@
 import { frontierReviewPolicy } from "../../src/review/frontier-simplify-policy.ts";
 import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
 
-import { allow, type Decision } from "../../src/core/errors.ts";
+import { allow, deny, type Decision } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { Daemon } from "../../src/daemon/daemon.ts";
 import {
@@ -27,6 +27,7 @@ import { drivenPrimary } from "../helpers/driven-primary-cto.ts";
 import { planCarrying, stricter } from "../helpers/contract-change.ts";
 import { cleanupTempDirs, gitSync, tempDir } from "../helpers/fixtures.ts";
 import { bindWorkerForTask } from "../helpers/harness.ts";
+import { TestProductionAdapter } from "../helpers/production-adapter.ts";
 import { callMcpToolOverSocket } from "../helpers/mcp-socket.ts";
 
 afterAll(cleanupTempDirs);
@@ -108,6 +109,8 @@ const CLAUSE = {
   inactiveWorker: "a worker whose state is not ACTIVE is reported with mcp__acp-cto__escalation_open",
   /** #1477 — a worker on a retired model is replaced by provisioning, not reused and not escalated. */
   replaceRetired: "a worker contract_get marks replacementRequired runs a retired model and is not reused: staff its task with mcp__acp-cto__task_worker_provision",
+  /** #1477 — the replacement is staffed on the provider the retired worker ran, as contract_get names it, never on the prompt's usual one. */
+  replacementProvider: "the provider contract_get names as its replacementProvider",
   provision: "otherwise staff it with mcp__acp-cto__task_worker_provision",
   claim: "exactly as its spec's writeTarget names it",
   missingTarget: "when the spec names no writeTarget, report it with mcp__acp-cto__escalation_open",
@@ -138,7 +141,7 @@ interface RecordTask {
   taskId: string;
   state: string;
   spec: { writeTarget?: { repositoryIdentity: string; branch: string; paths: string[] } };
-  worker: { sessionId: string; state: string; model?: string; replacementRequired?: boolean } | null;
+  worker: { sessionId: string; state: string; model?: string; replacementRequired?: boolean; replacementProvider?: string } | null;
   executions: Array<{ executionId: string; state: string }>;
 }
 
@@ -271,9 +274,10 @@ const scriptStandardOwner = (
         }
         if (task.worker === null || task.worker.replacementRequired === true) {
           if (task.worker === null ? !says(CLAUSE.provision) : !says(CLAUSE.replaceRetired)) return;
-          if (provider === null) return;
+          const staffOn = task.worker === null || !says(CLAUSE.replacementProvider) ? provider : task.worker.replacementProvider ?? null;
+          if (staffOn === null) return;
           const provisioned = await call("task_worker_provision", runId, task.taskId, {
-            idempotencyKey: `std-owner-${++keys}`, runId, taskId: task.taskId, provider,
+            idempotencyKey: `std-owner-${++keys}`, runId, taskId: task.taskId, provider: staffOn,
           });
           if (provisioned["ok"] !== true) {
             if (says(CLAUSE.refusal)) await escalate(runId, task.taskId, "task_worker_provision was refused");
@@ -927,10 +931,14 @@ describe("R1-01 (a), CEO e64aa10b — contract_get gives a STANDARD_WORK run's c
 });
 
 describe("#1477 — a READY task whose ACTIVE worker runs a retired model is replaced by the owner, not reused and not escalated", () => {
-  it("contract_get marks the binding replacementRequired and names its model; the woken owner provisions, and the replacement binds as generation 2 on opus", async () => {
+  it("contract_get marks the binding replacementRequired and names its model and provider; the woken owner provisions on that provider, which binds gpt-6.2-sol as generation 2 while claude admission is refused", async () => {
     await withBootstrapRuntime(async (f) => {
       const cp = f.harness.cp;
       const real = realWorkerRuntime(f);
+      // The deployment under test: Claude admission is refused, GPT is allowed, as an explicit provision on GPT would find it.
+      cp.providers.registerForRole(new TestProductionAdapter(f.harness.clock, "gpt"), Role.WORKER);
+      vi.spyOn(cp.tasks, "admitWorkerFanout").mockImplementation(async (provider) =>
+        provider === "claude" ? deny(ReasonCode.CAPACITY_UNKNOWN_NOT_ROUTABLE, "claude worker admission refused") : allow(ReasonCode.OK, undefined));
       const { owner, runId, sessionId, taskId } = await stalledAfterPlan(f, "std-retired", "follow-prompt");
       const retired = bindRunWorker(f, runId, taskId, { provider: "gpt", model: "gpt-6.1-sol" });
       const workerRole = roleKeyFor(Role.WORKER, { taskId });
@@ -938,7 +946,10 @@ describe("#1477 — a READY task whose ACTIVE worker runs a retired model is rep
       const record = await f.cto(sessionId, "contract_get", { runId });
       expect((record["value"] as { tasks: unknown[] }).tasks).toEqual([expect.objectContaining({
         taskId,
-        worker: { sessionId: retired.sessionId, generation: 1, state: "ACTIVE", sessionLifecycle: "READY", model: "gpt-6.1-sol", replacementRequired: true },
+        worker: {
+          sessionId: retired.sessionId, generation: 1, state: "ACTIVE", sessionLifecycle: "READY",
+          model: "gpt-6.1-sol", replacementRequired: true, replacementProvider: "gpt",
+        },
         executions: [],
       })]);
 
@@ -953,12 +964,43 @@ describe("#1477 — a READY task whose ACTIVE worker runs a retired model is rep
         ["task_worker_provision", true],
       ]);
       expect(real.provision).toHaveBeenCalledTimes(1);
+      expect(real.provision.mock.calls[0]![0]).toMatchObject({ provider: "gpt" });
       expect(cp.bindings.active(workerRole)).toMatchObject({ bindingGeneration: 2 });
-      expect(cp.sessions.get(cp.bindings.active(workerRole)!.sessionId)).toMatchObject({ provider: "claude", model: "opus", lifecycle: "READY" });
+      expect(cp.sessions.get(cp.bindings.active(workerRole)!.sessionId)).toMatchObject({ provider: "gpt", model: "gpt-6.2-sol", lifecycle: "READY" });
       expect(cp.bindings.history(workerRole).map((binding) => [binding.sessionId, binding.status])).toEqual([
         [retired.sessionId, "REVOKED"],
         [cp.bindings.active(workerRole)!.sessionId, "ACTIVE"],
       ]);
+    });
+  });
+
+  it("a generation-1 binding moved to a gpt-6.2-sol session is judged by its current session: contract_get does not flag it, and staffing agrees", async () => {
+    await withBootstrapRuntime(async (f) => {
+      const cp = f.harness.cp;
+      const { runId, sessionId, taskId } = await stalledAfterPlan(f, "std-moved", "ignore");
+      const original = bindRunWorker(f, runId, taskId, { provider: "gpt", model: "gpt-6.1-sol" });
+      const workerRole = roleKeyFor(Role.WORKER, { taskId });
+      // The same generation's runtime moves to a gpt-6.2-sol session: the assignment row still records the first.
+      const moved = cp.sessions.create({ provider: "gpt", model: "gpt-6.2-sol" });
+      expect(cp.sessions.transition(moved.sessionId, SessionLifecycle.READY, "test: moved runtime").allowed).toBe(true);
+      cp.db.run(
+        `UPDATE conversational_actors SET current_session_id = ?, current_session_incarnation = ?
+          WHERE actor_id = (SELECT actor_id FROM assignments WHERE role_key = ? AND status = 'ACTIVE')`,
+        [moved.sessionId, moved.incarnation, workerRole],
+      );
+      expect(cp.bindings.active(workerRole)).toMatchObject({ sessionId: moved.sessionId, bindingGeneration: 1 });
+
+      const record = await f.cto(sessionId, "contract_get", { runId });
+      const worker = (record["value"] as { tasks: Array<{ worker: Record<string, unknown> }> }).tasks[0]!.worker;
+      expect(worker).toMatchObject({ sessionId: original.sessionId, generation: 1, state: "ACTIVE" });
+      expect(worker).not.toHaveProperty("replacementRequired");
+      expect(worker).not.toHaveProperty("model");
+      // Staffing reads the same binding the same way, so it refuses the replacement the record does not ask for.
+      const refused = await cp.workers.provision({
+        runId, taskId, provider: "gpt", ownerBindingGeneration: 1,
+        fence: () => allow(ReasonCode.OK, { sessionId, bindingGeneration: 1 }),
+      });
+      expect(refused).toMatchObject({ allowed: false, reasonCode: ReasonCode.BINDING_ALREADY_ACTIVE });
     });
   });
 });

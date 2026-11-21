@@ -33,6 +33,20 @@ export const FIXED_ROLE_RUNTIME: Readonly<Partial<Record<Role, readonly FixedRol
  */
 export const isRetiredModel = (model: string): boolean => /^gpt-6\.1-/.test(model);
 
+/**
+ * The retired session a binding runs on, or null: not retired, or no such session. A binding runs on its
+ * live session (`sessionId`, which a same-generation runtime move changes), never on the one its assignment
+ * row first recorded. One reading for staffing (which replaces such a worker) and `contract_get` (which
+ * tells the owner to), so the two cannot disagree.
+ */
+export const retiredSessionOf = (
+  binding: { readonly sessionId: string },
+  sessions: { get(sessionId: string): { readonly provider: string; readonly model: string } | null | undefined },
+): { provider: string; model: string } | null => {
+  const session = sessions.get(binding.sessionId);
+  return session && isRetiredModel(session.model) ? { provider: session.provider, model: session.model } : null;
+};
+
 /** The fixed provider/model pairs for a role. Empty when the role is not fixed. */
 export const fixedRuntimes = (role: Role): readonly FixedRoleRuntime[] => FIXED_ROLE_RUNTIME[role] ?? [];
 

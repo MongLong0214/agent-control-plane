@@ -324,6 +324,25 @@ describe("provisioning replaces a worker bound to a retired model (#1477)", () =
     }
   });
 
+  it("a session on a retired model is not ready however its binding ended: a binding revoked before any replacement leaves a READY session that sessionReadiness refuses", async () => {
+    const harness = makeHarness();
+    try {
+      const run = await activeRun(harness);
+      const retiredSessionId = bindWorker(harness, run.taskId, { provider: "gpt", model: "gpt-6.1-sol" });
+      const current = harness.cp.sessions.create({ provider: "gpt", model: "gpt-6.2-sol" }).sessionId;
+      expect(harness.cp.sessions.transition(current, SessionLifecycle.READY, "test: a session on the current model").allowed).toBe(true);
+      const roleKey = roleKeyFor(Role.WORKER, { taskId: run.taskId });
+      expect(harness.cp.bindings.revoke(roleKey, "test: revoked before any replacement").allowed).toBe(true);
+
+      // Revoked, not drained by provisioning: the session is still READY, and the gate still says no.
+      expect(harness.cp.sessions.get(retiredSessionId)?.lifecycle).toBe(SessionLifecycle.READY);
+      expect(await harness.cp.doctor.sessionReadiness(retiredSessionId)).toMatchObject({ allowed: false, reasonCode: ReasonCode.SESSION_NOT_READY });
+      expect(await harness.cp.doctor.sessionReadiness(current)).toMatchObject({ allowed: true });
+    } finally {
+      harness.cp.close();
+    }
+  });
+
   it("an ACTIVE binding on a model that is not retired still refuses BINDING_ALREADY_ACTIVE, and is left bound", async () => {
     const harness = makeHarness();
     try {

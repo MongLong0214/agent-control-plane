@@ -4,7 +4,7 @@ import { ReasonCode } from "../core/reason-codes.ts";
 import { containedWorkdir, probeSessionHealth } from "../cto/cto-lifecycle.ts";
 import type { AuditLog } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
-import { fixedRuntimes, isRetiredModel } from "../domain/fixed-role-runtime.ts";
+import { fixedRuntimes, retiredSessionOf } from "../domain/fixed-role-runtime.ts";
 import { Role, type RoleBinding, RunState, SessionLifecycle, TaskState, roleKeyFor } from "../domain/types.ts";
 import type { ProcessGroupReap } from "../runtime/cli-adapters.ts";
 import type { ProviderAdapter, ProviderRegistry, SessionHandle } from "../runtime/provider.ts";
@@ -306,8 +306,7 @@ export class WorkerStaffing {
 
   /** The retired model a binding's session runs, or null: not retired, or no such session. */
   #retiredModelOf(binding: RoleBinding): string | null {
-    const model = this.ports.sessions.get(binding.sessionId)?.model;
-    return model !== undefined && isRetiredModel(model) ? model : null;
+    return retiredSessionOf(binding, this.ports.sessions)?.model ?? null;
   }
 
   /** Stops a session this path constituted and did not bind, through the provider's own handle. */
