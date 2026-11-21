@@ -69,6 +69,8 @@ export interface StoredHandoff {
   conversation: string; source: "cto" | "acp"; text: string; writtenAt: string;
   /** The new conversation the swap goes to, written before the switchover is prepared; and whether the swap was seen through. */
   next?: string; completed?: boolean;
+  /** The folder the new conversation starts in (relaunch --fresh --cwd), kept so a rerun of the same swap uses it. */
+  cwd?: string;
   /**
    * A fresh conversation's cutoff, kept with its uuid: what was signed before `before` (unix seconds) is shown to it as
    * history. Every launch of that conversation, fresh or resumed, passes the same cutoff to its channel.
@@ -98,7 +100,7 @@ export const writeHandoff = (
   // A rewrite for the same conversation (the CTO's own, after the switchover was prepared) keeps where the swap goes.
   const prior = readHandoff(files, stateDir, input.projectId);
   const kept = {
-    ...(prior?.conversation === input.conversation ? { ...(prior.next ? { next: prior.next } : {}), ...(prior.completed ? { completed: true } : {}) } : {}),
+    ...(prior?.conversation === input.conversation ? { ...(prior.next ? { next: prior.next } : {}), ...(prior.cwd ? { cwd: prior.cwd } : {}), ...(prior.completed ? { completed: true } : {}) } : {}),
     // The cutoff belongs to its conversation, not to this handoff: a later handoff written by that conversation keeps it.
     ...(prior?.history ? { history: prior.history } : {}),
   };
@@ -119,7 +121,7 @@ export const readHandoff = (files: StoreFiles, stateDir: string, projectId: stri
 };
 
 /** Records the swap's target (before the switchover is prepared) or that it was seen through, keeping the rest. */
-export const markHandoff = (files: StoreFiles, stateDir: string, projectId: string, patch: { next?: string; completed?: boolean; history?: { conversation: string; before: number } }): void => {
+export const markHandoff = (files: StoreFiles, stateDir: string, projectId: string, patch: { next?: string; completed?: boolean; cwd?: string; history?: { conversation: string; before: number } }): void => {
   const stored = readHandoff(files, stateDir, projectId);
   if (stored) files.replace(handoffPathOf(stateDir, projectId), `${JSON.stringify({ ...stored, ...patch })}\n`);
 };
