@@ -1,6 +1,6 @@
 import { spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -100,6 +100,8 @@ export interface CtoFiles {
   /** Removes a file or a directory tree. */
   remove(path: string): void;
   mtimeMs(path: string): number | null;
+  /** The path with every symlink resolved, and whether it is a directory; null when it does not exist. Without it a path is taken as given. */
+  real?(path: string): { path: string; directory: boolean } | null;
 }
 
 /** The operator socket, as `agentctl`'s own client speaks it. */
@@ -546,6 +548,24 @@ const canonicalResumeSteps = (
   const cwd = options.fresh?.cwd() ?? (planned ? cwdOf(planned) : null);
   const oldCwd = planned ? cwdOf(planned) : null;
   const launcher = canonicalLauncherOf(ports, projectId);
+  const realOf = (path: string): string => ports.files.real?.(path)?.path ?? path;
+  type McpEntry = { command?: string; args?: string[] };
+  /** The acp-cto entry Claude Code keeps for a folder, or undefined. */
+  const entryAt = (folder: string): McpEntry | undefined => {
+    const config = join(ports.home, ".claude.json");
+    if (!ports.files.exists(config)) return undefined;
+    try { return (JSON.parse(ports.files.read(config)) as { projects?: Record<string, { mcpServers?: Record<string, McpEntry> }> }).projects?.[folder]?.mcpServers?.["acp-cto"]; } catch { return undefined; }
+  };
+  /** --fresh in another folder: the folder whose entry for this CTO moves. The same folder by realpath is no move at all. */
+  const movesFrom = (target: string): string | null => (options.fresh && oldCwd && realOf(oldCwd) !== realOf(target) ? oldCwd : null);
+  /** The destination already holds an acp-cto entry that is not this project's: moving over it would break the other project. */
+  const mcpConflict = (target: string): string | null => {
+    const entry = movesFrom(target) ? entryAt(target) : undefined;
+    if (!entry) return null;
+    const args = entry.args ?? [];
+    const owner = args[args.indexOf("--project-id") + 1];
+    return args.includes("--project-id") && owner === projectId ? null : `${target} already has an acp-cto entry that belongs to ${owner && args.includes("--project-id") ? owner : "another project"}; nothing was changed`;
+  };
   const bound = (): { record: CtoRecord; uuid: string; cwd: string } | string => {
     const record = fresh(ports, projectId);
     const conversation = wanted(record);
@@ -601,8 +621,8 @@ const canonicalResumeSteps = (
       const at = bound();
       if (typeof at === "string") return refused(at);
       const trust = launchFolderTrust(at.cwd, { home: ports.home, env: ports.env });
-      return trust.trusted ? ok({ folder: trust.folder })
-        : refused(`Claude Code would not find ${at.cwd} trusted (${trust.reason}); run ~/.claude/scripts/claude-trust-dir.sh ${at.cwd}, then run this again; nothing was stopped`);
+      if (trust.trusted) { const conflict = mcpConflict(at.cwd); return conflict ? refused(conflict) : ok({ folder: trust.folder }); }
+      return refused(`Claude Code would not find ${at.cwd} trusted (${trust.reason}); run ~/.claude/scripts/claude-trust-dir.sh ${at.cwd}, then run this again; nothing was stopped`);
     },
   }, {
     id: "channel",
@@ -634,11 +654,14 @@ const canonicalResumeSteps = (
       const record = fresh(ports, projectId);
       if (options.fresh && await newRunning()) return true;
       const role = await roleProcesses(ports, projectId);
-      const written = readCanonicalLauncher(ports, projectId)?.resume;
+      const launcherNow = readCanonicalLauncher(ports, projectId);
+      const written = launcherNow?.resume;
       // --fresh: a launcher written for the other mode (the transcript has appeared, or vanished, since) is not the one to start.
       const at = bound();
       const mode = options.fresh && typeof at !== "string" ? freshFlag(at) : "--resume";
-      return role.matches.length === 0 && written?.[0] === mode && written.includes(wanted(record) ?? "\0");
+      // The launcher cds to the folder it recorded: one written for another folder is not the one to start.
+      const sameFolder = typeof at === "string" || launcherNow?.cwd === at.cwd;
+      return role.matches.length === 0 && sameFolder && written?.[0] === mode && written.includes(wanted(record) ?? "\0");
     },
     run: async () => {
       const at = bound();
@@ -676,19 +699,18 @@ const canonicalResumeSteps = (
       if (options.fresh && await newRunning()) return true;
       const at = bound();
       if (typeof at === "string") return false;
-      const config = join(ports.home, ".claude.json");
-      if (!ports.files.exists(config)) return false;
-      const entry = (JSON.parse(ports.files.read(config)) as { projects?: Record<string, { mcpServers?: Record<string, { command?: string; args?: string[] }> }> })
-        .projects?.[at.cwd]?.mcpServers?.["acp-cto"];
+      const entry = entryAt(at.cwd);
       // A fresh conversation in another folder: the old folder's entry for this CTO must be gone, so only one exists.
-      if (options.fresh && oldCwd && oldCwd !== at.cwd
-        && (JSON.parse(ports.files.read(config)) as { projects?: Record<string, { mcpServers?: Record<string, unknown> }> }).projects?.[oldCwd]?.mcpServers?.["acp-cto"] !== undefined) return false;
+      const from = movesFrom(at.cwd);
+      if (from && entryAt(from) !== undefined) return false;
       return entry?.command === runtimeNodeOf(ports) && JSON.stringify(entry.args ?? []) === JSON.stringify(acpCtoEntryArgs(ports, projectId, at.uuid));
     },
     run: () => {
       const at = bound();
       if (typeof at === "string") return refused(at);
       if (!UUID.test(at.uuid)) return refused("the conversation to start is not known; nothing was changed");
+      const conflict = mcpConflict(at.cwd);
+      if (conflict) return refused(conflict);
       const earlier = readCanonicalLauncher(ports, projectId);
       const claude = claudeBinaryOf(ports, earlier ? [earlier.claude] : readLegacyLauncher(ports, projectId)?.argv ?? null);
       if (!claude) return refused("the claude binary is not known: set ACP_CLAUDE_BINARY");
@@ -696,7 +718,11 @@ const canonicalResumeSteps = (
       ports.run(claude, ["mcp", "remove", "--scope", "local", "acp-cto"], { cwd: at.cwd, timeoutMs: 30_000 });
       const added = ports.run(claude, ["mcp", "add", "--scope", "local", "acp-cto", "--", runtimeNodeOf(ports), ...acpCtoEntryArgs(ports, projectId, at.uuid)], { cwd: at.cwd, timeoutMs: 30_000 });
       if (added.status !== 0) return refused(`claude mcp add acp-cto failed: ${firstLine(added.stderr)}`);
-      if (options.fresh && oldCwd && oldCwd !== at.cwd) ports.run(claude, ["mcp", "remove", "--scope", "local", "acp-cto"], { cwd: oldCwd, timeoutMs: 30_000 });
+      const from = movesFrom(at.cwd);
+      if (from) {
+        ports.run(claude, ["mcp", "remove", "--scope", "local", "acp-cto"], { cwd: from, timeoutMs: 30_000 });
+        if (entryAt(from) !== undefined) return refused(`claude mcp remove acp-cto left ${from}'s entry in place, so two entries would exist; run this again`);
+      }
       return ok();
     },
   }, stopOldStep(), {
@@ -1345,15 +1371,23 @@ export const runCtoCommand = async (args: readonly string[], ports: CtoPorts): P
     if (record.retiredAt) return refuse(ports, `project ${projectId} is retired`);
     if (record.kind === "none") return refuse(ports, `project ${projectId} has no CTO allocation or entitlement to relaunch`);
     const cwdFlag = value("--cwd");
+    // The folder as the host has it (symlinks resolved): checked here, before anything is written, a dry run included.
+    let cwdReal: string | null = null;
     if (cwdFlag !== null) {
       if (!flags.has("--fresh")) return refuse(ports, "--cwd is only valid together with --fresh; nothing was changed");
       if (!isAbsolute(cwdFlag)) return refuse(ports, `--cwd ${cwdFlag} must be an absolute path; nothing was changed`);
-      if (resolve(cwdFlag) === resolve(ports.home)) return refuse(ports, `--cwd ${cwdFlag} is the home folder, which Claude Code never trusts; nothing was changed`);
-      if (!ports.files.exists(cwdFlag)) return refuse(ports, `--cwd ${cwdFlag} does not exist; nothing was changed`);
+      const homeRefusal = `--cwd ${cwdFlag} is the home folder, which Claude Code never trusts; nothing was changed`;
+      if (resolve(cwdFlag) === resolve(ports.home)) return refuse(ports, homeRefusal);
+      const there = ports.files.real ? ports.files.real(cwdFlag) : ports.files.exists(cwdFlag) ? { path: resolve(cwdFlag), directory: true } : null;
+      if (!there) return refuse(ports, `--cwd ${cwdFlag} does not exist; nothing was changed`);
+      if (!there.directory) return refuse(ports, `--cwd ${cwdFlag} is not a directory; nothing was changed`);
+      if (there.path === (ports.files.real?.(ports.home)?.path ?? resolve(ports.home))) return refuse(ports, homeRefusal);
+      cwdReal = there.path;
     }
     if (flags.has("--fresh")) {
       if (record.kind !== "canonical" || !record.conversation) return refuse(ports, "--fresh needs a canonical CTO with a bound conversation");
-      const again = `agentctl cto relaunch ${projectId} --fresh --apply`;
+      // The folder is named in the retry until the handoff file keeps it, which is after the first steps; naming it after is the same folder.
+      const again = `agentctl cto relaunch ${projectId} --fresh${cwdReal !== null ? ` --cwd ${/^[A-Za-z0-9._/:=@-]+$/.test(cwdReal) ? cwdReal : JSON.stringify(cwdReal)}` : ""} --apply`;
       // A second run at the same time cannot exist: --apply takes the daemon's hold on this project first and keeps that connection
       // open for the whole run (the daemon releases it when the connection closes). Nothing is rolled back; the recovery is this command again.
       let hold: { decision: Decision<unknown>; open(): boolean; release(): void } | null = null;
@@ -1367,7 +1401,7 @@ export const runCtoCommand = async (args: readonly string[], ports: CtoPorts): P
         const current = fresh(ports, projectId);
         if (current?.kind !== "canonical" || !current.conversation) return refuse(ports, "--fresh needs a canonical CTO with a bound conversation");
         return await executeCtoPlan(ports, { command: "relaunch", project: projectId, kind: current.kind, fresh: true, oldConversation: current.conversation },
-          freshSteps(ports, current, ports.newUuid(), hold, cwdFlag !== null ? resolve(cwdFlag) : null), apply, again);
+          freshSteps(ports, current, ports.newUuid(), hold, cwdReal), apply, again);
       } finally { hold?.release(); }
     }
     return executeCtoPlan(ports, { command: "relaunch", project: projectId, kind: record.kind }, relaunchPlan(ports, record), apply, rerun);
@@ -1508,6 +1542,7 @@ export const createCtoPorts = async (input: {
       move: (from, to) => { mkdirSync(dirname(to), { recursive: true, mode: 0o700 }); renameSync(from, to); },
       remove: (path) => rmSync(path, { recursive: true, force: true }),
       mtimeMs: (path) => { try { return statSync(path).mtimeMs; } catch { return null; } },
+      real: (path) => { try { const at = realpathSync(path); return { path: at, directory: statSync(at).isDirectory() }; } catch { return null; } },
     },
     publicKeyOf: (keyFile) => { try { return daemonBuzzSigner(readFileSync(keyFile, "utf8")); } catch { return null; } },
     now: () => Date.now(),
