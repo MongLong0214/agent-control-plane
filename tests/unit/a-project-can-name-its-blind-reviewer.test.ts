@@ -251,6 +251,30 @@ describe("a project's own Blind Reviewer", () => {
     }
   });
 
+  it("2b (#1477): a project preferring gpt-6.2-sol under UNCONFIGURED gpt scope falls back to Opus, and the audit names the project's own preferred reviewer", async () => {
+    const setup = await prepared();
+    try {
+      const gate = gateFor(setup, { [setup.projectId]: GPT_HIGH });
+      gate.attach({ packetReviewerScope: (provider) => provider === "gpt" ? { state: "UNCONFIGURED", root: "/fixture/no-codex-home" } : null });
+      const fallback = await review(gate, setup);
+      expect(fallback.allowed, JSON.stringify(fallback)).toBe(true);
+      if (!fallback.allowed) return;
+      expect(fallback.value.provider).toBe("claude");
+      expect(setup.gpt.invocations).toHaveLength(0);
+      expect(reviewerMode(setup, fallback.value.reviewerSessionId)).toBe("FALLBACK");
+      expect(setup.harness.cp.audit.byKind("BLIND_REVIEW_FALLBACK")).toEqual([expect.objectContaining({
+        runId: setup.run.runId,
+        evidence: expect.objectContaining({
+          from: "gpt", preferredModel: "gpt-6.2-sol", provider: "claude", reason: REVIEWER_FALLBACK_SCOPE_UNCONFIGURED,
+        }),
+      })]);
+      // Opus here is the fallback, not the project's choice: the receipt does not call it a project preference.
+      expect(completed(setup)[0]?.evidence).not.toHaveProperty("reviewerSource");
+    } finally {
+      setup.harness.cp.close();
+    }
+  });
+
   it("3: a capacity refusal on the project's GPT reviewer ends selection, with no fallback to claude", async () => {
     const setup = await prepared();
     try {
