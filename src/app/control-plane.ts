@@ -655,7 +655,7 @@ export class ControlPlane {
         this.sessions, this.bindings, this.providers, this.repositories, this.telemetry,
         {
           ...(config.reviewer ?? {
-            preferred: { provider: "gpt", model: "gpt-6.1-sol", effort: "xhigh" },
+            preferred: { provider: "gpt", model: "gpt-6.2-sol", effort: "xhigh" },
             fallbacks: [{ provider: "claude", model: "opus", effort: null }],
           }),
           // Absent unless an entry applies, so the default preferences are exactly what they were.

@@ -132,14 +132,14 @@ class NoIsolationAdapter extends TestProductionAdapter {
   readonly supportsReviewerIsolation = false;
 }
 
-/** The production default (gpt-6.1-sol preferred, Claude Opus fallback) plus the given project entries. */
+/** The production default (gpt-6.2-sol preferred, Claude Opus fallback) plus the given project entries. */
 const gateFor = (setup: Prepared, projects: Record<string, ReviewerPreference>) => {
   const cp = setup.harness.cp;
   return new BlindReviewGate(
     cp.clock, cp.db, cp.audit, cp.artifacts, cp.evidenceWritersForTests().BLIND_REVIEW, cp.sessions, cp.bindings,
     cp.providers, cp.repositories, cp.telemetry,
     {
-      preferred: { provider: "gpt", model: "gpt-6.1-sol", effort: "xhigh" },
+      preferred: { provider: "gpt", model: "gpt-6.2-sol", effort: "xhigh" },
       fallbacks: [{ provider: "claude", model: "opus", effort: null }],
       projects: new Map(Object.entries(projects)),
     },
@@ -185,14 +185,14 @@ describe("a project's own Blind Reviewer", () => {
     }
   });
 
-  it("2 (control): a project without an entry keeps gpt-6.1-sol preferred and its Claude fallback, unchanged", async () => {
+  it("2 (control): a project without an entry keeps gpt-6.2-sol preferred and its Claude fallback, unchanged", async () => {
     const setup = await prepared();
     try {
       const gate = gateFor(setup, { "some-other-project": OPUS });
       const preferred = await review(gate, setup);
       expect(preferred.allowed, JSON.stringify(preferred)).toBe(true);
       if (!preferred.allowed) return;
-      expect(preferred.value).toMatchObject({ provider: "gpt", model: "gpt-6.1-sol", effort: "xhigh" });
+      expect(preferred.value).toMatchObject({ provider: "gpt", model: "gpt-6.2-sol", effort: "xhigh" });
       expect(setup.claude.invocations).toHaveLength(0);
       expect(completed(setup)[0]?.evidence).not.toHaveProperty("reviewerSource");
 
@@ -280,7 +280,7 @@ describe("a project whose reviewer entry names a provider ACP does not support",
     const setup = await prepared({
       reviewerPreferencesFile: readProjectReviewerFile(file),
       reviewer: {
-        preferred: { provider: "gpt", model: "gpt-6.1-sol", effort: "xhigh" },
+        preferred: { provider: "gpt", model: "gpt-6.2-sol", effort: "xhigh" },
         fallbacks: [{ provider: "claude", model: "opus", effort: null }],
       },
     });
@@ -398,7 +398,7 @@ describe("the daemon's reviewer preference file", () => {
       const preferences = refused.review["preferences"];
       expect(preferences.projects).toEqual(new Map([["e2e-1", OPUS]]));
       expect(preferences.refusedProjects).toEqual(new Map([["e2e-2", expect.objectContaining({ provider })]]));
-      expect(preferences.preferred).toEqual({ provider: "gpt", model: "gpt-6.1-sol", effort: "xhigh" });
+      expect(preferences.preferred).toEqual({ provider: "gpt", model: "gpt-6.2-sol", effort: "xhigh" });
       expect(preferences.fallbacks).toEqual([{ provider: "claude", model: "opus", effort: null }]);
       expect(refused.audit.byKind("REVIEWER_PREFERENCES_REFUSED")).toEqual([expect.objectContaining({
         reasonCode: ReasonCode.REVIEWER_PREFERENCES_INVALID,

@@ -17,7 +17,7 @@ const ok = { stdout: "ok", stderr: "", exitCode: 0, timedOut: false, isolationEn
 it("PR1163-R1-01: restart can identify a live Codex worker from the actual adapter argv", async () => {
   const core = makeCore();
   const world = seedWorkerWorld(core);
-  world.db.run("UPDATE sessions SET provider = 'gpt', model = 'gpt-6.1-sol' WHERE session_id = ?", [world.worker.sessionId]);
+  world.db.run("UPDATE sessions SET provider = 'gpt', model = 'gpt-6.2-sol' WHERE session_id = ?", [world.worker.sessionId]);
   let live = true;
   let killed = 0;
   let argv: string[] = [];
@@ -86,10 +86,10 @@ it("PR1163-R1-02: capacity, login and worker exec use the configured Codex accou
   const { allow } = await import("../../src/core/errors.ts");
   const { ReasonCode } = await import("../../src/core/reason-codes.ts");
   const adapter = new CodexCliAdapter({ clock, binary: process.execPath, capacityFile: join(root, "capacity.json"), codexHome: account, managedWriteBroker: { authorize: async (_write, effect) => allow(ReasonCode.OK, await effect()) } });
-  const handle = await adapter.startSession({ model: "gpt-6.1-sol", workdir: root, purpose: "worker:review" });
+  const handle = await adapter.startSession({ model: "gpt-6.2-sol", workdir: root, purpose: "worker:review" });
   await adapter.probeCapacity();
   expect(await adapter.probeSession(handle)).toBe("HEALTHY");
-  await adapter.invoke({ model: "gpt-6.1-sol", workdir: root, prompt: "offline witness", timeoutMs: 1000, correlationId: "review", readOnly: false, managedWrite: { operation: "FILE_MUTATION", targetPath: realpathSync(root), assignedWorktreeId: realpathSync(root), taskId: "review", taskReceiptId: "review#1", runId: "review", sessionId: "review", sessionIncarnation: "review#now", bindingGeneration: 1 } });
+  await adapter.invoke({ model: "gpt-6.2-sol", workdir: root, prompt: "offline witness", timeoutMs: 1000, correlationId: "review", readOnly: false, managedWrite: { operation: "FILE_MUTATION", targetPath: realpathSync(root), assignedWorktreeId: realpathSync(root), taskId: "review", taskReceiptId: "review#1", runId: "review", sessionId: "review", sessionIncarnation: "review#now", bindingGeneration: 1 } });
   console.error("PR1163 account witness", JSON.stringify({ capacityHome: capacity.mock.calls[0]?.[0].codexHome, selected: account, defaultHome: join(homedir(), ".codex"), seen }));
   expect(capacity.mock.calls[0]?.[0].codexHome).toBe(account);
   expect(seen.filter((call) => call.command !== "--version").map((call) => call.home)).toEqual([account, account]);

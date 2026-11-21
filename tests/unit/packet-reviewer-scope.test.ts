@@ -8,7 +8,7 @@ import { ControlPlane } from "../../src/app/control-plane.ts";
 import { ManualClock } from "../../src/core/clock.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { acpScratchDir } from "../../src/core/scratch-root.ts";
-import { CodexCliAdapter, __testing } from "../../src/runtime/cli-adapters.ts";
+import { CODEX_REVIEWER_INPUT_MAX_BYTES, CodexCliAdapter, __testing } from "../../src/runtime/cli-adapters.ts";
 import { ProviderSessionProvisionError } from "../../src/runtime/provider.ts";
 import {
   PacketReviewerScopeUnconfigured,
@@ -124,7 +124,7 @@ const adapterFor = (options: { codexHome?: string; reviewerCodexHome?: string } 
 
 const reviewOnce = async (adapter: CodexCliAdapter, label: string) => {
   const packetRoot = tempDir(`acp-prs-packet-${label}-`);
-  const spec = { model: "gpt-6.1-sol", effort: "xhigh", workdir: packetRoot, purpose: "blind-review", isolation: isolationFor(packetRoot) };
+  const spec = { model: "gpt-6.2-sol", effort: "xhigh", workdir: packetRoot, purpose: "blind-review", isolation: isolationFor(packetRoot) };
   const handle = await adapter.startSession(spec);
   const result = await adapter.invoke({
     ...spec,
@@ -170,7 +170,7 @@ describe("one predicate decides UNCONFIGURED, for the doctor and the reviewer al
       const calls = stubCodex();
       const packetRoot = tempDir("acp-prs-agree-");
       const started = await adapter.startSession({
-        model: "gpt-6.1-sol", workdir: packetRoot, purpose: "blind-review", isolation: isolationFor(packetRoot),
+        model: "gpt-6.2-sol", workdir: packetRoot, purpose: "blind-review", isolation: isolationFor(packetRoot),
       }).then(() => null, (error: unknown) => error);
       const reviewerSaysUnconfigured = started instanceof PacketReviewerScopeUnconfigured;
       const doctorState = await doctorScopeState();
@@ -355,9 +355,9 @@ console.log(JSON.stringify({ type: 'item.completed', item: { type: 'agent_messag
           reviewerEgress: { profilePath, proxyPath, runtimeDir: join(fixture, `lease-${label}`), port,
             providerEndpoints: { gpt: ["api.openai.com"] } },
         });
-        const handle = await proxied.startSession({ model: "gpt-6.1-sol", effort: "xhigh", workdir: packetRoot,
+        const handle = await proxied.startSession({ model: "gpt-6.2-sol", effort: "xhigh", workdir: packetRoot,
           purpose: "blind-review", isolation });
-        const result = await proxied.invoke({ model: "gpt-6.1-sol", effort: "xhigh", workdir: packetRoot,
+        const result = await proxied.invoke({ model: "gpt-6.2-sol", effort: "xhigh", workdir: packetRoot,
           externalSessionId: handle.externalSessionId, prompt: "review", timeoutMs: 10_000, readOnly: true,
           correlationId: `prs-seatbelt-${label}`, isolation });
         await proxied.stopSession(handle);
@@ -385,14 +385,18 @@ console.log(JSON.stringify({ type: 'item.completed', item: { type: 'agent_messag
   }, 60_000);
 });
 
-describe("the GPT sol pins are gpt-6.1-sol", () => {
-  it("names gpt-6.1-sol for the Codex reviewer, CEO and CTO defaults and the control plane's preferred reviewer", () => {
+describe("the GPT sol pins are gpt-6.2-sol", () => {
+  it("names gpt-6.2-sol for the Codex reviewer, CEO and CTO defaults and the control plane's preferred reviewer", () => {
     expect(adapterFor().defaultModels).toEqual({
-      reviewer: "gpt-6.1-sol",
-      ceo: "gpt-6.1-sol",
+      reviewer: "gpt-6.2-sol",
+      ceo: "gpt-6.2-sol",
       worker: "gpt-5.6-luna-max",
-      cto: "gpt-6.1-sol",
+      cto: "gpt-6.2-sol",
     });
+    // The input bound is derived for gpt-6.2-sol alone; the retired 6.1 models get none.
+    expect(adapterFor().reviewerInputMaxBytes("gpt-6.2-sol")).toBe(CODEX_REVIEWER_INPUT_MAX_BYTES);
+    expect(adapterFor().reviewerInputMaxBytes("gpt-6.1-sol")).toBeUndefined();
+    expect(adapterFor().reviewerInputMaxBytes("gpt-6.1-terra")).toBeUndefined();
     const root = tempDir("acp-prs-defaults-");
     const clock = new ManualClock("2026-10-16T00:00:00.000Z");
     const cp = new ControlPlane({
@@ -406,7 +410,7 @@ describe("the GPT sol pins are gpt-6.1-sol", () => {
     });
     try {
       expect(cp.review["preferences"]).toEqual({
-        preferred: { provider: "gpt", model: "gpt-6.1-sol", effort: "xhigh" },
+        preferred: { provider: "gpt", model: "gpt-6.2-sol", effort: "xhigh" },
         fallbacks: [{ provider: "claude", model: "opus", effort: null }],
       });
     } finally {

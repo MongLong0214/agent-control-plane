@@ -89,7 +89,7 @@ describe("a gpt worker session is ready only when codex can actually run", () =>
     const workdir = tempDir("acp-codex-workdir-");
     const adapter = adapterFor(root, stubCodex(root, "ok", workdir));
     const handle = await adapter.startSession({
-      model: "gpt-6.1-sol",
+      model: "gpt-6.2-sol",
       effort: null,
       workdir,
       purpose: "worker:task-1",
@@ -102,7 +102,7 @@ describe("a gpt worker session is ready only when codex can actually run", () =>
     const workdir = tempDir("acp-codex-workdir-deny-");
     const adapter = adapterFor(root, stubCodex(root, "deny", workdir));
     const handle = await adapter.startSession({
-      model: "gpt-6.1-sol",
+      model: "gpt-6.2-sol",
       effort: null,
       workdir,
       purpose: "worker:task-1",
@@ -115,7 +115,7 @@ describe("a gpt worker session is ready only when codex can actually run", () =>
     const workdir = tempDir("acp-codex-workdir-missing-bin-");
     const adapter = adapterFor(root, join(root, "absent-codex"));
     const handle = await adapter.startSession({
-      model: "gpt-6.1-sol",
+      model: "gpt-6.2-sol",
       effort: null,
       workdir,
       purpose: "worker:task-1",
@@ -128,7 +128,7 @@ describe("a gpt worker session is ready only when codex can actually run", () =>
     const workdir = join(tempDir("acp-codex-wd-parent-"), "missing");
     const adapter = adapterFor(root, stubCodex(root, "ok", workdir));
     const handle = await adapter.startSession({
-      model: "gpt-6.1-sol",
+      model: "gpt-6.2-sol",
       effort: null,
       workdir,
       purpose: "worker:task-1",
@@ -141,7 +141,7 @@ describe("a gpt worker session is ready only when codex can actually run", () =>
     const workdir = tempDir("acp-codex-workdir-other-");
     const adapter = adapterFor(root, stubCodex(root, "ok", workdir));
     const other = await adapter.startSession({
-      model: "gpt-6.1-sol",
+      model: "gpt-6.2-sol",
       effort: null,
       workdir,
       purpose: "continuity:PRIMARY_CTO",
@@ -150,7 +150,7 @@ describe("a gpt worker session is ready only when codex can actually run", () =>
     expect(await adapter.probeSession({
       externalSessionId: "not-constituted",
       provider: "gpt",
-      model: "gpt-6.1-sol",
+      model: "gpt-6.2-sol",
       effort: null,
       pid: null,
       workdir,
@@ -210,7 +210,7 @@ describe("provisioning a gpt worker", () => {
         runId: run.runId,
         taskId: run.taskId,
         provider: "gpt",
-        model: "gpt-6.1-sol",
+        model: "gpt-6.2-sol",
         ownerBindingGeneration: run.ownerBindingGeneration,
         fence: () => allow(ReasonCode.OK, {
           sessionId: run.ownerSessionId,
@@ -222,7 +222,7 @@ describe("provisioning a gpt worker", () => {
       expect(harness.cp.sessions.get(provisioned.value.workerSessionId)?.lifecycle).toBe("READY");
       expect(harness.cp.sessions.get(provisioned.value.workerSessionId)).toMatchObject({
         provider: "gpt",
-        model: "gpt-6.1-sol",
+        model: "gpt-6.2-sol",
       });
     } finally {
       harness.cp.close();
@@ -245,10 +245,10 @@ const startTurn = (runner: WorkerTurnRunner, world: ReturnType<typeof seedWorker
   });
 
 describe("a worker turn runs on the bound session", () => {
-  it("invokes codex exec for a gpt worker, on gpt-6.1-sol, with stdin closed", async () => {
+  it("invokes codex exec for a gpt worker, on gpt-6.2-sol, with stdin closed", async () => {
     const core = makeCore();
     const world = seedWorkerWorld(core);
-    retarget(world.worker.sessionId, world.db, "gpt", "gpt-6.1-sol");
+    retarget(world.worker.sessionId, world.db, "gpt", "gpt-6.2-sol");
     const root = tempDir("acp-codex-turn-");
     const codex = new CodexCliAdapter({
       clock: core.clock,
@@ -291,10 +291,10 @@ describe("a worker turn runs on the bound session", () => {
     const execution = world.tasks.execution(started.value.executionId)!;
     expect(execution.status, JSON.stringify(runner.describe(execution.executionId, world.runId))).toBe("SUCCEEDED");
     expect(execution.provider).toBe("gpt");
-    expect(execution.model).toBe("gpt-6.1-sol");
+    expect(execution.model).toBe("gpt-6.2-sol");
     expect(claudeCalls).toEqual([]);
     const report = JSON.parse(texts[0] ?? "{}") as { args: string[]; stdin: string; cwd: string };
-    expect(report.args.slice(0, 5)).toEqual(["exec", "-m", "gpt-6.1-sol", "--skip-git-repo-check", "-o"]);
+    expect(report.args.slice(0, 5)).toEqual(["exec", "-m", "gpt-6.2-sol", "--skip-git-repo-check", "-o"]);
     expect(report.args).toContain("-s");
     expect(report.args).toContain("workspace-write");
     expect(report.args).toContain("sandbox_workspace_write.exclude_slash_tmp=true");
@@ -351,7 +351,7 @@ describe("a worker turn runs on the bound session", () => {
     expect(claude.requests[0]?.model).toBe("opus");
   });
 
-  it("refuses a gpt worker whose model is not gpt-6.1-sol", async () => {
+  it("refuses a gpt worker whose model is not gpt-6.2-sol", async () => {
     const core = makeCore();
     const world = seedWorkerWorld(core);
     retarget(world.worker.sessionId, world.db, "gpt", "gpt-5.6-luna-max");
@@ -370,13 +370,13 @@ describe("a worker turn runs on the bound session", () => {
     expect(started.allowed).toBe(false);
     if (started.allowed) return;
     expect(started.reasonCode).toBe(ReasonCode.INVALID_ARGUMENT);
-    expect(started.evidence).toMatchObject({ provider: "gpt", model: "gpt-5.6-luna-max", required: "gpt-6.1-sol" });
+    expect(started.evidence).toMatchObject({ provider: "gpt", model: "gpt-5.6-luna-max", required: "gpt-6.2-sol" });
   });
 
   it("preserves a capacity refusal and does not launch the provider", async () => {
     const core = makeCore();
     const world = seedWorkerWorld(core);
-    retarget(world.worker.sessionId, world.db, "gpt", "gpt-6.1-sol");
+    retarget(world.worker.sessionId, world.db, "gpt", "gpt-6.2-sol");
     world.tasks.attach({
       capacity: {
         refreshForWorkerFanout: async () => deny(ReasonCode.CAPACITY_UNKNOWN_NOT_ROUTABLE, "fixture capacity refusal"),

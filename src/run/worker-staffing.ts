@@ -16,7 +16,7 @@ import type { TaskGraph } from "./task-graph.ts";
 /**
  * The providers a worker may be staffed on, and the model each one runs.
  *
- * Fixed rather than chosen per call: Claude Opus, or GPT 6.1 Sol (CEO decision 129edfa1; owner
+ * Fixed rather than chosen per call: Claude Opus, or GPT 6.2 Sol (CEO decision 129edfa1; owner
  * instruction of 2026-10-19). The caller still names the provider — nothing is substituted for a
  * provider it did not ask for — and a provider or model outside this table is refused rather than
  * mapped to one inside it. The model is not the adapter's `defaultModels.worker`, which for Claude

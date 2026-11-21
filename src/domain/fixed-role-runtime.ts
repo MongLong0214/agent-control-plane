@@ -8,10 +8,10 @@ export interface FixedRoleRuntime {
 
 /**
  * Roles whose runtime is fixed. A run's BOOTSTRAP_CTO (#246, RF PRD:156) runs on Claude Opus.
- * A task's WORKER (#512) runs on Claude Opus, or on GPT 6.1 Sol (CEO decision 129edfa1; owner
+ * A task's WORKER (#512) runs on Claude Opus, or on GPT 6.2 Sol (CEO decision 129edfa1; owner
  * instruction of 2026-10-19). The caller names the provider. Nothing is substituted or defaulted.
  * Claude's own default worker model (Sonnet) is not Opus, and GPT's default worker model (Luna)
- * is not 6.1 Sol.
+ * is not 6.2 Sol.
  *
  * Every writer that constitutes a session for one of these roles reads this table — staffing at
  * provisioning, continuity at a WORKER's failover and restoration — and none substitutes a
@@ -23,7 +23,7 @@ export const FIXED_ROLE_RUNTIME: Readonly<Partial<Record<Role, readonly FixedRol
   [Role.BOOTSTRAP_CTO]: Object.freeze([Object.freeze({ provider: "claude", model: "opus" })]),
   [Role.WORKER]: Object.freeze([
     Object.freeze({ provider: "claude", model: "opus" }),
-    Object.freeze({ provider: "gpt", model: "gpt-6.1-sol" }),
+    Object.freeze({ provider: "gpt", model: "gpt-6.2-sol" }),
   ]),
 });
 

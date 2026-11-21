@@ -193,7 +193,7 @@ process.stdin.on("end", () => {
 
 /** One gpt WORKER turn on the real Codex adapter, its binary the stand-in above. */
 const codexTurn = async (world: WorkerWorld, options: CodexScript) => {
-  world.db.run(`UPDATE sessions SET provider = 'gpt', model = 'gpt-6.1-sol' WHERE session_id = ?`, [world.worker.sessionId]);
+  world.db.run(`UPDATE sessions SET provider = 'gpt', model = 'gpt-6.2-sol' WHERE session_id = ?`, [world.worker.sessionId]);
   const root = tempDir("acp-codex-optional-locks-");
   const codex = new CodexCliAdapter({
     clock: world.clock,

@@ -1429,7 +1429,7 @@ export class BlindReviewGate {
   }
 
   /**
-   * §18.1 / §18.7 — prefer GPT-6.1 Sol at xhigh; fall back to a *separate* fresh
+   * §18.1 / §18.7 — prefer GPT-6.2 Sol at xhigh; fall back to a *separate* fresh
    * session when the preferred provider is unavailable. Session and context
    * independence is required even when the provider family is reused; if no isolated
    * reviewer can be constituted the gate is not lowered — the caller waits.

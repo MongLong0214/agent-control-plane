@@ -12,14 +12,14 @@ import { TestProductionAdapter } from "../helpers/production-adapter.ts";
 afterAll(cleanupTempDirs);
 
 describe("a worker may be staffed on gpt", () => {
-  it("accepts provider gpt with model gpt-6.1-sol and still accepts claude opus", () => {
+  it("accepts provider gpt with model gpt-6.2-sol and still accepts claude opus", () => {
     expect(resolveWorkerModel("gpt", undefined)).toEqual({
       allowed: true,
       reasonCode: ReasonCode.OK,
       evidence: {},
-      value: "gpt-6.1-sol",
+      value: "gpt-6.2-sol",
     });
-    expect(resolveWorkerModel("gpt", "gpt-6.1-sol")).toMatchObject({ allowed: true, value: "gpt-6.1-sol" });
+    expect(resolveWorkerModel("gpt", "gpt-6.2-sol")).toMatchObject({ allowed: true, value: "gpt-6.2-sol" });
     expect(resolveWorkerModel("claude", undefined)).toMatchObject({ allowed: true, value: "opus" });
   });
 
@@ -39,10 +39,19 @@ describe("a worker may be staffed on gpt", () => {
     });
   });
 
+  it("refuses the retired gpt 6.1 models", () => {
+    for (const retired of ["gpt-6.1-sol", "gpt-6.1-terra"]) {
+      expect(resolveWorkerModel("gpt", retired)).toMatchObject({
+        allowed: false,
+        reasonCode: ReasonCode.INVALID_ARGUMENT,
+      });
+    }
+  });
+
   it("continuity constitutes a worker from the same table", async () => {
     expect(Object.fromEntries(fixedRuntimes(Role.WORKER).map((runtime) => [runtime.provider, runtime.model])))
       .toEqual(WORKER_MODEL_BY_PROVIDER);
-    expect(WORKER_MODEL_BY_PROVIDER).toEqual({ claude: "opus", gpt: "gpt-6.1-sol" });
+    expect(WORKER_MODEL_BY_PROVIDER).toEqual({ claude: "opus", gpt: "gpt-6.2-sol" });
 
     const harness = makeHarness();
     try {
@@ -67,7 +76,7 @@ describe("a worker may be staffed on gpt", () => {
       const accepted = await harness.cp.continuity["provisionRoutableSession"](Role.WORKER, "gpt", "gpt worker");
       expect(accepted.allowed).toBe(true);
       expect(gptStart).toHaveBeenCalledOnce();
-      expect(gptStart.mock.calls[0]![0]).toMatchObject({ model: "gpt-6.1-sol" });
+      expect(gptStart.mock.calls[0]![0]).toMatchObject({ model: "gpt-6.2-sol" });
 
       const claudeAccepted = await harness.cp.continuity["provisionRoutableSession"](Role.WORKER, "claude", "claude worker");
       expect(claudeAccepted.allowed).toBe(true);
