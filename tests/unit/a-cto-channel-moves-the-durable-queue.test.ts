@@ -110,14 +110,14 @@ describe("the rules for what a receipt may move", () => {
     }
   });
 
-  it("completes nothing for a reply signed before the channel showed the message, or for one it never showed", () => {
+  it("completes the message a reply names by its exact id, even when the channel showed it after the reply was signed, or never", () => {
     const good = signedReply(cto, [["h", ROOM], ["e", E1, "", "reply"], ["p", OWNER]]);
-    // Shown 80 s after the reply was signed (a replayed reply): it did not answer what it had not seen.
+    // Shown 80 s after the reply was signed (the CTO read it another way): naming its id is the proof it was answered.
     const shownAfter: ChannelReceipt = { type: "emitted", eventId: E1, room: ROOM, senderPubkey: OWNER, emittedAt: good.created_at + 80 };
     for (const receipts of [[shownAfter, replied(good, E1)], [replied(good, E1)]]) {
       const f = fake();
-      expect(applyChannelReceipts(f.deps, holder.roleKey, receipts).completed).toEqual([]);
-      expect(f.calls.filter((call) => call === "complete")).toEqual([]);
+      expect(applyChannelReceipts(f.deps, holder.roleKey, receipts).completed).toEqual(["m1"]);
+      expect(f.calls).toEqual(["deliver", "complete"]);
     }
   });
 

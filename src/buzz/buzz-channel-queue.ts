@@ -23,8 +23,8 @@ import { BUZZ_CHANNEL_RECEIPT_SUFFIX, channelDir, readChannelReceipts } from "./
  *   - `replied`: the CTO's reply was posted, by the reply tool or seen on the relay whatever sent it.
  *     It completes exactly one message: the one whose event the reply answers by its NIP-10 `reply`
  *     marker, when the reply is a signed kind-9 by the identity this session is bound to as its Buzz
- *     actor, in the room the message came from, and was signed after the channel's `emitted` receipt
- *     for that message. A reply is settled per message it completed, never as a whole receipt.
+ *     actor, in the room the message came from. A reply is settled per message it completed, never as
+ *     a whole receipt, so a message admitted after its reply was read is still completed.
  *
  * A receipt is a claim by a file anyone running as this user can append to, so none of it is trusted
  * for what it says about itself: the message is found from the daemon's own rows, the reply's
@@ -97,13 +97,6 @@ export const applyChannelReceipts = (
     }
     return queue;
   };
-  // When the channel first showed each event: a reply completes a message only when it was signed after this.
-  const emittedAt = new Map<string, number>();
-  for (const receipt of receipts) {
-    if (!isChannelReceipt(receipt) || receipt.type !== "emitted") continue;
-    const at = `${receipt.room}|${receipt.eventId}`;
-    emittedAt.set(at, Math.min(emittedAt.get(at) ?? Number.POSITIVE_INFINITY, receipt.emittedAt));
-  }
   for (const receipt of receipts) {
     // One receipt that is not a receipt, or that the queue cannot make sense of, never stops the others.
     if (!isChannelReceipt(receipt)) {
@@ -118,7 +111,7 @@ export const applyChannelReceipts = (
         const parent = replyParentOf(receipt.event);
         const target = parent === null ? undefined : queued().get(parent);
         if (target === undefined) result.ignored += 1;
-        else if (!settled.has(`${key}${ROW}${target.messageId}`) && applyReply(deps, receipt, target, emittedAt, result, queued())) {
+        else if (!settled.has(`${key}${ROW}${target.messageId}`) && applyReply(deps, receipt, target, result, queued())) {
           settled.add(`${key}${ROW}${target.messageId}`);
         }
         continue;
@@ -148,20 +141,18 @@ const applyOne = (
 };
 
 /**
- * Whether a CTO's posted reply completed `message`, the one whose event it answers: a signed kind-9 by the holder's bound
- * Buzz actor, in the message's room, signed after the channel showed the message.
+ * Whether a CTO's posted reply completed `message`, the one whose event its `reply` marker names: a signed kind-9 by the
+ * holder's bound Buzz actor, in the message's room. Naming the event's id is the proof it answered that message.
  */
 const applyReply = (
   deps: ChannelQueueDeps,
   receipt: Extract<ChannelReceipt, { type: "replied" }>,
   message: ChannelQueueMessage,
-  emittedAt: ReadonlyMap<string, number>,
   result: ChannelApplyResult,
   queue: Map<string, ChannelQueueMessage>,
 ): boolean => {
   const event = receipt.event;
   const rooms = event.tags.filter((tag) => tag[0] === "h").map((tag) => tag[1]);
-  const shownAt = message.room === null ? undefined : emittedAt.get(`${message.room}|${message.eventId}`);
   if (
     message.room === null ||
     message.room !== receipt.room ||
@@ -170,9 +161,6 @@ const applyReply = (
     rooms.length !== 1 ||
     rooms[0] !== message.room ||
     (receipt.ack !== "ACCEPTED" && receipt.ack !== "DUPLICATE") ||
-    // Shown first, answered after: a reply signed before the channel showed the message does not complete it.
-    shownAt === undefined ||
-    !(shownAt < event.created_at) ||
     // A fresh seven-field copy: `verifyEvent` caches its verdict on the object it is given, and a
     // spread of an already-verified event carries that verdict over a body that was changed after.
     !verifyEvent({
