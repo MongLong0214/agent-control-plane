@@ -1059,6 +1059,33 @@ describe("a canonical relaunch resumes the role's bound conversation", () => {
       expect(after.procs.some((p) => p.pid === CLAUDE)).toBe(true);
     });
 
+    it("D: a hold lost during the switchover's own status read: rotate is not asked and the handoff is not rewritten", async () => {
+      const { w } = canonicalWorld();
+      w.files.set(`${STATE}/cto-refresh/handoff-${P}.json`, JSON.stringify({ schema: "acp.cto-handoff.v1", projectId: P, conversation: CONVERSATION, source: "cto", text: "Go on.", writtenAt: "2026-11-20T00:00:00Z" }));
+      // After the channel step: the first status read is the step's done, the second is run's own, which awaits before it mutates.
+      let reads = 0;
+      w.onStatus = () => { if (w.out.some((l) => l["step"] === "channel" && l["result"]) && ++reads === 2) w.hold.open = false; };
+      expect(await runCtoCommand(["relaunch", P, "--fresh", "--apply"], w.ports)).toBe(1);
+      expect(reads).toBeGreaterThanOrEqual(2);
+      expect(w.rotateCalls).toHaveLength(0);
+      expect(mutations(w)).toEqual([]);
+      expect(handoffFile(w).next).toBeUndefined();
+      expect(JSON.stringify(w.out)).toContain("the hold on this swap was lost");
+    });
+
+    it("E: a hold lost during the stop's own process reading: the old CTO is not signalled and U is not launched", async () => {
+      const { w } = canonicalWorld();
+      w.switchovers = [{ toSessionUuid: U1, state: "PENDING" }];
+      let reads = 0;
+      // The third process-table reading after the mcp step is the stop's own selection, awaited before the signal.
+      w.onTable = () => { if (w.out.some((l) => l["step"] === "mcp" && l["result"]) && ++reads === 3) w.hold.open = false; };
+      expect(await runCtoCommand(["relaunch", P, "--fresh", "--apply"], w.ports)).toBe(1);
+      expect(reads).toBeGreaterThanOrEqual(3);
+      expect(w.changes.filter((c) => c.startsWith("SIGTERM") || c.startsWith("tmux new-"))).toEqual([]);
+      expect(w.procs.some((p) => p.pid === CLAUDE)).toBe(true);
+      expect(JSON.stringify(w.out)).toContain("the hold on this swap was lost");
+    });
+
     describe("--cwd: the new conversation starts in another folder", () => {
       const withFolder = (): { w: World; cwd: string; dir: string } => {
         const { w, cwd } = canonicalWorld();

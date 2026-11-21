@@ -374,6 +374,8 @@ const stopStep = (
   ports: CtoPorts, projectId: string, id = "stop", keepChanneled = false, stopped: ExpectedProcess[] = [],
   // Which process this run signals, chosen once; what is signalled is exactly that pid and start token, never a fresh reading of the binding.
   pick?: (role: RoleProcesses) => Promise<StopTarget | null | { refused: string }>,
+  // --fresh: asked again right before the signal, after the reads above awaited; an outcome here is returned and nothing is signalled.
+  gate?: () => Outcome | null,
 ): CtoStep => ({
   id,
   plan: keepChanneled
@@ -404,6 +406,8 @@ const stopStep = (
         ? `pid ${target.pid}'s start cannot be read right before the signal, so it cannot be confirmed as the process selected; nothing was signalled or launched`
         : `pid ${target.pid} is another process than the one selected (its start changed); nothing was signalled or launched`);
     }
+    const gated = gate?.();
+    if (gated) return gated;
     try { ports.signal(target.pid, "SIGTERM"); } catch (error) {
       // Gone between the read and the signal is the outcome this step wants; anything else is reported.
       if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
@@ -605,7 +609,7 @@ const canonicalResumeSteps = (
       const picked = await stopTargetOf(ports, record, role);
       return picked === null || "refused" in picked ? picked : notOld(record, role, picked) ? null : picked;
     };
-    const stop = stopStep(ports, projectId, "stop", !restart, stopped, pick);
+    const stop = stopStep(ports, projectId, "stop", !restart, stopped, pick, options.fresh.gate);
     return {
       ...stop,
       done: async () => {
@@ -963,6 +967,9 @@ const freshSteps = (ports: CtoPorts, record: CtoRecord, next: string, hold: { op
       if (before === null) return refused("canonicalCto.status could not be read; no switchover was prepared");
       const stored = readHandoff(ports.files, ports.stateDir, projectId);
       if (!stored) return refused("the handoff is not stored; no switchover was prepared");
+      // The status read awaited: the hold may have been lost, or the role taken, since this step began.
+      const gatedBefore = target.gate();
+      if (gatedBefore) return gatedBefore;
       // Immediately before rotate: it is asked only while the old conversation still holds the role.
       if (before.holderSessionUuid !== old) {
         return before.holderSessionUuid !== null && before.holderSessionUuid === (stored.next ?? target.uuid)
@@ -979,6 +986,8 @@ const freshSteps = (ports: CtoPorts, record: CtoRecord, next: string, hold: { op
       // A conversation an earlier attempt wrote down and the daemon never recorded is used again; one it recorded is not.
       const used = new Set(before.rotations.map((r) => r.toSessionUuid));
       const to = stored.next && !used.has(stored.next) ? stored.next : next;
+      const gatedRotate = target.gate();
+      if (gatedRotate) return gatedRotate;
       markHandoff(ports.files, ports.stateDir, projectId, { next: to });
       let said = "";
       try {
@@ -1021,7 +1030,7 @@ const freshSteps = (ports: CtoPorts, record: CtoRecord, next: string, hold: { op
       if (cwdFlag !== null) markHandoff(ports.files, ports.stateDir, projectId, { cwd: cwdFlag });
       // The first read of the daemon's record: a pending switchover's conversation is written down now, before anything else can happen to it.
       const pending = pendingOf(await readStatus());
-      if (pending !== null) { markHandoff(ports.files, ports.stateDir, projectId, { next: pending }); target.uuid = pending; }
+      if (pending !== null) { const gated = target.gate(); if (gated) return gated; markHandoff(ports.files, ports.stateDir, projectId, { next: pending }); target.uuid = pending; }
       return ok({ source: stored.source, oldConversation: old, ...(pending !== null ? { newConversation: pending } : {}) });
     },
   }, ...canonicalResumeSteps(ports, projectId, true, { fresh: target })];
