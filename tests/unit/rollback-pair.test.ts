@@ -1658,6 +1658,39 @@ describe("state-admin migrate-approved, then the rollback (migrate-before-start)
     expect(userVersionOf(fixture.databasePath)).toBe(SCHEMA_VERSION);
   }, 180_000);
 
+  it("leaves no -wal or -shm behind when it refuses a WAL-mode database", async () => {
+    // A read-only connection to a WAL database creates its sidecars, so a refusal that merely looked at the
+    // version through SQLite would leave them: a database that rollback then sees as changed.
+    const asWal = (path: string): void => {
+      const raw = new Database(path);
+      raw.pragma("journal_mode = WAL");
+      raw.close();
+      for (const suffix of ["-wal", "-shm"]) expect(existsSync(`${path}${suffix}`)).toBe(false);
+    };
+    const sidecars = (path: string): string[] =>
+      ["-wal", "-shm", "-journal"].filter((suffix) => existsSync(`${path}${suffix}`));
+
+    const unapproved = await sealAtV25();
+    asWal(unapproved.fixture.databasePath);
+    const before = digestOfFile(unapproved.fixture.databasePath);
+    await expect(
+      stateAdmin(["migrate-approved", "--database", unapproved.fixture.databasePath, "--confirm-migration"]),
+    ).rejects.toMatchObject({ reasonCode: ReasonCode.SCHEMA_MIGRATION_NOT_APPROVED });
+    expect(sidecars(unapproved.fixture.databasePath)).toEqual([]);
+    expect(digestOfFile(unapproved.fixture.databasePath)).toBe(before);
+
+    const migrated = await sealAtV25();
+    approveMigration(migrated.fixture.databasePath, "migrate-before-start-test");
+    await runMigrateApproved(migrated.fixture.databasePath);
+    asWal(migrated.fixture.databasePath);
+    const current = digestOfFile(migrated.fixture.databasePath);
+    await expect(
+      stateAdmin(["migrate-approved", "--database", migrated.fixture.databasePath, "--confirm-migration"]),
+    ).rejects.toThrow(/already at schema version/);
+    expect(sidecars(migrated.fixture.databasePath)).toEqual([]);
+    expect(digestOfFile(migrated.fixture.databasePath)).toBe(current);
+  }, 180_000);
+
   it("refuses a database already at this build's schema, one that does not exist, and an unconfirmed run", async () => {
     const { fixture } = await sealAtV25();
     approveMigration(fixture.databasePath, "migrate-before-start-test");

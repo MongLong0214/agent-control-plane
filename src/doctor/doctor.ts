@@ -23,7 +23,7 @@ import type { AuditLog } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
 import { strandedBootstrapApplications } from "../bootstrap/bootstrap-applications.ts";
 import { contractChangeRunsWithoutGrant } from "../registry/manifest-activation-grants.ts";
-import { inspectDatabaseStatePaths, inspectPrivatePath } from "../db/state-preflight.ts";
+import { inspectDatabaseStatePaths, inspectPrivatePath, type StatePathInspection } from "../db/state-preflight.ts";
 import { probeSessionLiveness } from "../daemon/dead-binding-recovery.ts";
 import { RoleScopeUnreadable, type CtoProcessReader, ctoProcessesFor, ctoRoleScope, snapshotCtoProcesses, systemCtoProcessReader } from "../cto/one-cto-per-project.ts";
 import { ctoTranscriptPath, longReasons, measureConversation, refreshLimitsFromEnv } from "../cto/cto-conversation.ts";
@@ -647,45 +647,6 @@ export class Doctor {
     return report;
   }
 
-  /**
-   * migrate-before-start — the part of the startup verdict that can be given before the start writes
-   * anything, so a start that is going to be refused is refused with the database exactly as it was.
-   *
-   * A start writes before it judges: it refreshes capacity (probe audits, snapshots, telemetry), runs
-   * reconcile (settling claims, messages, sessions, executions, observing every repository) and only then
-   * takes its system report. A refusal after that has already moved the database, which is what made the
-   * official rollback to the pair sealed before an approved migration refuse it as stale.
-   *
-   * A check belongs here only if no write the start makes can change its answer:
-   *
-   *   - `checkStatePaths` — file modes and ownership of the state root, the database and its sidecars.
-   *   - `checkGitHubGate` — whether the trusted gate's credential is installed and private (files).
-   *   - `checkRepositories` and `checkWorktrees` — read-only git probes of each registered checkout. They
-   *     are asked for their blocking findings only: whether a checkout is unreadable or its worktrees cannot
-   *     be listed does not depend on `last_observed_at`, and their other findings (drift, orphans) are
-   *     non-blocking and are left to the report taken after reconcile, which can still change them.
-   *
-   * Every other check reads rows the start's own writes settle, or takes its measurement by writing, and
-   * so cannot be judged first: bindings, runs, workers and sessions (reconcile settles dead sessions,
-   * abandons orphaned executions, retires worker bindings), claims and the outbox (`expireOverdue`),
-   * unresolved and canonical turns, and capacity coverage (`checkCapacity` refreshes what it then scores,
-   * which writes). They are judged where they always were, in the report after reconcile.
-   *
-   * Monotonic by construction: `aggregate` over more findings can only stay as bad or get worse, and a
-   * finding set containing one blocking ERROR or CRITICAL finding is BLOCKED or ERROR whatever else the
-   * full report adds. So a refusal here is never one the full report would have lifted. It writes nothing,
-   * records no `DOCTOR_REPORT`, and takes no capacity measurement.
-   */
-  async judgeBeforeWrites(): Promise<{ status: DoctorStatus; findings: Finding[] }> {
-    const findings: Finding[] = [
-      ...this.checkStatePaths(),
-      ...this.checkGitHubGate(),
-      ...(await this.checkRepositories()).filter((finding) => finding.blocking),
-      ...(await this.checkWorktrees()).filter((finding) => finding.blocking),
-    ];
-    return { status: aggregate(findings), findings };
-  }
-
   /** §9.5 step 3 — readiness gate before a fresh CTO is bound. */
   async sessionReadiness(sessionId: string): Promise<Decision<void>> {
     const session = this.sessions.get(sessionId);
@@ -704,31 +665,12 @@ export class Doctor {
 
   /** A startup preflight prevents trust; Doctor makes later chmod/symlink drift observable. */
   private checkStatePaths(): Finding[] {
-    const inspections = [
+    return statePathFindings([
       ...inspectDatabaseStatePaths(this.statePaths.databasePath),
       inspectPrivatePath(this.statePaths.worktreeRoot, "directory"),
       inspectPrivatePath(this.statePaths.secretsDir, "directory"),
       inspectPrivatePath(this.statePaths.capacityDir, "directory"),
-    ];
-    return inspections
-      .filter((inspection) => !inspection.secure)
-      .map((inspection) => ({
-        code: "STATE_PATH_INSECURE",
-        severity: "CRITICAL" as const,
-        scope: "host",
-        blocking: true,
-        confidence: "HIGH" as const,
-        observedEvidence: {
-          path: inspection.path,
-          kind: inspection.kind,
-          reason: inspection.reason,
-          expectedMode: inspection.expectedMode.toString(8),
-          actualMode: inspection.actualMode === null ? null : inspection.actualMode.toString(8),
-          ownerUid: inspection.ownerUid,
-          currentUid: inspection.currentUid,
-        },
-        recommendedAction: "stop the daemon and restore owner-only, non-symlinked state paths from a trusted backup",
-      }));
+    ]);
   }
 
   /**
@@ -2347,23 +2289,7 @@ export class Doctor {
         });
         branch = branchProbe.exitCode === 0 ? branchProbe.stdout.trim() : null;
       } catch (err) {
-        const projectSuspended = this.repositoryProjectSuspended(repository.projectId);
-        findings.push({
-          code: "REPOSITORY_PROBE_FAILED",
-          severity: projectSuspended ? "WARN" : "ERROR",
-          scope: `repository:${repository.identity}`,
-          blocking: !projectSuspended,
-          confidence: "HIGH",
-          observedEvidence: {
-            checkoutPath: repository.checkoutPath,
-            error: safeErrorMessage(err),
-            ...(projectSuspended ? { projectSuspended: true } : {}),
-          },
-          recommendedAction: projectSuspended
-            ? "restore the checkout before resuming the project"
-            : "the repository probe did not complete, so this checkout's drift state is unknown; " +
-              "check that the checkout is reachable and that git responds there",
-        });
+        findings.push(repositoryProbeFailedFinding(repository, safeErrorMessage(err), this.repositoryProjectSuspended(repository.projectId)));
         continue;
       }
       const driftState =
@@ -2389,22 +2315,7 @@ export class Doctor {
         });
       }
       if (driftState === "UNKNOWN") {
-        const projectSuspended = this.repositoryProjectSuspended(repository.projectId);
-        findings.push({
-          code: "REPOSITORY_UNREADABLE",
-          severity: projectSuspended ? "WARN" : "ERROR",
-          scope: `repository:${repository.identity}`,
-          blocking: !projectSuspended,
-          confidence: "HIGH",
-          observedEvidence: {
-            checkoutPath: repository.checkoutPath,
-            ...(projectSuspended ? { projectSuspended: true } : {}),
-          },
-          // #1189 (CEO msg_390e287c) — the blocking text states the fact and the open decision; under 200 characters.
-          recommendedAction: projectSuspended
-            ? "restore the checkout before resuming the project"
-            : "nothing is requested of anyone: this checkout is missing or not a repository; re-registering it or suspending its project is an open decision",
-        });
+        findings.push(repositoryUnreadableFinding(repository, this.repositoryProjectSuspended(repository.projectId)));
       }
     }
     return findings;
@@ -2426,22 +2337,7 @@ export class Doctor {
       try {
         orphans = await this.worktrees.orphans(repository.checkoutPath, live);
       } catch (err) {
-        const projectSuspended = this.repositoryProjectSuspended(repository.projectId);
-        findings.push({
-          code: "WORKTREE_PROBE_FAILED",
-          severity: projectSuspended ? "WARN" : "ERROR",
-          scope: `repository:${repository.identity}`,
-          blocking: !projectSuspended,
-          confidence: "HIGH",
-          observedEvidence: {
-            checkoutPath: repository.checkoutPath,
-            error: safeErrorMessage(err),
-            ...(projectSuspended ? { projectSuspended: true } : {}),
-          },
-          recommendedAction: projectSuspended
-            ? "restore the checkout before resuming the project"
-            : "restore worktree inspection before trusting repository isolation",
-        });
+        findings.push(worktreeProbeFailedFinding(repository, safeErrorMessage(err), this.repositoryProjectSuspended(repository.projectId)));
         continue;
       }
       if (orphans.length > 0) {
@@ -2460,33 +2356,131 @@ export class Doctor {
   }
 
   private checkGitHubGate(): Finding[] {
-    const health = this.github.gateHealth();
-    const findings: Finding[] = [];
-    if (!health.credentialInstalled) {
-      findings.push({
-        code: "TRUSTED_GATE_CREDENTIAL_MISSING",
-        severity: "ERROR",
-        scope: "github",
-        blocking: true,
-        confidence: "HIGH",
-        observedEvidence: {},
-        // #1189 WIP 2 — an explicit failure, never a request that someone act; under the audit's 200-character bound.
-        recommendedAction: "nothing is requested of anyone: a daemon start fails without the trusted gate's GitHub App credential, and programmatic merges are impossible until the daemon can read it",
-      });
-    } else if (!health.permissionsOk) {
-      findings.push({
-        code: "TRUSTED_GATE_CREDENTIAL_PERMISSIONS",
-        severity: "CRITICAL",
-        scope: "github",
-        blocking: true,
-        confidence: "HIGH",
-        observedEvidence: {},
-        recommendedAction: "restrict the secret directory to owner-only access",
-      });
-    }
-    return findings;
+    return gitHubGateFindings(this.github.gateHealth());
   }
 }
+
+/**
+ * The blocking findings below are built here, not in the `Doctor` methods that first produced them, so
+ * the start's gate before the control plane opens the database (`src/daemon/start-gate.ts`) states a
+ * refusal in exactly the words and shape the full report does. They read nothing: each takes what was
+ * already observed.
+ */
+
+/** A state path that is not the owner-only, non-symlinked path the daemon requires. */
+export const statePathFindings = (inspections: readonly StatePathInspection[]): Finding[] =>
+  inspections
+    .filter((inspection) => !inspection.secure)
+    .map((inspection) => ({
+      code: "STATE_PATH_INSECURE",
+      severity: "CRITICAL" as const,
+      scope: "host",
+      blocking: true,
+      confidence: "HIGH" as const,
+      observedEvidence: {
+        path: inspection.path,
+        kind: inspection.kind,
+        reason: inspection.reason,
+        expectedMode: inspection.expectedMode.toString(8),
+        actualMode: inspection.actualMode === null ? null : inspection.actualMode.toString(8),
+        ownerUid: inspection.ownerUid,
+        currentUid: inspection.currentUid,
+      },
+      recommendedAction: "stop the daemon and restore owner-only, non-symlinked state paths from a trusted backup",
+    }));
+
+/** The trusted gate's GitHub App credential: installed, and private. */
+export const gitHubGateFindings = (health: { credentialInstalled: boolean; permissionsOk: boolean }): Finding[] => {
+  const findings: Finding[] = [];
+  if (!health.credentialInstalled) {
+    findings.push({
+      code: "TRUSTED_GATE_CREDENTIAL_MISSING",
+      severity: "ERROR",
+      scope: "github",
+      blocking: true,
+      confidence: "HIGH",
+      observedEvidence: {},
+      // #1189 WIP 2 — an explicit failure, never a request that someone act; under the audit's 200-character bound.
+      recommendedAction: "nothing is requested of anyone: a daemon start fails without the trusted gate's GitHub App credential, and programmatic merges are impossible until the daemon can read it",
+    });
+  } else if (!health.permissionsOk) {
+    findings.push({
+      code: "TRUSTED_GATE_CREDENTIAL_PERMISSIONS",
+      severity: "CRITICAL",
+      scope: "github",
+      blocking: true,
+      confidence: "HIGH",
+      observedEvidence: {},
+      recommendedAction: "restrict the secret directory to owner-only access",
+    });
+  }
+  return findings;
+};
+
+interface ProbedRepository {
+  identity: string;
+  checkoutPath: string;
+}
+
+/** A registered checkout whose git probe did not complete. Not blocking for a suspended project. */
+export const repositoryProbeFailedFinding = (
+  repository: ProbedRepository,
+  error: string,
+  projectSuspended: boolean,
+): Finding => ({
+  code: "REPOSITORY_PROBE_FAILED",
+  severity: projectSuspended ? "WARN" : "ERROR",
+  scope: `repository:${repository.identity}`,
+  blocking: !projectSuspended,
+  confidence: "HIGH",
+  observedEvidence: {
+    checkoutPath: repository.checkoutPath,
+    error,
+    ...(projectSuspended ? { projectSuspended: true } : {}),
+  },
+  recommendedAction: projectSuspended
+    ? "restore the checkout before resuming the project"
+    : "the repository probe did not complete, so this checkout's drift state is unknown; " +
+      "check that the checkout is reachable and that git responds there",
+});
+
+/** A registered checkout that is missing or not a repository. Not blocking for a suspended project. */
+export const repositoryUnreadableFinding = (repository: ProbedRepository, projectSuspended: boolean): Finding => ({
+  code: "REPOSITORY_UNREADABLE",
+  severity: projectSuspended ? "WARN" : "ERROR",
+  scope: `repository:${repository.identity}`,
+  blocking: !projectSuspended,
+  confidence: "HIGH",
+  observedEvidence: {
+    checkoutPath: repository.checkoutPath,
+    ...(projectSuspended ? { projectSuspended: true } : {}),
+  },
+  // #1189 (CEO msg_390e287c) — the blocking text states the fact and the open decision; under 200 characters.
+  recommendedAction: projectSuspended
+    ? "restore the checkout before resuming the project"
+    : "nothing is requested of anyone: this checkout is missing or not a repository; re-registering it or suspending its project is an open decision",
+});
+
+/** A registered checkout whose worktrees git could not list. Not blocking for a suspended project. */
+export const worktreeProbeFailedFinding = (
+  repository: ProbedRepository,
+  error: string,
+  projectSuspended: boolean,
+): Finding => ({
+  code: "WORKTREE_PROBE_FAILED",
+  severity: projectSuspended ? "WARN" : "ERROR",
+  scope: `repository:${repository.identity}`,
+  blocking: !projectSuspended,
+  confidence: "HIGH",
+  observedEvidence: {
+    checkoutPath: repository.checkoutPath,
+    error,
+    ...(projectSuspended ? { projectSuspended: true } : {}),
+  },
+  recommendedAction: projectSuspended
+    ? "restore the checkout before resuming the project"
+    : "restore worktree inspection before trusting repository isolation",
+});
 
 /** PRD §25.5 — deterministic aggregation. */
 export const aggregate = (findings: readonly Finding[]): DoctorStatus => {

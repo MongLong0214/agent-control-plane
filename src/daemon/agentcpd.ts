@@ -181,6 +181,7 @@ import { HOLDER_CLAIMED_KINDS, MessageKind } from "../outbox/envelope.ts";
 import type { HolderIdentity } from "../outbox/outbox.ts";
 import { respond, type AuthenticatedMcpPeer, type McpPeerAuthenticator } from "../mcp/shared.ts";
 import type { AuthenticatedOperatorPeer, Daemon, StartStallNoticeRoute } from "./daemon.ts";
+import { refuseStartBeforeOpening } from "./start-gate.ts";
 import { executeCanonicalSelfClaimOperator } from "./canonical-self-claim-operator.ts";
 import {
   startAdoptedCeoToolListener,
@@ -6500,48 +6501,49 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
   // control plane or any listener exists. In that mode the long-poll parser answers null.
   const telegramExternalConfig = configuredTelegramExternalConsumerConfig(config.ownerIdentities ?? []);
   const telegramConfig = configuredTelegramLongPollConfig(config.ownerIdentities ?? []);
+  // migrate-before-start — everything the doctor can already judge from files, credentials and the
+  // registered checkouts is judged here, before the control plane opens the database. Opening it creates
+  // a missing file, switches a rollback-journal file to WAL, applies an approved migration and retires its
+  // approval, and the constructor then appends audit rows; a start that is going to be refused must do none
+  // of that, or the official rollback to the pair sealed before the migration refuses the database as
+  // stale. The refusal is printed and counted in `crash-loop.json`, and the process leaves without
+  // installing the signal handlers whose shutdown writes an audit row.
+  const refusedBeforeOpening = await refuseStartBeforeOpening(config);
+  if (refusedBeforeOpening !== null) {
+    process.stderr.write(`${JSON.stringify(refusedBeforeOpening.decision, null, 2)}\n`);
+    process.stderr.write(
+      `backoff: ${JSON.stringify({ failures: refusedBeforeOpening.failures, backoffSeconds: refusedBeforeOpening.backoffSeconds })}\n`,
+    );
+    if (refusedBeforeOpening.backoffSeconds > 0) await waitForBackoff(refusedBeforeOpening.backoffSeconds);
+    process.exit(1);
+  }
+
   const cp = new ControlPlane({ ...config, servingEntrypoint: realpathSync(fileURLToPath(import.meta.url)) });
+  cp.review.attach({ servingRuntimeEventId: recordBootstrapServingRuntime(cp.audit, import.meta.url) });
 
-  // migrate-before-start — nothing below writes to the database until `daemon.start()` has judged
-  // everything that can be judged without writing (`Doctor.judgeBeforeWrites`) and called `afterGate`.
-  // The runtime observation, the approval's audit rows and the canonical grants were written here, so a
-  // start the doctor then refused had already moved the database and the official rollback to the pair
-  // sealed before an approved migration refused it as stale. They are the same writes in the same order;
-  // only a refused start no longer makes them.
-  const recordStartWrites = (): void => {
-    cp.review.attach({ servingRuntimeEventId: recordBootstrapServingRuntime(cp.audit, import.meta.url) });
-
-    // A migration that ran did so because someone approved it, and the approval names them.
-    // `schema_migrations` records what changed; this records who decided it should (#738).
-    if (cp.db.appliedMigrationApproval !== null) {
-      cp.audit.record({
-        kind: "SCHEMA_MIGRATION_APPROVAL_SPENT",
-        reasonCode: ReasonCode.OK,
-        evidence: {
-          ...cp.db.appliedMigrationApproval,
-          // #747 — filing the approval away can fail after the migration commits, and that no
-          // longer fails the start. This is where the outcome becomes visible rather than lost:
-          // an approval left on disk is inert, but it is not silent.
-          retirement: cp.db.migrationApprovalRetirement,
-        },
-      });
-    }
-    // The repair half: an approval that outlived its own migration, filed away on this open.
-    if (cp.db.staleMigrationApprovalRetirement !== null) {
-      cp.audit.record({
-        kind: "SCHEMA_MIGRATION_APPROVAL_RETIRED_LATE",
-        reasonCode: ReasonCode.OK,
-        evidence: { ...cp.db.staleMigrationApprovalRetirement },
-      });
-    }
-    if (canonicalGrants.length > 0) {
-      const canonicalRegistry = new CanonicalSessionRegistry(cp.db);
-      for (const entry of canonicalGrants) canonicalRegistry.grant(entry, null);
-    }
-  };
-  // The entitlements the configuration asks for, decided (read-only) before `start()` and written by
-  // `recordStartWrites` once it has passed its gate.
-  let canonicalGrants: Array<Required<CanonicalAdoptableSession>> = [];
+  // A migration that ran did so because someone approved it, and the approval names them.
+  // `schema_migrations` records what changed; this records who decided it should (#738).
+  if (cp.db.appliedMigrationApproval !== null) {
+    cp.audit.record({
+      kind: "SCHEMA_MIGRATION_APPROVAL_SPENT",
+      reasonCode: ReasonCode.OK,
+      evidence: {
+        ...cp.db.appliedMigrationApproval,
+        // #747 — filing the approval away can fail after the migration commits, and that no
+        // longer fails the start. This is where the outcome becomes visible rather than lost:
+        // an approval left on disk is inert, but it is not silent.
+        retirement: cp.db.migrationApprovalRetirement,
+      },
+    });
+  }
+  // The repair half: an approval that outlived its own migration, filed away on this open.
+  if (cp.db.staleMigrationApprovalRetirement !== null) {
+    cp.audit.record({
+      kind: "SCHEMA_MIGRATION_APPROVAL_RETIRED_LATE",
+      reasonCode: ReasonCode.OK,
+      evidence: { ...cp.db.staleMigrationApprovalRetirement },
+    });
+  }
 
   let sessionLaunch: LocalSessionLaunchChannel;
   try {
@@ -6593,7 +6595,7 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
             `${canonicalSessions.length} names a project that is not registered`,
         );
       }
-      canonicalGrants = canonicalSessions.map((entry) => ({ ...entry, buzzAddress: entry.buzzAddress ?? canonicalBuzzChannelId }));
+      for (const entry of canonicalSessions) canonicalRegistry.grant({...entry,buzzAddress:entry.buzzAddress ?? canonicalBuzzChannelId},null);
     } catch (err) {
       // Nothing past this point has started yet: the session-launch channel and the control plane
       // are the two things open, and both are closed before the refusal leaves.
@@ -6729,7 +6731,6 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
   process.on("SIGINT", () => void shutdown("SIGINT"));
 
   const started = await daemon.start({
-    afterGate: recordStartWrites,
     bootstrapDoor: () =>
       startBootstrapOperatorDoor(
         daemon,

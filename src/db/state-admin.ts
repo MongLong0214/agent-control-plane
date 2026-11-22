@@ -318,19 +318,19 @@ const daemonIsLive = (databasePath: string): { pid: number; startedAt: string } 
 };
 
 /** Read the main-file version without asking SQLite to materialize WAL or SHM on a refusal. */
-const offlineSchemaVersion = (databasePath: string): number => {
+const offlineSchemaVersion = (databasePath: string, what = "offline suspension"): number => {
   assertPrivateDatabaseFiles(databasePath);
   // A version committed only in a WAL is not in the main header. Refuse instead of guessing or
   // opening SQLite, which can create sidecars even in read-only mode.
   if (databaseSidecarPaths(databasePath).some((path) => existsSync(path))) {
-    throw new Error("offline suspension requires a checkpointed database without journal sidecars");
+    throw new Error(`${what} requires a checkpointed database without journal sidecars`);
   }
   const fd = openSync(databasePath, "r");
   try {
     const header = Buffer.alloc(100);
     if (readSync(fd, header, 0, header.length, 0) !== header.length ||
         !header.subarray(0, 16).equals(Buffer.from("SQLite format 3\0"))) {
-      throw new Error("offline suspension requires a valid SQLite database header");
+      throw new Error(`${what} requires a valid SQLite database header`);
     }
     return header.readUInt32BE(60);
   } finally {
@@ -368,6 +368,9 @@ const migrateApprovedInPlace = (databasePath: string): {
   approvedBy: string;
   approvalRetired: boolean;
 } => {
+  // Every refusal below happens before SQLite touches the file: no handle is opened for reading either,
+  // because a read-only connection to a WAL database creates `-shm` and `-wal` beside it.
+  if (!existsSync(databasePath)) throw new Error(`refusing to migrate: ${databasePath} does not exist`);
   ensurePrivateDirectory(dirname(databasePath));
   const lock = new SingleInstanceLock(join(dirname(databasePath), "agentcpd.lock"));
   const acquired = lock.acquire(systemClock.nowIso());
@@ -375,8 +378,7 @@ const migrateApprovedInPlace = (databasePath: string): {
     throw new Error(`refusing to migrate while another process holds the state lock: ${acquired.message}`);
   }
   try {
-    if (!existsSync(databasePath)) throw new Error(`refusing to migrate: ${databasePath} does not exist`);
-    const version = onDiskSchemaVersion(databasePath);
+    const version = offlineSchemaVersion(databasePath, "migrate-approved");
     if (version === 0) {
       throw new Error("refusing to migrate a database that carries no schema version; it has nothing to migrate from");
     }

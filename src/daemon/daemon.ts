@@ -63,6 +63,7 @@ import {
 import { isProjectlessBootstrap } from "../bootstrap/bootstrap-plan.ts";
 import { REPAIR_OWNER_APPROVAL_OPERATION } from "../doctor/repair.ts";
 import { OWNERLESS_STALL_OWED, type ReleasedPipelineAttempt } from "../doctor/watchdog.ts";
+import { type CrashLoopFile, backoffSecondsFor, clearCrashLoopFile, countStartupFailure, readCrashLoopFile } from "./crash-loop.ts";
 import { reapOrphanedReviewerEgress } from "../runtime/reviewer-egress.ts";
 import { describeStartStall, type StartStall } from "./start-stall.ts";
 import { routeUnreleasedWorkerOrphans } from "../run/worker-orphan-routing.ts";
@@ -272,16 +273,6 @@ const assertSweepFitsItsInterval = (refreshMs: number, budgetMs: number, provide
 
 export interface DaemonOptions {
   stateDir: string;
-  /**
-   * migrate-before-start — whether a start judges what it can without writing, and refuses on it before
-   * its first write (default true, and what `agentcpd` runs). A refusal then leaves the database as it
-   * found it and says so on stderr and in `crash-loop.json`, and it writes no stall notice, audit row or
-   * outbox message: those are writes. `false` restores the earlier order, where every check waits for
-   * reconcile and a refused start tells the CEO what it waits on (#1189 D1) at the price of having
-   * moved the database. It exists so that notice machinery stays testable on the findings the gate
-   * now answers first; nothing in production sets it.
-   */
-  gateBeforeWrites?: boolean;
   watchdogIntervalMs?: number;
   deliveryIntervalMs?: number;
   /** Keeps the daemon-owned structured capacity sensors inside their freshness window. */
@@ -482,13 +473,6 @@ export interface BootstrapDoor {
 }
 
 export interface DaemonStartOptions {
-  /**
-   * migrate-before-start — the writes a caller makes at start that are not the daemon's own (the serving
-   * runtime observation, the approval's audit rows, entitlement grants). Called once, after the lock is
-   * held and the checks that can be judged without writing have passed, and before this start's first
-   * write. A refused start never calls it. A throw is a startup failure like any other write's.
-   */
-  afterGate?: () => void;
   bootstrapDoor?: () => Promise<BootstrapDoor>;
   /**
    * #1189 D1 — the route the CEO stall notice of a refused or parked start is sent over, used while this
@@ -611,23 +595,6 @@ const LEGACY_RETRY_TRAIL_KINDS: readonly string[] = Object.freeze([
   "TASK_GRAPH_SUBMITTED",
   BOOTSTRAP_PLAN_TASKS,
 ]);
-
-interface CrashLoopFile {
-  failures: number;
-  firstAt: string;
-  retryNotBefore?: string;
-  /**
-   * migrate-before-start — a start refused before it wrote anything leaves no audit row, so the refusal
-   * is kept here, outside the database, for whoever reads this file.
-   */
-  lastRefusal?: {
-    at: string;
-    reasonCode: string;
-    doctorStatus: string;
-    blockingFindings: BlockingFinding[];
-    databaseWritten: false;
-  };
-}
 
 interface TimerFailure {
   consecutiveFailures: number;
@@ -1462,34 +1429,6 @@ export class Daemon {
     );
 
     try {
-      // migrate-before-start — the verdict that can be given without writing, before any write. A start
-      // the doctor is going to refuse for one of these findings leaves the database exactly as it found
-      // it: no capacity measurement, no reconcile, no repository observation, no stall notice, and no
-      // audit row for the refusal — it is reported to the caller and kept in `crash-loop.json`.
-      const gate = this.options.gateBeforeWrites === false
-        ? { status: "HEALTHY" as const, findings: [] }
-        : await this.cp.doctor.judgeBeforeWrites();
-      if (gate.status === "BLOCKED" || gate.status === "ERROR") {
-        const blockingFindings = blockingFindingsOf(gate);
-        // A finding the bootstrap park can wait out is not refused here; it is judged, and parked, where
-        // it always was. None of the checks above is parkable, so this is a guard on the rule, not a path.
-        if (!(options.bootstrapDoor !== undefined && canParkForBootstrap(blockingFindings))) {
-          const reasonCode = gate.status === "BLOCKED" ? ReasonCode.DOCTOR_BLOCKED : ReasonCode.DOCTOR_ERROR;
-          this.recordRefusalBeforeWrites(reasonCode, gate.status, blockingFindings);
-          this.cp.doctor.clearSupplementalFindings(this.#doctorSupplier);
-          this.lock.release();
-          this.#startedAt = null;
-          return deny(reasonCode, "startup doctor refused this start before it wrote anything", {
-            beforeWrites: true,
-            databaseWritten: false,
-            // The shape a caller of `start()` already reads a refusal from. Reconcile did not run, so it
-            // carries only the verdict and what blocks, not the counts a reconcile would have taken.
-            reconcile: { ran: false, doctorStatus: gate.status, blockingFindings },
-          });
-        }
-      }
-      options.afterGate?.();
-
       // #1189 I3-1 — the CEO notice attempt journal's boundary, before this start can write any notice and
       // whatever route its notices have: it is a local record and needs no transport, target or lane secret.
       // A notice written from here on is one no pre-journal daemon saw; one still PENDING now stays held.
@@ -3899,50 +3838,14 @@ export class Daemon {
   }
 
   private recordStartupFailure(reasonCode: ReasonCodeValue, evidence: Record<string, unknown>): void {
-    const { next, threshold, backoffSeconds } = this.countStartupFailure();
+    const { next, backoffSeconds } = countStartupFailure(this.options.stateDir, this.cp.clock.nowIso());
+
+    const threshold = this.options.crashLoopThreshold ?? 3;
     this.cp.audit.record({
       kind: next.failures >= threshold ? "DAEMON_CRASH_LOOP" : "DAEMON_START_FAILED",
       reasonCode,
       evidence: { ...next, threshold, backoffSeconds, ...evidence },
     });
-  }
-
-  /**
-   * migrate-before-start — the same failure count and backoff as `recordStartupFailure`, and the refusal
-   * itself, written to the crash-loop file alone. The audit row that function writes is the write this
-   * path exists not to make.
-   */
-  private recordRefusalBeforeWrites(
-    reasonCode: ReasonCodeValue,
-    doctorStatus: string,
-    blockingFindings: BlockingFinding[],
-  ): void {
-    this.countStartupFailure({
-      at: this.cp.clock.nowIso(),
-      reasonCode,
-      doctorStatus,
-      blockingFindings,
-      databaseWritten: false,
-    });
-  }
-
-  /** Counts one failed start in `crash-loop.json` and returns what it wrote. */
-  private countStartupFailure(
-    refusal?: NonNullable<CrashLoopFile["lastRefusal"]>,
-  ): { next: CrashLoopFile; threshold: number; backoffSeconds: number } {
-    const path = join(this.options.stateDir, "crash-loop.json");
-    const previous = this.readCrashLoop();
-    const now = this.cp.clock.nowIso();
-    const failures = previous.failures + 1;
-    const backoffSeconds = Math.min(300, 2 ** failures);
-    const next: CrashLoopFile = {
-      failures,
-      firstAt: previous.failures === 0 ? now : previous.firstAt,
-      retryNotBefore: new Date(Date.parse(now) + backoffSeconds * 1000).toISOString(),
-      ...(refusal ? { lastRefusal: refusal } : {}),
-    };
-    writeFileSync(path, JSON.stringify(next), { mode: 0o600 });
-    return { next, threshold: this.options.crashLoopThreshold ?? 3, backoffSeconds };
   }
 
   /**
@@ -4024,21 +3927,16 @@ export class Daemon {
   }
 
   private readCrashLoop(): CrashLoopFile {
-    return readJson<CrashLoopFile>(join(this.options.stateDir, "crash-loop.json")) ?? {
-      failures: 0,
-      firstAt: this.cp.clock.nowIso(),
-    };
+    return readCrashLoopFile(this.options.stateDir, this.cp.clock.nowIso());
   }
 
   private clearCrashLoop(): void {
-    writeFileSync(join(this.options.stateDir, "crash-loop.json"), JSON.stringify({ failures: 0 }), {
-      mode: 0o600,
-    });
+    clearCrashLoopFile(this.options.stateDir);
   }
 
   crashLoopState(): { failures: number; backoffSeconds: number } {
     const failures = this.readCrashLoop().failures;
-    return { failures, backoffSeconds: failures === 0 ? 0 : Math.min(300, 2 ** failures) };
+    return { failures, backoffSeconds: backoffSecondsFor(failures) };
   }
 
   /**

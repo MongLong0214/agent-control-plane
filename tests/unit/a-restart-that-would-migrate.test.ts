@@ -7,6 +7,7 @@ import { afterAll, describe, expect, it } from "vitest";
 
 import { SCHEMA_VERSION, openDb } from "../../src/db/database.ts";
 import { migrationChainFrom } from "../../src/db/migrations.ts";
+import { installGitHubAppCredential } from "../helpers/github-app-credential.ts";
 
 /**
  * A restart is a migration, and nothing asked.
@@ -56,10 +57,13 @@ const takeHome = (): string => {
   return home;
 };
 
-const stateRootOf = (home: string): string => {
+const stateRootOf = (home: string, options: { credential?: boolean } = {}): string => {
   const root = join(home, ".agent-control-plane");
   mkdirSync(root, { recursive: true, mode: 0o700 });
   chmodSync(root, 0o700);
+  // These starts are about the refusal the database open makes. A start without the trusted gate's
+  // credential is refused earlier, before the database is opened (migrate-before-start).
+  if (options.credential !== false) installGitHubAppCredential(root);
   return root;
 };
 
@@ -181,7 +185,8 @@ describe("a daemon start that would migrate the live database", () => {
 
   it("is unaffected when the start does not migrate, so the gate does not fire on every boot", async () => {
     const home = takeHome();
-    const databasePath = join(stateRootOf(home), "state.sqlite");
+    // No credential, deliberately: the start must end in its doctor's refusal, not run.
+    const databasePath = join(stateRootOf(home, { credential: false }), "state.sqlite");
     openDb(databasePath).close();
     expect(schemaVersionOf(databasePath)).toBe(SCHEMA_VERSION);
 
@@ -190,8 +195,8 @@ describe("a daemon start that would migrate the live database", () => {
     expect(result.stderr).not.toContain("SCHEMA_MIGRATION_NOT_APPROVED");
     expect(existsSync(join(home, ".agent-control-plane", "migration-refusal.json"))).toBe(false);
     expect(schemaVersionOf(databasePath)).toBe(SCHEMA_VERSION);
-    // This host has no GitHub App credential, so the start fails its doctor and exits 1 — the
-    // ordinary unsuccessful exit launchd is meant to retry. The refusal's exit 0 is scoped to
+    // This host has no GitHub App credential, so the start is refused by the doctor's gate (before the
+    // database is opened) and exits 1 — the ordinary unsuccessful exit launchd is meant to retry. The refusal's exit 0 is scoped to
     // the refusal and did not become the exit code for everything.
     expect({ status: result.status, timedOut: result.timedOut }).toEqual({
       status: 1,

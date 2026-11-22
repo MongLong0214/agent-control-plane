@@ -248,9 +248,6 @@ describe("#1344 D: a daemon start reaps the reviewer egress proxy an earlier ins
 
   it("the daemon's start reaps it before any review can start, and records what it found", async () => {
     const harness = makeHarness();
-    // A start that is going to serve. One without the trusted gate's credential is refused before it
-    // writes or reaps anything (migrate-before-start), and a refused start does not reap.
-    harness.cp.credentials.install({ token: "test-token", creatorIdentity: "acme-bot" });
     const { config, port, lease } = await layout();
     // The harness's own reviewer egress, on a free port rather than the machine's fixed one.
     const egress = harness.cp.config.reviewerEgress!;
