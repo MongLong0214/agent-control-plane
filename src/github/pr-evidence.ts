@@ -186,6 +186,12 @@ const BRIEF_GAP_CHARS = 200;
 const BRIEF_WHERE_CHARS = 60;
 
 /**
+ * The most characters (as JSON writes each entry) of `incomplete` an answer lists, however many gaps it counts:
+ * the rest are counted in `incompleteNotListed` and by kind in the brief, so the diff text always gets the room.
+ */
+const GAP_LIST_BUDGET_CHARS = 5_000;
+
+/**
  * The answer's state in under 2048 characters, done, complete and nextCursor first, so a reader that sees only
  * the start (a Hermes tool error, a spillover preview) still has it and can ask for the next page. It is the
  * answer's first text block as well as a field. Each value is a copy of what the fields below carry in full.
@@ -223,8 +229,9 @@ export interface PrEvidence {
   /** true only on the last page (`diff.done`) of a read no page of which named a gap. */
   complete: boolean;
   /**
-   * The gaps this page names. A continuation page lists none of its own: one SNAPSHOT_INCOMPLETE entry counts
-   * every gap the read has named so far, and the first page lists as many as stay inline.
+   * The gaps this page names, failures first and PATCH_OMITTED last, within GAP_LIST_BUDGET_CHARS. A continuation
+   * page lists after one SNAPSHOT_INCOMPLETE entry, which counts every gap the read has named so far, only the gaps
+   * new to that page: the compare's gaps the first page (or an earlier page) already counted are not named again.
    */
   incomplete: PrEvidenceIncomplete[];
   /** Gaps this page counted but left out of `incomplete`. */
@@ -262,6 +269,9 @@ const cursorSchema = z.object({
   /** How many gaps the pages before this one named, and a digest chained over them page by page. */
   g: z.number().int().min(0),
   gd: z.string(),
+  /** Digests of the compare's PATCH_OMITTED gaps and of its other gaps as the pages before this one counted them. */
+  ko: z.string(),
+  kf: z.string(),
 }).strict();
 type Cursor = z.infer<typeof cursorSchema>;
 
@@ -374,6 +384,12 @@ const textCostOf = (code: number): number =>
   : code === 0x0a || code === 0x0d || code === 0x09 || code === 0x08 || code === 0x0c ? 5
   : code < 0x20 || (code >= 0xd800 && code <= 0xdfff) ? 13
   : 2;
+
+/** The compare's gaps, those of omitted patches apart from the rest. */
+const splitGaps = (gaps: PrEvidenceIncomplete[]) => ({
+  omitted: gaps.filter((entry) => entry.kind === "PATCH_OMITTED"),
+  failures: gaps.filter((entry) => entry.kind !== "PATCH_OMITTED"),
+});
 
 /** `gaps` is every gap this page counts, listed or not. */
 const briefOf = (
@@ -806,15 +822,27 @@ export const readPrEvidence = async (source: PrEvidenceSource, input: PrEvidence
 
   let summary: PrEvidenceSummary | null = null;
   // What the next cursor carries: every gap the read has named up to and including this page.
-  let carried = { g: 0, gd: "" };
+  let carried = { g: 0, gd: "", ko: "", kf: "" };
+  const compareGaps = splitGaps(incomplete);
   if (cursor) {
-    // A continuation page counts its own gaps into the read's, and lists them after one entry that counts the read's.
-    const own = incomplete.splice(0);
-    carried = { g: cursor.g + own.length, gd: own.length === 0 ? cursor.gd : digestOf({ before: cursor.gd, gaps: own }) };
+    // A continuation page re-reads the compare, so what that read names again is not new: a group of gaps the
+    // pages before already counted (same digest) is neither counted nor listed again. What is new is counted into
+    // the read's, and listed after one entry that counts the read's.
+    incomplete.splice(0);
+    const fresh = [
+      ...(compareGaps.failures.length > 0 && digestOf(compareGaps.failures) !== cursor.kf ? compareGaps.failures : []),
+      ...(compareGaps.omitted.length > 0 && digestOf(compareGaps.omitted) !== cursor.ko ? compareGaps.omitted : []),
+    ];
+    carried = {
+      g: cursor.g + fresh.length,
+      gd: fresh.length === 0 ? cursor.gd : digestOf({ before: cursor.gd, gaps: fresh }),
+      ko: compareGaps.omitted.length > 0 ? digestOf(compareGaps.omitted) : cursor.ko,
+      kf: compareGaps.failures.length > 0 ? digestOf(compareGaps.failures) : cursor.kf,
+    };
     if (carried.g > 0) {
       incomplete.push({ kind: "SNAPSHOT_INCOMPLETE", lookup: pullLookup,
-        detail: `this read has named ${carried.g} gap(s), ${cursor.g} before this page and ${own.length} on it `
-          + `(digest ${carried.gd}); every page of it is incomplete` }, ...own);
+        detail: `this read has named ${carried.g} gap(s), ${cursor.g} before this page and ${fresh.length} on it `
+          + `(digest ${carried.gd}); every page of it is incomplete` }, ...fresh);
     }
   } else {
     const state = text(pull["state"]);
@@ -863,9 +891,12 @@ export const readPrEvidence = async (source: PrEvidenceSource, input: PrEvidence
     };
   }
 
-  // Sliced after every read of the snapshot, so the next cursor carries the first page's whole gap list.
-  if (!cursor) carried = { g: incomplete.length, gd: digestOf(incomplete) };
-  const gaps = [...incomplete];
+  // Failures first, the compare's omitted patches last, so a gap that says what went wrong is never behind forty
+  // that say a file is binary. Sliced after every read of the snapshot, so the next cursor carries the first page's
+  // whole gap list.
+  const ordered = [...incomplete.filter((entry) => entry.kind !== "PATCH_OMITTED"), ...incomplete.filter((entry) => entry.kind === "PATCH_OMITTED")];
+  if (!cursor) carried = { g: ordered.length, gd: digestOf(ordered), ko: digestOf(compareGaps.omitted), kf: digestOf(compareGaps.failures) };
+  const gaps = ordered;
   const pageIndex = cursor?.i ?? 1;
   const pageChars = input.pageChars ?? PR_EVIDENCE_DIFF_PAGE_MAX_CHARS;
   const cursorAt = (o: number): string => encodeCursor({
@@ -906,7 +937,12 @@ export const readPrEvidence = async (source: PrEvidenceSource, input: PrEvidence
   // them by kind), then the check runs, statuses and required-check observations, then the required contexts.
   const fits = (): boolean => answerCost(evidence) <= PR_EVIDENCE_ANSWER_MAX_CHARS;
   const listGaps = (): void => {
-    evidence.incompleteNotListed = gaps.length - fitPrefix(gaps.length, (n) => { evidence.incomplete = gaps.slice(0, n); }, fits);
+    let budgeted = 0;
+    for (let spent = 0; budgeted < gaps.length; budgeted += 1) {
+      spent += JSON.stringify(gaps[budgeted]).length;
+      if (spent > GAP_LIST_BUDGET_CHARS) break;
+    }
+    evidence.incompleteNotListed = gaps.length - fitPrefix(budgeted, (n) => { evidence.incomplete = gaps.slice(0, n); }, fits);
   };
   if (summary) {
     const { files } = summary;

@@ -656,8 +656,8 @@ describe("pr_evidence_get", () => {
     expect(page.summary!.requiredChecks).toMatchObject({ allSatisfied: true });
   });
 
-  it("lists a continuation page's own gaps after one entry counting the read's, and keeps it inline", async () => {
-    // Forty files GitHub gave no patch for: the first page names forty gaps, a continuation re-reads all forty.
+  it("counts a continuation page's recurring gaps once, in the one entry counting the read's, and keeps it inline", async () => {
+    // Forty files GitHub gave no patch for: the first page names forty gaps; a continuation re-reads the same forty.
     const omitted = Array.from({ length: 40 }, (_, i) => {
       const row: Row = { ...fileRow(i, 900), filename: `assets/${"generated-".repeat(8)}${i}.bin` };
       delete row["patch"];
@@ -677,15 +677,78 @@ describe("pr_evidence_get", () => {
       const page = (result.structuredContent as { evidence: Page }).evidence;
       expect(hermesInlineChars(result)).toBeLessThanOrEqual(HERMES_MCP_INLINE_CHARS);
       expect(page.incomplete[0]).toMatchObject({ kind: "SNAPSHOT_INCOMPLETE",
-        detail: expect.stringContaining(`${40 * (continuations + 2)} gap(s)`) });
-      expect(page.incomplete.slice(1).every((entry) => entry.kind === "PATCH_OMITTED")).toBe(true);
-      expect(page.incomplete.length + page.incompleteNotListed).toBe(41);
+        detail: expect.stringContaining("40 gap(s), 40 before this page and 0 on it") });
+      // Nothing is new to the page, so the forty are not listed (or counted) again.
+      expect(page.incomplete).toHaveLength(1);
+      expect(page.incompleteNotListed).toBe(0);
       expect(page.complete).toBe(false);
       if (page.diff.nextCursor) expectCursorUpFront(result, page.diff.nextCursor);
       cursor = page.diff.nextCursor;
       continuations += 1;
     }
     expect(continuations).toBeGreaterThan(1);
+  });
+
+  describe("a continuation page lists only the gaps new to it, comparison failures first, within a small budget (#1483)", () => {
+    const binaryRows = (): Row[] => Array.from({ length: 40 }, (_, i) => ({ ...fileRow(i, 900), filename: `assets/${"generated-".repeat(8)}${i}.bin` }));
+    const seedBinaries = (number: number): void => {
+      const omitted = binaryRows();
+      for (const row of omitted) delete row["patch"];
+      gh.pulls.push(pullRow(number, HEAD_A, 190));
+      gh.filesByHead.set(HEAD_A, [...omitted, ...Array.from({ length: 150 }, (_, i) => fileRow(100 + i))]);
+      gh.checkRuns.push({ id: 8, name: "ci", head_sha: HEAD_A, status: "completed", conclusion: "success" });
+    };
+
+    /** Every page of a read, an incomplete one included, as the answer carries it. */
+    const pagesOf = async (number: number): Promise<Page[]> => {
+      const pages: Page[] = [];
+      let cursor: string | null | undefined;
+      do {
+        const answer = await ceoCall({ projectId, prNumber: number, expectedHead: HEAD_A, ...(cursor ? { cursor } : {}) });
+        const page = (answer.ok ? answer.value : answer.evidence) as unknown as Page;
+        pages.push(page);
+        cursor = page.diff.nextCursor;
+        expect(pages.length).toBeLessThan(5_000);
+      } while (cursor);
+      return pages;
+    };
+
+    it("reads a PR with 40 binaries in about as many pages as one with none", async () => {
+      seedBinaries(41);
+      const withBinaries = (await pagesOf(41)).length;
+      gh.pulls.push(pullRow(42, HEAD_A, 190));
+      gh.filesByHead.set(HEAD_A, [...binaryRows(), ...Array.from({ length: 150 }, (_, i) => fileRow(100 + i))]);
+      const withoutGaps = (await pagesOf(42)).length;
+      // Before the fix: 40 re-listed gaps per page left the diff a sliver of each page.
+      expect(withBinaries).toBeLessThanOrEqual(withoutGaps + 3);
+    });
+
+    it("lists a comparison failure new to a continuation page first, with its detail, and counts the recurring gaps once", async () => {
+      seedBinaries(43);
+      const firstAnswer = await ceoCall({ projectId, prNumber: 43, expectedHead: HEAD_A });
+      if (firstAnswer.ok) throw new Error("unreachable");
+      const first = firstAnswer.evidence as unknown as Page;
+      expect(first.brief.gaps.count).toBe(40);
+      // The merge-base disappears from the compare of page 2: a failure the first page did not have.
+      gh.reshape = { compare: (body) => { const { merge_base_commit: _gone, ...rest } = body; return rest; } };
+      const answer = await ceoCall({ projectId, prNumber: 43, expectedHead: HEAD_A, cursor: first.diff.nextCursor });
+      if (answer.ok) throw new Error("unreachable");
+      const page = answer.evidence as unknown as Page;
+      expect(page.incomplete[0]).toMatchObject({ kind: "SNAPSHOT_INCOMPLETE", detail: expect.stringContaining("41 gap(s), 40 before this page and 1 on it") });
+      expect(page.incomplete[1]).toMatchObject({ kind: "MALFORMED_RESPONSE", detail: expect.stringContaining("merge-base") });
+      expect(page.incomplete.some((entry) => entry.kind === "PATCH_OMITTED")).toBe(false);
+      expect(page.incomplete.length + page.incompleteNotListed).toBe(2);
+    });
+
+    it("never gives the gap list more than a small share of an answer, first page included", async () => {
+      seedBinaries(44);
+      const first = await ceoCall({ projectId, prNumber: 44, expectedHead: HEAD_A });
+      if (first.ok) throw new Error("unreachable");
+      const page = first.evidence as unknown as Page;
+      expect(JSON.stringify(page.incomplete).length).toBeLessThanOrEqual(6_000);
+      expect(page.incompleteNotListed).toBeGreaterThan(0);
+      expect(page.incomplete.length + page.incompleteNotListed).toBe(40);
+    });
   });
 
   it("returns every page of a PR with a binary file as an ordinary result whose diff text is visible to the end", async () => {
