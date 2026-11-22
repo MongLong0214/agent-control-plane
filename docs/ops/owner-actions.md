@@ -956,28 +956,62 @@ rollback pair, whichever the owner names. Nothing else — not v61, not a v60 da
 change, not a v59 database. A database *created* at v60 rather than migrated to it carries the ledger
 row `bootstrap-v60`, not the one above, so the ledger guard refuses it; that is intended.
 
-**Preconditions.**
+**Preconditions.** All of these hold, and each of 1 to 4 is checked again immediately before and
+immediately after the copy is taken. If any differs at any of those points, the copy is discarded and
+the procedure stops.
 
 1. The daemon is stopped and `~/.agent-control-plane/agentcpd.lock` is free (item 3's wait, with its
    `exit 1`, not a warning).
-2. `state.sqlite-wal` is absent or zero bytes. The copy below is read through an immutable open,
-   and an immutable open does not read the WAL: frames sitting in it would be missing from the copy
-   without any error. A non-empty WAL on a stopped daemon is a stop, not something to checkpoint
-   here.
-3. Work only on a copy. The source is never opened for writing, never renamed and never repaired.
-   Record its digest before and again at the end; they must be equal.
+2. `state.sqlite-journal` does not exist.
+3. `state.sqlite-wal` is absent or zero bytes.
+4. The source main file's SHA-256 is the one recorded at the start.
+5. Work only on a copy, in a directory made new for this run. The source is never opened for
+   writing, never renamed and never repaired.
 
-       STATE="$HOME/.agent-control-plane"
-       WORK="$HOME/.agent-control-plane/downgrade-60-59-$(date -u +%Y%m%dT%H%M%SZ)"
-       mkdir "$WORK" && chmod 700 "$WORK"
-       shasum -a 256 "$STATE/state.sqlite" | tee "$WORK/source.sha256.before"
-       sqlite3 "file:$STATE/state.sqlite?immutable=1" ".backup '$WORK/state.sqlite'"
-       chmod 600 "$WORK/state.sqlite"   # .backup writes 644; the v59 build refuses a state file that is not 600
-       shasum -a 256 "$WORK/state.sqlite" > "$WORK/copy.sha256.before-convert"
+The copy is read through an immutable open, and an immutable open promises SQLite that nothing will
+change the file, so SQLite skips both journal recovery and the WAL. A `state.sqlite-journal` left by a
+stopped writer can leave pages in the main file from a transaction that never committed, which
+recovery would roll back and the copy would keep: the copy captures uncommitted data. A non-empty
+`state.sqlite-wal` holds committed pages that are not in the main file yet, and the copy would not
+see them: the copy misses committed data. Neither failure is an error; the copy opens cleanly. A lock
+that is not free, or a main file whose digest moves, says a writer is or was active, and either of
+the other two may be appearing as the copy is taken. A journal or non-empty WAL on a stopped daemon is
+a stop, not something to recover or checkpoint here.
 
-   Verify the copy before using it: `PRAGMA integrity_check` returns `ok` on it, and its content
-   digest (defined under the post-checks) equals the same digest taken from the source opened the
-   same immutable way. A copy that cannot be proven equal to the source is not a starting point.
+Run this as one block, in one `bash` that you keep for the conversion step below, so the function and
+the variables are the same ones:
+
+    set -euo pipefail
+    STATE="$HOME/.agent-control-plane"
+    SRC="$STATE/state.sqlite"
+    quiet() {
+      [ ! -e "$STATE/agentcpd.lock" ] || { echo "the agentcpd lock is not free" >&2; return 1; }
+      [ ! -e "$SRC-journal" ] || { echo "state.sqlite-journal exists" >&2; return 1; }
+      [ ! -s "$SRC-wal" ] || { echo "state.sqlite-wal is not empty" >&2; return 1; }
+      [ "$(stat -f %HT "$SRC")" = "Regular File" ] || { echo "the source is not a regular, non-symlink file" >&2; return 1; }
+      [ "$(shasum -a 256 < "$SRC")" = "$SOURCE_SHA" ] || { echo "the source main file changed" >&2; return 1; }
+    }
+    SOURCE_SHA="$(shasum -a 256 < "$SRC")"
+    # A new, unique path; mkdir without -p fails, and set -e stops, if anything already exists there.
+    WORK="$STATE/downgrade-60-59-$(date -u +%Y%m%dT%H%M%SZ)-$(uuidgen)"
+    mkdir -m 700 "$WORK"
+    COPY="$WORK/state.sqlite"
+    printf '%s\n' "$SOURCE_SHA" > "$WORK/source.sha256.before"
+    quiet || { rm -f "$COPY"; exit 1; }
+    sqlite3 "file:$SRC?immutable=1" ".backup '$COPY'"
+    quiet || { rm -f "$COPY"; exit 1; }
+    chmod 600 "$COPY"   # .backup writes 644; the v59 build refuses a state file that is not 600
+    check_copy() {
+      [ "$(stat -f %HT "$COPY")" = "Regular File" ] || { echo "the copy is not a regular, non-symlink file" >&2; return 1; }
+      [ "$(dirname "$(realpath "$COPY")")" = "$(realpath "$WORK")" ] || { echo "the copy is not inside the work directory" >&2; return 1; }
+      [ "$(stat -f %d:%i "$COPY")" != "$(stat -f %d:%i "$SRC")" ] || { echo "the copy is the source" >&2; return 1; }
+    }
+    check_copy || { rm -f "$COPY"; exit 1; }
+    shasum -a 256 < "$COPY" > "$WORK/copy.sha256.before-convert"
+
+Verify the copy before using it: `PRAGMA integrity_check` returns `ok` on it, and its content
+digest (defined under the post-checks) equals the same digest taken from the source opened the
+same immutable way. A copy that cannot be proven equal to the source is not a starting point.
 
 **Guards, checked on the copy, before anything is changed.** Any one of these failing stops the
 procedure. Nothing is repaired to make a guard pass.
@@ -993,9 +1027,14 @@ procedure. Nothing is repaired to make a guard pass.
   their text. Compare every `(type, name, tbl_name, sql)` row, not a count.
 - `PRAGMA integrity_check` is anything but `ok`.
 
-**The steps.** One transaction, on the copy, in a `sqlite3` shell that supports `.dbconfig`.
+**The steps.** One transaction, on the copy, in a `sqlite3` shell that supports `.dbconfig`. It starts
+by running `quiet` and `check_copy` again in the same `bash`: the source's digest is re-checked
+before the conversion, not only at the end, and the SQL never runs against a path that is not the
+verified copy.
 
-    sqlite3 "$WORK/state.sqlite" <<'SQL'
+    set -euo pipefail
+    quiet && check_copy || { echo "stop: the source or the copy changed since the copy was taken" >&2; exit 1; }
+    sqlite3 "$COPY" <<'SQL'
     .bail on
     .dbconfig enable_trigger off
     BEGIN IMMEDIATE;
@@ -1065,16 +1104,30 @@ duplicate's state directory. A refusal before the open is a defect in the duplic
 data difference: discard that duplicate and its `crash-loop.json`, fix the setup, make a new duplicate
 from the converted copy and retry. It says nothing about the converted copy and is not a stop.
 
-Once the setup is right, the start must reach ready (item 4's readiness: a `health.json` with a new
-`pid` and `startedAt`). The duplicate is the one that starts, so the converted copy stays exactly the
-bytes the post-checks were taken on. After the start, stop the duplicate cleanly and run the check
-below against it.
+Once the setup is right, the start must reach ready, and ready is the product's own answer, all
+three of these together:
+
+- the daemon's stdout carries the `{ "started": … }` report, which it prints only after the last
+  startup step that can still refuse the start;
+- `health.json` in the duplicate's state directory says `"mode": "NORMAL"`, not `BOOTSTRAP`;
+- the operator socket answers `agentctl daemon status` (with `ACP_STATE_DIR` and the operator token
+  pointed at the duplicate, never the live ones), and the answer reports mode `NORMAL`.
+
+A `health.json` with a new `pid` and `startedAt` is not enough on its own: the daemon writes both
+before it decides whether to run, park in `BOOTSTRAP` or refuse. A start that
+parks, refuses or exits is not ready, whatever `health.json` shows.
+
+The duplicate is the one that starts, so the converted copy stays exactly the bytes the post-checks
+were taken on. After the start, stop the duplicate cleanly and run the check below against it.
 
 **Known benign differences, and the post-start check.** A v59 start and stop is not a read-only
 act. It refreshes `repositories.last_observed_at` — normal observation, not a data change — and it
-appends rows: `audit_events` (runtime observed, capacity and role probes, the doctor report,
-started, stopped, drained, and so on), `capacity_snapshots` and `telemetry_metrics`, and it moves the
-matching `sqlite_sequence` counters. Compare the duplicate with the converted copy row by row, not by
+appends rows to `audit_events`, `capacity_snapshots` and `telemetry_metrics`, and it moves the
+matching `sqlite_sequence` counters. The appended `audit_events` rows are whatever this start and
+stop writes — runtime observed, capacity and role probes, the doctor report, the notification
+attempt journal's start, started, stopped, drained, and others, which vary with the build and its
+configuration. Those kinds are examples, not a list to check against: the rule is appends to the
+table, not a set of event kinds. Compare the duplicate with the converted copy row by row, not by
 table digest, because a table that was appended to no longer has the same digest. The check holds
 only if all four of these do:
 
