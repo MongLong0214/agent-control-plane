@@ -938,8 +938,9 @@ order, while the job is stopped, before the next `start`.
 
 ### Restore a stopped v60 database to v59 (single path, 60→59 only)
 
-This is the one way back from schema v60 (#1464) to v59 that keeps the data written under v60. It
-is written for one source and one target and it refuses everything else; there is no flag to widen
+This is the one way to turn a schema v60 (#1464) database into a v59 one that keeps the data written
+under v60. It produces and verifies a converted copy and stops there: replacing the operational
+database is blocked (see the end of this section). It is written for one source and one target and it refuses everything else; there is no flag to widen
 it, and a second variant for another version pair is not a smaller version of this one — it is a
 different procedure that needs its own rehearsal. It exists because the sealed pair above restores
 the database image it sealed, and that image predates whatever the daemon wrote after it.
@@ -1082,7 +1083,7 @@ different row cannot match it, and the `changes()` guard stops anything but exac
 3. `sqlite_schema` equals the v59 expected schema, every `(type, name, tbl_name, sql)` row.
 4. `PRAGMA integrity_check` is `ok`, and `PRAGMA user_version` is `59`.
 
-**Proving it before anything is replaced.** Make a throwaway duplicate of the converted copy, record
+**Proving the converted copy in isolation.** Make a throwaway duplicate of the converted copy, record
 the converted copy's `sha256`, and start the v59 build against the duplicate, in isolation: its own
 state directory, no launchd job, no connection to the live socket, lock or `health.json`, and no
 network. That state directory must contain exactly this and nothing else from the live one:
@@ -1142,11 +1143,24 @@ only if all four of these do:
 Anything else — a missing or changed row, a new row in any other table, another `repositories`
 column changing, a counter for any other table moving — is a stop.
 
-**Only then** may the converted copy replace the live database, and only under the existing restore
-rules in this section — the sealed rollback pair and item 6 — and with Isaac's approval on the day it
-is done. Replacing the live file is not part of this procedure and this procedure does not describe
-another way to do it. Before that step, record the source's `sha256` again; it must equal the value
-taken at the start, which shows the source was never touched.
+**Replacing the operational database is blocked.** This procedure supports conversion and isolated
+verification only. It ends with a verified converted copy and its evidence, and nothing here installs
+that copy over the live database.
+
+- No supported path exists that installs the v59 runtime generation — the closure, the plist and the
+  launcher — together with the converted database. A database-only `state-admin restore` would leave
+  a v59 database under a v60 runtime, so it must not be used to complete this recovery.
+- The sealed rollback pair does not fill this gap. Its database member is the image taken before the
+  migration, and it refuses a database written since its seal as `ROLLBACK_PAIR_STALE_DATABASE`. A
+  pair sealed from the work file targets the work path, not the live one, and is refused for that.
+  Neither the pair nor any other restore described in this document completes this recovery.
+- Record the source's `sha256` once more at the end; it must equal the value taken at the start,
+  which shows the source was never touched. Keep the verified converted copy, its
+  `source.sha256.before` and `copy.sha256.before-convert`, the digests and every output of the
+  checks. Do not replace anything, and do not delete the evidence.
+
+Operational replacement waits for a separately reviewed, supported install path, and for owner
+approval on the day it is done.
 
 **Stopping rules.**
 
