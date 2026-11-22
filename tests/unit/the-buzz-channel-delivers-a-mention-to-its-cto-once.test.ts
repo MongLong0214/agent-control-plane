@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -1041,6 +1041,32 @@ describe("the receipts file after a partial append", () => {
     const read = readChannelReceipts(channelReceiptPath(dir, "demo"));
     expect(read.receipts.map((r) => (r as { eventId: string }).eventId)).toEqual(["e1", "e2", "e3"]);
     expect(read.skipped).toEqual([2]);
+  });
+
+  it("finishes the line, and writes no second receipt, when a short write left this receipt's JSON without its newline", () => {
+    const dir = mkdtempSync(join(tmpdir(), "buzz-channel-short-"));
+    scratch.push(dir);
+    mkdirSync(join(dir, "buzz-channel"), { recursive: true });
+    writeFileSync(channelReceiptPath(dir, "demo"), `${JSON.stringify(receipt(1))}\n${JSON.stringify({ ...receipt(2), launchId: "this-launch" })}`);
+    expect(() => appendChannelReceipt(dir, "demo", receipt(2), "this-launch")).not.toThrow();
+    // A second retry, and an append of the same receipt by another path, add nothing either.
+    appendChannelReceipt(dir, "demo", receipt(2), "this-launch");
+    appendChannelReceipt(dir, "demo", receipt(3));
+    const read = readChannelReceipts(channelReceiptPath(dir, "demo"));
+    expect(read.receipts.map((r) => (r as { eventId: string }).eventId)).toEqual(["e1", "e2", "e3"]);
+    expect(read.skipped).toEqual([]);
+    expect(readFileSync(channelReceiptPath(dir, "demo"), "utf8").endsWith("\n")).toBe(true);
+  });
+
+  it("fails, and so is not counted as written, when a concurrent writer's fragment lands between the check and the write; a retry then succeeds", () => {
+    const dir = mkdtempSync(join(tmpdir(), "buzz-channel-race-"));
+    scratch.push(dir);
+    appendChannelReceipt(dir, "demo", receipt(1));
+    const fragment = () => appendFileSync(channelReceiptPath(dir, "demo"), '{"type":"emitted","eventI');
+    expect(() => appendChannelReceipt(dir, "demo", receipt(2), undefined, fragment)).toThrow(/read back/u);
+    appendChannelReceipt(dir, "demo", receipt(2));
+    const read = readChannelReceipts(channelReceiptPath(dir, "demo"));
+    expect(read.receipts.map((r) => (r as { eventId: string }).eventId)).toEqual(["e1", "e2"]);
   });
 
   it("refuses to write what would not read back, so the channel never counts it as reported", () => {

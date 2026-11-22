@@ -1,4 +1,4 @@
-import { closeSync, constants as fsConstants, existsSync, fstatSync, mkdirSync, openSync, readFileSync, readSync, renameSync, statSync, writeFileSync, writeSync } from "node:fs";
+import { closeSync, constants as fsConstants, existsSync, mkdirSync, openSync, readFileSync, renameSync, statSync, writeFileSync, writeSync } from "node:fs";
 import { join } from "node:path";
 
 import { isChannelReceipt, type ChannelEventEntry, type ChannelReceipt, type ChannelState, type ChannelStateStore } from "./buzz-channel.ts";
@@ -24,32 +24,58 @@ const ensureDir = (stateDir: string): void => {
   mkdirSync(channelDir(stateDir), { recursive: true, mode: 0o700 });
 };
 
+/** What makes two receipts the same one: a reply or a delivery is its event, a registration is its launch's time. */
+const identityOf = (receipt: ChannelReceipt, stampedLaunchId: unknown): string =>
+  receipt.type === "registered"
+    ? `registered|${receipt.registeredAt}|${typeof stampedLaunchId === "string" ? stampedLaunchId : ""}`
+    : receipt.type === "emitted"
+      ? `emitted|${receipt.room}|${receipt.eventId}`
+      : `replied|${receipt.room}|${receipt.event.id}`;
+
 /**
  * One receipt as one line, stamped with the launch the server was started by; `O_APPEND` makes concurrent writers' lines whole.
  *
- * A file whose last line has no newline (a writer that died mid-line) would join this receipt to the fragment and lose both,
- * so such an append starts on a new line: the fragment stays one skipped line and the receipt reads back. A receipt that would
- * not read back (it is not the shape the reader accepts) or that was only partly written is an error, never a success the
- * caller records as written.
+ * It returns only when this receipt reads back from the file through `readChannelReceipts`, the daemon's own reader, and
+ * throws otherwise, so a caller that records "written" on a return records something the daemon will see:
+ *   - a receipt already there for the same event is success and writes nothing, so a retry never doubles it;
+ *   - a last line with no newline is a writer that died mid-line: this receipt starts on a new line, so the fragment stays one
+ *     skipped line. When that fragment is this very receipt, whole but for its newline (a short write), only the newline is
+ *     written;
+ *   - a writer that appends a fragment between that check and this write joins it to this line, which then does not read back:
+ *     the read-back after the write throws, and a retry appends on a clean line;
+ *   - a receipt that would not read back (not the shape the reader accepts) or that was only partly written throws.
+ *
+ * The whole file is read for the check and the read-back, as the daemon reads it on every pass; `trimChannelReceipts`
+ * bounds it when a server starts. `beforeWrite` is a test seam: it runs between the check and the write.
  */
-export const appendChannelReceipt = (stateDir: string, projectId: string, receipt: ChannelReceipt, launchId?: string): void => {
+export const appendChannelReceipt = (
+  stateDir: string,
+  projectId: string,
+  receipt: ChannelReceipt,
+  launchId?: string,
+  beforeWrite?: () => void,
+): void => {
   const line = JSON.stringify(launchId === undefined ? receipt : { ...receipt, launchId });
   if (!isChannelReceipt(JSON.parse(line) as unknown)) throw new Error("the receipt would not read back");
+  const want = identityOf(receipt, launchId);
+  const matches = (value: unknown): boolean => isChannelReceipt(value) && identityOf(value, (value as { launchId?: unknown }).launchId) === want;
   ensureDir(stateDir);
-  const fd = openSync(
-    channelReceiptPath(stateDir, projectId),
-    fsConstants.O_RDWR | fsConstants.O_APPEND | fsConstants.O_CREAT | fsConstants.O_NOFOLLOW,
-    0o600,
-  );
+  const path = channelReceiptPath(stateDir, projectId);
+  const fd = openSync(path, fsConstants.O_RDWR | fsConstants.O_APPEND | fsConstants.O_CREAT | fsConstants.O_NOFOLLOW, 0o600);
   try {
-    const size = fstatSync(fd).size;
-    let lead = "";
-    if (size > 0) {
-      const last = Buffer.alloc(1);
-      if (readSync(fd, last, 0, 1, size - 1) === 1 && last[0] !== 0x0a) lead = "\n";
+    if (readChannelReceipts(path).receipts.some(matches)) return;
+    const text = readFileSync(path, "utf8");
+    const tail = text === "" || text.endsWith("\n") ? "" : text.slice(text.lastIndexOf("\n") + 1);
+    let finishesThis = false;
+    try {
+      finishesThis = tail !== "" && matches(JSON.parse(tail) as unknown);
+    } catch {
+      finishesThis = false;
     }
-    const bytes = Buffer.from(`${lead}${line}\n`, "utf8");
+    beforeWrite?.();
+    const bytes = Buffer.from(finishesThis ? "\n" : `${tail === "" ? "" : "\n"}${line}\n`, "utf8");
     if (writeSync(fd, bytes) !== bytes.length) throw new Error("the receipt was only partly written");
+    if (!readChannelReceipts(path).receipts.some(matches)) throw new Error("the receipt did not read back");
   } finally {
     closeSync(fd);
   }
