@@ -1691,6 +1691,73 @@ describe("state-admin migrate-approved, then the rollback (migrate-before-start)
     expect(digestOfFile(migrated.fixture.databasePath)).toBe(current);
   }, 180_000);
 
+  it("round 2 item 4: migration-plan leaves no sidecars, so migrate-approved runs after it on a WAL database", async () => {
+    const { fixture, pair } = await sealAtV25({ installingNode: true });
+    const image = join(pair.root, pair.manifest.database.member);
+    const raw = new Database(fixture.databasePath);
+    raw.pragma("journal_mode = WAL");
+    raw.close();
+    approveMigration(fixture.databasePath, "migrate-before-start-test");
+    const sidecars = (): string[] =>
+      ["-wal", "-shm", "-journal"].filter((suffix) => existsSync(`${fixture.databasePath}${suffix}`));
+    const before = digestOfFile(fixture.databasePath);
+
+    // The observation path the owner runs first: it reads the file and must not change it or what is beside it.
+    const written: string[] = [];
+    const spy = vi.spyOn(process.stdout, "write").mockImplementation(((chunk: string | Uint8Array) => {
+      written.push(String(chunk));
+      return true;
+    }) as typeof process.stdout.write);
+    try {
+      expect(await stateAdmin(["migration-plan", "--database", fixture.databasePath])).toBe(0);
+    } finally {
+      spy.mockRestore();
+    }
+    expect(JSON.parse(written.join("")) as { onDiskVersion: number }).toMatchObject({ onDiskVersion: 25 });
+    expect(sidecars()).toEqual([]);
+    expect(digestOfFile(fixture.databasePath)).toBe(before);
+
+    const { status } = await runMigrateApproved(fixture.databasePath);
+    expect(status).toBe(0);
+    expect(userVersionOf(fixture.databasePath)).toBe(SCHEMA_VERSION);
+    // And the rollback still restores the sealed image.
+    rollbackToSealedPair(pair.root, expectationFor(fixture, pair), join(fixture.home, "stage-plan-first"));
+    expect(userVersionOf(fixture.databasePath)).toBe(25);
+    expect(digestOfFile(fixture.databasePath)).toBe(digestOfFile(image));
+  }, 180_000);
+
+  it("round 2 item 4: migrate-approved takes a zero-length -wal and its -shm as nothing uncheckpointed, and refuses a log that holds something", async () => {
+    const { fixture } = await sealAtV25();
+    const raw = new Database(fixture.databasePath);
+    raw.pragma("journal_mode = WAL");
+    raw.close();
+    approveMigration(fixture.databasePath, "migrate-before-start-test");
+
+    // What an earlier read-only open leaves behind.
+    writeFileSync(`${fixture.databasePath}-wal`, "", { mode: 0o600 });
+    writeFileSync(`${fixture.databasePath}-shm`, Buffer.alloc(32768), { mode: 0o600 });
+    const { status } = await runMigrateApproved(fixture.databasePath);
+    expect(status).toBe(0);
+    expect(userVersionOf(fixture.databasePath)).toBe(SCHEMA_VERSION);
+
+    // A log with a frame in it is not nothing: the write is only there, and the command will not guess.
+    const held = await sealAtV25();
+    const wal = new Database(held.fixture.databasePath);
+    wal.pragma("journal_mode = WAL");
+    wal.pragma("wal_autocheckpoint = 0");
+    wal.exec("CREATE TABLE uncheckpointed (id INTEGER)");
+    try {
+      expect(statSync(`${held.fixture.databasePath}-wal`).size).toBeGreaterThan(0);
+      approveMigration(held.fixture.databasePath, "migrate-before-start-test");
+      await expect(
+        stateAdmin(["migrate-approved", "--database", held.fixture.databasePath, "--confirm-migration"]),
+      ).rejects.toThrow(/checkpointed database/);
+      expect(userVersionOf(held.fixture.databasePath)).toBe(25);
+    } finally {
+      wal.close();
+    }
+  }, 180_000);
+
   it("refuses a database already at this build's schema, one that does not exist, and an unconfirmed run", async () => {
     const { fixture } = await sealAtV25();
     approveMigration(fixture.databasePath, "migrate-before-start-test");

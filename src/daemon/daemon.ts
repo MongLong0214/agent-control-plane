@@ -273,6 +273,12 @@ const assertSweepFitsItsInterval = (refreshMs: number, budgetMs: number, provide
 
 export interface DaemonOptions {
   stateDir: string;
+  /**
+   * `agentcpd.lock` the caller already holds (migrate-before-start). The entry point takes it before it
+   * judges the start or opens the database, and hands it here so the daemon runs under the same lease
+   * instead of taking a second one. Absent, `start()` acquires it, as before.
+   */
+  lock?: SingleInstanceLock;
   watchdogIntervalMs?: number;
   deliveryIntervalMs?: number;
   /** Keeps the daemon-owned structured capacity sensors inside their freshness window. */
@@ -732,7 +738,7 @@ export class Daemon {
   ) {
     mkdirSync(options.stateDir, { recursive: true });
     chmodSync(options.stateDir, 0o700);
-    this.lock = new SingleInstanceLock(join(options.stateDir, "agentcpd.lock"));
+    this.lock = options.lock ?? new SingleInstanceLock(join(options.stateDir, "agentcpd.lock"));
     // #1336 R-1 — the same custody rule the MCP sockets apply (`drivenCredentialNotHeld` in agentcpd.ts):
     // an attachment is scoped to a PRIMARY_CTO, which is driven when its spawn record says DRIVEN.
     this.attachments = new RoleAttachmentCredentials(cp.sessions, cp.bindings, cp.clock, (sessionId) =>
@@ -1379,10 +1385,14 @@ export class Daemon {
    */
   async start(options: DaemonStartOptions = {}): Promise<Decision<ReconcileReport>> {
     const startedAt = this.cp.clock.nowIso();
-    const acquired = this.lock.acquire(startedAt);
-    if (!acquired.allowed) {
-      this.recordLockContention(acquired.evidence);
-      return acquired as Decision<ReconcileReport>;
+    // A lock the caller took before it opened anything is this daemon's already; only one not yet held
+    // is acquired here.
+    if (!this.lock.held()) {
+      const acquired = this.lock.acquire(startedAt);
+      if (!acquired.allowed) {
+        this.recordLockContention(acquired.evidence);
+        return acquired as Decision<ReconcileReport>;
+      }
     }
     this.#startedAt = startedAt;
 

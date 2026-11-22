@@ -181,7 +181,7 @@ import { HOLDER_CLAIMED_KINDS, MessageKind } from "../outbox/envelope.ts";
 import type { HolderIdentity } from "../outbox/outbox.ts";
 import { respond, type AuthenticatedMcpPeer, type McpPeerAuthenticator } from "../mcp/shared.ts";
 import type { AuthenticatedOperatorPeer, Daemon, StartStallNoticeRoute } from "./daemon.ts";
-import { refuseStartBeforeOpening } from "./start-gate.ts";
+import { refuseStartBeforeOpening, takeStartLock } from "./start-gate.ts";
 import { executeCanonicalSelfClaimOperator } from "./canonical-self-claim-operator.ts";
 import {
   startAdoptedCeoToolListener,
@@ -6501,24 +6501,34 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
   // control plane or any listener exists. In that mode the long-poll parser answers null.
   const telegramExternalConfig = configuredTelegramExternalConsumerConfig(config.ownerIdentities ?? []);
   const telegramConfig = configuredTelegramLongPollConfig(config.ownerIdentities ?? []);
-  // migrate-before-start — everything the doctor can already judge from files, credentials and the
-  // registered checkouts is judged here, before the control plane opens the database. Opening it creates
-  // a missing file, switches a rollback-journal file to WAL, applies an approved migration and retires its
-  // approval, and the constructor then appends audit rows; a start that is going to be refused must do none
-  // of that, or the official rollback to the pair sealed before the migration refuses the database as
-  // stale. The refusal is printed and counted in `crash-loop.json`, and the process leaves without
-  // installing the signal handlers whose shutdown writes an audit row.
+  // migrate-before-start — the lock first, then everything the doctor can already judge from files,
+  // credentials and the registered checkouts, all before the control plane opens the database. Opening it
+  // creates a missing file, switches a rollback-journal file to WAL, applies an approved migration and
+  // retires its approval, and the constructor then appends audit rows; a start that is going to be refused
+  // must do none of that, or the official rollback to the pair sealed before the migration refuses the
+  // database as stale. The lock comes first because another process holding it (an offline migration, a
+  // running daemon) is the one thing that must be learned before a single byte is read or written. It is
+  // handed on to the database's own open and to the daemon, so the whole start runs under one lease. A
+  // refusal is printed and counted in `crash-loop.json`, and the process leaves without installing the
+  // signal handlers whose shutdown writes an audit row.
+  const refuseBeforeOpening = async (refused: { decision: unknown; failures: number; backoffSeconds: number }): Promise<never> => {
+    process.stderr.write(`${JSON.stringify(refused.decision, null, 2)}\n`);
+    process.stderr.write(`backoff: ${JSON.stringify({ failures: refused.failures, backoffSeconds: refused.backoffSeconds })}\n`);
+    if (refused.backoffSeconds > 0) await waitForBackoff(refused.backoffSeconds);
+    return process.exit(1);
+  };
+  const taken = takeStartLock(config.databasePath);
+  if ("refused" in taken) return refuseBeforeOpening(taken.refused);
+  const startLock = taken.lock;
+  process.once("exit", () => startLock.release());
   const refusedBeforeOpening = await refuseStartBeforeOpening(config);
   if (refusedBeforeOpening !== null) {
-    process.stderr.write(`${JSON.stringify(refusedBeforeOpening.decision, null, 2)}\n`);
-    process.stderr.write(
-      `backoff: ${JSON.stringify({ failures: refusedBeforeOpening.failures, backoffSeconds: refusedBeforeOpening.backoffSeconds })}\n`,
-    );
-    if (refusedBeforeOpening.backoffSeconds > 0) await waitForBackoff(refusedBeforeOpening.backoffSeconds);
-    process.exit(1);
+    // Given back before the backoff is waited out: a daemon that refuses does not hold the lock while it sleeps.
+    startLock.release();
+    return refuseBeforeOpening(refusedBeforeOpening);
   }
 
-  const cp = new ControlPlane({ ...config, servingEntrypoint: realpathSync(fileURLToPath(import.meta.url)) });
+  const cp = new ControlPlane({ ...config, databaseMigrationLock: startLock, servingEntrypoint: realpathSync(fileURLToPath(import.meta.url)) });
   cp.review.attach({ servingRuntimeEventId: recordBootstrapServingRuntime(cp.audit, import.meta.url) });
 
   // A migration that ran did so because someone approved it, and the approval names them.
@@ -6643,7 +6653,7 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
     sessionLaunch,
   });
 
-  const daemon = cp.createDaemon({ stateDir, buzz });
+  const daemon = cp.createDaemon({ stateDir, buzz, lock: startLock });
 
   let listeners: LocalMcpListeners | null = null;
   let buzzActorIngress: LocalBuzzActorIngress | null = null;

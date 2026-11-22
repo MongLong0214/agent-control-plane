@@ -20,6 +20,7 @@ import { allow, deny, fail } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import { ArtifactStore, type EvidenceWriterSet } from "../db/artifacts.ts";
 import { Db } from "../db/database.ts";
+import type { SingleInstanceLock } from "../daemon/single-instance.ts";
 import { databaseSidecarPaths, ensurePrivateDirectory } from "../db/state-preflight.ts";
 import { ArtifactKind, Role, SessionLifecycle, roleKeyFor } from "../domain/types.ts";
 import {
@@ -91,6 +92,13 @@ export interface ControlPlaneConfig {
   databasePath: string;
   /** Optional connection policy for callers that may not inherit native temporary-file paths. */
   databaseTemporaryStorage?: "MEMORY";
+  /**
+   * `agentcpd.lock`, already held by the caller when it opens the database (migrate-before-start). The
+   * entry point takes the lock before it judges the start or opens anything, so a second start never
+   * writes before it learns another process holds it; a migration this open applies then runs under that
+   * lease rather than contending with it. Absent, `Db` takes the lock itself for a migration, as before.
+   */
+  databaseMigrationLock?: SingleInstanceLock;
   /**
    * Identities that may act as the owner (§21). Empty means this deployment has no owner
    * identity, so no human gate can be satisfied — an explicit absence, never an implicit
@@ -496,12 +504,10 @@ export class ControlPlane {
     });
     const runtimeRoot = config.runtimeRoot ?? join(dirname(config.databasePath), "runtime");
     ensurePrivateDirectory(runtimeRoot);
-    this.db = new Db(
-      config.databasePath,
-      config.databaseTemporaryStorage === undefined
-        ? {}
-        : { temporaryStorage: config.databaseTemporaryStorage },
-    );
+    this.db = new Db(config.databasePath, {
+      ...(config.databaseTemporaryStorage === undefined ? {} : { temporaryStorage: config.databaseTemporaryStorage }),
+      ...(config.databaseMigrationLock === undefined ? {} : { migrationLock: config.databaseMigrationLock }),
+    });
     // Everything after the database handle exists, wrapped because the coordinator below claims
     // the materialization capability and this constructor can still throw afterwards — rejecting
     // a non-production adapter, for one. A throw leaves no value for the caller to close, so the

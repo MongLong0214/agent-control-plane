@@ -4,11 +4,14 @@ import { createHash } from "node:crypto";
 import {
   chmodSync,
   existsSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   rmSync,
   statSync,
+  symlinkSync,
   utimesSync,
   writeFileSync,
 } from "node:fs";
@@ -20,6 +23,7 @@ import { afterAll, describe, expect, it } from "vitest";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { Daemon } from "../../src/daemon/daemon.ts";
 import type { StartGateConfig } from "../../src/daemon/start-gate.ts";
+import { SingleInstanceLock } from "../../src/daemon/single-instance.ts";
 import { Db } from "../../src/db/database.ts";
 import { approveMigration, migrationApprovalPath } from "../../src/db/migration-approval.ts";
 import { cleanupTempDirs, gitSync, makeRepo, tempDir } from "../helpers/fixtures.ts";
@@ -57,6 +61,7 @@ const imageOf = (path: string) => ({
   exists: existsSync(path),
   main: existsSync(path) ? sha(path) : null,
   wal: existsSync(`${path}-wal`),
+  walBytes: existsSync(`${path}-wal`) ? sha(`${path}-wal`) : null,
   shm: existsSync(`${path}-shm`),
   journal: existsSync(`${path}-journal`),
   header: existsSync(path) ? readFileSync(path).subarray(18, 20).toString("hex") : null,
@@ -337,6 +342,82 @@ describe("a start the doctor will refuse leaves the database as it found it (mig
     expect(sha(index)).toBe(indexBefore);
   }, 120_000);
 
+  it("round 2 item 1: a crash-loop.json that is a link to the database is replaced, never written through", async () => {
+    const { home, root, database } = newHome();
+    currentDatabase(database);
+    symlinkSync(database, join(root, "crash-loop.json"));
+    const before = imageOf(database);
+
+    const result = await runToExit(home);
+
+    expectRefusedUntouched(result, database, before, "TRUSTED_GATE_CREDENTIAL_MISSING");
+    // The record is a file of its own now, and says what happened; the database is the bytes it was.
+    expect(lstatSync(join(root, "crash-loop.json")).isSymbolicLink()).toBe(false);
+    expect(crashLoopOf(root).lastRefusal?.databaseWritten).toBe(false);
+    expect(readFileSync(database).subarray(0, 16).toString("latin1")).toBe("SQLite format 3\0");
+  }, 120_000);
+
+  it("round 2 item 2: a registration that is only in the write-ahead log is judged from a private copy, and the originals are untouched", async () => {
+    const { home, root, database } = newHome();
+    currentDatabase(database);
+    installGitHubAppCredential(root);
+    const writer = new Database(database);
+    writer.pragma("wal_autocheckpoint = 0");
+    writer
+      .prepare(
+        `INSERT INTO repositories (repository_id, identity, checkout_path, created_at)
+         VALUES ('repo_wal', 'example/wal', ?, '2026-11-22T00:00:00.000Z')`,
+      )
+      .run(join(root, "no-such-checkout"));
+    try {
+      expect(statSync(`${database}-wal`).size).toBeGreaterThan(0);
+      const before = imageOf(database);
+
+      const result = await runToExit(home);
+
+      // Only the missing checkout can have refused it: the credential is installed.
+      expectRefusedUntouched(result, database, before, "REPOSITORY_UNREADABLE");
+      expect(crashLoopOf(root).lastRefusal?.blockingFindings.map((finding) => finding.code)).toContain("REPOSITORY_UNREADABLE");
+    } finally {
+      writer.close();
+    }
+  }, 120_000);
+
+  it("round 2 item 3: a malformed checkout registration refuses the start before the database is opened", async () => {
+    const { home, root, database } = newHome();
+    currentDatabase(database);
+    installGitHubAppCredential(root);
+    const repo = makeRepo({ "docs.md": "# gate\n" });
+    registerCheckout(database, repo);
+    const registry = join(root, "worktrees", ".verification-checkouts");
+    mkdirSync(registry, { recursive: true, mode: 0o700 });
+    chmodSync(join(root, "worktrees"), 0o700);
+    chmodSync(registry, 0o700);
+    writeFileSync(join(registry, "broken.json"), "{ not a registration", { mode: 0o600 });
+    const before = imageOf(database);
+
+    const result = await runToExit(home);
+
+    expectRefusedUntouched(result, database, before, "WORKTREE_PROBE_FAILED");
+  }, 120_000);
+
+  it("round 2 item 5: a start that finds agentcpd.lock held writes nothing and says so", async () => {
+    const { home, root, database } = newHome();
+    currentDatabase(database);
+    // The gate passes, so what refuses this start is the lock and nothing else.
+    installGitHubAppCredential(root);
+    const before = imageOf(database);
+    const holder = new SingleInstanceLock(join(root, "agentcpd.lock"));
+    expect(holder.acquire(new Date().toISOString()).allowed).toBe(true);
+    try {
+      const result = await runToExit(home);
+
+      expectRefusedUntouched(result, database, before, ReasonCode.DAEMON_ALREADY_RUNNING);
+    } finally {
+      holder.release();
+    }
+  }, 120_000);
+
   it("a normal start still writes its usual rows, and a normal stop still records itself", async () => {
     const { home, root, database } = newHome("/tmp");
     installGitHubAppCredential(root);
@@ -396,7 +477,7 @@ describe("the gate before the database is opened (judgeStartBeforeOpening)", () 
     expect(imageOf(database)).toEqual(before);
   });
 
-  it("does not read the checkouts from a database whose write-ahead log holds more than its file does", async () => {
+  it("reads a registration that is only in the write-ahead log, from a copy, and fails closed when it cannot", async () => {
     const { root, database } = newHome();
     currentDatabase(database);
     const writer = new Database(database);
@@ -408,13 +489,72 @@ describe("the gate before the database is opened (judgeStartBeforeOpening)", () 
       )
       .run(join(root, "no-such-checkout"));
     try {
-      expect(statSync(`${database}-wal`).size).toBeGreaterThan(0);
+      const before = imageOf(database);
       const { judgeStartBeforeOpening } = await import("../../src/daemon/start-gate.ts");
       const judged = await judgeStartBeforeOpening(gateConfig(root, database));
-      expect(judged.notJudged.join(" ")).toContain("-wal");
-      expect(judged.findings.map((finding) => finding.code)).not.toContain("REPOSITORY_UNREADABLE");
+      expect(judged.findings.map((finding) => finding.code)).toContain("REPOSITORY_UNREADABLE");
+      expect(imageOf(database)).toEqual(before);
+
+      // A database file that is not one: the copy cannot be opened, and the gate refuses rather than skip.
+      const broken = join(root, "broken.sqlite");
+      writeFileSync(broken, "not a database", { mode: 0o600 });
+      const refused = await judgeStartBeforeOpening(gateConfig(root, broken));
+      expect(refused.findings.map((finding) => finding.code)).toContain("START_GATE_DATABASE_UNREADABLE");
+      expect(refused.status).toBe("BLOCKED");
     } finally {
       writer.close();
+    }
+  });
+
+  it("judges the probes of a database larger than the old in-memory cap, from an on-disk copy it removes", async () => {
+    const { root, database } = newHome();
+    currentDatabase(database);
+    registerCheckout(database, join(root, "no-such-checkout"));
+    const raw = new Database(database);
+    raw.pragma("journal_mode = DELETE");
+    raw.exec("CREATE TABLE gate_padding (b BLOB)");
+    // 300 MiB, past the 256 MiB the gate once refused to copy into memory (and so skipped, on a live database).
+    raw.prepare("INSERT INTO gate_padding VALUES (zeroblob(?))").run(300 * 1024 * 1024);
+    raw.close();
+    expect(statSync(database).size).toBeGreaterThan(256 * 1024 * 1024);
+    const before = imageOf(database);
+    const scratch = mkdtempSync(join(tmpdir(), "acp-gate-scratch-"));
+    homes.push(scratch);
+    const previous = process.env["TMPDIR"];
+    process.env["TMPDIR"] = scratch;
+    try {
+      const { judgeStartBeforeOpening } = await import("../../src/daemon/start-gate.ts");
+      const judged = await judgeStartBeforeOpening(gateConfig(root, database));
+
+      expect(judged.notJudged).toEqual([]);
+      expect(judged.findings.map((finding) => finding.code)).toContain("REPOSITORY_UNREADABLE");
+      expect(imageOf(database)).toEqual(before);
+      // The private copy lived in the scratch directory and is gone.
+      expect(readdirSync(scratch)).toEqual([]);
+    } finally {
+      if (previous === undefined) delete process.env["TMPDIR"];
+      else process.env["TMPDIR"] = previous;
+    }
+  }, 180_000);
+
+  it("refuses, and does not skip, when the private copy cannot be made", async () => {
+    const { root, database } = newHome();
+    currentDatabase(database);
+    const before = imageOf(database);
+    const previous = process.env["TMPDIR"];
+    // Nowhere to put a copy, as when the disk is full or the directory is gone.
+    process.env["TMPDIR"] = join(root, "no-such-scratch-directory");
+    try {
+      const { judgeStartBeforeOpening } = await import("../../src/daemon/start-gate.ts");
+      const judged = await judgeStartBeforeOpening(gateConfig(root, database));
+
+      expect(judged.status).toBe("BLOCKED");
+      expect(judged.findings.map((finding) => finding.code)).toContain("START_GATE_DATABASE_UNREADABLE");
+      expect(judged.notJudged).toEqual([]);
+      expect(imageOf(database)).toEqual(before);
+    } finally {
+      if (previous === undefined) delete process.env["TMPDIR"];
+      else process.env["TMPDIR"] = previous;
     }
   });
 

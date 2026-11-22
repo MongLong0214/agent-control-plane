@@ -1,6 +1,5 @@
 #!/usr/bin/env node
-import Database from "better-sqlite3";
-import { closeSync, existsSync, lstatSync, openSync, readFileSync, readSync, realpathSync } from "node:fs";
+import { closeSync, existsSync, lstatSync, openSync, readFileSync, readSync, realpathSync, statSync } from "node:fs";
 import { homedir, userInfo } from "node:os";
 import { dirname, isAbsolute, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -16,13 +15,13 @@ import { ProjectRegistry } from "../registry/project-registry.ts";
 import { AuditLog } from "./audit.ts";
 import { backupDatabase, pruneAutomaticBackups, restoreDatabase } from "./backup.ts";
 import { Db, migrateApprovedCopy } from "./database.ts";
+import { withDatabaseSnapshot } from "./database-snapshot.ts";
 import {
   approveMigration,
   assertMigrationApproved,
   migrationApprovalPath,
   migrationPlanFrom,
   migrationRefusalPath,
-  onDiskSchemaVersion,
   readMigrationApproval,
 } from "./migration-approval.ts";
 import { SCHEMA_VERSION, v51AnchorFallbackRoles } from "./migrations.ts";
@@ -318,11 +317,24 @@ const daemonIsLive = (databasePath: string): { pid: number; startedAt: string } 
 };
 
 /** Read the main-file version without asking SQLite to materialize WAL or SHM on a refusal. */
-const offlineSchemaVersion = (databasePath: string, what = "offline suspension"): number => {
+const offlineSchemaVersion = (
+  databasePath: string,
+  what = "offline suspension",
+  options: { acceptEmptyLog?: boolean } = {},
+): number => {
   assertPrivateDatabaseFiles(databasePath);
   // A version committed only in a WAL is not in the main header. Refuse instead of guessing or
   // opening SQLite, which can create sidecars even in read-only mode.
-  if (databaseSidecarPaths(databasePath).some((path) => existsSync(path))) {
+  //
+  // `acceptEmptyLog`: a zero-length `-wal` (and the `-shm` that indexes it) holds nothing uncheckpointed.
+  // An earlier read-only open of a WAL database leaves exactly that behind, so a command that must run
+  // after one does not refuse what carries no state. A log or journal with anything in it still refuses.
+  const holdsNothing = (path: string): boolean => existsSync(path) && statSync(path).size === 0;
+  const standing = databaseSidecarPaths(databasePath).filter((path) => existsSync(path));
+  const refused = options.acceptEmptyLog
+    ? standing.filter((path) => !(path.endsWith("-shm") || holdsNothing(path)))
+    : standing;
+  if (refused.length > 0) {
     throw new Error(`${what} requires a checkpointed database without journal sidecars`);
   }
   const fd = openSync(databasePath, "r");
@@ -339,14 +351,8 @@ const offlineSchemaVersion = (databasePath: string, what = "offline suspension")
 };
 
 /** `v51AnchorFallbackRoles` over a read-only handle: the plan never opens a writable one. */
-const readV51AnchorFallback = (databasePath: string): Array<{ roleKey: string; reason: string }> => {
-  const raw = new Database(databasePath, { readonly: true, fileMustExist: true });
-  try {
-    return v51AnchorFallbackRoles(raw);
-  } finally {
-    raw.close();
-  }
-};
+const readV51AnchorFallback = (databasePath: string): Array<{ roleKey: string; reason: string }> =>
+  withDatabaseSnapshot(databasePath, (copy) => v51AnchorFallbackRoles(copy));
 
 /**
  * The migration a daemon's first open would perform, performed alone (migrate-before-start).
@@ -378,7 +384,7 @@ const migrateApprovedInPlace = (databasePath: string): {
     throw new Error(`refusing to migrate while another process holds the state lock: ${acquired.message}`);
   }
   try {
-    const version = offlineSchemaVersion(databasePath, "migrate-approved");
+    const version = offlineSchemaVersion(databasePath, "migrate-approved", { acceptEmptyLog: true });
     if (version === 0) {
       throw new Error("refusing to migrate a database that carries no schema version; it has nothing to migrate from");
     }
@@ -431,7 +437,11 @@ export const main = async (argv: string[]): Promise<number> => {
   }
 
   if (parsed.command === "migration-plan") {
-    const version = onDiskSchemaVersion(parsed.databasePath);
+    // Read from a private copy: opening the file itself, even read-only, leaves `-shm` and a zero-length
+    // `-wal` beside a WAL database, which is a change the next offline step then has to work around.
+    const version = withDatabaseSnapshot(parsed.databasePath, (copy) =>
+      Number(copy.pragma("user_version", { simple: true })),
+    );
     process.stdout.write(
       `${JSON.stringify(
         {

@@ -159,6 +159,56 @@ const requireAllowed = <T>(decision: Decision<T>): T => {
  * afterwards, so a command can never observe or mutate the developer's checkout, and a
  * second run cannot share its working directory.
  */
+/**
+ * One verification checkout's registration, read and validated, or `null` when none is on file. A record
+ * that is there and unreadable, or that names another id or path, is an error: whether the checkout is
+ * registered is then unknown, and that is not the same as "not registered".
+ */
+const readCheckoutRegistration = (rootPath: string, worktreeId: string): CheckoutRegistration | null => {
+  const file = join(rootPath, CHECKOUT_REGISTRY, `${worktreeId}${REGISTRATION_SUFFIX}`);
+  const stat = lstatOrNull(file);
+  if (stat === null) return null;
+  let parsed: unknown = null;
+  if (stat.isFile()) {
+    try {
+      parsed = JSON.parse(readFileSync(file, "utf8"));
+    } catch {
+      parsed = null;
+    }
+  }
+  if (!isRegistration(parsed) || parsed.worktreeId !== worktreeId || parsed.path !== join(rootPath, worktreeId)) {
+    fail(ReasonCode.INTERNAL_ERROR, "a verification checkout registration is unreadable, so whether it is registered is unknown", {
+      worktreeId,
+      registration: file,
+    });
+  }
+  return parsed as CheckoutRegistration;
+};
+
+/**
+ * Every registration under a worktree root, each read and validated by `readCheckoutRegistration`. Reads
+ * only: it creates nothing, so the start's gate before the database is opened can ask what `orphans()`
+ * will ask, with the same parser, without constructing a manager (whose constructor creates its root).
+ * A root that is not there has none.
+ */
+export const readCheckoutRegistrations = (root: string): CheckoutRegistration[] => {
+  if (lstatOrNull(root) === null) return [];
+  const rootPath = canonical(root);
+  const directory = join(rootPath, CHECKOUT_REGISTRY);
+  if (lstatOrNull(directory) === null) return [];
+  ensurePrivateDirectory(directory);
+  const found: CheckoutRegistration[] = [];
+  for (const entry of readdirSync(directory).sort()) {
+    // A staged record (`.<id>.<uuid>.tmp`) is not a registration until it is linked into place.
+    if (!entry.endsWith(REGISTRATION_SUFFIX)) continue;
+    const worktreeId = entry.slice(0, -REGISTRATION_SUFFIX.length);
+    if (!WORKTREE_ID.test(worktreeId)) continue;
+    const registration = readCheckoutRegistration(rootPath, worktreeId);
+    if (registration !== null) found.push(registration);
+  }
+  return found;
+};
+
 export class WorktreeManager {
   private readonly rootPath: string;
 
@@ -583,24 +633,7 @@ export class WorktreeManager {
    * same mistake as reading an unreadable worktree listing as an empty one.
    */
   private readRegistration(worktreeId: string): CheckoutRegistration | null {
-    const file = this.registrationPath(worktreeId);
-    const stat = lstatOrNull(file);
-    if (stat === null) return null;
-    let parsed: unknown = null;
-    if (stat.isFile()) {
-      try {
-        parsed = JSON.parse(readFileSync(file, "utf8"));
-      } catch {
-        parsed = null;
-      }
-    }
-    if (!isRegistration(parsed) || parsed.worktreeId !== worktreeId || parsed.path !== join(this.rootPath, worktreeId)) {
-      fail(ReasonCode.INTERNAL_ERROR, "a verification checkout registration is unreadable, so whether it is registered is unknown", {
-        worktreeId,
-        registration: file,
-      });
-    }
-    return parsed as CheckoutRegistration;
+    return readCheckoutRegistration(this.rootPath, worktreeId);
   }
 
   /** The registration naming this managed path, if the path is one a checkout can have. */
@@ -610,19 +643,7 @@ export class WorktreeManager {
   }
 
   private registrations(): CheckoutRegistration[] {
-    const directory = join(this.rootPath, CHECKOUT_REGISTRY);
-    if (lstatOrNull(directory) === null) return [];
-    ensurePrivateDirectory(directory);
-    const found: CheckoutRegistration[] = [];
-    for (const entry of readdirSync(directory).sort()) {
-      // A staged record (`.<id>.<uuid>.tmp`) is not a registration until it is linked into place.
-      if (!entry.endsWith(REGISTRATION_SUFFIX)) continue;
-      const worktreeId = entry.slice(0, -REGISTRATION_SUFFIX.length);
-      if (!WORKTREE_ID.test(worktreeId)) continue;
-      const registration = this.readRegistration(worktreeId);
-      if (registration !== null) found.push(registration);
-    }
-    return found;
+    return readCheckoutRegistrations(this.rootPath);
   }
 
   private managedPath(worktreeId: string): string {

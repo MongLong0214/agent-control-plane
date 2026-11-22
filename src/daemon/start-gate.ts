@@ -1,6 +1,5 @@
-import Database from "better-sqlite3";
-import { existsSync, readFileSync, statSync } from "node:fs";
-import { dirname } from "node:path";
+import { existsSync } from "node:fs";
+import { dirname, join } from "node:path";
 
 import { systemClock } from "../core/clock.ts";
 import { type Decision, deny } from "../core/errors.ts";
@@ -18,8 +17,11 @@ import {
 } from "../doctor/doctor.ts";
 import { git, isClean, listWorktrees, tryRevParse } from "../git/git.ts";
 import { TrustedCredentialStore } from "../github/credential-store.ts";
-import { databaseSidecarPaths, inspectDatabaseStatePaths, inspectPrivatePath } from "../db/state-preflight.ts";
+import { DatabaseSnapshotUnavailable, withDatabaseSnapshot } from "../db/database-snapshot.ts";
+import { ensurePrivateDirectory, inspectDatabaseStatePaths, inspectPrivatePath } from "../db/state-preflight.ts";
+import { readCheckoutRegistrations } from "../verify/worktree.ts";
 import { backoffSecondsFor, countStartupFailure, readCrashLoopFile } from "./crash-loop.ts";
+import { SingleInstanceLock } from "./single-instance.ts";
 
 /**
  * migrate-before-start — the startup verdict that is given before the control plane opens the database.
@@ -30,9 +32,11 @@ import { backoffSecondsFor, countStartupFailure, readCrashLoopFile } from "./cra
  * reason that was visible beforehand must refuse before any of that, or the official rollback to the pair
  * sealed before an approved migration refuses the database as stale (ROLLBACK_PAIR_STALE_DATABASE).
  *
- * What is judged here reads only files and read-only git, and, for the registered checkouts, a copy of the
- * database's own bytes held in memory. Nothing is opened for writing, no sidecar is created, no repository
- * index is refreshed, and a refusal is reported on stderr and in `crash-loop.json` only.
+ * What is judged here reads only files and read-only git, and, for the registered checkouts, a private copy
+ * of the database's own files (`withDatabaseSnapshot`). Nothing is opened for writing, no sidecar is
+ * created, no repository index is refreshed, and a refusal is reported on stderr and in `crash-loop.json`
+ * only. The caller holds `agentcpd.lock` for all of it (`takeStartLock`), so a second start learns that
+ * another process holds the lock before it has read or written anything.
  */
 export interface StartGateConfig {
   databasePath: string;
@@ -58,54 +62,47 @@ interface RegisteredCheckout {
   suspended: boolean;
 }
 
-/** A database larger than this is not copied into memory to read its repository list. */
-const SNAPSHOT_LIMIT_BYTES = 256 * 1024 * 1024;
-
 const safeErrorMessage = (err: unknown): string =>
   (err instanceof Error ? err.message : String(err)).replace(/[\r\n\t]/g, " ").slice(0, 500);
 
 /**
- * The registered checkouts, read from a private in-memory copy of the main database file.
+ * The registered checkouts, read from a private copy of the database (`withDatabaseSnapshot`): the main
+ * file and any write-ahead log or hot journal that holds more than the file does, so a registration that
+ * is still only in the log is seen. The originals are never opened for writing, and no sidecar is created
+ * beside them.
  *
- * A read-only connection to the file itself is not read-only to its neighbours: on a WAL database it
- * creates `-shm` (and `-wal`), which is the very change a refused start must not leave. The copy is
- * opened as a rollback-journal database (header bytes 18 and 19 set to 1 in the copy, never in the
- * file), so it needs no sidecar, and the committed state of the file is all it can show. A write-ahead
- * or hot journal that holds more than the file does makes the copy stale, so it is not read then.
+ * A copy that cannot be made or opened is not a reason to go on: the finding it returns blocks, because a
+ * start that cannot say what it is about to open should not open it. A schema too old to register
+ * checkouts has none to probe, which is not a failure.
  */
-const registeredCheckouts = (databasePath: string): { checkouts: RegisteredCheckout[] } | { notJudged: string } => {
+const registeredCheckouts = (
+  databasePath: string,
+): { checkouts: RegisteredCheckout[] } | { notJudged: string } | { unavailable: string } => {
   if (!existsSync(databasePath)) return { checkouts: [] };
-  for (const sidecar of databaseSidecarPaths(databasePath)) {
-    if (existsSync(sidecar) && statSync(sidecar).size > 0 && !sidecar.endsWith("-shm")) {
-      return { notJudged: `the database has a non-empty ${sidecar.slice(databasePath.length)} beside it, so its main file alone is not its state` };
-    }
-  }
-  if (statSync(databasePath).size > SNAPSHOT_LIMIT_BYTES) {
-    return { notJudged: "the database is too large to read a copy of" };
-  }
   try {
-    const bytes = Buffer.from(readFileSync(databasePath));
-    if (bytes.length < 100 || !bytes.subarray(0, 16).equals(Buffer.from("SQLite format 3\0"))) {
-      return { notJudged: "the database file has no SQLite header" };
-    }
-    bytes[18] = 1;
-    bytes[19] = 1;
-    const copy = new Database(bytes, { readonly: true });
-    try {
+    return withDatabaseSnapshot(databasePath, (copy) => {
+      const columns = (table: string): Set<string> =>
+        new Set((copy.prepare(`PRAGMA table_info("${table}")`).all() as Array<{ name: string }>).map((row) => row.name));
+      const repositories = columns("repositories");
+      for (const needed of ["repository_id", "identity", "checkout_path", "project_id", "created_at"]) {
+        if (!repositories.has(needed)) {
+          return { notJudged: "the database's schema is too old to register checkouts, so it has none to probe" };
+        }
+      }
+      const suspended = columns("projects").has("suspended") ? "COALESCE(p.suspended, 0)" : "0";
       const rows = copy
         .prepare(
           `SELECT r.identity AS identity, r.checkout_path AS checkoutPath, r.project_id AS projectId,
-                  COALESCE(p.suspended, 0) AS suspended
+                  ${suspended} AS suspended
              FROM repositories r LEFT JOIN projects p ON p.project_id = r.project_id
             ORDER BY r.created_at, r.repository_id`,
         )
         .all() as Array<{ identity: string; checkoutPath: string; projectId: string | null; suspended: number }>;
       return { checkouts: rows.map((row) => ({ ...row, suspended: row.suspended === 1 })) };
-    } finally {
-      copy.close();
-    }
+    });
   } catch (error) {
-    return { notJudged: `the registered checkouts could not be read from the database file: ${safeErrorMessage(error)}` };
+    if (error instanceof DatabaseSnapshotUnavailable) return { unavailable: error.message };
+    return { unavailable: safeErrorMessage(error) };
   }
 };
 
@@ -115,7 +112,7 @@ const registeredCheckouts = (databasePath: string): { checkouts: RegisteredCheck
  * are not blocking and are left to the full report. `git status` runs with `--no-optional-locks`, so a
  * tracked file whose stat changed does not get its index rewritten.
  */
-const checkoutFindings = async (checkouts: readonly RegisteredCheckout[]): Promise<Finding[]> => {
+const checkoutFindings = async (checkouts: readonly RegisteredCheckout[], worktreeRoot: string): Promise<Finding[]> => {
   const findings: Finding[] = [];
   const deadlineAt = Date.now() + REPOSITORY_SWEEP_BUDGET_MS;
   const remaining = (): number => Math.max(1, deadlineAt - Date.now());
@@ -141,6 +138,10 @@ const checkoutFindings = async (checkouts: readonly RegisteredCheckout[]): Promi
   for (const checkout of checkouts) {
     try {
       await listWorktrees(checkout.checkoutPath);
+      // What `WorktreeManager.orphans` reads next, with its parser: a registration under
+      // `.verification-checkouts` that cannot be read or does not name its own id and path makes the
+      // doctor's worktree probe fail for every repository, so it fails the gate's too.
+      readCheckoutRegistrations(worktreeRoot);
     } catch (error) {
       findings.push(worktreeProbeFailedFinding(checkout, safeErrorMessage(error), checkout.suspended));
     }
@@ -184,9 +185,55 @@ export const judgeStartBeforeOpening = async (config: StartGateConfig): Promise<
 
   const registered = registeredCheckouts(config.databasePath);
   if ("notJudged" in registered) notJudged.push(`repository and worktree probes: ${registered.notJudged}`);
-  else findings.push(...(await checkoutFindings(registered.checkouts)));
+  else if ("unavailable" in registered) {
+    findings.push({
+      code: "START_GATE_DATABASE_UNREADABLE",
+      severity: "ERROR",
+      scope: "host",
+      blocking: true,
+      confidence: "HIGH",
+      observedEvidence: { error: registered.unavailable },
+      recommendedAction: "the registered checkouts could not be read without opening the database, so the start was refused before it opened it",
+    });
+  } else findings.push(...(await checkoutFindings(registered.checkouts, config.worktreeRoot)));
 
   return { status: aggregate(findings), findings, notJudged };
+};
+
+/**
+ * Takes `agentcpd.lock` before anything else is judged or opened, or says why this start must end.
+ *
+ * The lock used to be taken by `Daemon.start`, after the control plane had opened the database and the
+ * entry point had recorded its runtime in it, so a second start during an offline migration appended audit
+ * rows before it was told another process held the lock. A start that finds the lock held writes nothing
+ * to the database; it is counted in `crash-loop.json` as it always was, so the supervisor's backoff is the
+ * same, and it is reported on stderr.
+ *
+ * A state directory that does not exist yet is created owner-only first: the lock lives in it, and the
+ * database's own open requires it to be exactly that.
+ */
+export const takeStartLock = (
+  databasePath: string,
+  nowIso: () => string = () => systemClock.nowIso(),
+): { lock: SingleInstanceLock } | { refused: StartRefusedBeforeOpening } => {
+  const stateDir = dirname(databasePath);
+  if (!existsSync(stateDir)) ensurePrivateDirectory(stateDir);
+  const lock = new SingleInstanceLock(join(stateDir, "agentcpd.lock"));
+  const acquired = lock.acquire(nowIso());
+  if (acquired.allowed) return { lock };
+  let failures = readCrashLoopFile(stateDir, nowIso()).failures + 1;
+  try {
+    failures = countStartupFailure(stateDir, nowIso()).next.failures;
+  } catch {
+    // The count is the supervisor's throttle; the refusal stands without it.
+  }
+  return {
+    refused: {
+      decision: deny(acquired.reasonCode, acquired.message, { ...acquired.evidence, databaseWritten: false }),
+      failures,
+      backoffSeconds: backoffSecondsFor(failures),
+    },
+  };
 };
 
 /** A start refused before the database was opened: what to print, and the backoff the supervisor reads. */

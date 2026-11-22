@@ -1,4 +1,5 @@
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { randomBytes } from "node:crypto";
+import { closeSync, constants, lstatSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync, writeSync } from "node:fs";
 import { join } from "node:path";
 
 /**
@@ -30,9 +31,39 @@ export const crashLoopPath = (stateDir: string): string => join(stateDir, "crash
 
 const readJson = <T>(path: string): T | null => {
   try {
+    // A record that is not a regular file (a link to somewhere else) is not read as one.
+    if (!lstatSync(path).isFile()) return null;
     return JSON.parse(readFileSync(path, "utf8")) as T;
   } catch {
     return null;
+  }
+};
+
+/**
+ * Replaces the record atomically and never through a link.
+ *
+ * `writeFileSync` on a path opens it and follows a symbolic link, so a `crash-loop.json` that points at
+ * `state.sqlite` made a refusal overwrite the database while reporting `databaseWritten: false`. The
+ * record is written to a new file beside it, created exclusively with `O_NOFOLLOW` at 0600, and renamed
+ * over the path: a rename replaces a link at the target and never writes through it.
+ */
+const replaceRecord = (stateDir: string, contents: string): void => {
+  const target = crashLoopPath(stateDir);
+  const staged = join(stateDir, `.crash-loop.${process.pid}.${randomBytes(6).toString("hex")}.tmp`);
+  const fd = openSync(staged, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
+  try {
+    writeSync(fd, contents);
+  } catch (error) {
+    closeSync(fd);
+    unlinkSync(staged);
+    throw error;
+  }
+  closeSync(fd);
+  try {
+    renameSync(staged, target);
+  } catch (error) {
+    unlinkSync(staged);
+    throw error;
   }
 };
 
@@ -59,10 +90,10 @@ export const countStartupFailure = (
   // A state directory that does not exist yet (a first start refused before anything created it) is made
   // here, owner-only, so the refusal has somewhere to be recorded.
   mkdirSync(stateDir, { recursive: true, mode: 0o700 });
-  writeFileSync(crashLoopPath(stateDir), JSON.stringify(next), { mode: 0o600 });
+  replaceRecord(stateDir, JSON.stringify(next));
   return { next, backoffSeconds };
 };
 
 export const clearCrashLoopFile = (stateDir: string): void => {
-  writeFileSync(crashLoopPath(stateDir), JSON.stringify({ failures: 0 }), { mode: 0o600 });
+  replaceRecord(stateDir, JSON.stringify({ failures: 0 }));
 };
