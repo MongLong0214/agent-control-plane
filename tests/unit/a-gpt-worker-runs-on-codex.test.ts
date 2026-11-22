@@ -5,7 +5,7 @@ import { afterAll, describe, expect, it, vi } from "vitest";
 import { ManualClock } from "../../src/core/clock.ts";
 import { allow, deny } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
-import { ExecutionMode, Role, roleKeyFor } from "../../src/domain/types.ts";
+import { ExecutionMode, Role, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
 import type { TaskContract } from "../../src/run/run-engine.ts";
 import { WorkerTurnRunner } from "../../src/run/worker-turn.ts";
 import { WorkerStaffing } from "../../src/run/worker-staffing.ts";
@@ -13,6 +13,7 @@ import { CodexCliAdapter } from "../../src/runtime/cli-adapters.ts";
 import type { InvocationRequest, ProviderAdapter } from "../../src/runtime/provider.ts";
 import { cleanupTempDirs, gitSync, makeCore, tempDir } from "../helpers/fixtures.ts";
 import { bindCeo, bindWorker, makeHarness, registerFixtureProject, type Harness } from "../helpers/harness.ts";
+import { TestProductionAdapter } from "../helpers/production-adapter.ts";
 import { FakeWorkerAdapter, admittingCapacity, seedWorkerWorld } from "../helpers/worker-turn-fixture.ts";
 
 afterAll(cleanupTempDirs);
@@ -224,6 +225,182 @@ describe("provisioning a gpt worker", () => {
         provider: "gpt",
         model: "gpt-6.2-sol",
       });
+    } finally {
+      harness.cp.close();
+    }
+  });
+});
+
+describe("provisioning replaces a worker bound to a retired model (#1477)", () => {
+  const provisionOn = async (harness: Harness, run: Awaited<ReturnType<typeof activeRun>>) => {
+    const root = tempDir("acp-codex-replace-");
+    const runtime = tempDir("acp-codex-replace-runtime-");
+    mkdirSync(runtime, { recursive: true });
+    const codex = new CodexCliAdapter({
+      clock: harness.clock,
+      capacityFile: join(root, "capacity.json"),
+      binary: stubCodex(root, "ok", runtime),
+    });
+    const staffing = new WorkerStaffing(harness.cp.db, harness.clock, harness.cp.audit, {
+      runs: harness.cp.runs,
+      tasks: {
+        get: (taskId) => harness.cp.tasks.get(taskId),
+        admitWorkerFanout: async () => allow(ReasonCode.OK, undefined),
+      },
+      bindings: harness.cp.bindings,
+      sessions: harness.cp.sessions,
+      providers: { requireForRole: () => codex },
+      readiness: { checkSession: async () => allow(ReasonCode.OK, undefined) },
+    }, runtime);
+    return staffing.provision({
+      runId: run.runId,
+      taskId: run.taskId,
+      provider: "gpt",
+      model: "gpt-6.2-sol",
+      ownerBindingGeneration: run.ownerBindingGeneration,
+      fence: () => allow(ReasonCode.OK, { sessionId: run.ownerSessionId, bindingGeneration: run.ownerBindingGeneration }),
+    });
+  };
+
+  it("a READY task whose ACTIVE worker binding is on gpt-6.1-sol gets its gpt-6.2-sol replacement; the retired binding is revoked", async () => {
+    const harness = makeHarness();
+    try {
+      const run = await activeRun(harness);
+      const retiredSessionId = bindWorker(harness, run.taskId, { provider: "gpt", model: "gpt-6.1-sol" });
+      const roleKey = roleKeyFor(Role.WORKER, { taskId: run.taskId });
+
+      const provisioned = await provisionOn(harness, run);
+      expect(provisioned, JSON.stringify(provisioned)).toMatchObject({ allowed: true, value: { generation: 2 } });
+      if (!provisioned.allowed) return;
+      expect(harness.cp.sessions.get(provisioned.value.workerSessionId)).toMatchObject({ provider: "gpt", model: "gpt-6.2-sol", lifecycle: "READY" });
+      expect(harness.cp.bindings.active(roleKey)).toMatchObject({ sessionId: provisioned.value.workerSessionId, bindingGeneration: 2 });
+      expect(harness.cp.bindings.history(roleKey).map((binding) => [binding.sessionId, binding.status])).toEqual([
+        [retiredSessionId, "REVOKED"],
+        [provisioned.value.workerSessionId, "ACTIVE"],
+      ]);
+      // The retired session is no longer ready: it leaves READY in the transaction that revokes it, for the
+      // retirement sweep to stop once the run ends.
+      expect(harness.cp.sessions.get(retiredSessionId)?.lifecycle).toBe(SessionLifecycle.DRAINING);
+      expect(await harness.cp.doctor.sessionReadiness(retiredSessionId)).toMatchObject({ allowed: false, reasonCode: ReasonCode.SESSION_NOT_READY });
+      expect(await harness.cp.doctor.sessionReadiness(provisioned.value.workerSessionId)).toMatchObject({ allowed: true });
+    } finally {
+      harness.cp.close();
+    }
+  });
+
+  it("a refused replacement bind leaves the retired binding ACTIVE and its session READY", async () => {
+    const harness = makeHarness();
+    try {
+      const run = await activeRun(harness);
+      const retiredSessionId = bindWorker(harness, run.taskId, { provider: "gpt", model: "gpt-6.1-sol" });
+      const roleKey = roleKeyFor(Role.WORKER, { taskId: run.taskId });
+      const root = tempDir("acp-codex-refused-bind-");
+      const runtime = tempDir("acp-codex-refused-bind-runtime-");
+      mkdirSync(runtime, { recursive: true });
+      const codex = new CodexCliAdapter({
+        clock: harness.clock,
+        capacityFile: join(root, "capacity.json"),
+        binary: stubCodex(root, "ok", runtime),
+      });
+      const staffing = new WorkerStaffing(harness.cp.db, harness.clock, harness.cp.audit, {
+        runs: harness.cp.runs,
+        tasks: {
+          get: (taskId) => harness.cp.tasks.get(taskId),
+          admitWorkerFanout: async () => allow(ReasonCode.OK, undefined),
+        },
+        // The real registry revokes, and the replacement's bind is then refused: the revocation must not stand.
+        bindings: {
+          active: (key) => harness.cp.bindings.active(key),
+          history: (key) => harness.cp.bindings.history(key),
+          revoke: (key, reason, options) => harness.cp.bindings.revoke(key, reason, options),
+          bind: () => deny(ReasonCode.CONFLICT, "test: the replacement's bind is refused"),
+        },
+        sessions: harness.cp.sessions,
+        providers: { requireForRole: () => codex },
+        readiness: { checkSession: async () => allow(ReasonCode.OK, undefined) },
+      }, runtime);
+      const provisioned = await staffing.provision({
+        runId: run.runId,
+        taskId: run.taskId,
+        provider: "gpt",
+        ownerBindingGeneration: run.ownerBindingGeneration,
+        fence: () => allow(ReasonCode.OK, { sessionId: run.ownerSessionId, bindingGeneration: run.ownerBindingGeneration }),
+      });
+      expect(provisioned).toMatchObject({ allowed: false, reasonCode: ReasonCode.CONFLICT });
+      expect(harness.cp.bindings.active(roleKey)).toMatchObject({ sessionId: retiredSessionId, bindingGeneration: 1, status: "ACTIVE" });
+      expect(harness.cp.bindings.history(roleKey)).toHaveLength(1);
+      expect(harness.cp.sessions.get(retiredSessionId)?.lifecycle).toBe(SessionLifecycle.READY);
+      expect(harness.cp.audit.byKind("BINDING_REVOKED").filter((row) => row.roleKey === roleKey)).toEqual([]);
+    } finally {
+      harness.cp.close();
+    }
+  });
+
+  it("the BINDING_REVOKED record names the replacement actually bound: a claude worker is opus, never gpt-6.2-sol", async () => {
+    const harness = makeHarness();
+    try {
+      const run = await activeRun(harness);
+      bindWorker(harness, run.taskId, { provider: "gpt", model: "gpt-6.1-sol" });
+      const roleKey = roleKeyFor(Role.WORKER, { taskId: run.taskId });
+      const claude = new TestProductionAdapter(harness.clock, "claude");
+      const staffing = new WorkerStaffing(harness.cp.db, harness.clock, harness.cp.audit, {
+        runs: harness.cp.runs,
+        tasks: {
+          get: (taskId) => harness.cp.tasks.get(taskId),
+          admitWorkerFanout: async () => allow(ReasonCode.OK, undefined),
+        },
+        bindings: harness.cp.bindings,
+        sessions: harness.cp.sessions,
+        providers: { requireForRole: () => claude },
+        readiness: { checkSession: async () => allow(ReasonCode.OK, undefined) },
+      }, tempDir("acp-claude-replace-runtime-"));
+      const provisioned = await staffing.provision({
+        runId: run.runId,
+        taskId: run.taskId,
+        provider: "claude",
+        ownerBindingGeneration: run.ownerBindingGeneration,
+        fence: () => allow(ReasonCode.OK, { sessionId: run.ownerSessionId, bindingGeneration: run.ownerBindingGeneration }),
+      });
+      expect(provisioned, JSON.stringify(provisioned)).toMatchObject({ allowed: true, value: { generation: 2 } });
+      expect(harness.cp.sessions.get(harness.cp.bindings.active(roleKey)!.sessionId)).toMatchObject({ provider: "claude", model: "opus" });
+      const revoked = harness.cp.audit.byKind("BINDING_REVOKED").filter((row) => row.roleKey === roleKey);
+      expect(revoked).toHaveLength(1);
+      expect(revoked[0]!.evidence).toMatchObject({ generation: 1, retiredModel: "gpt-6.1-sol", replacementProvider: "claude", replacementModel: "opus" });
+      expect(JSON.stringify(revoked[0]!.evidence)).not.toContain("gpt-6.2-sol");
+    } finally {
+      harness.cp.close();
+    }
+  });
+
+  it("a session on a retired model is not ready however its binding ended: a binding revoked before any replacement leaves a READY session that sessionReadiness refuses", async () => {
+    const harness = makeHarness();
+    try {
+      const run = await activeRun(harness);
+      const retiredSessionId = bindWorker(harness, run.taskId, { provider: "gpt", model: "gpt-6.1-sol" });
+      const current = harness.cp.sessions.create({ provider: "gpt", model: "gpt-6.2-sol" }).sessionId;
+      expect(harness.cp.sessions.transition(current, SessionLifecycle.READY, "test: a session on the current model").allowed).toBe(true);
+      const roleKey = roleKeyFor(Role.WORKER, { taskId: run.taskId });
+      expect(harness.cp.bindings.revoke(roleKey, "test: revoked before any replacement").allowed).toBe(true);
+
+      // Revoked, not drained by provisioning: the session is still READY, and the gate still says no.
+      expect(harness.cp.sessions.get(retiredSessionId)?.lifecycle).toBe(SessionLifecycle.READY);
+      expect(await harness.cp.doctor.sessionReadiness(retiredSessionId)).toMatchObject({ allowed: false, reasonCode: ReasonCode.SESSION_NOT_READY });
+      expect(await harness.cp.doctor.sessionReadiness(current)).toMatchObject({ allowed: true });
+    } finally {
+      harness.cp.close();
+    }
+  });
+
+  it("an ACTIVE binding on a model that is not retired still refuses BINDING_ALREADY_ACTIVE, and is left bound", async () => {
+    const harness = makeHarness();
+    try {
+      const run = await activeRun(harness);
+      const current = bindWorker(harness, run.taskId, { provider: "gpt", model: "gpt-6.2-sol" });
+      const roleKey = roleKeyFor(Role.WORKER, { taskId: run.taskId });
+
+      const provisioned = await provisionOn(harness, run);
+      expect(provisioned).toMatchObject({ allowed: false, reasonCode: ReasonCode.BINDING_ALREADY_ACTIVE });
+      expect(harness.cp.bindings.active(roleKey)).toMatchObject({ sessionId: current, bindingGeneration: 1 });
     } finally {
       harness.cp.close();
     }

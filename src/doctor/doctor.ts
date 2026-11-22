@@ -27,6 +27,7 @@ import { inspectDatabaseStatePaths, inspectPrivatePath } from "../db/state-prefl
 import { probeSessionLiveness } from "../daemon/dead-binding-recovery.ts";
 import { RoleScopeUnreadable, type CtoProcessReader, ctoProcessesFor, ctoRoleScope, snapshotCtoProcesses, systemCtoProcessReader } from "../cto/one-cto-per-project.ts";
 import { ctoTranscriptPath, longReasons, measureConversation, refreshLimitsFromEnv } from "../cto/cto-conversation.ts";
+import { isRetiredModel } from "../domain/fixed-role-runtime.ts";
 import { Role, RunState, SessionLifecycle, roleKeyFor } from "../domain/types.ts";
 import type { GitHubKernel } from "../github/github-kernel.ts";
 import { git, isClean, tryRevParse } from "../git/git.ts";
@@ -652,6 +653,10 @@ export class Doctor {
     if (!session) return deny(ReasonCode.NOT_FOUND, "unknown session", { sessionId });
     if (session.lifecycle !== SessionLifecycle.READY) {
       return deny(ReasonCode.SESSION_NOT_READY, `session is ${session.lifecycle}`, { sessionId });
+    }
+    // #1477 — a session on a retired model is not ready, however its binding ended: nothing is launched on one.
+    if (isRetiredModel(session.model)) {
+      return deny(ReasonCode.SESSION_NOT_READY, `session runs the retired model ${session.model}`, { sessionId, model: session.model });
     }
     return allow(ReasonCode.OK, undefined);
   }
