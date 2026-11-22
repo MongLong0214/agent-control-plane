@@ -837,8 +837,9 @@ const createHermesServerFromPort = (
         "be empty. The answer's first line is its brief: pageIndex, done, complete, nextCursor, reasonCode, the compared " +
         "SHAs and counts. Pass nextCursor back as cursor with the same expectedHead until done, and join the pages' " +
         "diff.text in order; the pages hash to diff.sha256. On the first page the files, then the gaps, then the checks, " +
-        "then the required contexts give way to keep it inline, counted in brief.notListed; a continuation page lists its " +
-        "own gaps after one SNAPSHOT_INCOMPLETE entry counting every gap the read named. complete is true only on the last " +
+        "then the required contexts give way to keep it inline, counted in brief.notListed; a continuation page lists the " +
+        "compare's gaps only when brief.compareGapsChanged is true; otherwise it carries one SNAPSHOT_INCOMPLETE entry and " +
+        "the read's running count. complete is true only on the last " +
         "page of a read no page of which named a gap. A " +
         "cursor issued against another head, base or diff is refused SNAPSHOT_STALE; start again without one. Anything " +
         "not read (a failed or missing page, a patch GitHub omitted, mergeability not yet computed) is named in incomplete, " +
