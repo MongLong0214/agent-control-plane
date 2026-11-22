@@ -181,6 +181,7 @@ import { HOLDER_CLAIMED_KINDS, MessageKind } from "../outbox/envelope.ts";
 import type { HolderIdentity } from "../outbox/outbox.ts";
 import { respond, type AuthenticatedMcpPeer, type McpPeerAuthenticator } from "../mcp/shared.ts";
 import type { AuthenticatedOperatorPeer, Daemon, StartStallNoticeRoute } from "./daemon.ts";
+import type { SingleInstanceLock } from "./single-instance.ts";
 import { refuseStartBeforeOpening, takeStartLock } from "./start-gate.ts";
 import { executeCanonicalSelfClaimOperator } from "./canonical-self-claim-operator.ts";
 import {
@@ -6434,6 +6435,14 @@ export const configuredCanonicalSessions = (raw: string): readonly CanonicalAdop
  * Intended to run under a process supervisor (`launchd` on macOS). The daemon owns the
  * single-instance lock, restart reconciliation, the watchdog timer and Buzz delivery.
  */
+/**
+ * A test hook, inert unless `ACP_TEST_RAISE_SIGTERM_AT` names the point: the process sends itself SIGTERM
+ * there, so a test can place a stop in a window no external signal can be aimed at.
+ */
+const raiseTestSignalAt = (point: "after-lock" | "after-yield"): void => {
+  if (process.env["ACP_TEST_RAISE_SIGTERM_AT"] === point) process.kill(process.pid, "SIGTERM");
+};
+
 export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => {
   // Classify the complete environment-only group before reading config or acquiring resources.
   // Blank values are absent; nonblank values are retained exactly for the claim boundary.
@@ -6511,25 +6520,22 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
   // handed on to the database's own open and to the daemon, so the whole start runs under one lease. A
   // refusal is printed and counted in `crash-loop.json`, and the process leaves without installing the
   // signal handlers whose shutdown writes an audit row.
-  const refuseBeforeOpening = async (refused: { decision: unknown; failures: number; backoffSeconds: number }): Promise<never> => {
-    process.stderr.write(`${JSON.stringify(refused.decision, null, 2)}\n`);
-    process.stderr.write(`backoff: ${JSON.stringify({ failures: refused.failures, backoffSeconds: refused.backoffSeconds })}\n`);
-    if (refused.backoffSeconds > 0) await waitForBackoff(refused.backoffSeconds);
-    return process.exit(1);
-  };
-  const taken = takeStartLock(config.databasePath);
-  if ("refused" in taken) return refuseBeforeOpening(taken.refused);
-  const startLock = taken.lock;
-  process.once("exit", () => startLock.release());
-  // From the moment the lock is held, a stop signal gives it back and leaves. The daemon's own shutdown is
-  // installed far below, after the control plane and the listeners exist; without this a SIGTERM during the
-  // gate's probes ended the process by default, `exit` never fired, and `agentcpd.lock/holder.json` stayed
-  // behind for the installer to wait on forever. It writes nothing: no database is open yet, and when one
-  // is, a start that was never served has no stop to record.
+  // A stop is never timed against the start; it is held by structure. The handler is installed before the
+  // lock is even asked for, because a signal with no handler is the kernel's default action, which ends the
+  // process on the spot, mid-publication, with `agentcpd.lock/holder.json` left for the installer to wait on
+  // forever. What it does depends only on whether the database has been opened:
+  //   - not yet: give the lock back if it is held, and leave. Nothing was opened, so nothing is written.
+  //   - already: remember it (`stopRequested`). The start goes on as a normal start, and the normal shutdown
+  //     is run the moment its handlers exist (below). That outcome writes the normal start and stop rows
+  //     (the runtime observation, DAEMON_STARTED, DAEMON_STOPPED); it is a limit of a stop that arrives after
+  //     the open, not a defect, and it is the only other outcome: a stop is honoured either way.
   let stopRequested = false;
+  let databaseOpened = false;
+  let heldLock: SingleInstanceLock | null = null;
   const earlyStop = (): void => {
     stopRequested = true;
-    startLock.release();
+    if (databaseOpened) return;
+    heldLock?.release();
     process.exit(0);
   };
   process.on("SIGTERM", earlyStop);
@@ -6538,23 +6544,37 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
     process.off("SIGTERM", earlyStop);
     process.off("SIGINT", earlyStop);
   };
+  const refuseBeforeOpening = async (refused: { decision: unknown; failures: number; backoffSeconds: number }): Promise<never> => {
+    process.stderr.write(`${JSON.stringify(refused.decision, null, 2)}\n`);
+    process.stderr.write(`backoff: ${JSON.stringify({ failures: refused.failures, backoffSeconds: refused.backoffSeconds })}\n`);
+    // A refusal is waited out the way it always was: a signal during the wait ends the process by default.
+    dropEarlyStop();
+    if (refused.backoffSeconds > 0) await waitForBackoff(refused.backoffSeconds);
+    return process.exit(1);
+  };
+  const taken = takeStartLock(config.databasePath);
+  // The handler is already installed, so a signal that lands from here on is dispatched, not fatal.
+  raiseTestSignalAt("after-lock");
+  if ("refused" in taken) return refuseBeforeOpening(taken.refused);
+  const startLock = taken.lock;
+  heldLock = startLock;
+  process.once("exit", () => startLock.release());
   const refusedBeforeOpening = await refuseStartBeforeOpening(config);
   if (refusedBeforeOpening !== null) {
-    // Given back before the backoff is waited out: a daemon that refuses does not hold the lock while it
-    // sleeps, and a signal during that sleep ends the process the way it always did.
+    // Given back before the backoff is waited out: a daemon that refuses does not hold the lock while it sleeps.
     startLock.release();
-    dropEarlyStop();
     return refuseBeforeOpening(refusedBeforeOpening);
   }
   // A turn of the event loop before anything is opened, then a look at whether a stop arrived while the gate
-  // ran. The gate's promises can settle without the loop ever turning, which would let a signal that landed
-  // during it wait behind the open of the live database (a switch to WAL, a runtime observation, a started
-  // daemon). If one did arrive, the process leaves here without having opened it.
+  // ran. The gate's promises can settle without the loop ever turning; if a stop did arrive, the process
+  // leaves here without having opened the database. One that arrives after this look is held by `databaseOpened`.
   await new Promise<void>((resolveYield) => setImmediate(resolveYield));
   if (stopRequested) {
     startLock.release();
     process.exit(0);
   }
+  databaseOpened = true;
+  raiseTestSignalAt("after-yield");
 
   const cp = new ControlPlane({ ...config, databaseMigrationLock: startLock, servingEntrypoint: realpathSync(fileURLToPath(import.meta.url)) });
   cp.review.attach({ servingRuntimeEventId: recordBootstrapServingRuntime(cp.audit, import.meta.url) });
@@ -6765,9 +6785,12 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
   // `install-launchd.sh upgrade` and `rollback` both wait for that file to disappear before
   // they will touch the database — so a parked daemon would fail every deploy on the host this
   // whole change exists for.
-  dropEarlyStop();
   process.on("SIGTERM", () => void shutdown("SIGTERM"));
   process.on("SIGINT", () => void shutdown("SIGINT"));
+  // The full handlers are in place before the early ones come off, so there is no instant with none. A stop
+  // that arrived while the database was already open is run now, as the stop it was.
+  dropEarlyStop();
+  if (stopRequested) void shutdown("SIGTERM");
 
   const started = await daemon.start({
     bootstrapDoor: () =>

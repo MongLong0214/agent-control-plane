@@ -470,6 +470,51 @@ describe("a start the doctor will refuse leaves the database as it found it (mig
     expect(readdirSync(scratch).filter((name) => name.startsWith("acp-db-snapshot-"))).toEqual([]);
   }, 180_000);
 
+  it("structural (a): a SIGTERM raised the instant the lock is published leaves no holder.json and writes nothing", async () => {
+    const { home, root, database } = newHome();
+    currentDatabase(database);
+    const scratch = mkdtempSync(join(tmpdir(), "acp-gate-scratch-"));
+    homes.push(scratch);
+    const before = imageOf(database);
+
+    // The process signals itself right after `takeStartLock` returns: holder.json is published, and in the
+    // earlier order no handler existed yet, so the kernel's default action ended it with the record behind.
+    const run = startDaemon(home, { ACP_TEST_RAISE_SIGTERM_AT: "after-lock", TMPDIR: scratch });
+    const exit = await run.exited;
+
+    expect(exit.status).toBe(0);
+    expect(existsSync(join(root, "agentcpd.lock"))).toBe(false);
+    expect(existsSync(join(root, "agentcpd.lock", "holder.json"))).toBe(false);
+    expect(imageOf(database)).toEqual(before);
+    expect(readdirSync(scratch).filter((name) => name.startsWith("acp-db-snapshot-"))).toEqual([]);
+  }, 120_000);
+
+  it("structural (b): a SIGTERM raised after the last yield is honoured, as a normal start followed at once by a normal stop", async () => {
+    const { home, root, database } = newHome("/tmp");
+    currentDatabase(database);
+    installGitHubAppCredential(root);
+    const auditBefore = countOf(database, "SELECT COUNT(*) AS n FROM audit_events");
+    const before = imageOf(database);
+
+    // Raised after the final look at the stop flag and after `databaseOpened` is set: nothing before the
+    // open can see it, and the open is the very next statement.
+    const run = startDaemon(home, { ACP_TEST_RAISE_SIGTERM_AT: "after-yield" });
+    const exit = await run.exited;
+
+    // Stopped, with the lock given back, and not left running until something kills it.
+    expect(exit.status).toBe(0);
+    expect(existsSync(join(root, "agentcpd.lock"))).toBe(false);
+    // Either it never opened the database (unchanged), or it ran a normal start and a normal stop: the stop
+    // is on record. A start with no stop after it is the defect.
+    const auditAfter = countOf(database, "SELECT COUNT(*) AS n FROM audit_events");
+    if (auditAfter === auditBefore) {
+      expect(imageOf(database)).toEqual(before);
+    } else {
+      expect(countOf(database, "SELECT COUNT(*) AS n FROM audit_events WHERE kind = 'DAEMON_RUNTIME_OBSERVED'")).toBe(1);
+      expect(countOf(database, "SELECT COUNT(*) AS n FROM audit_events WHERE kind = 'DAEMON_STOPPED'")).toBe(1);
+    }
+  }, 180_000);
+
   it("round 2 item 5: a start that finds agentcpd.lock held writes nothing and says so", async () => {
     const { home, root, database } = newHome();
     currentDatabase(database);
@@ -656,6 +701,36 @@ describe("the gate before the database is opened (judgeStartBeforeOpening)", () 
     expect(judged.findings.map((finding) => finding.code)).toContain("REPOSITORY_UNREADABLE");
     expect(judged.findings.map((finding) => finding.code)).not.toContain("START_GATE_DATABASE_UNREADABLE");
     expect(imageOf(hot)).toEqual(before);
+  });
+
+  it("structural (c): every way out of a snapshot, normal or not, leaves no snapshot directory", async () => {
+    const { root, database } = newHome();
+    currentDatabase(database);
+    const scratch = mkdtempSync(join(tmpdir(), "acp-gate-scratch-"));
+    homes.push(scratch);
+    const previous = process.env["TMPDIR"];
+    process.env["TMPDIR"] = scratch;
+    const left = (): string[] => readdirSync(scratch).filter((name) => name.startsWith("acp-db-snapshot-"));
+    try {
+      const { withDatabaseSnapshot, withDatabaseSnapshotAsync } = await import("../../src/db/database-snapshot.ts");
+      const user = (copy: Database.Database): number => Number(copy.pragma("user_version", { simple: true }));
+
+      expect(withDatabaseSnapshot(database, user)).toBeGreaterThan(0);
+      expect(left()).toEqual([]);
+      expect(await withDatabaseSnapshotAsync(database, user)).toBeGreaterThan(0);
+      expect(left()).toEqual([]);
+      // A reader that throws, and a file that is not a database.
+      expect(() => withDatabaseSnapshot(database, () => { throw new Error("reader failed"); })).toThrow("reader failed");
+      await expect(withDatabaseSnapshotAsync(database, () => { throw new Error("reader failed"); })).rejects.toThrow("reader failed");
+      const broken = join(root, "broken.sqlite");
+      writeFileSync(broken, "not a database", { mode: 0o600 });
+      expect(() => withDatabaseSnapshot(broken, user)).toThrow(/private copy/);
+      await expect(withDatabaseSnapshotAsync(broken, user)).rejects.toThrow(/private copy/);
+      expect(left()).toEqual([]);
+    } finally {
+      if (previous === undefined) delete process.env["TMPDIR"];
+      else process.env["TMPDIR"] = previous;
+    }
   });
 
   it("lets a start with a readable credential and sound paths go on, writing nothing", async () => {
