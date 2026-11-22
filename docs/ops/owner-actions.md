@@ -1045,14 +1045,49 @@ different row cannot match it, and the `changes()` guard stops anything but exac
 
 **Proving it before anything is replaced.** Make a throwaway duplicate of the converted copy, record
 the converted copy's `sha256`, and start the v59 build against the duplicate, in isolation: its own
-state directory holding only that file, no launchd job, no connection to the live socket, lock or
-`health.json`, and no network. It must reach ready (item 4's readiness: a `health.json` with a new
-`pid` and `startedAt`). The duplicate is the one that starts, so the converted copy stays exactly the
-bytes the post-checks were taken on. Repeat post-check 1 against the duplicate once it is ready.
+state directory, no launchd job, no connection to the live socket, lock or `health.json`, and no
+network. That state directory must contain exactly this and nothing else from the live one:
 
-**Known benign difference.** When v59 starts it refreshes `repositories.last_observed_at`. That is
-normal observation, not a data change, and it is the only difference the duplicate may show in
-post-check 1. Any other table, or any other column of `repositories`, changing is a stop.
+- the duplicate database as `state.sqlite`, mode 0600;
+- the GitHub App credential the start gate requires, as the deployment has it. The gate
+  (`judgeStartBeforeOpening`, `src/daemon/start-gate.ts`) asks the credential store whether the App
+  env file and the private key it names are usable, and it does so before it opens any database.
+  By default the env file is `credentials/github-app.env` in the state directory; it must give a
+  numeric `GITHUB_APP_ID`, a numeric `GITHUB_APP_INSTALLATION_ID` and a `GITHUB_APP_PRIVATE_KEY_PATH`,
+  and that path must name a parseable private key. Both files must be regular files, not symlinks, owned
+  by the user that runs the daemon and mode 0600, and `credentials/` must sit where the daemon looks for
+  it. Copy the two files from the deployment; point the duplicate's key path at the copy of the key
+  inside the duplicate's own `credentials/`, so the start reads nothing from the live state directory.
+
+A start without that credential is refused by the gate with `TRUSTED_GATE_CREDENTIAL_MISSING`. The
+refusal happens before the database is opened and leaves a `crash-loop.json` backoff record in the
+duplicate's state directory. A refusal before the open is a defect in the duplicate's setup, not a
+data difference: discard that duplicate and its `crash-loop.json`, fix the setup, make a new duplicate
+from the converted copy and retry. It says nothing about the converted copy and is not a stop.
+
+Once the setup is right, the start must reach ready (item 4's readiness: a `health.json` with a new
+`pid` and `startedAt`). The duplicate is the one that starts, so the converted copy stays exactly the
+bytes the post-checks were taken on. After the start, stop the duplicate cleanly and run the check
+below against it.
+
+**Known benign differences, and the post-start check.** A v59 start and stop is not a read-only
+act. It refreshes `repositories.last_observed_at` — normal observation, not a data change — and it
+appends rows: `audit_events` (runtime observed, capacity and role probes, the doctor report,
+started, stopped, drained, and so on), `capacity_snapshots` and `telemetry_metrics`, and it moves the
+matching `sqlite_sequence` counters. Compare the duplicate with the converted copy row by row, not by
+table digest, because a table that was appended to no longer has the same digest. The check holds
+only if all four of these do:
+
+1. No row that exists in the converted copy is missing from the duplicate.
+2. No row that exists in the converted copy has changed, except the `last_observed_at` column of
+   `repositories`.
+3. New rows appear only in `audit_events`, `capacity_snapshots` and `telemetry_metrics`, and the only
+   `sqlite_sequence` changes are those tables' counters rising.
+4. `sqlite_schema` is still equal to the v59 expected schema, `user_version` is 59 and
+   `integrity_check` is `ok`.
+
+Anything else — a missing or changed row, a new row in any other table, another `repositories`
+column changing, a counter for any other table moving — is a stop.
 
 **Only then** may the converted copy replace the live database, and only under the existing restore
 rules in this section — the sealed rollback pair and item 6 — and with Isaac's approval on the day it
