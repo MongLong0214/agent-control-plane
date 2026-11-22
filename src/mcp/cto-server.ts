@@ -24,6 +24,7 @@ import type { ArtifactStore } from "../db/artifacts.ts";
 import type { AuditLog } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
 import type { Doctor } from "../doctor/doctor.ts";
+import { retiredSessionOf } from "../domain/fixed-role-runtime.ts";
 import { ArtifactKind, Role, RunKind, roleKeyFor } from "../domain/types.ts";
 import type { Outbox } from "../outbox/outbox.ts";
 import { ContractChangeRefusal, contractChangePlanForSubmission, isContractChangeRun } from "../registry/contract-change-plan.ts";
@@ -108,6 +109,10 @@ const standardWorkTasks = (source: CtoMcpSource, runId: string) => {
   const executions = source.tasks.executions(runId);
   return source.tasks.list(runId).map((task) => {
     const worker = source.bindings.history(roleKeyFor(Role.WORKER, { taskId: task.taskId })).at(-1) ?? null;
+    // #1477 — an ACTIVE worker on a retired model is not reused: its replacement is provisioned, on the provider it ran.
+    // Judged from the active binding's current session, as staffing judges it, not from the history row's recorded one.
+    const active = worker?.status === "ACTIVE" ? source.bindings.active(roleKeyFor(Role.WORKER, { taskId: task.taskId })) : null;
+    const retired = active === null ? null : retiredSessionOf(active, source.sessions);
     return {
       taskId: task.taskId,
       title: task.title,
@@ -124,6 +129,7 @@ const standardWorkTasks = (source: CtoMcpSource, runId: string) => {
             generation: worker.bindingGeneration,
             state: worker.status,
             sessionLifecycle: source.sessions.get(worker.sessionId)?.lifecycle ?? null,
+            ...(retired === null ? {} : { model: retired.model, replacementRequired: true, replacementProvider: retired.provider }),
           },
       executions: executions
         .filter((execution) => execution.taskId === task.taskId)
