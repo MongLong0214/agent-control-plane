@@ -1108,20 +1108,44 @@ different row cannot match it, and the `changes()` guard stops anything but exac
 4. `PRAGMA integrity_check` is `ok`, and `PRAGMA user_version` is `59`.
 
 **Proving the converted copy in isolation.** Make a throwaway duplicate of the converted copy, record
-the converted copy's `sha256`, and start the v59 build against the duplicate, in isolation: its own
-state directory, no launchd job, no connection to the live socket, lock or `health.json`, and no
-network. That state directory must contain exactly this and nothing else from the live one:
+the converted copy's `sha256`, and start the v59 build against the duplicate, in a throwaway home of
+its own: no launchd job, no connection to the live socket, lock or `health.json`, and no network.
+
+**This command line does not isolate the network.** `env -i HOME=… node …` changes which directory
+the daemon uses and which variables it sees. It does not stop it opening a connection, and it does
+not stop it reaching a credential held outside `HOME`, such as the login Keychain. So the start proof
+runs with no network access at all: under a no-network sandbox profile, as below (on macOS,
+`sandbox-exec` with `(deny network*)` and a local unix-socket allow for the duplicate's directory),
+or on a host with networking disabled. Without one of those, do not run it.
+
+The duplicate's state directory, `<throwaway home>/.agent-control-plane`, holds exactly this and
+nothing else from the live one:
 
 - the duplicate database as `state.sqlite`, mode 0600;
-- the GitHub App credential the start gate requires, as the deployment has it. The gate
-  (`judgeStartBeforeOpening`, `src/daemon/start-gate.ts`) asks the credential store whether the App
-  env file and the private key it names are usable, and it does so before it opens any database.
-  By default the env file is `credentials/github-app.env` in the state directory; it must give a
-  numeric `GITHUB_APP_ID`, a numeric `GITHUB_APP_INSTALLATION_ID` and a `GITHUB_APP_PRIVATE_KEY_PATH`,
-  and that path must name a parseable private key. Both files must be regular files, not symlinks, owned
-  by the user that runs the daemon and mode 0600, and `credentials/` must sit where the daemon looks for
-  it. Copy the two files from the deployment; point the duplicate's key path at the copy of the key
-  inside the duplicate's own `credentials/`, so the start reads nothing from the live state directory.
+- a throwaway GitHub App credential in `credentials/`, which the start gate requires to exist. The
+  gate (`judgeStartBeforeOpening`, `src/daemon/start-gate.ts`) asks the credential store whether the
+  App env file and the private key it names are usable, before it opens any database. What it
+  checks (`TrustedCredentialStore`, `src/github/credential-store.ts`) is shape and presence: both
+  files are regular, non-symlink files owned by the daemon's user with mode 0600, the env file gives
+  a numeric `GITHUB_APP_ID`, a numeric `GITHUB_APP_INSTALLATION_ID` and a `GITHUB_APP_PRIVATE_KEY_PATH`,
+  and the key at that path parses as a private key. It makes no call to GitHub and does not check
+  that the App exists. So the proof does not need the deployment's credential and must not have it:
+  generate a key and made-up IDs for this run. Never copy the deployment's `github-app.env` or key,
+  and never one that works against GitHub. The env file the deployment holds names an absolute key
+  path in the live directory, which is one more reason not to copy it. A later start step that needs
+  a working installation token cannot succeed here, by design; report it as a finding about the
+  proof, not as a reason to use the real credential.
+
+Write the credential and the throwaway temp directory once, after the duplicate exists:
+
+    set -euo pipefail
+    umask 077
+    DUP="$DUP_HOME/.agent-control-plane"
+    mkdir -p "$DUP/credentials" "$DUP_HOME/tmp"
+    openssl genrsa -out "$DUP/credentials/github-app.pem" 2048
+    printf '%s\n' 'GITHUB_APP_ID=1' 'GITHUB_APP_INSTALLATION_ID=1' \
+      "GITHUB_APP_PRIVATE_KEY_PATH=$DUP/credentials/github-app.pem" > "$DUP/credentials/github-app.env"
+    chmod 700 "$DUP" "$DUP/credentials" "$DUP_HOME/tmp"
 
 A start without that credential is refused by the gate with `TRUSTED_GATE_CREDENTIAL_MISSING`. The
 refusal happens before the database is opened and leaves a `crash-loop.json` backoff record in the
@@ -1137,65 +1161,122 @@ daemon**; only `agentctl` reads it (`src/cli/agentctl.ts`). So the duplicate is 
 holding `state.sqlite` and `credentials/`. A daemon started without that `HOME` override opens the
 live state directory — its lock, `crash-loop.json` and `health.json` — whatever else was set.
 
-The daemon also refuses to start without three values of its own (`src/daemon/agentcpd.ts`), and
-`env -i` drops every one it is not given:
+The start reads these, and `env -i` drops every one it is not given:
 
-- `ACP_OPERATOR_TOKEN`, and a separate `ACP_MCP_TOKEN` that must not equal it. Give them throwaway
-  values, generated for this run and never printed, never the deployment's.
+- `ACP_OPERATOR_TOKEN`, and a separate `ACP_MCP_TOKEN` that must not equal it
+  (`src/daemon/agentcpd.ts`). Throwaway values generated for this run, kept in 0600 files in the work
+  directory and never printed, never the deployment's.
 - `ACP_OPERATOR_ACTOR`: the account name the daemon gives its operator peer (`cli:<name>`). It reads
   `ACP_OPERATOR_ACTOR` and, only if that is empty, `USER`, and refuses to start with "ACP_OPERATOR_ACTOR
   or USER is required to establish the operator peer identity" when neither is set — which is what
   `env -i` leaves. Use the operator's own account name (`id -un`). The name does not have to match
   anything else for this proof: `agentctl` presents only the token, and the daemon assigns the
   identity bound to it, so `agentctl daemon status` needs no actor and no `USER`.
+- `TMPDIR`, as `<throwaway home>/tmp`, mode 0700, created beforehand. `env -i` drops it and
+  `os.tmpdir()` falls back to the shared `/tmp`. The start gate copies the database into a private
+  snapshot under the temp directory (`src/db/database-snapshot.ts`, `acp-db-snapshot-*`) before it
+  opens it, and the daemon creates its runtime scratch there too
+  (`src/continuity/continuity-kernel.ts`); both must stay inside the throwaway home, and a
+  sandbox that denies `/tmp` otherwise refuses the start as `START_GATE_DATABASE_UNREADABLE`.
+  `agentctl daemon status` does not use the temp directory and does not need it.
+- `HOME` and `PATH`.
 
-Start it from an empty environment (`env -i`), so no live token, socket path or other `ACP_*` variable
-reaches it, and give it exactly what it needs. `HOME` and `PATH` are the two the start reads that
-have no default. Everything else the daemon reads is optional or defaults to the duplicate's own
-state directory, and is left unset on purpose: `ACP_GITHUB_APP_ENV_FILE` and
-`ACP_GITHUB_APP_PRIVATE_KEY_PATH` default to `credentials/github-app.env` in the state directory (an
-inherited override would send the gate to the live credential); the Buzz, Telegram and Hermes
-variables leave those routes unconfigured, which the start reports and continues; `ACP_CLAUDE_BINARY`
-and `ACP_CODEX_BINARY` unset gives at most a provider finding that does not block the start;
-`ACP_DAEMON_SUPERVISOR` only changes the exit code of a refused start; `ACP_STATE_DIR` is ignored by
-the daemon, as above.
+Everything else the daemon reads is optional or defaults to the duplicate's own state directory, and
+is left unset on purpose: `ACP_GITHUB_APP_ENV_FILE` and `ACP_GITHUB_APP_PRIVATE_KEY_PATH` default to
+`credentials/github-app.env` in the state directory (an inherited override would send the gate to
+the live credential); the Buzz, Telegram and Hermes variables leave those routes unconfigured,
+which the start reports and continues; `ACP_CLAUDE_BINARY` and `ACP_CODEX_BINARY` unset gives at
+most a provider finding that does not block the start; `LANG`, `LC_ALL`, `SHELL`, `DEVELOPER_DIR`,
+`GNUPGHOME`, `SSH_AUTH_SOCK` and the proxy variables are read only for optional behaviour or carry a
+default; `ACP_DAEMON_SUPERVISOR` only changes the exit code of a refused start; `ACP_STATE_DIR` is
+ignored by the daemon, as above. Nothing in `src/` reads an `XDG_*` variable.
 
-Before the start, print the state path the daemon would resolve and refuse if it is not the duplicate
-or if it is the live one. `V59_ROOT` is the v59 build:
+Before the start, check what it would touch, and refuse on anything outside the throwaway home.
+`V59_ROOT` is the v59 build, `DUP_HOME` the throwaway home:
 
     set -euo pipefail
     LIVE="$HOME/.agent-control-plane"
     DUP_HOME=/absolute/path/to/throwaway-home      # the duplicate is "$DUP_HOME/.agent-control-plane", mode 700
     V59_ROOT=/absolute/path/to/the/v59/build
+    DUP="$DUP_HOME/.agent-control-plane"
+    stop() { echo "stop: $1" >&2; exit 1; }
+    within() { case "$(realpath "$2")/" in "$(realpath "$1")"/*) return 0 ;; *) return 1 ;; esac; }
     RESOLVED="$(env -i HOME="$DUP_HOME" PATH="$PATH" node --input-type=module -e \
       'const { defaultConfig } = await import(process.argv[1]); console.log(defaultConfig().databasePath)' \
       "$V59_ROOT/dist/app/control-plane.js")"
     echo "the daemon would open: $RESOLVED"
-    [ "$(realpath "$(dirname "$RESOLVED")")" = "$(realpath "$DUP_HOME/.agent-control-plane")" ] || { echo "stop: that is not the duplicate" >&2; exit 1; }
-    [ "$(realpath "$(dirname "$RESOLVED")")" != "$(realpath "$LIVE")" ] || { echo "stop: that is the live state directory" >&2; exit 1; }
+    [ "$(realpath "$(dirname "$RESOLVED")")" = "$(realpath "$DUP")" ] || stop "that is not the duplicate"
+    [ "$(realpath "$(dirname "$RESOLVED")")" != "$(realpath "$LIVE")" ] || stop "that is the live state directory"
+    within "$DUP_HOME" "$DUP_HOME/tmp" || stop "TMPDIR is outside the throwaway home"
+    [ "$(stat -f %Lp "$DUP_HOME/tmp")" = 700 ] || stop "TMPDIR is not mode 700"
+    ENV_FILE="$DUP/credentials/github-app.env"
+    KEY_PATH="$(sed -n -E 's/^[[:space:]]*(export[[:space:]]+)?GITHUB_APP_PRIVATE_KEY_PATH=//p' "$ENV_FILE" \
+      | tail -n 1 | sed -E "s/^[\"']//; s/[\"']\$//")"
+    [ -n "$KEY_PATH" ] || stop "the env file names no private key path"
+    for f in "$ENV_FILE" "$KEY_PATH" "$DUP"/credentials/*; do
+      [ ! -L "$f" ] || stop "$f is a symbolic link"
+      within "$DUP" "$f" || stop "$f is outside $DUP"
+    done
 
-Then start the daemon, and ask it with `agentctl`:
+That check resolves the key path the env file names and every file in `credentials/` and refuses
+anything that lands outside the duplicate's own directory, which is what stops an env file copied
+from the deployment from pointing the gate at the live key.
 
-    OPERATOR_TOKEN="$(uuidgen)"; MCP_TOKEN="$(uuidgen)"
-    env -i HOME="$DUP_HOME" PATH="$PATH" ACP_OPERATOR_ACTOR="$(id -un)" \
-      ACP_OPERATOR_TOKEN="$OPERATOR_TOKEN" ACP_MCP_TOKEN="$MCP_TOKEN" \
-      node "$V59_ROOT/dist/daemon/agentcpd.js"
-    # in another shell, with the same OPERATOR_TOKEN:
-    env -i HOME="$DUP_HOME" PATH="$PATH" ACP_STATE_DIR="$DUP_HOME/.agent-control-plane" \
-      ACP_OPERATOR_TOKEN="$OPERATOR_TOKEN" node "$V59_ROOT/dist/cli/agentctl.js" daemon status
+The no-network sandbox profile, for the duplicate's directory (macOS `sandbox-exec`; the profile also
+fences writes to the throwaway home). Write it with `printf`, not a heredoc:
+
+    DUP_HOME_REAL="$(realpath "$DUP_HOME")"
+    printf '%s\n' '(version 1)' '(allow default)' '(deny network*)' \
+      "(deny file-write* (require-not (require-any (subpath \"$DUP_HOME_REAL\") (literal \"/dev/null\") (literal \"/dev/tty\") (literal \"/dev/dtracehelper\") (subpath \"/dev/fd\"))))" \
+      "(allow network-bind network-inbound network-outbound (local unix-socket (subpath \"$DUP_HOME_REAL\")))" \
+      "(allow network-outbound (remote unix-socket (subpath \"$DUP_HOME_REAL\")))" > "$WORK/nonet.sb"
+
+Then start the daemon in the background from this same shell, so that its pid and the token files are
+at hand, and ask it with `agentctl` from the same shell. The tokens are read from the files and are
+never printed:
+
+    set -euo pipefail
+    umask 077
+    uuidgen > "$WORK/operator.token"; uuidgen > "$WORK/mcp.token"
+    : > "$WORK/daemon.out"; : > "$WORK/daemon.err"
+    sandbox-exec -f "$WORK/nonet.sb" env -i HOME="$DUP_HOME" PATH="$PATH" TMPDIR="$DUP_HOME/tmp" \
+      ACP_OPERATOR_ACTOR="$(id -un)" ACP_OPERATOR_TOKEN="$(cat "$WORK/operator.token")" \
+      ACP_MCP_TOKEN="$(cat "$WORK/mcp.token")" \
+      node "$V59_ROOT/dist/daemon/agentcpd.js" > "$WORK/daemon.out" 2> "$WORK/daemon.err" < /dev/null &
+    DAEMON_PID=$!
+    echo "$DAEMON_PID" > "$WORK/daemon.pid"
+    abort() { kill "$DAEMON_PID" 2>/dev/null || true; echo "stop: $1; see $WORK/daemon.err" >&2; exit 1; }
+    for i in $(seq 1 120); do
+      kill -0 "$DAEMON_PID" 2>/dev/null || abort "the daemon exited"
+      grep -q '"started"' "$WORK/daemon.out" && break
+      sleep 1
+    done
+    grep -q '"started"' "$WORK/daemon.out" || abort "no started report after 120 seconds"
+    sandbox-exec -f "$WORK/nonet.sb" env -i HOME="$DUP_HOME" PATH="$PATH" \
+      ACP_STATE_DIR="$DUP_HOME/.agent-control-plane" ACP_OPERATOR_TOKEN="$(cat "$WORK/operator.token")" \
+      node "$V59_ROOT/dist/cli/agentctl.js" daemon status > "$WORK/daemon-status.json" \
+      || abort "agentctl daemon status failed"
+    node -e 'const fs = require("node:fs"); const [status, health] = process.argv.slice(1).map((p) => JSON.parse(fs.readFileSync(p, "utf8")));
+      if (status.mode !== "NORMAL" || health.mode !== "NORMAL") { console.error(`not ready: daemon status mode ${status.mode}, health.json mode ${health.mode}`); process.exit(1); }
+      console.log("ready: mode NORMAL")' "$WORK/daemon-status.json" "$DUP/health.json" || abort "not ready"
+    # Stop it cleanly, then run the post-start check below on the duplicate.
+    kill -TERM "$DAEMON_PID"; wait "$DAEMON_PID" || true
 
 For `agentctl`, `ACP_STATE_DIR` must name the duplicate and `ACP_OPERATOR_SOCKET` must be unset: when
 it is set it overrides `ACP_STATE_DIR` (`src/cli/agentctl.ts`) and the CLI would talk to whatever
-socket it names, which on a deployed host is the live one. `env -i` leaves it unset.
+socket it names, which on a deployed host is the live one. `env -i` leaves it unset. The token has to
+be the daemon's: with a wrong or missing token `agentctl daemon status` does not fail. It falls back
+to an offline reading of the lock file, exits 0, and carries no `mode` at all. That is why the token
+comes from the file the daemon was started with, in the same shell, and why an offline reading is not
+ready.
 
-Once the setup is right, the start must reach ready, and ready is the product's own answer, all
-three of these together:
+Ready is the product's own answer, all three of these together, and the block above requires them:
 
 - the daemon's stdout carries the `{ "started": … }` report, which it prints only after the last
   startup step that can still refuse the start;
 - `health.json` in the duplicate's state directory says `"mode": "NORMAL"`, not `BOOTSTRAP`;
-- the operator socket answers `agentctl daemon status`, run as above against the duplicate, and the
-  answer reports mode `NORMAL`.
+- the operator socket answers `agentctl daemon status` and the answer reports `mode` `NORMAL`. An
+  offline reading — no `mode`, `daemonStatus` carrying a refusal reason — is NOT ready.
 
 A `health.json` with a new `pid` and `startedAt` is not enough on its own: the daemon writes both
 before it decides whether to run, park in `BOOTSTRAP` or refuse. A start that
