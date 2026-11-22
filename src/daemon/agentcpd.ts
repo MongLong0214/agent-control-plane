@@ -6543,8 +6543,9 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
   //     the open, not a defect, and it is the only other outcome: a stop is honoured either way.
   let stopRequested = false;
   let databaseOpened = false;
-  // Set when a stop could not confirm its workers gone: the lock then stays held, and so does the fence.
-  let retainLockAtExit = false;
+  // Set when the one cleanup has begun. From then on the lock is its to give back or keep (after the close
+  // succeeded, and only for a stop that was complete); the exit hook must not release it behind its back.
+  let cleanupStarted = false;
   let heldLock: SingleInstanceLock | null = null;
   const earlyStop = (): void => {
     stopRequested = true;
@@ -6573,7 +6574,7 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
   const startLock = taken.lock;
   heldLock = startLock;
   process.once("exit", () => {
-    if (!retainLockAtExit) startLock.release();
+    if (!cleanupStarted) startLock.release();
   });
   const refusedBeforeOpening = await refuseStartBeforeOpening(config);
   if (refusedBeforeOpening !== null) {
@@ -6783,6 +6784,7 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
     // already running, must not run this twice: the listener handles have no closing guard, and Node
     // rejects a second `server.close()` with ERR_SERVER_NOT_RUNNING.
     cleaning ??= (async () => {
+      cleanupStarted = true;
       process.stdout.write(`\nshutting down on ${signal}\n`);
       const stopped = await gracefulStop(startTracker, {
         // The decision to stop closes off a bootstrap promotion first, before the drain below can run.
@@ -6810,11 +6812,13 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
           if (delay > 0) await new Promise<void>((resolveWait) => setTimeout(resolveWait, delay));
           return daemon.stop({ leaveLockHeld: true });
         },
-        closeDatabase: () => cp.close(),
+        closeDatabase: () => {
+          // A test hook, inert unless set: a close that throws, as one does with a query still running.
+          if (process.env["ACP_TEST_FAIL_DATABASE_CLOSE"] === "1") throw new Error("the database is busy: a query is still running");
+          cp.close();
+        },
         releaseLock: () => startLock.release(),
       });
-      // An incomplete stop keeps the lock and the durable fence beside it; the exit hook must not undo that.
-      if (!stopped.complete) retainLockAtExit = true;
       return stopped;
     })();
     return cleaning;

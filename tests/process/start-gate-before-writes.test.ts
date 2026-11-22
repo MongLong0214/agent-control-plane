@@ -656,6 +656,22 @@ describe("a start the doctor will refuse leaves the database as it found it (mig
     expect(run.stderr()).toContain("the stop did not complete cleanly");
   }, 180_000);
 
+  it("stop (ii): a close that throws keeps the lock marker, exits non-zero, and the exit hook does not release it", async () => {
+    const { home, root, database } = newHome("/tmp");
+    currentDatabase(database);
+    installGitHubAppCredential(root);
+
+    // The close throws, as it does with a query still running on the handle.
+    const run = startDaemon(home, { ACP_TEST_RAISE_SIGTERM_AT: "after-check", ACP_TEST_FAIL_DATABASE_CLOSE: "1" });
+    const exit = await run.exited;
+
+    expect(exit.status).toBe(1);
+    expect(run.stderr()).toContain("the stop did not complete cleanly");
+    // The marker stays: whoever finds it learns the handle may still have been open. The kernel releases
+    // the process's own locks when it exits; the record is not the process's to delete after a failed close.
+    expect(existsSync(join(root, "agentcpd.lock", "holder.json"))).toBe(true);
+  }, 180_000);
+
   it("stop (ii): a start that fails is not recorded as a start, and the stop after it still closes the handle and releases the lock", async () => {
     const { home, root, database } = newHome("/tmp");
     currentDatabase(database);

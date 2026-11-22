@@ -94,6 +94,18 @@ export class StartTracker {
   }
 }
 
+/**
+ * A stop that threw after it had settled whether its workers are confirmed gone. `complete: false` means it
+ * had already fenced them (the fence is written before anything that can fail), so the failure, an audit
+ * insert for instance, must not be read as "nothing is known": the lock is kept.
+ */
+export class StopFailure extends Error {
+  constructor(readonly original: unknown, readonly complete: boolean) {
+    super(original instanceof Error ? original.message : String(original));
+    this.name = "StopFailure";
+  }
+}
+
 /** The steps a stop runs, handed in so the order is the one thing this module owns. */
 export interface GracefulStopSteps {
   /**
@@ -117,9 +129,10 @@ export interface GracefulStopSteps {
  * stop the daemon, give a start that was woken from a park a bounded time to settle, close the database in
  * any case, and only then let go of the lock. The close and the release are in a `finally`: a step that
  * fails (the stop's own audit write included) still closes the handle, and the lock still goes only after
- * it. The bound exists so a start that never settles cannot hold a stop forever; it never skips the close.
- * A stop that could not confirm its worker process groups finished keeps the lock (and the fence beside
- * it), exactly as before; a stop that failed outright reports nothing about them and releases it.
+ * it, and only if the close itself succeeded. The bound exists so a start that never settles cannot hold a
+ * stop forever; it never skips the close. A stop that could not confirm its worker process groups finished
+ * keeps the lock (and the fence beside it), whether it returned that or failed after deciding it; a stop
+ * that failed before it knew anything about them releases the lock once the handle is closed.
  */
 export const gracefulStop = async (
   tracker: StartTracker,
@@ -129,16 +142,22 @@ export const gracefulStop = async (
   steps.begin();
   await tracker.untilStoppable();
   let stopped: { complete: boolean } | null = null;
+  // Whether a stop that failed had already fenced workers it could not confirm gone. Such a stop is incomplete
+  // whatever else failed with it, and the lock stays.
+  let incomplete = false;
   try {
     await steps.closeListeners();
     stopped = await steps.stopDaemon();
     await tracker.untilSettled(options.settleBoundMs ?? 5_000);
+  } catch (error) {
+    if (error instanceof StopFailure && !error.complete) incomplete = true;
+    throw error;
   } finally {
-    try {
-      steps.closeDatabase();
-    } finally {
-      if (stopped === null || stopped.complete) steps.releaseLock();
-    }
+    // The close comes first, and the lock is let go only if it succeeded: a close that throws (a query still
+    // running on the handle) leaves the lock held, and nothing below it runs. The process leaves non-zero,
+    // and the kernel releases what the process held; the lock's marker stays for whoever finds it.
+    steps.closeDatabase();
+    if (!incomplete && (stopped === null || stopped.complete)) steps.releaseLock();
   }
   return stopped;
 };

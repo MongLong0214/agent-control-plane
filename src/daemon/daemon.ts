@@ -63,6 +63,7 @@ import {
 import { isProjectlessBootstrap } from "../bootstrap/bootstrap-plan.ts";
 import { REPAIR_OWNER_APPROVAL_OPERATION } from "../doctor/repair.ts";
 import { OWNERLESS_STALL_OWED, type ReleasedPipelineAttempt } from "../doctor/watchdog.ts";
+import { StopFailure } from "./graceful-stop.ts";
 import { type CrashLoopFile, backoffSecondsFor, clearCrashLoopFile, countStartupFailure, readCrashLoopFile } from "./crash-loop.ts";
 import { reapOrphanedReviewerEgress } from "../runtime/reviewer-egress.ts";
 import { describeStartStall, type StartStall } from "./start-stall.ts";
@@ -4165,13 +4166,19 @@ export class Daemon {
       ? (workers.unconfirmedGroups && workers.unconfirmedGroups.length > 0 ? workers.unconfirmedGroups : null)
       : [];
     if (lockRetained) this.lock.fence(fencedGroups, this.cp.clock.nowIso());
-    this.cp.audit.record({
-      kind: "DAEMON_STOPPED",
-      evidence: {
-        pid: process.pid, drained: workers.drained, executions: workers.outstanding, gitStopped: workers.gitStopped, lockRetained,
-        fencedGroups: fencedGroups === null ? null : fencedGroups.map((group) => group.pgid),
-      },
-    });
+    // The fence is down, and what it says is decided: from here a failure to write the audit row must not
+    // hide it. It is reported with the answer, so the caller keeps the lock for a stop that was incomplete.
+    try {
+      this.cp.audit.record({
+        kind: "DAEMON_STOPPED",
+        evidence: {
+          pid: process.pid, drained: workers.drained, executions: workers.outstanding, gitStopped: workers.gitStopped, lockRetained,
+          fencedGroups: fencedGroups === null ? null : fencedGroups.map((group) => group.pgid),
+        },
+      });
+    } catch (error) {
+      throw new StopFailure(error, !lockRetained);
+    }
     if (!lockRetained && options.leaveLockHeld !== true) this.lock.release();
     return { complete: !lockRetained };
   }
