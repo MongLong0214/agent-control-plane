@@ -936,6 +936,141 @@ build"` (thrown by `applySchema` in `src/db/database.ts`) — and with
 `ThrottleInterval`, launchd retries that failure forever. Both restores must complete, in either
 order, while the job is stopped, before the next `start`.
 
+### Restore a stopped v60 database to v59 (single path, 60→59 only)
+
+This is the one way back from schema v60 (#1464) to v59 that keeps the data written under v60. It
+is written for one source and one target and it refuses everything else; there is no flag to widen
+it, and a second variant for another version pair is not a smaller version of this one — it is a
+different procedure that needs its own rehearsal. It exists because the sealed pair above restores
+the database image it sealed, and that image predates whatever the daemon wrote after it.
+
+It is a procedure, not a command: nothing in `src/` runs it, and `state-admin` has no verb for it.
+Every step is something an operator reads, runs and checks.
+
+**What it applies to.** The source is a database at `user_version` 60 whose `schema_migrations`
+holds the v60 row exactly — `version = 60`, `migration_id = 'v60-review-completion-bootstrap-only'`,
+`checksum = 'sha256:65511a8e156217490cf3b92da02b673e13832007425b438a8cc76cefb15e1a68'` — and whose
+triggers are exactly the v59 set plus `runs_review_completion_bootstrap_only` and
+`runs_kind_immutable`. The target is the v59 build: main at `47451b33`, or the v59 build pinned in the
+rollback pair, whichever the owner names. Nothing else — not v61, not a v60 database with a second
+change, not a v59 database. A database *created* at v60 rather than migrated to it carries the ledger
+row `bootstrap-v60`, not the one above, so the ledger guard refuses it; that is intended.
+
+**Preconditions.**
+
+1. The daemon is stopped and `~/.agent-control-plane/agentcpd.lock` is free (item 3's wait, with its
+   `exit 1`, not a warning).
+2. `state.sqlite-wal` is absent or zero bytes. The copy below is read through an immutable open,
+   and an immutable open does not read the WAL: frames sitting in it would be missing from the copy
+   without any error. A non-empty WAL on a stopped daemon is a stop, not something to checkpoint
+   here.
+3. Work only on a copy. The source is never opened for writing, never renamed and never repaired.
+   Record its digest before and again at the end; they must be equal.
+
+       STATE="$HOME/.agent-control-plane"
+       WORK="$HOME/.agent-control-plane/downgrade-60-59-$(date -u +%Y%m%dT%H%M%SZ)"
+       mkdir "$WORK" && chmod 700 "$WORK"
+       shasum -a 256 "$STATE/state.sqlite" | tee "$WORK/source.sha256.before"
+       sqlite3 "file:$STATE/state.sqlite?immutable=1" ".backup '$WORK/state.sqlite'"
+       chmod 600 "$WORK/state.sqlite"   # .backup writes 644; the v59 build refuses a state file that is not 600
+       shasum -a 256 "$WORK/state.sqlite" > "$WORK/copy.sha256.before-convert"
+
+   Verify the copy before using it: `PRAGMA integrity_check` returns `ok` on it, and its content
+   digest (defined under the post-checks) equals the same digest taken from the source opened the
+   same immutable way. A copy that cannot be proven equal to the source is not a starting point.
+
+**Guards, checked on the copy, before anything is changed.** Any one of these failing stops the
+procedure. Nothing is repaired to make a guard pass.
+
+- `PRAGMA user_version` is not `60`, or the v60 ledger row is absent, appears more than once, or
+  carries a different `migration_id` or `checksum`, or `max(version)` in `schema_migrations` is not 60.
+- The trigger set is not exactly the v59 set plus `runs_review_completion_bootstrap_only` and
+  `runs_kind_immutable`. Compare names and `tbl_name` against the v59 expected image — the database
+  image sealed in the pair, or one created by the pinned v59 build — and read the two v60 triggers
+  back as `type='trigger' AND tbl_name='runs'`. A missing, extra or renamed trigger is a stop.
+- `sqlite_schema` differs from v60's expected schema. The expected v60 schema is the v59 expected
+  schema plus those two triggers, byte for byte in `sql` — `src/db/schema.sql` on this build carries
+  their text. Compare every `(type, name, tbl_name, sql)` row, not a count.
+- `PRAGMA integrity_check` is anything but `ok`.
+
+**The steps.** One transaction, on the copy, in a `sqlite3` shell that supports `.dbconfig`.
+
+    sqlite3 "$WORK/state.sqlite" <<'SQL'
+    .bail on
+    .dbconfig enable_trigger off
+    BEGIN IMMEDIATE;
+    -- Each guard raises "integer overflow" when its condition holds; .bail on then stops the shell and the
+    -- open transaction is rolled back when the connection closes.
+    SELECT CASE WHEN (SELECT user_version FROM pragma_user_version) <> 60 THEN abs(-9223372036854775807-1) END;
+    SELECT CASE WHEN (SELECT count(*) FROM sqlite_schema WHERE type='trigger' AND tbl_name='runs'
+      AND name IN ('runs_review_completion_bootstrap_only','runs_kind_immutable')) <> 2 THEN abs(-9223372036854775807-1) END;
+    SELECT CASE WHEN (SELECT count(*) FROM schema_migrations WHERE version=60
+      AND migration_id='v60-review-completion-bootstrap-only'
+      AND checksum='sha256:65511a8e156217490cf3b92da02b673e13832007425b438a8cc76cefb15e1a68') <> 1 THEN abs(-9223372036854775807-1) END;
+    SELECT CASE WHEN (SELECT max(version) FROM schema_migrations) <> 60 THEN abs(-9223372036854775807-1) END;
+    DROP TRIGGER runs_review_completion_bootstrap_only;
+    DROP TRIGGER runs_kind_immutable;
+    DELETE FROM schema_migrations WHERE version = 60 AND migration_id = 'v60-review-completion-bootstrap-only';
+    SELECT CASE WHEN changes() <> 1 THEN abs(-9223372036854775807-1) END;
+    PRAGMA user_version = 59;
+    SELECT CASE WHEN (SELECT max(version) FROM schema_migrations) <> 59 THEN abs(-9223372036854775807-1) END;
+    SELECT CASE WHEN (SELECT count(*) FROM sqlite_schema
+      WHERE name IN ('runs_review_completion_bootstrap_only','runs_kind_immutable')) <> 0 THEN abs(-9223372036854775807-1) END;
+    COMMIT;
+    PRAGMA wal_checkpoint(TRUNCATE);
+    SELECT 'user_version', user_version FROM pragma_user_version;
+    SQL
+
+`.dbconfig enable_trigger off` is what makes the `DELETE` possible, and it is the only thing that
+does. `schema_migrations_no_delete` refuses to delete a receipt row on purpose
+(`SCHEMA_MIGRATION_RECEIPT_IMMUTABLE`), and the ledger is the one table this procedure has to remove
+a row from. The setting is a property of this connection alone
+(`SQLITE_DBCONFIG_ENABLE_TRIGGER = 0`): no trigger is dropped or rewritten to get past it, so
+`sqlite_schema` keeps every other object byte for byte, and the next connection — the v59 build's —
+has every trigger back. Do not replace it with `DROP TRIGGER schema_migrations_no_delete`, and do
+not widen it into a general switch for other tables. The `DELETE` names the version and the id; a
+different row cannot match it, and the `changes()` guard stops anything but exactly one.
+
+**Post-checks on the copy.** All four must hold; none is optional.
+
+1. Every table except `schema_migrations` has the same content digest as before the transaction. The
+   digest is, per table, a SHA-256 over every row's column values, each typed (NULL, integer, real,
+   text with its length, blob), rows in `rowid` order — primary-key order for a `WITHOUT ROWID` table
+   — for every table in `sqlite_schema` that does not start with `sqlite_`, plus `sqlite_sequence`.
+   Take it from the copy before the transaction and after it. A count of rows is not a digest.
+2. `schema_migrations` differs from its pre-transaction state by the v60 row and nothing else: the
+   same digest over the rows where `version <> 60` is equal, and the v60 row is gone.
+3. `sqlite_schema` equals the v59 expected schema, every `(type, name, tbl_name, sql)` row.
+4. `PRAGMA integrity_check` is `ok`, and `PRAGMA user_version` is `59`.
+
+**Proving it before anything is replaced.** Make a throwaway duplicate of the converted copy, record
+the converted copy's `sha256`, and start the v59 build against the duplicate, in isolation: its own
+state directory holding only that file, no launchd job, no connection to the live socket, lock or
+`health.json`, and no network. It must reach ready (item 4's readiness: a `health.json` with a new
+`pid` and `startedAt`). The duplicate is the one that starts, so the converted copy stays exactly the
+bytes the post-checks were taken on. Repeat post-check 1 against the duplicate once it is ready.
+
+**Known benign difference.** When v59 starts it refreshes `repositories.last_observed_at`. That is
+normal observation, not a data change, and it is the only difference the duplicate may show in
+post-check 1. Any other table, or any other column of `repositories`, changing is a stop.
+
+**Only then** may the converted copy replace the live database, and only under the existing restore
+rules in this section — the sealed rollback pair and item 6 — and with Isaac's approval on the day it
+is done. Replacing the live file is not part of this procedure and this procedure does not describe
+another way to do it. Before that step, record the source's `sha256` again; it must equal the value
+taken at the start, which shows the source was never touched.
+
+**Stopping rules.**
+
+- Any unexpected schema or data difference — a guard, a post-check, or the start proof — means stop.
+  Keep the copy, the digests and every output exactly as they are, and report them.
+- Never delete or alter a row, a trigger or a ledger entry to make a check pass. A check that
+  passes after being edited around has stopped being a check.
+- Never run the SQL against the live file, and never against a copy that has been started or was not
+  made by the `.backup` above.
+- If any step fails midway, discard nothing: the source is untouched by construction, so the whole
+  procedure can be run again from a new copy, and the failed copy is the evidence.
+
 ### What it creates
 
 A database backup and manifest under `~/.agent-control-plane/backups/` (item 2); a `dist/`
