@@ -1137,10 +1137,28 @@ daemon**; only `agentctl` reads it (`src/cli/agentctl.ts`). So the duplicate is 
 holding `state.sqlite` and `credentials/`. A daemon started without that `HOME` override opens the
 live state directory — its lock, `crash-loop.json` and `health.json` — whatever else was set.
 
-The daemon also refuses to start without two credentials of its own: `ACP_OPERATOR_TOKEN`, and a
-separate `ACP_MCP_TOKEN` that must not equal it (`src/daemon/agentcpd.ts`). Give it throwaway values,
-generated for this run and never printed, never the deployment's. Start it from an empty environment
-(`env -i`), so no live token, socket path or other `ACP_*` variable reaches it.
+The daemon also refuses to start without three values of its own (`src/daemon/agentcpd.ts`), and
+`env -i` drops every one it is not given:
+
+- `ACP_OPERATOR_TOKEN`, and a separate `ACP_MCP_TOKEN` that must not equal it. Give them throwaway
+  values, generated for this run and never printed, never the deployment's.
+- `ACP_OPERATOR_ACTOR`: the account name the daemon gives its operator peer (`cli:<name>`). It reads
+  `ACP_OPERATOR_ACTOR` and, only if that is empty, `USER`, and refuses to start with "ACP_OPERATOR_ACTOR
+  or USER is required to establish the operator peer identity" when neither is set — which is what
+  `env -i` leaves. Use the operator's own account name (`id -un`). The name does not have to match
+  anything else for this proof: `agentctl` presents only the token, and the daemon assigns the
+  identity bound to it, so `agentctl daemon status` needs no actor and no `USER`.
+
+Start it from an empty environment (`env -i`), so no live token, socket path or other `ACP_*` variable
+reaches it, and give it exactly what it needs. `HOME` and `PATH` are the two the start reads that
+have no default. Everything else the daemon reads is optional or defaults to the duplicate's own
+state directory, and is left unset on purpose: `ACP_GITHUB_APP_ENV_FILE` and
+`ACP_GITHUB_APP_PRIVATE_KEY_PATH` default to `credentials/github-app.env` in the state directory (an
+inherited override would send the gate to the live credential); the Buzz, Telegram and Hermes
+variables leave those routes unconfigured, which the start reports and continues; `ACP_CLAUDE_BINARY`
+and `ACP_CODEX_BINARY` unset gives at most a provider finding that does not block the start;
+`ACP_DAEMON_SUPERVISOR` only changes the exit code of a refused start; `ACP_STATE_DIR` is ignored by
+the daemon, as above.
 
 Before the start, print the state path the daemon would resolve and refuse if it is not the duplicate
 or if it is the live one. `V59_ROOT` is the v59 build:
@@ -1159,7 +1177,8 @@ or if it is the live one. `V59_ROOT` is the v59 build:
 Then start the daemon, and ask it with `agentctl`:
 
     OPERATOR_TOKEN="$(uuidgen)"; MCP_TOKEN="$(uuidgen)"
-    env -i HOME="$DUP_HOME" PATH="$PATH" ACP_OPERATOR_TOKEN="$OPERATOR_TOKEN" ACP_MCP_TOKEN="$MCP_TOKEN" \
+    env -i HOME="$DUP_HOME" PATH="$PATH" ACP_OPERATOR_ACTOR="$(id -un)" \
+      ACP_OPERATOR_TOKEN="$OPERATOR_TOKEN" ACP_MCP_TOKEN="$MCP_TOKEN" \
       node "$V59_ROOT/dist/daemon/agentcpd.js"
     # in another shell, with the same OPERATOR_TOKEN:
     env -i HOME="$DUP_HOME" PATH="$PATH" ACP_STATE_DIR="$DUP_HOME/.agent-control-plane" \
