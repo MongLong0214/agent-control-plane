@@ -590,6 +590,28 @@ describe("a start the doctor will refuse leaves the database as it found it (mig
     expect(left).toEqual(closedAndReleased);
   }, 180_000);
 
+  it.each([
+    ["without a signal", {}],
+    ["with a stop recorded after the last check", { ACP_TEST_RAISE_SIGTERM_AT: "after-check" }],
+  ] as const)("stop (ii): a start() that rejects, %s, runs the one cleanup before the process exits: handle closed, lock released", async (_label, env) => {
+    const { home, root, database } = newHome("/tmp");
+    currentDatabase(database);
+    installGitHubAppCredential(root);
+    // A crash-loop record that is a directory: the start runs to its end and then cannot replace the record
+    // (EISDIR), in the start's own failure handling too, so `start()` rejects after it has written.
+    mkdirSync(join(root, "crash-loop.json"), { mode: 0o700 });
+
+    const run = startDaemon(home, { ...env });
+    const exit = await run.exited;
+    const left = leftovers(root, database);
+
+    expect(exit.status).not.toBeNull();
+    // The failed start is not a start; the cleanup that follows it is the normal stop, and it closed the handle.
+    expect(auditCount(database, "DAEMON_STARTED")).toBe(0);
+    expect(auditCount(database, "DAEMON_STOPPED")).toBe(1);
+    expect(left).toEqual(closedAndReleased);
+  }, 180_000);
+
   it("stop (ii): malformed canonical-session configuration with a recorded stop closes the handle, releases the lock, and writes nothing more", async () => {
     const { home, root, database } = newHome("/tmp");
     currentDatabase(database);

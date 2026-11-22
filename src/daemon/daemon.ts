@@ -4116,7 +4116,11 @@ export class Daemon {
    * nor anyone reclaiming the lock lets a successor take authority while one of them may still run.
    * A caller that exits must report that, not exit as if the stop were clean.
    */
-  async stop(): Promise<{ complete: boolean }> {
+  /**
+   * `leaveLockHeld`: the caller gives the lock back itself, after it has closed the database, so the lock is
+   * never released ahead of the close. A stop that could not confirm its workers gone keeps the lock either way.
+   */
+  async stop(options: { leaveLockHeld?: boolean } = {}): Promise<{ complete: boolean }> {
     // #512 (ACP-WORKER-03) — before this daemon gives up its authority, every worker turn it owns is
     // aborted and drained. A process that would not be confirmed gone stays recorded as outstanding,
     // durably, so the next start reconciles it and no retry of its task runs first.
@@ -4146,7 +4150,7 @@ export class Daemon {
         fencedGroups: fencedGroups === null ? null : fencedGroups.map((group) => group.pgid),
       },
     });
-    if (!lockRetained) this.lock.release();
+    if (!lockRetained && options.leaveLockHeld !== true) this.lock.release();
     return { complete: !lockRetained };
   }
 }
