@@ -1,5 +1,6 @@
 import Database from "better-sqlite3";
 import { createHash } from "node:crypto";
+import { performance } from "node:perf_hooks";
 import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
@@ -497,6 +498,8 @@ describe("the notice goes only to the Gateway the active CEO binding names (#149
     ["a 200 that names POST", { status: 200, allow: "POST" }, "HEAD answered 200 with Allow: POST"],
     ["a 405 whose Allow does not name POST", { status: 405, allow: "GET" }, "HEAD answered 405"],
     ["a 405 with no Allow header", { status: 405 }, "HEAD answered 405"],
+    ["a 405 whose Allow says `post`: method names are case-sensitive", { status: 405, allow: "post" }, "HEAD answered 405"],
+    ["a 405 whose Allow says `Post, GET`", { status: 405, allow: "Post, GET" }, "HEAD answered 405"],
   ])("%s is no route: nothing is sent", async (_name, head, detail) => {
     const { root, database, config, startToken } = adoptedState();
     const gateway = await loopbackGateway({ session_id: LIVE, lineage_root_digest: DIGEST, process_pid: process.pid,
@@ -547,6 +550,50 @@ describe("the notice goes only to the Gateway the active CEO binding names (#149
       await gateway.close();
     }
   });
+
+  it("a final process read that stalls past the budget authorizes no send: the deadline is checked after the recheck, before the POST", async () => {
+    const { root, database, config, startToken } = adoptedState();
+    // The recheck reads the process twice (processStartedAt, then the token): the second pass is the one right
+    // before the POST. It blocks the loop, as a stuck `ps` would, so the timer cannot fire during it.
+    let reads = 0;
+    const budgetMs = 1_500;
+    const ports = {
+      processStartedAt: (pid: number | null | undefined) => processStartedAt(pid),
+      processStartToken: (pid: number) => {
+        reads += 1;
+        if (reads === 2) {
+          const until = performance.now() + budgetMs + 300;
+          while (performance.now() < until) { /* a read that does not return in time */ }
+        }
+        return readProcessStartToken(pid);
+      },
+    };
+    const gateway = await loopbackGateway({ session_id: LIVE, lineage_root_digest: DIGEST, process_pid: process.pid,
+      process_started_at: startToken });
+    try {
+      const route = refusalNoticeRouteFrom({
+        noticeEnabled: true,
+        adoption: { apiKey: "loopback-key", port: gateway.port, lineageRootDigest: DIGEST },
+        laneSecret: LANE_SECRET,
+        databasePath: database,
+        ports,
+      });
+      const before = imageOf(root, database);
+
+      const refused = await refuseStartBeforeOpening(config, clockAt(0), { route, host: "h", timeoutMs: budgetMs });
+
+      expect(reads).toBe(2);
+      expect(refused!.decision.reasonCode).toBe(ReasonCode.DOCTOR_BLOCKED);
+      expect(gateway.posts).toHaveLength(0);
+      expect(gateway.requests.map((request) => request.method)).not.toContain("POST");
+      expect(readCrashLoopFile(root, clockAt(0)()).lastRefusal?.notice).toMatchObject({
+        outcome: "failed", reason: `timeout after ${budgetMs}ms before the request began; nothing was sent`,
+      });
+      expect(imageOf(root, database)).toEqual(before);
+    } finally {
+      await gateway.close();
+    }
+  }, 20_000);
 
   it("a destination that is not the binding's is sent nothing, and is not even probed", async () => {
     const { root, database, config, startToken } = adoptedState();

@@ -1,5 +1,6 @@
 import { existsSync } from "node:fs";
 import { hostname } from "node:os";
+import { performance } from "node:perf_hooks";
 
 import { digestOf } from "../core/digest.ts";
 import { readProcessStartToken } from "../core/process-argv.ts";
@@ -321,26 +322,47 @@ export const deliverRefusalNotice = async (
   const timeoutMs = options.timeoutMs ?? REFUSAL_NOTICE_TIMEOUT_MS;
   let eventId: string | undefined;
   const controller = new AbortController();
+  // A monotonic deadline beside the timer: the timer cannot fire while a synchronous check (a process read, a
+  // snapshot copy) blocks the loop, so a send is also refused when this clock says the budget has run out.
+  const deadline = performance.now() + timeoutMs;
   let expired = false;
   let dispatched = false;
+  let resolveBound: (outcome: RefusalNoticeOutcome) => void = () => undefined;
+  const bound = new Promise<RefusalNoticeOutcome>((resolve) => { resolveBound = resolve; });
+  /** The bound has run out: what was in flight is aborted, and the answer is a pre-send timeout or `unknown`. */
+  const expire = (): void => {
+    if (expired) return;
+    expired = true;
+    const outcome: RefusalNoticeOutcome = dispatched && eventId
+      ? { outcome: "unknown", at: nowIso(), eventId, reason: UNKNOWN_AT_TIMEOUT }
+      : { outcome: "failed", at: nowIso(), ...(eventId ? { eventId } : {}),
+          reason: `timeout after ${timeoutMs}ms before the request began; nothing was sent` };
+    controller.abort();
+    resolveBound(outcome);
+  };
+  const pastBound = (): boolean => {
+    if (!expired && performance.now() >= deadline) expire();
+    return expired;
+  };
   const dispatch: RefusalNoticeDispatch = {
     signal: controller.signal,
+    // Called after the transport's last synchronous check and immediately before the request is written.
     begin: () => {
-      if (expired || dispatched) return false;
+      if (dispatched || pastBound()) return false;
       dispatched = true;
       return true;
     },
   };
   const attempt = async (): Promise<RefusalNoticeOutcome> => {
     const destination = await route.destination(controller.signal);
-    if (expired) throw new Error("the bound expired before the request began");
+    if (pastBound()) throw new Error("the bound expired before the request began");
     const { messageId, text } = refusalNoticeMessage(refusal, context);
     // The outbox's own derivation for a one-part CEO notification, so the id is stable for this refusal.
     eventId = daemonNoticeEventId(messageId, "CEO", `CEO_NOTIFICATION:${digestOf(destination)}:0`);
     const body = sealDaemonNotice(daemonNoticeCanonical(daemonNoticeFields(eventId, destination, text)),
       daemonNoticeKey(route.laneSecret));
     // Checked synchronously with the call: nothing between this line and the transport's `begin` yields.
-    if (expired) throw new Error("the bound expired before the request began");
+    if (pastBound()) throw new Error("the bound expired before the request began");
     const result = await route.send(body, dispatch);
     if (result.kind !== "RESPONDED") {
       return { outcome: "failed", at: nowIso(), eventId, reason: `${result.kind}: ${result.reason}` };
@@ -352,19 +374,8 @@ export const deliverRefusalNotice = async (
       ? { outcome: "delivered", at: nowIso(), eventId, receiptId: settled.receiptId }
       : { outcome: "failed", at: nowIso(), eventId, reason: `not settled (status ${result.status}): ${settled.mismatches.join(",")}` };
   };
-  let timer: NodeJS.Timeout | undefined;
-  const bound = new Promise<RefusalNoticeOutcome>((resolve) => {
-    timer = setTimeout(() => {
-      expired = true;
-      const outcome: RefusalNoticeOutcome = dispatched && eventId
-        ? { outcome: "unknown", at: nowIso(), eventId, reason: UNKNOWN_AT_TIMEOUT }
-        : { outcome: "failed", at: nowIso(), ...(eventId ? { eventId } : {}),
-            reason: `timeout after ${timeoutMs}ms before the request began; nothing was sent` };
-      controller.abort();
-      resolve(outcome);
-    }, timeoutMs);
-    timer.unref?.();
-  });
+  const timer = setTimeout(expire, timeoutMs);
+  timer.unref?.();
   try {
     return await Promise.race([
       attempt().catch((error: unknown): RefusalNoticeOutcome => ({
@@ -374,7 +385,7 @@ export const deliverRefusalNotice = async (
       bound,
     ]);
   } finally {
-    if (timer) clearTimeout(timer);
+    clearTimeout(timer);
   }
 };
 

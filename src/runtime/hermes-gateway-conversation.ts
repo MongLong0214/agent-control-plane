@@ -206,7 +206,8 @@ export const probeDaemonNoticeRoute = (options: { port?: number; signal?: AbortS
   const req = request({ hostname: HERMES_GATEWAY_HOST, family: 4, port, path: DAEMON_NOTICES_PATH, method: "HEAD",
     agent: false }, (res) => {
     const status = res.statusCode ?? 0;
-    const allow = String(res.headers["allow"] ?? "").split(",").map((method) => method.trim().toUpperCase());
+    // Method names are case-sensitive: `Allow: post` does not name POST.
+    const allow = String(res.headers["allow"] ?? "").split(",").map((method) => method.trim());
     res.resume();
     // Only the POST-only route refusing a HEAD names this route: 405 with `Allow: POST`. A 2xx (204 included),
     // a 404, a 405 without POST in `Allow` and anything else is no route, and nothing is sent.
