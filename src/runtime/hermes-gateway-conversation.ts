@@ -208,7 +208,9 @@ export const probeDaemonNoticeRoute = (options: { port?: number; signal?: AbortS
     const status = res.statusCode ?? 0;
     const allow = String(res.headers["allow"] ?? "").split(",").map((method) => method.trim().toUpperCase());
     res.resume();
-    finish((status === 405 || (status >= 200 && status < 300)) && allow.includes("POST"),
+    // Only the POST-only route refusing a HEAD names this route: 405 with `Allow: POST`. A 2xx (204 included),
+    // a 404, a 405 without POST in `Allow` and anything else is no route, and nothing is sent.
+    finish(status === 405 && allow.includes("POST"),
       `HEAD answered ${status}${allow.includes("POST") ? " with Allow: POST" : ""}`, req);
   });
   req.on("error", () => finish(false, "HEAD failed"));

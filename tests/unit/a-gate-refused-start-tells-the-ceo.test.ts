@@ -10,6 +10,7 @@ import { afterAll, describe, expect, it, vi } from "vitest";
 import { BuzzCliTransport } from "../../src/buzz/buzz-adapter.ts";
 
 import { readProcessStartToken } from "../../src/core/process-argv.ts";
+import { processStartedAt } from "../../src/core/process-identity.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { readCrashLoopFile } from "../../src/daemon/crash-loop.ts";
 import { SingleInstanceLock } from "../../src/daemon/single-instance.ts";
@@ -328,7 +329,15 @@ const NOTICE_PATH = "/v1/canonical-surface/daemon-notices";
  * `/events` takes only an ordinary event, so a signed notice there is the 400 the deployed build gives.
  * `requests` is every request it saw, `posts` every POST body that reached a route that takes it.
  */
-const loopbackGateway = async (identity: DaemonNoticeDestination, options: { noticeRoute?: boolean } = {}) => {
+const loopbackGateway = async (
+  identity: DaemonNoticeDestination,
+  options: {
+    noticeRoute?: boolean;
+    /** What a HEAD on the notice route answers, instead of the contract's 405 with `Allow: POST`. */
+    head?: { status: number; allow?: string };
+    onHead?: () => void;
+  } = {},
+) => {
   const noticeRoute = options.noticeRoute ?? true;
   const posts: DaemonNoticeBody[] = [];
   const requests: Array<{ method: string; path: string; headers: string[] }> = [];
@@ -337,6 +346,12 @@ const loopbackGateway = async (identity: DaemonNoticeDestination, options: { not
     requests.push({ method: req.method ?? "", path: req.url ?? "", headers: Object.keys(req.headers).sort() });
     if (req.method === "GET") return void res.end(JSON.stringify(identity));
     if (req.method === "HEAD") {
+      options.onHead?.();
+      if (options.head) {
+        if (options.head.allow !== undefined) res.setHeader("Allow", options.head.allow);
+        res.statusCode = options.head.status;
+        return void res.end();
+      }
       if (noticeRoute && req.url === NOTICE_PATH) res.setHeader("Allow", "POST");
       res.statusCode = noticeRoute && req.url === NOTICE_PATH ? 405 : 404;
       return void res.end();
@@ -473,6 +488,62 @@ describe("the notice goes only to the Gateway the active CEO binding names (#149
       expect(imageOf(root, database)).toEqual(before);
     } finally {
       vi.restoreAllMocks();
+      await gateway.close();
+    }
+  });
+
+  it.each([
+    ["a 204 with no Allow header", { status: 204 }, "HEAD answered 204"],
+    ["a 200 that names POST", { status: 200, allow: "POST" }, "HEAD answered 200 with Allow: POST"],
+    ["a 405 whose Allow does not name POST", { status: 405, allow: "GET" }, "HEAD answered 405"],
+    ["a 405 with no Allow header", { status: 405 }, "HEAD answered 405"],
+  ])("%s is no route: nothing is sent", async (_name, head, detail) => {
+    const { root, database, config, startToken } = adoptedState();
+    const gateway = await loopbackGateway({ session_id: LIVE, lineage_root_digest: DIGEST, process_pid: process.pid,
+      process_started_at: startToken }, { head });
+    try {
+      await refuseStartBeforeOpening(config, clockAt(0), { route: routeFor(gateway, database), host: "h" });
+
+      expect(gateway.posts).toHaveLength(0);
+      expect(gateway.requests.map((request) => request.method)).toEqual(["GET", "HEAD"]);
+      expect(readCrashLoopFile(root, clockAt(0)()).lastRefusal?.notice).toMatchObject({
+        outcome: "failed", reason: "receiver has no signed daemon-notice route", detail,
+      });
+    } finally {
+      await gateway.close();
+    }
+  });
+
+  it("a bound process that exits while the route is being probed is sent nothing, though the Gateway still reports it", async () => {
+    const { root, database, config, startToken } = adoptedState();
+    let alive = true;
+    const ports = {
+      processStartedAt: (pid: number | null | undefined) => (alive ? processStartedAt(pid) : null),
+      processStartToken: (pid: number) => (alive ? readProcessStartToken(pid) : null),
+    };
+    // The Gateway goes on answering with the identity it had: only the process behind it is gone.
+    const gateway = await loopbackGateway({ session_id: LIVE, lineage_root_digest: DIGEST, process_pid: process.pid,
+      process_started_at: startToken }, { onHead: () => { alive = false; } });
+    try {
+      const route = refusalNoticeRouteFrom({
+        noticeEnabled: true,
+        adoption: { apiKey: "loopback-key", port: gateway.port, lineageRootDigest: DIGEST },
+        laneSecret: LANE_SECRET,
+        databasePath: database,
+        ports,
+      });
+      const before = imageOf(root, database);
+
+      const refused = await refuseStartBeforeOpening(config, clockAt(0), { route, host: "h" });
+
+      expect(refused!.decision.reasonCode).toBe(ReasonCode.DOCTOR_BLOCKED);
+      expect(gateway.posts).toHaveLength(0);
+      expect(gateway.requests.map((request) => request.method)).not.toContain("POST");
+      expect(readCrashLoopFile(root, clockAt(0)()).lastRefusal?.notice).toMatchObject({
+        outcome: "failed", reason: "destination changed before dispatch",
+      });
+      expect(imageOf(root, database)).toEqual(before);
+    } finally {
       await gateway.close();
     }
   });

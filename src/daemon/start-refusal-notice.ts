@@ -79,6 +79,9 @@ export const DESTINATION_MISMATCH = "destination does not match the active CEO b
 /** The one reason a Gateway that does not confirm the signed daemon-notice route is told nothing. */
 export const NO_NOTICE_ROUTE = "receiver has no signed daemon-notice route";
 
+/** The one reason a notice is not sent because the process the binding names changed after it was checked. */
+export const DESTINATION_CHANGED = "destination changed before dispatch";
+
 /** A refusal to send, with what was observed beside the reason (recorded as `detail`). */
 class NoticeNotSent extends Error {
   constructor(message: string, readonly detail?: string) { super(message); }
@@ -163,17 +166,27 @@ const matchesBinding = (
   reported: DaemonNoticeDestination,
   ports: RefusalNoticeProcessPorts,
 ): boolean => {
-  if ((ports.processStartedAt ?? processStartedAt)(binding.osPid) !== binding.osProcessStartedAt) return false;
+  const startToken = liveStartToken(binding, ports);
+  if (startToken === null) return false;
+  if (reported.process_pid !== binding.osPid || reported.process_started_at !== startToken) return false;
+  return judgeLiveHead(binding.target, reported).verdict !== "REFUSE";
+};
+
+/**
+ * The native start token of the process the binding names, when that process is alive as recorded and its
+ * start is the one pinned for the session; null otherwise. Synchronous, so it can be asked again at the
+ * instant before the request leaves, as the outbox route's `preDispatch` asks `currentAuthority`.
+ */
+const liveStartToken = (binding: ActiveCeoBinding, ports: RefusalNoticeProcessPorts): string | null => {
+  if ((ports.processStartedAt ?? processStartedAt)(binding.osPid) !== binding.osProcessStartedAt) return null;
   const startToken = (ports.processStartToken ?? readProcessStartToken)(binding.osPid);
-  if (!startToken) return false;
+  if (!startToken) return null;
   const recordedStart = recordedStartIsLive(
     { sessionId: binding.sessionId, osProcessStartedAt: binding.osProcessStartedAt },
     startToken,
     { pinnedNativeStart: () => binding.pinnedStart },
   );
-  if (!recordedStart.allowed) return false;
-  if (reported.process_pid !== binding.osPid || reported.process_started_at !== startToken) return false;
-  return judgeLiveHead(binding.target, reported).verdict !== "REFUSE";
+  return recordedStart.allowed ? startToken : null;
 };
 
 /** What `configuredHermesAdoptionValues` hands over: only the three values this route reads. */
@@ -200,6 +213,8 @@ export const refusalNoticeRouteFrom = (input: {
   const laneSecret = input.laneSecret?.trim();
   if (!laneSecret) return { configured: false, reason: "ACP_TELEGRAM_EXTERNAL_SECRET is not configured" };
   const { apiKey, port, lineageRootDigest } = input.adoption;
+  // The binding the destination was checked against, held for the check made again right before the POST.
+  let checkedBinding: ActiveCeoBinding | null = null;
   return {
     configured: true,
     laneSecret,
@@ -207,6 +222,7 @@ export const refusalNoticeRouteFrom = (input: {
       // The binding first, from a private copy: with none, the Gateway is not asked at all.
       const binding = await readActiveCeoBinding(input.databasePath, lineageRootDigest);
       if (!binding) throw new Error(DESTINATION_MISMATCH);
+      checkedBinding = binding;
       const identity = await createHermesGatewayIdentityReader({ apiKey, port, signal })();
       if (identity.lineage_root_digest !== lineageRootDigest || !matchesBinding(binding, identity, input.ports ?? {})) {
         throw new Error(DESTINATION_MISMATCH);
@@ -219,9 +235,23 @@ export const refusalNoticeRouteFrom = (input: {
     },
     // The sender asks `preDispatch` synchronously before it writes the request, and answers NOT_SENT when told no.
     // The endpoint is named, never read from an origin the notice does not have.
-    send: async (body, dispatch) => createHermesGatewayDaemonNoticeSender({
-      apiKey, port, path: DAEMON_NOTICES_PATH, preDispatch: dispatch.begin, signal: dispatch.signal,
-    })(body),
+    send: async (body, dispatch) => {
+      // Synchronously, as the request is about to leave: the bound process is still alive as recorded, and
+      // its native start is still the one the destination names. The bound is asked second, so a notice that
+      // is not sent for this reason never counts as begun.
+      let changed = false;
+      const result = await createHermesGatewayDaemonNoticeSender({
+        apiKey, port, path: DAEMON_NOTICES_PATH, signal: dispatch.signal,
+        preDispatch: () => {
+          const binding = checkedBinding;
+          changed = binding === null || body.destination.process_pid !== binding.osPid ||
+            liveStartToken(binding, input.ports ?? {}) !== body.destination.process_started_at;
+          return !changed && dispatch.begin();
+        },
+      })(body);
+      if (changed) throw new NoticeNotSent(DESTINATION_CHANGED);
+      return result;
+    },
   };
 };
 
