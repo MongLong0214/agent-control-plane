@@ -709,7 +709,14 @@ export class WorkerTurnRunner {
    */
   async shutdown(
     budgetMs = DEFAULT_SHUTDOWN_BUDGET_MS,
-  ): Promise<{ drained: boolean; outstanding: string[]; gitStopped: boolean; unconfirmedGroups: GitProcessGroup[] }> {
+  ): Promise<{
+    drained: boolean;
+    outstanding: string[];
+    gitStopped: boolean;
+    unconfirmedGroups: GitProcessGroup[];
+    /** The first audit write of the drain that failed. Present only then; the verdict above stands without it. */
+    auditError?: unknown;
+  }> {
     this.#stopping = true;
     // An admission that sees `#stopping` refuses before it opens an execution or registers a turn, so
     // every turn that will ever exist is already in `#turns`; the admissions are waited for too.
@@ -735,6 +742,9 @@ export class WorkerTurnRunner {
     // execution is ended ABANDONED in the database, so a late resume finds nothing RUNNING to commit for
     // or succeed, in this process or in any successor. `#stopping` is never cleared.
     const fenced: string[] = [];
+    // The first audit write of this drain that failed. The drain's verdict does not depend on any audit
+    // write: it is computed from the registries, and returned with this, so a failing insert cannot erase it.
+    let auditError: unknown = null;
     for (const turn of turns) {
       if (turn.settled) continue;
       if (this.isRunning(turn.executionId)) {
@@ -746,19 +756,25 @@ export class WorkerTurnRunner {
         fenced.push(turn.executionId);
       }
       const closed = await turn.facts.repo.children.close(GIT_REAP_BOUND_MS);
-      this.ports.audit.record({
-        kind: WorkerTurnEvent.GIT_STOPPED,
-        runId: turn.facts.runId,
-        sessionId: turn.facts.worker.sessionId,
-        roleKey: turn.facts.worker.roleKey,
-        reasonCode: closed.reaped ? ReasonCode.OK : ReasonCode.INTERNAL_ERROR,
-        evidence: {
-          executionId: turn.executionId,
-          taskId: turn.facts.taskId,
-          reason: closed.reaped ? "GIT_STOPPED_AT_SHUTDOWN" : "GIT_NOT_CONFIRMED_STOPPED",
-          ...(await this.repositoryAtStop(turn.facts, closed)),
-        } as Evidence,
-      });
+      // The reaping is done by here and the verdict is read from the registries below, not from this row: a
+      // row that cannot be written is reported with the verdict, and does not stop the reaping of what is left.
+      try {
+        this.ports.audit.record({
+          kind: WorkerTurnEvent.GIT_STOPPED,
+          runId: turn.facts.runId,
+          sessionId: turn.facts.worker.sessionId,
+          roleKey: turn.facts.worker.roleKey,
+          reasonCode: closed.reaped ? ReasonCode.OK : ReasonCode.INTERNAL_ERROR,
+          evidence: {
+            executionId: turn.executionId,
+            taskId: turn.facts.taskId,
+            reason: closed.reaped ? "GIT_STOPPED_AT_SHUTDOWN" : "GIT_NOT_CONFIRMED_STOPPED",
+            ...(await this.repositoryAtStop(turn.facts, closed)),
+          } as Evidence,
+        });
+      } catch (error) {
+        auditError ??= error;
+      }
     }
     // Then every other registry this runner opened: a settled turn's, a refused admission's. A git child
     // that exited can have left a descendant in its group, and that group is still this daemon's to stop.
@@ -783,14 +799,19 @@ export class WorkerTurnRunner {
       .map((row) => row.execution_id);
     const pendingStarts = this.#admissions.size;
     const drained = finished && pendingStarts === 0 && this.#turns.size === 0;
-    this.ports.audit.record({
-      kind: WorkerTurnEvent.SHUTDOWN_DRAINED,
-      evidence: {
-        drained, turns: turns.length, admissions: admissions.length, pendingStarts, fenced, gitStopped,
-        lingeringGroupsKilled, unconfirmedGroups: unconfirmedGroups.map((group) => group.pgid), executions: outstanding,
-      },
-    });
-    return { drained: drained && outstanding.length === 0 && gitStopped, outstanding, gitStopped, unconfirmedGroups };
+    const verdict = { drained: drained && outstanding.length === 0 && gitStopped, outstanding, gitStopped, unconfirmedGroups };
+    try {
+      this.ports.audit.record({
+        kind: WorkerTurnEvent.SHUTDOWN_DRAINED,
+        evidence: {
+          drained, turns: turns.length, admissions: admissions.length, pendingStarts, fenced, gitStopped,
+          lingeringGroupsKilled, unconfirmedGroups: unconfirmedGroups.map((group) => group.pgid), executions: outstanding,
+        },
+      });
+    } catch (error) {
+      auditError ??= error;
+    }
+    return auditError === null ? verdict : { ...verdict, auditError };
   }
 
   private openRegistry(children: GitChildren, facts: DurableFacts): void {

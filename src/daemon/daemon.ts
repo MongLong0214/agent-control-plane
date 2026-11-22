@@ -63,6 +63,8 @@ import {
 import { isProjectlessBootstrap } from "../bootstrap/bootstrap-plan.ts";
 import { REPAIR_OWNER_APPROVAL_OPERATION } from "../doctor/repair.ts";
 import { OWNERLESS_STALL_OWED, type ReleasedPipelineAttempt } from "../doctor/watchdog.ts";
+import { StopFailure } from "./graceful-stop.ts";
+import { type CrashLoopFile, backoffSecondsFor, clearCrashLoopFile, countStartupFailure, readCrashLoopFile } from "./crash-loop.ts";
 import { reapOrphanedReviewerEgress } from "../runtime/reviewer-egress.ts";
 import { describeStartStall, type StartStall } from "./start-stall.ts";
 import { routeUnreleasedWorkerOrphans } from "../run/worker-orphan-routing.ts";
@@ -272,6 +274,12 @@ const assertSweepFitsItsInterval = (refreshMs: number, budgetMs: number, provide
 
 export interface DaemonOptions {
   stateDir: string;
+  /**
+   * `agentcpd.lock` the caller already holds (migrate-before-start). The entry point takes it before it
+   * judges the start or opens the database, and hands it here so the daemon runs under the same lease
+   * instead of taking a second one. Absent, `start()` acquires it, as before.
+   */
+  lock?: SingleInstanceLock;
   watchdogIntervalMs?: number;
   deliveryIntervalMs?: number;
   /** Keeps the daemon-owned structured capacity sensors inside their freshness window. */
@@ -595,12 +603,6 @@ const LEGACY_RETRY_TRAIL_KINDS: readonly string[] = Object.freeze([
   BOOTSTRAP_PLAN_TASKS,
 ]);
 
-interface CrashLoopFile {
-  failures: number;
-  firstAt: string;
-  retryNotBefore?: string;
-}
-
 interface TimerFailure {
   consecutiveFailures: number;
   lastError: string;
@@ -661,6 +663,18 @@ export class Daemon {
   readonly attachments: RoleAttachmentCredentials;
   #timers: NodeJS.Timeout[] = [];
   #startedAt: string | null = null;
+  /**
+   * Whether `options.lock` arrived already held, and has not yet been used by a start. Only that one start
+   * may run under a lease it did not take; every later call on this instance acquires, finds the lock
+   * held by this very instance, and is refused, as a second start on one daemon always was.
+   */
+  #lockHandedOver = false;
+  /**
+   * Whether the lock is the caller's (`options.lock`). A start that refuses, fails or throws leaves it held:
+   * the caller closes the database first and gives it back after, so the lock is never released ahead of
+   * the close. A daemon that took its own lock gives it back itself, as before.
+   */
+  #lockIsTheCallers = false;
   #mode: DaemonMode = "NORMAL";
   #bootstrapBlocking: BlockingFinding[] = [];
   /** #1189 D1 — what this start is stalled on, in `health.json` until a start succeeds. */
@@ -737,7 +751,9 @@ export class Daemon {
   ) {
     mkdirSync(options.stateDir, { recursive: true });
     chmodSync(options.stateDir, 0o700);
-    this.lock = new SingleInstanceLock(join(options.stateDir, "agentcpd.lock"));
+    this.lock = options.lock ?? new SingleInstanceLock(join(options.stateDir, "agentcpd.lock"));
+    this.#lockHandedOver = options.lock?.held() === true;
+    this.#lockIsTheCallers = options.lock !== undefined;
     // #1336 R-1 — the same custody rule the MCP sockets apply (`drivenCredentialNotHeld` in agentcpd.ts):
     // an attachment is scoped to a PRIMARY_CTO, which is driven when its spawn record says DRIVEN.
     this.attachments = new RoleAttachmentCredentials(cp.sessions, cp.bindings, cp.clock, (sessionId) =>
@@ -1384,16 +1400,22 @@ export class Daemon {
    */
   async start(options: DaemonStartOptions = {}): Promise<Decision<ReconcileReport>> {
     const startedAt = this.cp.clock.nowIso();
-    const acquired = this.lock.acquire(startedAt);
-    if (!acquired.allowed) {
-      this.recordLockContention(acquired.evidence);
-      return acquired as Decision<ReconcileReport>;
+    // A lock the caller took before it opened anything is this daemon's already, for this one start. A
+    // repeat call does not inherit it: it acquires, and `acquire` refuses a lock this instance holds.
+    if (this.#lockHandedOver && this.lock.held()) {
+      this.#lockHandedOver = false;
+    } else {
+      const acquired = this.lock.acquire(startedAt);
+      if (!acquired.allowed) {
+        this.recordLockContention(acquired.evidence);
+        return acquired as Decision<ReconcileReport>;
+      }
     }
     this.#startedAt = startedAt;
 
     const priorFailures = this.readCrashLoop();
     if (priorFailures.retryNotBefore && Date.parse(priorFailures.retryNotBefore) > Date.parse(startedAt)) {
-      this.lock.release();
+      this.#giveBackLockUnlessCallerHoldsIt();
       this.#startedAt = null;
       const backoffSeconds = Math.ceil(
         (Date.parse(priorFailures.retryNotBefore) - Date.parse(startedAt)) / 1000,
@@ -1459,7 +1481,7 @@ export class Daemon {
             this.recordStartupFailure(reasonCode, { reconcile: report, stall });
             this.uninstallContinuityCoordinator();
             this.cp.doctor.clearSupplementalFindings(this.#doctorSupplier);
-            this.lock.release();
+            this.#giveBackLockUnlessCallerHoldsIt();
             this.#startedAt = null;
             return deny(reasonCode, "startup doctor did not permit dispatch resume", { reconcile: report });
           }
@@ -1467,7 +1489,7 @@ export class Daemon {
           this.recordStartupFailure(reasonCode, { reconcile: report, stall });
           this.uninstallContinuityCoordinator();
           this.cp.doctor.clearSupplementalFindings(this.#doctorSupplier);
-          this.lock.release();
+          this.#giveBackLockUnlessCallerHoldsIt();
           this.#startedAt = null;
           return deny(reasonCode, "startup doctor did not permit dispatch resume", { reconcile: report });
         }
@@ -1534,7 +1556,7 @@ export class Daemon {
       this.recordStartupFailure(ReasonCode.DAEMON_STARTUP_FAILED, evidence);
       this.uninstallContinuityCoordinator();
       this.cp.doctor.clearSupplementalFindings(this.#doctorSupplier);
-      this.lock.release();
+      this.#giveBackLockUnlessCallerHoldsIt();
       this.#startedAt = null;
       return deny(ReasonCode.DAEMON_STARTUP_FAILED, "daemon startup failed", evidence);
     }
@@ -3843,21 +3865,11 @@ export class Daemon {
   }
 
   private recordStartupFailure(reasonCode: ReasonCodeValue, evidence: Record<string, unknown>): void {
-    const path = join(this.options.stateDir, "crash-loop.json");
-    const previous = this.readCrashLoop();
-    const now = this.cp.clock.nowIso();
-    const failures = previous.failures + 1;
-    const backoffSeconds = Math.min(300, 2 ** failures);
-    const next: CrashLoopFile = {
-      failures,
-      firstAt: previous.failures === 0 ? now : previous.firstAt,
-      retryNotBefore: new Date(Date.parse(now) + backoffSeconds * 1000).toISOString(),
-    };
-    writeFileSync(path, JSON.stringify(next), { mode: 0o600 });
+    const { next, backoffSeconds } = countStartupFailure(this.options.stateDir, this.cp.clock.nowIso());
 
     const threshold = this.options.crashLoopThreshold ?? 3;
     this.cp.audit.record({
-      kind: failures >= threshold ? "DAEMON_CRASH_LOOP" : "DAEMON_START_FAILED",
+      kind: next.failures >= threshold ? "DAEMON_CRASH_LOOP" : "DAEMON_START_FAILED",
       reasonCode,
       evidence: { ...next, threshold, backoffSeconds, ...evidence },
     });
@@ -3942,21 +3954,16 @@ export class Daemon {
   }
 
   private readCrashLoop(): CrashLoopFile {
-    return readJson<CrashLoopFile>(join(this.options.stateDir, "crash-loop.json")) ?? {
-      failures: 0,
-      firstAt: this.cp.clock.nowIso(),
-    };
+    return readCrashLoopFile(this.options.stateDir, this.cp.clock.nowIso());
   }
 
   private clearCrashLoop(): void {
-    writeFileSync(join(this.options.stateDir, "crash-loop.json"), JSON.stringify({ failures: 0 }), {
-      mode: 0o600,
-    });
+    clearCrashLoopFile(this.options.stateDir);
   }
 
   crashLoopState(): { failures: number; backoffSeconds: number } {
     const failures = this.readCrashLoop().failures;
-    return { failures, backoffSeconds: failures === 0 ? 0 : Math.min(300, 2 ** failures) };
+    return { failures, backoffSeconds: backoffSecondsFor(failures) };
   }
 
   /**
@@ -4098,6 +4105,21 @@ export class Daemon {
     }
   }
 
+  #giveBackLockUnlessCallerHoldsIt(): void {
+    if (!this.#lockIsTheCallers) this.lock.release();
+  }
+
+  /**
+   * The decision to stop, taken before anything else a stop does. A start parked for the bootstrap door
+   * would otherwise go on to promote while the stop drains workers (the abandon was only recorded once the
+   * drain ended): resuming runs, starting timers and writing DAEMON_STARTED after the stop had begun. Marking
+   * the park abandoned first, synchronously, means no promotion can follow; `stop()` records it again, which
+   * changes nothing.
+   */
+  beginStop(): void {
+    this.wakeBootstrap("ABANDONED");
+  }
+
   /**
    * Record the signal first, deliver second. `stop()` can land while the park is inside its
    * re-check with no waiter armed, so the abandon is latched rather than delivered — the loop
@@ -4117,11 +4139,25 @@ export class Daemon {
    * nor anyone reclaiming the lock lets a successor take authority while one of them may still run.
    * A caller that exits must report that, not exit as if the stop were clean.
    */
-  async stop(): Promise<{ complete: boolean }> {
+  /**
+   * `leaveLockHeld`: the caller gives the lock back itself, after it has closed the database, so the lock is
+   * never released ahead of the close. A stop that could not confirm its workers gone keeps the lock either way.
+   */
+  async stop(options: { leaveLockHeld?: boolean } = {}): Promise<{ complete: boolean }> {
     // #512 (ACP-WORKER-03) — before this daemon gives up its authority, every worker turn it owns is
     // aborted and drained. A process that would not be confirmed gone stays recorded as outstanding,
     // durably, so the next start reconciles it and no retry of its task runs first.
-    const workers = await this.cp.workerTurns.shutdown();
+    //
+    // A drain that threw, or returned no usable verdict, is a drain that did not confirm its workers gone:
+    // it is treated as exactly that (fenced, lock kept), never as permission to release the lock.
+    let drainFailure: unknown = null;
+    let workers: Awaited<ReturnType<ControlPlane["workerTurns"]["shutdown"]>> | null = null;
+    try {
+      workers = await this.cp.workerTurns.shutdown();
+    } catch (error) {
+      drainFailure = error;
+    }
+    const verdictKnown = workers !== null && typeof workers?.gitStopped === "boolean";
     this.wakeBootstrap("ABANDONED");
     for (const timer of this.#timers) clearInterval(timer);
     this.#timers = [];
@@ -4134,20 +4170,37 @@ export class Daemon {
     // and the lock goes stale, acquisition still refuses while any named group may still run, and
     // reclaims once each is gone — matched by group id and its leader's start time, so a reused id
     // never fences forever. A stop that names no group fences until an operator removes the fence.
-    const lockRetained = !workers.gitStopped;
-    // ACP-WORKER-03-FC-EMPTY: an incomplete stop that names no group is fenced as an unknown one.
+    const lockRetained = !verdictKnown || !workers!.gitStopped;
+    // ACP-WORKER-03-FC-EMPTY: an incomplete stop that names no group (or has no verdict to name any) is
+    // fenced as an unknown one.
     const fencedGroups = lockRetained
-      ? (workers.unconfirmedGroups && workers.unconfirmedGroups.length > 0 ? workers.unconfirmedGroups : null)
+      ? (verdictKnown && workers!.unconfirmedGroups && workers!.unconfirmedGroups.length > 0 ? workers!.unconfirmedGroups : null)
       : [];
     if (lockRetained) this.lock.fence(fencedGroups, this.cp.clock.nowIso());
-    this.cp.audit.record({
-      kind: "DAEMON_STOPPED",
-      evidence: {
-        pid: process.pid, drained: workers.drained, executions: workers.outstanding, gitStopped: workers.gitStopped, lockRetained,
-        fencedGroups: fencedGroups === null ? null : fencedGroups.map((group) => group.pgid),
-      },
-    });
-    if (!lockRetained) this.lock.release();
+    // The fence is down, and what it says is decided: from here a failure to write the audit row must not
+    // hide it. It is reported with the answer, so the caller keeps the lock for a stop that was incomplete.
+    let auditFailure: unknown = null;
+    try {
+      this.cp.audit.record({
+        kind: "DAEMON_STOPPED",
+        evidence: {
+          pid: process.pid,
+          drained: verdictKnown ? workers!.drained : false,
+          executions: verdictKnown ? workers!.outstanding : [],
+          gitStopped: verdictKnown ? workers!.gitStopped : false,
+          lockRetained,
+          fencedGroups: fencedGroups === null ? null : fencedGroups.map((group) => group.pgid),
+        },
+      });
+    } catch (error) {
+      auditFailure = error;
+    }
+    // Whatever failed, the answer about the workers is settled and reported with it: a drain that threw or
+    // lost an audit row, and the stop's own row, are failures of the stop, and none of them can make an
+    // unconfirmed stop read as complete.
+    const failure = drainFailure ?? (verdictKnown ? workers!.auditError : null) ?? auditFailure;
+    if (failure !== null && failure !== undefined) throw new StopFailure(failure, !lockRetained);
+    if (!lockRetained && options.leaveLockHeld !== true) this.lock.release();
     return { complete: !lockRetained };
   }
 }

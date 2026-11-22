@@ -181,6 +181,9 @@ import { HOLDER_CLAIMED_KINDS, MessageKind } from "../outbox/envelope.ts";
 import type { HolderIdentity } from "../outbox/outbox.ts";
 import { respond, type AuthenticatedMcpPeer, type McpPeerAuthenticator } from "../mcp/shared.ts";
 import type { AuthenticatedOperatorPeer, Daemon, StartStallNoticeRoute } from "./daemon.ts";
+import { StartTracker, gracefulStop } from "./graceful-stop.ts";
+import type { SingleInstanceLock } from "./single-instance.ts";
+import { refuseStartBeforeOpening, takeStartLock } from "./start-gate.ts";
 import { executeCanonicalSelfClaimOperator } from "./canonical-self-claim-operator.ts";
 import {
   startAdoptedCeoToolListener,
@@ -6433,6 +6436,25 @@ export const configuredCanonicalSessions = (raw: string): readonly CanonicalAdop
  * Intended to run under a process supervisor (`launchd` on macOS). The daemon owns the
  * single-instance lock, restart reconciliation, the watchdog timer and Buzz delivery.
  */
+/**
+ * A test hook, inert unless `ACP_TEST_RAISE_SIGTERM_AT` names the point: the process sends itself SIGTERM
+ * there, so a test can place a stop in a window no external signal can be aimed at.
+ *   - `after-lock`: the instant the lock is published.
+ *   - `before-check`: before the last stop check, and then the event loop is let turn for a moment, so the
+ *     handler has run by the time the check looks (the stop is "seen at the last check").
+ *   - `after-check`: after that check, with the very next statement the open of the database (the stop is
+ *     "handled after the check").
+ */
+type TestSignalPoint = "after-lock" | "before-check" | "after-check";
+const raiseTestSignalAt = (point: TestSignalPoint): void => {
+  if (process.env["ACP_TEST_RAISE_SIGTERM_AT"] === point) process.kill(process.pid, "SIGTERM");
+};
+const raiseTestSignalAndLetItLand = async (point: TestSignalPoint): Promise<void> => {
+  if (process.env["ACP_TEST_RAISE_SIGTERM_AT"] !== point) return;
+  process.kill(process.pid, "SIGTERM");
+  await new Promise<void>((resolveWait) => setTimeout(resolveWait, 200));
+};
+
 export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => {
   // Classify the complete environment-only group before reading config or acquiring resources.
   // Blank values are absent; nonblank values are retained exactly for the claim boundary.
@@ -6500,7 +6522,88 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
   // control plane or any listener exists. In that mode the long-poll parser answers null.
   const telegramExternalConfig = configuredTelegramExternalConsumerConfig(config.ownerIdentities ?? []);
   const telegramConfig = configuredTelegramLongPollConfig(config.ownerIdentities ?? []);
-  const cp = new ControlPlane({ ...config, servingEntrypoint: realpathSync(fileURLToPath(import.meta.url)) });
+  // migrate-before-start — the lock first, then everything the doctor can already judge from files,
+  // credentials and the registered checkouts, all before the control plane opens the database. Opening it
+  // creates a missing file, switches a rollback-journal file to WAL, applies an approved migration and
+  // retires its approval, and the constructor then appends audit rows; a start that is going to be refused
+  // must do none of that, or the official rollback to the pair sealed before the migration refuses the
+  // database as stale. The lock comes first because another process holding it (an offline migration, a
+  // running daemon) is the one thing that must be learned before a single byte is read or written. It is
+  // handed on to the database's own open and to the daemon, so the whole start runs under one lease. A
+  // refusal is printed and counted in `crash-loop.json`, and the process leaves without installing the
+  // signal handlers whose shutdown writes an audit row.
+  // A stop is never timed against the start; it is held by structure. The handler is installed before the
+  // lock is even asked for, because a signal with no handler is the kernel's default action, which ends the
+  // process on the spot, mid-publication, with `agentcpd.lock/holder.json` left for the installer to wait on
+  // forever. What it does depends only on whether the database has been opened:
+  //   - not yet: give the lock back if it is held, and leave. Nothing was opened, so nothing is written.
+  //   - already: remember it (`stopRequested`). The start goes on as a normal start, and the normal shutdown
+  //     is run the moment its handlers exist (below). That outcome writes the normal start and stop rows
+  //     (the runtime observation, DAEMON_STARTED, DAEMON_STOPPED); it is a limit of a stop that arrives after
+  //     the open, not a defect, and it is the only other outcome: a stop is honoured either way.
+  let stopRequested = false;
+  let databaseOpened = false;
+  // Set when the one cleanup has begun. From then on the lock is its to give back or keep (after the close
+  // succeeded, and only for a stop that was complete); the exit hook must not release it behind its back.
+  let cleanupStarted = false;
+  let heldLock: SingleInstanceLock | null = null;
+  const earlyStop = (): void => {
+    stopRequested = true;
+    if (databaseOpened) return;
+    heldLock?.release();
+    process.exit(0);
+  };
+  process.on("SIGTERM", earlyStop);
+  process.on("SIGINT", earlyStop);
+  const dropEarlyStop = (): void => {
+    process.off("SIGTERM", earlyStop);
+    process.off("SIGINT", earlyStop);
+  };
+  const refuseBeforeOpening = async (refused: { decision: unknown; failures: number; backoffSeconds: number }): Promise<never> => {
+    process.stderr.write(`${JSON.stringify(refused.decision, null, 2)}\n`);
+    process.stderr.write(`backoff: ${JSON.stringify({ failures: refused.failures, backoffSeconds: refused.backoffSeconds })}\n`);
+    // A refusal is waited out the way it always was: a signal during the wait ends the process by default.
+    dropEarlyStop();
+    if (refused.backoffSeconds > 0) await waitForBackoff(refused.backoffSeconds);
+    return process.exit(1);
+  };
+  const taken = takeStartLock(config.databasePath);
+  // The handler is already installed, so a signal that lands from here on is dispatched, not fatal.
+  raiseTestSignalAt("after-lock");
+  if ("refused" in taken) return refuseBeforeOpening(taken.refused);
+  const startLock = taken.lock;
+  heldLock = startLock;
+  process.once("exit", () => {
+    if (!cleanupStarted) startLock.release();
+  });
+  const refusedBeforeOpening = await refuseStartBeforeOpening(config);
+  if (refusedBeforeOpening !== null) {
+    // Given back before the backoff is waited out: a daemon that refuses does not hold the lock while it sleeps.
+    startLock.release();
+    return refuseBeforeOpening(refusedBeforeOpening);
+  }
+  // The last stop check, immediately before the writable open of the database. Two cases, kept apart:
+  //   (i)  A stop the process has seen by here (its handler ran, so `stopRequested` is set): the database is
+  //        not opened. The lock is released and the process leaves; nothing of the database has moved, not
+  //        its bytes, its journal mode, its sidecars or its audit rows.
+  //   (ii) A stop that lands after this check: the open below is synchronous, and a signal that arrives
+  //        while it runs, or between this look and it, cannot be dispatched until it returns. That window
+  //        cannot be closed in Node, and it is not tried: the stop is handled as a stop after the open,
+  //        handed to exactly one normal graceful shutdown (below), which waits for the start to settle and
+  //        then runs the normal stop path. Whatever the open and the start wrote stays written, and the
+  //        existing rule that a rollback refuses a database that has moved is unchanged.
+  // The yield is a turn of the event loop so that a stop which arrived while the gate ran (whose promises can
+  // settle without the loop turning) has been dispatched before the look.
+  await raiseTestSignalAndLetItLand("before-check");
+  await new Promise<void>((resolveYield) => setImmediate(resolveYield));
+  if (stopRequested) {
+    startLock.release();
+    process.exit(0);
+  }
+  databaseOpened = true;
+  raiseTestSignalAt("after-check");
+
+  const cp = new ControlPlane({ ...config, databaseMigrationLock: startLock, servingEntrypoint: realpathSync(fileURLToPath(import.meta.url)) });
   cp.review.attach({ servingRuntimeEventId: recordBootstrapServingRuntime(cp.audit, import.meta.url) });
 
   // A migration that ran did so because someone approved it, and the approval names them.
@@ -6534,6 +6637,9 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
     });
   } catch (err) {
     cp.close();
+    // The handle is closed and the lock given back here, whether or not a stop was recorded after the open:
+    // the error leaves the process, and a stop that was waiting for the hand-over has nothing left to wait for.
+    startLock.release();
     throw err;
   }
 
@@ -6583,6 +6689,9 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
       // are the two things open, and both are closed before the refusal leaves.
       await sessionLaunch.close();
       cp.close();
+      // As above: closed and released on this path, with a recorded stop or without one, and no row written
+      // beyond what this path already writes (no stop row: no daemon was ever constructed).
+      startLock.release();
       throw err;
     }
   }
@@ -6625,7 +6734,7 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
     sessionLaunch,
   });
 
-  const daemon = cp.createDaemon({ stateDir, buzz });
+  const daemon = cp.createDaemon({ stateDir, buzz, lock: startLock });
 
   let listeners: LocalMcpListeners | null = null;
   let buzzActorIngress: LocalBuzzActorIngress | null = null;
@@ -6661,44 +6770,92 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
   let hermesBootstrap: HermesBootstrapAuthority | null = null;
   let telegram: TelegramLongPollListener | null = null;
   let telegramExternal: LocalTelegramExternalIngress | null = null;
-  let startCompleted = false;
+  // The in-flight `daemon.start()`, seen from every exit after the database is open. A stop (a signal after
+  // the handlers exist, one recorded before they did, a start that failed, or one that threw) must not take
+  // the process out from under a start that is still writing, and must not leave the live handle open. Every
+  // such exit awaits the one cleanup below, which waits for the start to settle (a start parked for the
+  // bootstrap door is the one thing it does not wait out: it settles only when the stop wakes it), stops the
+  // daemon, closes the database, and only then gives the lock back.
+  const startTracker = new StartTracker();
 
+  let cleaning: Promise<{ complete: boolean }> | null = null;
+  const cleanup = (signal: string): Promise<{ complete: boolean }> => {
+    // A supervisor that sends SIGTERM twice, or SIGTERM then SIGINT, or a start that fails while a stop is
+    // already running, must not run this twice: the listener handles have no closing guard, and Node
+    // rejects a second `server.close()` with ERR_SERVER_NOT_RUNNING.
+    cleaning ??= (async () => {
+      cleanupStarted = true;
+      process.stdout.write(`\nshutting down on ${signal}\n`);
+      const stopped = await gracefulStop(startTracker, {
+        // The decision to stop closes off a bootstrap promotion first, before the drain below can run.
+        begin: () => daemon.beginStop(),
+        closeListeners: async () => {
+          if (hermesAutoAdoptionTimer) clearInterval(hermesAutoAdoptionTimer);
+          await telegram?.close();
+          ownerReplies?.close();
+          peerMessageNotices?.close();
+          await telegramExternal?.close();
+          buzzMentionSubscriber?.close();
+          await buzzMessageIngress?.close();
+          await buzzActorIngress?.close();
+          await operator?.close();
+          await canonicalSelfClaim?.close();
+          await adoptedCeoTools?.close();
+          await hermesBootstrap?.close();
+          await listeners?.close();
+          await sessionLaunch.close();
+        },
+        // The lock stays held until the handle is closed: `daemon.stop()` leaves it to this caller.
+        stopDaemon: async () => {
+          // A test hook, inert unless set: holds the daemon's stop, so a test can land signals inside it.
+          const delay = Number(process.env["ACP_TEST_DELAY_STOP_MS"] ?? 0);
+          if (delay > 0) await new Promise<void>((resolveWait) => setTimeout(resolveWait, delay));
+          return daemon.stop({ leaveLockHeld: true });
+        },
+        closeDatabase: () => {
+          // A test hook, inert unless set: a close that throws, as one does with a query still running.
+          if (process.env["ACP_TEST_FAIL_DATABASE_CLOSE"] === "1") throw new Error("the database is busy: a query is still running");
+          cp.close();
+        },
+        // Worker exit unconfirmed, or the handle would not close: a fence beside the kept lock, so a successor
+        // is refused the way it is for a group the drain could not reap. Unknown groups hold until removed.
+        fenceUnconfirmed: () => daemon.lock.fence(null, cp.clock.nowIso()),
+        releaseLock: () => startLock.release(),
+      });
+      return stopped;
+    })();
+    return cleaning;
+  };
+  // The cleanup for a caller that already has an error to throw: a cleanup that fails too is reported, and
+  // does not replace the error the caller is about to raise.
+  const cleanupReportingFailure = async (signal: string): Promise<void> => {
+    try {
+      await cleanup(signal);
+    } catch (error) {
+      process.stderr.write(`agentcpd: the stop did not complete cleanly: ${error instanceof Error ? error.message : String(error)}\n`);
+    }
+  };
   let shuttingDown: Promise<void> | null = null;
   const shutdown = async (signal: string): Promise<void> => {
-    // A supervisor that sends SIGTERM twice, or SIGTERM then SIGINT, must not run this twice:
-    // the listener handles have no closing guard, and Node rejects a second `server.close()`
-    // with ERR_SERVER_NOT_RUNNING — which, through `void shutdown(...)`, is an unhandled
-    // rejection during the one operation that most needs to finish.
     if (shuttingDown) return shuttingDown;
     shuttingDown = (async () => {
-    process.stdout.write(`\nshutting down on ${signal}\n`);
-    if (hermesAutoAdoptionTimer) clearInterval(hermesAutoAdoptionTimer);
-    await telegram?.close();
-    ownerReplies?.close();
-    peerMessageNotices?.close();
-    await telegramExternal?.close();
-    buzzMentionSubscriber?.close();
-    await buzzMessageIngress?.close();
-    await buzzActorIngress?.close();
-    await operator?.close();
-    await canonicalSelfClaim?.close();
-    await adoptedCeoTools?.close();
-    await hermesBootstrap?.close();
-    await listeners?.close();
-    await sessionLaunch.close();
-    const stopped = await daemon.stop();
-    // Before `start()` returns, the control plane is still unwinding it — `daemon.stop()` has
-    // released the lock, which is what a supervisor is waiting for, and closing the database
-    // out from under that unwind would only turn a clean stop into an error.
-    if (startCompleted) cp.close();
-    // #1070 ACP-WORKER-03-FC — an incomplete stop is reported, never exited as clean. The lock and the
-    // durable fence beside it stay, so exiting here does not let a successor take authority while a
-    // worker git process group may still run; the exit status tells the supervisor why.
-    if (!stopped.complete) {
-      process.stderr.write("agentcpd: a worker git process group was not confirmed finished; the daemon lock stays fenced\n");
-      process.exit(STOP_INCOMPLETE_EXIT_CODE);
-    }
-    process.exit(0);
+      let stopped: { complete: boolean };
+      try {
+        stopped = await cleanup(signal);
+      } catch (error) {
+        // A stop step failed (the stop's own audit write among them). The handle is closed and the lock
+        // given back by then; what is left is to say so and leave non-zero.
+        process.stderr.write(`agentcpd: the stop did not complete cleanly: ${error instanceof Error ? error.message : String(error)}\n`);
+        process.exit(1);
+      }
+      // #1070 ACP-WORKER-03-FC — an incomplete stop is reported, never exited as clean. The lock and the
+      // durable fence beside it stay, so exiting here does not let a successor take authority while a
+      // worker git process group may still run; the exit status tells the supervisor why.
+      if (!stopped.complete) {
+        process.stderr.write("agentcpd: a worker git process group was not confirmed finished; the daemon lock stays fenced\n");
+        process.exit(STOP_INCOMPLETE_EXIT_CODE);
+      }
+      process.exit(0);
     })();
     return shuttingDown;
   };
@@ -6711,34 +6868,67 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
   // whole change exists for.
   process.on("SIGTERM", () => void shutdown("SIGTERM"));
   process.on("SIGINT", () => void shutdown("SIGINT"));
+  // The full handlers are in place before the early ones come off, so there is no instant with none. A stop
+  // that arrived while the database was already open is run now, as the stop it was.
+  dropEarlyStop();
 
-  const started = await daemon.start({
-    bootstrapDoor: () =>
-      startBootstrapOperatorDoor(
-        daemon,
-        stateDir,
-        { token: operatorToken, peerId: `cli:${operatorActor}`, actor: operatorActor },
-        { mcpToken },
-      ),
-    stallNotice: startStallNoticeRoute(cp, {
-      environment: process.env,
-      hermesConfiguration: hermesAdoptionConfiguration,
-      ports: { authorityHeld: () => daemon.lock.held() },
+  const startPromise = startTracker.track(
+    daemon.start({
+      bootstrapDoor: async () => {
+        // Parked: the start now settles only when a stop wakes it. The door's close is the end of the park,
+        // by promotion (the start goes on, and writes) or by abandonment; from then on a stop waits for it.
+        startTracker.park();
+        const door = await startBootstrapOperatorDoor(
+          daemon,
+          stateDir,
+          { token: operatorToken, peerId: `cli:${operatorActor}`, actor: operatorActor },
+          { mcpToken },
+        );
+        return {
+          close: async () => {
+            startTracker.resume();
+            await door.close();
+          },
+        };
+      },
+      stallNotice: startStallNoticeRoute(cp, {
+        environment: process.env,
+        hermesConfiguration: hermesAdoptionConfiguration,
+        ports: { authorityHeld: () => daemon.lock.held() },
+      }),
     }),
-  });
+  );
+  // A stop recorded while the database was already open is handed over here, to the one shutdown: it waits
+  // for the start just begun, then stops. SIGTERM and SIGINT together are still one shutdown (the guard).
+  if (stopRequested) void shutdown("SIGTERM");
+  let started: Awaited<typeof startPromise>;
+  try {
+    started = await startPromise;
+  } catch (error) {
+    // A start that threw is an exit after the open like any other: the one cleanup runs and finishes (the
+    // handle closed, the lock given back) before the error is allowed to reach the process's exit.
+    await cleanupReportingFailure("a failed start");
+    throw error;
+  }
+  // The start has settled; a shutdown that is already running owns what happens next, and never returns.
+  if (shuttingDown) await shuttingDown;
   if (!started.allowed) {
     process.stderr.write(`${JSON.stringify(started, null, 2)}\n`);
     process.stderr.write(
       `backoff: ${JSON.stringify(daemon.crashLoopState())}\n`,
     );
     const backoffSeconds = daemon.crashLoopState().backoffSeconds;
+    // A refused start is an exit after the open like any other, so it goes through the one cleanup and
+    // waits for it: the handle is closed and only then is the lock given back (the refusal itself no
+    // longer releases it). It does not close or exit on its own, and a shutdown already running is its
+    // own cleanup, not something this branch may cut short.
+    await cleanupReportingFailure("a refused start");
+    if (shuttingDown) await shuttingDown;
     if (backoffSeconds > 0) await waitForBackoff(backoffSeconds);
-    await sessionLaunch.close();
-    cp.close();
+    if (shuttingDown) await shuttingDown;
     process.exit(1);
   }
 
-  startCompleted = true;
   try {
     hermesBootstrap = createHermesBootstrapAuthority(cp, {
       stateDir,
@@ -7077,26 +7267,10 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
     // subscriber is decided, its rooms are checked, and only now may a claim or correction open a room.
     settleCanonicalRooms();
   } catch (err) {
-    if (hermesAutoAdoptionTimer) clearInterval(hermesAutoAdoptionTimer);
-    await telegram?.close();
-    await telegramExternal?.close();
-    // Both Buzz listeners, which this teardown used to walk past: a startup that failed after
-    // one of them bound left its socket file behind for the next daemon to find. The relay
-    // subscriber joins them for the same reason: it holds outbound sockets, and a startup that
-    // failed after it opened them would leave a daemon that exited still subscribed.
-    ownerReplies?.close();
-    peerMessageNotices?.close();
-    buzzMentionSubscriber?.close();
-    await buzzMessageIngress?.close();
-    await buzzActorIngress?.close();
-    await operator?.close();
-    await canonicalSelfClaim?.close();
-    await adoptedCeoTools?.close();
-    await hermesBootstrap?.close();
-    await listeners?.close();
-    await sessionLaunch.close();
-    await daemon.stop();
-    cp.close();
+    // A startup that failed after some listener bound: the one cleanup closes every one of them (the Buzz
+    // listeners and the relay subscriber included, which a failed startup used to walk past), stops the
+    // daemon, closes the handle and gives the lock back, and finishes before the error leaves.
+    await cleanupReportingFailure("a failed startup");
     throw err;
   }
 
