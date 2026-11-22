@@ -500,6 +500,8 @@ describe("the notice goes only to the Gateway the active CEO binding names (#149
     ["a 405 with no Allow header", { status: 405 }, "HEAD answered 405"],
     ["a 405 whose Allow says `post`: method names are case-sensitive", { status: 405, allow: "post" }, "HEAD answered 405"],
     ["a 405 whose Allow says `Post, GET`", { status: 405, allow: "Post, GET" }, "HEAD answered 405"],
+    ["a 405 whose Allow says `POST` followed by a no-break space (0xA0)", { status: 405, allow: "POST\u00a0" }, "HEAD answered 405"],
+    ["a 405 whose Allow says `GET,\u00a0POST`", { status: 405, allow: "GET,\u00a0POST" }, "HEAD answered 405"],
   ])("%s is no route: nothing is sent", async (_name, head, detail) => {
     const { root, database, config, startToken } = adoptedState();
     const gateway = await loopbackGateway({ session_id: LIVE, lineage_root_digest: DIGEST, process_pid: process.pid,
