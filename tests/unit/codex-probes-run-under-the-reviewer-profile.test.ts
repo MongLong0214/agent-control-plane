@@ -491,7 +491,7 @@ const leaseDirectories = (fixture: Fixture): string[] =>
 
 describe("W1: a missing reviewer egress profile stops the review before any Codex process", () => {
   it("returns ISOLATION_LOST naming REVIEWER_EGRESS_PROFILE_MISSING with no version, collector or reviewer call", async () => {
-    const harness = makeHarness({ reviewer: { preferred: { provider: "gpt", model: "gpt-6.1-sol", effort: "xhigh" }, fallbacks: [] } });
+    const harness = makeHarness({ reviewer: { preferred: { provider: "gpt", model: "gpt-6.2-sol", effort: "xhigh" }, fallbacks: [] } });
     const fixture = await makeFixture({ profile: "missing", clockIso: harness.clock.nowIso() });
     const adapter = new CodexCliAdapter({
       clock: harness.clock,
@@ -779,7 +779,7 @@ describe("W9: a Codex home that cannot be resolved is a boundary refusal, before
   }
 
   it("a blind review with both the home and the profile missing starts no Codex process for the whole submit", async () => {
-    const harness = makeHarness({ reviewer: { preferred: { provider: "gpt", model: "gpt-6.1-sol", effort: "xhigh" }, fallbacks: [] } });
+    const harness = makeHarness({ reviewer: { preferred: { provider: "gpt", model: "gpt-6.2-sol", effort: "xhigh" }, fallbacks: [] } });
     const fixture = await makeFixture({ profile: "missing", ownHome: { state: "missing" }, clockIso: harness.clock.nowIso() });
     const adapter = new CodexCliAdapter({
       clock: harness.clock,
@@ -904,7 +904,7 @@ describe("W10: whatever settles the read first, a launch the composed profile di
 describe("W5: a collector and a reviewer each hold and release only their own egress", () => {
   const reviewOnce = async (adapter: CodexCliAdapter) => {
     const packetRoot = realpathSync(tempDir("acp-cpr-packet-"));
-    return adapter.startSession({ model: "gpt-6.1-sol", effort: "xhigh", workdir: packetRoot, purpose: "blind-review", isolation: isolationFor(packetRoot) });
+    return adapter.startSession({ model: "gpt-6.2-sol", effort: "xhigh", workdir: packetRoot, purpose: "blind-review", isolation: isolationFor(packetRoot) });
   };
 
   it("a collector that times out behind a running reviewer leaves the reviewer's proxy and lease, and releases only its own", async (ctx) => {

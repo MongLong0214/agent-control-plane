@@ -7,7 +7,7 @@ import { DARWIN_START_TOKEN, readProcessStartToken } from "../../src/core/proces
 import { lstartSecondStartMs, processStartedAt } from "../../src/core/process-identity.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import {
-  parseDeadBindingRecoveryRequest,
+  DEAD_BINDING_SWEEP_ACTOR,
   probeSessionLiveness,
   recoverDeadCanonicalBinding,
 } from "../../src/daemon/dead-binding-recovery.ts";
@@ -81,17 +81,14 @@ const canonicalBinding = async (recorded: { osPid: number; startedAt: string }) 
   return { h, projectId, sessionId: session.sessionId, binding: bound.value, roleKey: roleKeyFor(Role.PRIMARY_CTO, { projectId }) };
 };
 
-/** The operator door, as `Daemon.executeDeadBindingRecovery` drives it: parse, then recover with no seam. */
-const operatorDoor = (h: Harness, params: Record<string, unknown>) => {
-  const parsed = parseDeadBindingRecoveryRequest(params);
-  if (!parsed.allowed) return parsed;
-  return recoverDeadCanonicalBinding("operator", parsed.value, {
+/** The release the daemon's liveness sweep makes, as `Daemon.releaseDeadCanonicalBindings` drives it: no seam. */
+const sweepRelease = (h: Harness, request: Parameters<typeof recoverDeadCanonicalBinding>[1]) =>
+  recoverDeadCanonicalBinding(DEAD_BINDING_SWEEP_ACTOR, request, {
     db: h.cp.db,
     audit: h.cp.audit,
     sessions: h.cp.sessions,
     bindings: h.cp.bindings,
   });
-};
 
 const assignmentStatuses = (h: Harness, roleKey: string) =>
   h.cp.db.all<{ g: number; status: string }>(
@@ -104,10 +101,10 @@ describe("a live canonical CTO is not read as dead", () => {
     expect(probeSessionLiveness(process.pid, liveNativeToken())).toBe("ALIVE");
   });
 
-  it("(b) the operator door refuses to revoke a canonical binding whose recorded process is this running one", async () => {
+  it("(b) the sweep's release refuses to revoke a canonical binding whose recorded process is this running one", async () => {
     const f = await canonicalBinding({ osPid: process.pid, startedAt: liveNativeToken() });
     try {
-      const released = operatorDoor(f.h, {
+      const released = sweepRelease(f.h, {
         projectId: f.projectId,
         role: Role.PRIMARY_CTO,
         sessionId: f.sessionId,
@@ -151,7 +148,7 @@ describe("a live canonical CTO is not read as dead", () => {
 
     const f = await canonicalBinding({ osPid: exitedPid(), startedAt: "darwin-tv:1790000100.000001" });
     try {
-      const released = operatorDoor(f.h, {
+      const released = sweepRelease(f.h, {
         projectId: f.projectId,
         role: Role.PRIMARY_CTO,
         sessionId: f.sessionId,

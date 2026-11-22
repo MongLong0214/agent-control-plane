@@ -149,8 +149,6 @@ The daemon serves two MCP servers on owner-only Unix sockets in its state direct
 - the CEO server on `hermes.mcp.sock`: `run_create`, `run_dispatch`, `run_get`, `run_cancel`, `ceo_decision_submit`, `escalation_resolve`, `owner_decision_submit`, `doctor_run`, and others;
 - the CTO server on `cto.mcp.sock`: `session_attest`, `contract_get`, `plan_submit`, `resource_claim`, `task_worker_provision`, `task_worker_run`, `task_receipt_submit`, `result_submit`, `escalation_open`, `handoff_submit`, `handoff_ack`, `run_ack`, `role_dispatch_pending`, `role_dispatch_ack`, `capacity_get`, `doctor_run`, and others.
 
-`blind_review_request` exists on the CTO server only to refuse: blind review is started by the control plane.
-
 ## Configuration and state
 
 The state root is `~/.agent-control-plane` by default. `agentctl` honors `ACP_STATE_DIR` to point elsewhere. It holds the SQLite database (`state.sqlite`, WAL), `health.json`, the MCP sockets, worktrees, capacity records and a secrets directory. Treat it as sensitive: the directory is owner-only (`0700`), database files are `0600`, and it must never live inside a project checkout or be committed.

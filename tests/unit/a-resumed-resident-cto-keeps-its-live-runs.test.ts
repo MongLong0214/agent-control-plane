@@ -616,13 +616,13 @@ describe("a resumed resident CTO keeps its live runs (CEO msg_00ce7760, option A
     // A late message to the old generation is not admitted.
     expect(harness.cp.outbox.enqueue({
       idempotencyKey: "late-to-old", roleKey, bindingGeneration: 1, targetSessionId: old.sessionId, runId: f.runId,
-      kind: MessageKind.REVIEW_REQUEST, payload: { note: "late" },
+      kind: MessageKind.DRAIN_REQUEST, payload: { note: "late" },
     })).toMatchObject({ allowed: false, reasonCode: ReasonCode.OUTBOX_TARGET_NOT_CURRENT });
 
     // ACK: the old generation cannot settle the successor's message.
     const queued = harness.cp.outbox.enqueue({
       idempotencyKey: "for-new", roleKey, bindingGeneration: 2, targetSessionId: next.sessionId, runId: f.runId,
-      kind: MessageKind.REVIEW_REQUEST, payload: { note: "for the successor" },
+      kind: MessageKind.DRAIN_REQUEST, payload: { note: "for the successor" },
     });
     if (!queued.allowed) throw new Error(JSON.stringify(queued));
     expect(harness.cp.outbox.acknowledge(queued.value.messageId, old.sessionId, 1, old.incarnation)).toMatchObject({

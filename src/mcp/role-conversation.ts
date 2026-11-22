@@ -328,33 +328,6 @@ export class RoleConversationPort {
     return peer !== undefined && this.#holderFor(peer.server, roleKey).allowed;
   }
 
-
-  /**
-   * Answers a client's `role_wake_endpoint_register` call, which older clients still make.
-   *
-   * It records nothing and opens nothing: no frame is written to any endpoint, so there is no path
-   * to hold. It still says whether the connection is the live, current holder of the roles it
-   * attached for, so a caller that reads the answer learns the same thing it always did about its
-   * own standing, and one that is not the holder is refused as it was.
-   */
-  acknowledgeRegistration(server: McpServer): Decision<readonly string[]> {
-    const owned = [...this.#live.entries()].filter(([, peer]) => peer.server === server);
-    if (owned.length === 0) {
-      return deny(
-        ReasonCode.ROLE_PEER_ABSENT,
-        "this connection is not the live peer of any binding of this role",
-        { role: this.#role },
-      );
-    }
-    for (const [, peer] of owned) {
-      const identity = peer.authenticate();
-      if (!identity.allowed || !this.#isCurrentHolder(peer.binding, identity.value)) {
-        return deny(ReasonCode.ROLE_PEER_STALE, "the registering peer no longer holds its role");
-      }
-    }
-    return allow(ReasonCode.OK, owned.map(([roleKey]) => roleKey));
-  }
-
   /**
    * The exact holder behind one authenticated connection — every field derived, none supplied.
    *

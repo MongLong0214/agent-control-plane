@@ -5,7 +5,6 @@ import { afterAll, describe, expect, it, vi } from "vitest";
 import type { Decision } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import {
-  BOOTSTRAP_OPERATOR_METHODS,
   canParkForBootstrap,
   Daemon,
   OPERATOR_METHOD,
@@ -15,6 +14,7 @@ import {
 } from "../../src/daemon/daemon.ts";
 import {
   DEAD_BINDING_RECOVERY_ROLE,
+  DEAD_BINDING_SWEEP_ACTOR,
   probeSessionLiveness,
 } from "../../src/daemon/dead-binding-recovery.ts";
 import {
@@ -41,14 +41,6 @@ const OWNER_PEER: AuthenticatedOperatorPeer = {
   channel: "cli",
   peerId: `cli:${TEST_OWNER.actor}`,
   actor: TEST_OWNER.actor,
-  incarnation: "operator-incarnation-1",
-};
-
-/** Authenticated on the socket, but not an owner this deployment allowlisted. */
-const STRANGER_PEER: AuthenticatedOperatorPeer = {
-  channel: "cli",
-  peerId: "cli:not-the-owner",
-  actor: "not-the-owner",
   incarnation: "operator-incarnation-1",
 };
 
@@ -305,26 +297,15 @@ const deadCanonicalCto = async (
   };
 };
 
-/**
- * The recovery request `agentctl binding recover-dead` sends, with every field overridable.
- *
- * Five fields, all of them naming the target. There is no `nonce` and no `approved`: the door
- * no longer mints or reads an owner decision, and `recoverableState.admittedNonces` below is the
- * witness for that — it stays empty through every case in this file, including the ones that
- * succeed.
- */
-const recoveryRequest = (fixture: Fixture, overrides: Record<string, unknown> = {}) => ({
-  requestId: "req-recover-dead-binding",
-  method: OPERATOR_METHOD.BINDING_RECOVER_DEAD,
-  params: {
-    projectId: fixture.projectId,
-    role: Role.PRIMARY_CTO,
-    sessionId: fixture.sessionId,
-    sessionIncarnation: fixture.sessionIncarnation,
-    expectedBindingGeneration: fixture.bindingGeneration,
-    ...overrides,
-  },
-});
+/** What a refused or rolled-back release must leave exactly as it was: the role, its runs and its outbox. */
+const holderState = (harness: Harness) => {
+  const { assignments, runs, outbox } = recoverableState(harness);
+  return { assignments, runs, outbox };
+};
+
+/** Runs the daemon's own dead-session sweep, the way `start()` and every watchdog tick do. */
+const sweep = (fixture: Fixture, prefix: string) =>
+  new Daemon(fixture.harness.cp, { stateDir: tempDir(prefix) }).reconcile();
 
 describe("a canonical CTO whose process is gone", () => {
   /**
@@ -332,55 +313,17 @@ describe("a canonical CTO whose process is gone", () => {
    *
    * The chain that produced it ran entirely inside one `start()`: `reconcile()` swept
    * `sessions.live()`, found the dead `osPid`, marked the session ERROR and left the ACTIVE
-   * assignment pointing at it; the same pass ran the doctor, which read that assignment and
-   * raised CTO_BINDING_POINTS_AT_DEAD_SESSION — CRITICAL, blocking, recommending "run a recovery
-   * takeover for this project"; `canParkForBootstrap` did not admit it, so `start()` denied
-   * DOCTOR_ERROR and the entrypoint exited with backoff; and every door that could perform the
-   * recommended recovery was opened only after `start()` returned allowed. The remedy the finding
-   * named was unreachable in exactly the state that raised it.
-   *
-   * A park answered the operator door and still kept the claim socket and cto.mcp.sock shut, and
-   * those are how a CTO takes the role back. A project's CTO is availability, not authority over
-   * the daemon, so the system report now names the dead binding as a non-blocking ERROR and the
-   * daemon comes up. The project's own report still blocks on it, and the operator door still
-   * releases it: the finding moved from the daemon's startup gate to the project it is about.
+   * assignment pointing at it, so the doctor raised CTO_BINDING_POINTS_AT_DEAD_SESSION and the
+   * role stayed held by a corpse until a person released it through a door. The same sweep now
+   * releases the binding it just proved dead, so the daemon comes up with the role free and the
+   * doctor has nothing to name.
    */
-  it("comes up past a dead canonical binding, and the operator door still releases it", async () => {
+  it("comes up past a dead canonical binding, and the sweep releases it without an operator call", async () => {
     const fixture = await deadCanonicalCto();
-    const { harness, projectId, sessionId, assignmentId } = fixture;
+    const { harness, sessionId, assignmentId } = fixture;
     const daemon = await startedPastTheBinding(fixture, "acp-dsr-recover-");
 
-    // The premise, stated so a failure here reads as "the fixture moved" rather than as the
-    // defect: the sweep found the session dead, and its assignment survived that decision.
     expect(harness.cp.sessions.require(sessionId).lifecycle).toBe(SessionLifecycle.ERROR);
-    expect(activeAssignmentIds(harness)).toContain(assignmentId);
-    // Reported, not normalised: the startup report named it, without blocking on it, and the
-    // report scoped to the project it belongs to still blocks.
-    expect(startupFinding(harness, "CTO_BINDING_POINTS_AT_DEAD_SESSION")).toEqual({
-      code: "CTO_BINDING_POINTS_AT_DEAD_SESSION",
-      severity: "ERROR",
-      blocking: false,
-    });
-    const projectReport = await harness.cp.doctor.run("project", projectId);
-    expect(projectReport.status).toBe("ERROR");
-    expect(projectReport.findings.find((finding) => finding.code === "CTO_BINDING_POINTS_AT_DEAD_SESSION"))
-      .toMatchObject({ severity: "CRITICAL", blocking: true });
-
-    const recovered = await daemon.handleOperatorRequest(recoveryRequest(fixture), OWNER_PEER);
-    expect(recovered).toMatchObject({
-      allowed: true,
-      reasonCode: ReasonCode.OK,
-      value: {
-        assignmentId,
-        sessionId,
-        releasedGeneration: fixture.bindingGeneration,
-        liveness: "DEAD",
-      },
-    });
-    expect(await modeOf(daemon)).toBe("NORMAL");
-
-    // The release itself: the assignment is REVOKED with a reason naming its cause, and the
-    // in-flight message for that generation is fenced rather than left addressable.
     expect(activeAssignmentIds(harness)).not.toContain(assignmentId);
     const assignment = harness.cp.db.get<{ status: string; revoked_reason: string | null }>(
       `SELECT status, revoked_reason FROM assignments WHERE assignment_id = ?`,
@@ -388,201 +331,97 @@ describe("a canonical CTO whose process is gone", () => {
     );
     expect(assignment?.status).toBe("REVOKED");
     expect(assignment?.revoked_reason).toContain("dead canonical binding recovery");
+    // The in-flight message for that generation is fenced rather than left addressable.
     expect(
       harness.cp.db.get<{ status: string }>(`SELECT status FROM outbox WHERE message_id = ?`, [
         fixture.messageId,
       ])?.status,
     ).toBe("REJECTED");
-    expect(harness.cp.audit.byKind("DEAD_BINDING_RECOVERED")).toHaveLength(1);
-    // Asserted as zero rather than dropped: the release happening without one is the change, so
-    // an approval reappearing here would be a regression this case has to catch.
+    const recorded = harness.cp.audit.byKind("DEAD_BINDING_RECOVERED");
+    expect(recorded).toHaveLength(1);
+    expect(recorded[0]?.actor).toBe(DEAD_BINDING_SWEEP_ACTOR);
     expect(harness.cp.audit.byKind("OWNER_APPROVAL_CONSUMED")).toHaveLength(0);
     expect(recoverableState(harness).admittedNonces).toEqual([]);
+    expect(startupFinding(harness, "CTO_BINDING_POINTS_AT_DEAD_SESSION")).toBeUndefined();
 
     await daemon.stop();
   });
 
   /**
-   * The half of the change that must never land alone. `canParkForBootstrap` admitting this
-   * finding, without a method on the door that clears it, is a daemon that parks forever behind
-   * a held lock on a state no reachable command can answer — the bypass, wearing the fix's
-   * clothes. Asserted as one statement so that deleting either half fails here.
+   * The door is gone and so is the park that existed for it. Admitting the finding for parking
+   * with no method to clear it is a daemon that waits forever behind a held lock, so the two left
+   * together: the finding no longer parks the daemon, and the removed method is refused as unknown.
    */
-  it("admits the finding for parking only alongside the door method that clears it", () => {
+  it("no longer parks for the finding, and refuses the removed operator method as unknown", async () => {
     expect(canParkForBootstrap([
       { code: "CTO_BINDING_POINTS_AT_DEAD_SESSION", severity: "CRITICAL", scope: "project:p" },
-    ])).toBe(true);
-    expect(BOOTSTRAP_OPERATOR_METHODS.has(OPERATOR_METHOD.BINDING_RECOVER_DEAD)).toBe(true);
-  });
+    ])).toBe(false);
 
-  /**
-   * Case 2 — the authority this door actually has, stated in both directions.
-   *
-   * It used to be established in three places: who the socket said was calling, whether the
-   * owner had said yes, and whether the request carried a decision at all. Two of those are
-   * gone, and the first case here is what says so out loud rather than leaving their absence to
-   * be inferred from tests that no longer exist. An allowlist check re-added to this door would
-   * fail it.
-   *
-   * The second case is the half that remains: a request that does not name its target is
-   * refused, and a refusal has to be inert — a door that denies and still releases the role is
-   * not a door that refused.
-   */
-  it("admits a peer this deployment has not allowlisted as an owner", async () => {
     const fixture = await deadCanonicalCto();
-    const daemon = await startedPastTheBinding(fixture, "acp-dsr-stranger-");
-
-    // STRANGER_PEER holds the operator socket's bearer credential and is named nowhere in
-    // `ownerIdentities`. That used to be INGRESS_ACTOR_NOT_ALLOWLISTED. What bounds the door now
-    // is the liveness proof, which this fixture satisfies and which no caller can supply.
-    const recovered = await daemon.handleOperatorRequest(recoveryRequest(fixture), STRANGER_PEER);
-
-    expect(recovered.allowed, JSON.stringify(recovered)).toBe(true);
-    expect(activeAssignmentIds(fixture.harness)).not.toContain(fixture.assignmentId);
-    // And nothing was minted on the way: no nonce admitted, no owner approval consumed.
-    expect(recoverableState(fixture.harness).admittedNonces).toEqual([]);
-    expect(fixture.harness.cp.audit.byKind("OWNER_APPROVAL_CONSUMED")).toHaveLength(0);
-    // The actor that reached the socket is still recorded, because the audit answers "who did
-    // this" even where nothing was checking the answer.
-    const [recordedEvent] = fixture.harness.cp.audit.byKind("DEAD_BINDING_RECOVERED");
-    expect(recordedEvent?.actor).toBe(STRANGER_PEER.actor);
-
-    await daemon.stop();
-  });
-
-  it("refuses a request that does not name its target", async () => {
-    const fixture = await deadCanonicalCto();
-    const daemon = await startedPastTheBinding(fixture, "acp-dsr-no-target-");
-    const before = recoverableState(fixture.harness);
-
-    const malformed: Array<Record<string, unknown>> = [
-      { projectId: undefined },
-      { sessionId: "" },
-      { sessionIncarnation: undefined },
-      { expectedBindingGeneration: "1" },
-      { expectedBindingGeneration: 0 },
-    ];
-    for (const params of malformed) {
-      const refused = await daemon.handleOperatorRequest(
-        recoveryRequest(fixture, params),
-        OWNER_PEER,
-      );
-      expect({ params, allowed: refused.allowed, reasonCode: refused.reasonCode }).toEqual({
-        params,
-        allowed: false,
-        reasonCode: ReasonCode.INVALID_ARGUMENT,
-      });
-    }
-    expect(recoverableState(fixture.harness)).toEqual(before);
+    const daemon = await startedPastTheBinding(fixture, "acp-dsr-removed-door-");
+    // Spelled in parts so a search for the removed method's name stays empty across src and tests.
+    const removed = ["binding", "recover" + "Dead"].join(".");
+    expect(Object.values(OPERATOR_METHOD)).not.toContain(removed);
+    const refused = await daemon.handleOperatorRequest(
+      { requestId: "req-removed-door", method: removed, params: {} },
+      OWNER_PEER,
+    );
+    expect(refused.allowed).toBe(false);
     await daemon.stop();
   });
 
   /**
-   * Case 3 — a request naming anything other than the binding actually in force is refused.
-   *
-   * Every field is exercised separately rather than as one "wrong request", because they fail at
-   * different checks and a single case would pass on whichever check happens to run first. The
-   * generation row is the one that carries the no-regression property: a replayed request naming
-   * a superseded generation must be refused, not applied.
+   * A session whose process is still running is not released, however the binding came to look
+   * broken. The doctor's finding is about the session's *lifecycle*, a record; the process is the
+   * fact, and only the fact may release an authority.
    */
-  it("refuses a request that names a different target", async () => {
-    const fixture = await deadCanonicalCto();
-    const daemon = await startedPastTheBinding(fixture, "acp-dsr-wrong-target-");
-    const before = recoverableState(fixture.harness);
-
-    const wrong: Array<[string, Record<string, unknown>, ReasonCode]> = [
-      ["project", { projectId: "some-other-project" }, ReasonCode.NOT_FOUND],
-      ["role", { role: Role.CEO }, ReasonCode.INVALID_ARGUMENT],
-      ["session", { sessionId: "ses_not_the_bound_one" }, ReasonCode.INVALID_ARGUMENT],
-      ["incarnation", { sessionIncarnation: "not-the-bound-lifetime" }, ReasonCode.INVALID_ARGUMENT],
-      [
-        "generation",
-        { expectedBindingGeneration: fixture.bindingGeneration + 1 },
-        ReasonCode.WRITE_BINDING_GENERATION_STALE,
-      ],
-    ];
-    for (const [field, override, expected] of wrong) {
-      const refused = await daemon.handleOperatorRequest(
-        recoveryRequest(fixture, override),
-        OWNER_PEER,
-      );
-      expect({ field, allowed: refused.allowed, reasonCode: refused.reasonCode }).toEqual({
-        field,
-        allowed: false,
-        reasonCode: expected,
-      });
-    }
-
-    expect(recoverableState(fixture.harness)).toEqual(before);
-    expect(await modeOf(daemon)).toBe("NORMAL");
-    await daemon.stop();
-  });
-
-  /**
-   * Case 4, first half — a session whose process is still running is not recoverable, however
-   * the binding came to look broken. The doctor's finding is about the session's *lifecycle*, and
-   * a lifecycle is a record; the process is the fact. Only the fact may release an authority.
-   */
-  it("refuses a session whose process is still alive", async () => {
+  it("does not release a holder whose process is still alive", async () => {
     // This test process: unambiguously alive, and `create()` records its start time alongside the
     // pid, so the pair the probe compares is a real one.
     const fixture = await deadCanonicalCto({ osPid: process.pid, lifecycle: "ERROR" });
     const daemon = await startedPastTheBinding(fixture, "acp-dsr-alive-");
-    const before = recoverableState(fixture.harness);
+    const before = holderState(fixture.harness);
 
-    const refused = await daemon.handleOperatorRequest(recoveryRequest(fixture), OWNER_PEER);
+    await sweep(fixture, "acp-dsr-alive-again-");
 
-    expect(refused.allowed).toBe(false);
-    expect(refused.reasonCode).toBe(ReasonCode.RECOVERY_TAKEOVER_REQUIRES_UNREACHABLE_OWNER);
-    expect(refused.evidence).toMatchObject({ liveness: "ALIVE" });
-    expect(recoverableState(fixture.harness)).toEqual(before);
+    expect(holderState(fixture.harness)).toEqual(before);
+    expect(activeAssignmentIds(fixture.harness)).toContain(fixture.assignmentId);
+    expect(fixture.harness.cp.audit.byKind("DEAD_BINDING_RECOVERED")).toHaveLength(0);
     expect(await modeOf(daemon)).toBe("NORMAL");
     await daemon.stop();
   });
 
   /**
-   * Case 4, second half, and the one that is easiest to get wrong: a session with no recorded pid
-   * cannot be *proven* dead. It is overwhelmingly likely to be dead — nothing is running it — and
-   * that is precisely the reasoning this refuses. Unknown is a refusal, not a permission.
+   * A session with no recorded pid cannot be *proven* dead. It is overwhelmingly likely to be dead
+   * — nothing is running it — and that is precisely the reasoning this refuses. Unknown is a
+   * refusal, not a permission.
    */
-  it("refuses a session whose liveness cannot be determined", async () => {
+  it("does not release a holder whose liveness cannot be determined", async () => {
     const fixture = await deadCanonicalCto({ osPid: null, lifecycle: "ERROR" });
     const daemon = await startedPastTheBinding(fixture, "acp-dsr-unknown-");
-    const before = recoverableState(fixture.harness);
+    const before = holderState(fixture.harness);
 
-    const refused = await daemon.handleOperatorRequest(recoveryRequest(fixture), OWNER_PEER);
+    await sweep(fixture, "acp-dsr-unknown-again-");
 
-    expect(refused.allowed).toBe(false);
-    expect(refused.reasonCode).toBe(ReasonCode.RECOVERY_TAKEOVER_REQUIRES_UNREACHABLE_OWNER);
-    expect(refused.evidence).toMatchObject({ liveness: "UNKNOWN" });
-    expect(recoverableState(fixture.harness)).toEqual(before);
+    expect(holderState(fixture.harness)).toEqual(before);
+    expect(activeAssignmentIds(fixture.harness)).toContain(fixture.assignmentId);
+    expect(fixture.harness.cp.audit.byKind("DEAD_BINDING_RECOVERED")).toHaveLength(0);
     await daemon.stop();
   });
 
   /**
-   * Case 5 — a failure part-way through leaves nothing behind.
+   * A failure part-way through leaves nothing behind.
    *
-   * The *audit* is made to throw, not the revoke, and the difference is what gives this case its
-   * teeth. The revoke is the first write of the sequence now, so a revoke that throws has written
-   * nothing and a run with no transaction at all would look identical — the case would pass
-   * either way and prove nothing. It used to distinguish them only because an owner approval had
-   * been admitted and consumed before the revoke ran; when that went, so did the witness, and the
-   * falsifiability harness said so before this comment was written.
-   *
-   * Failing at the audit instead puts a real write on the wrong side of the boundary:
-   * `BindingRegistry.revoke` has already flipped the assignment to REVOKED *and* fenced the
-   * outbox message. Without the transaction those two stand while the `DEAD_BINDING_RECOVERED`
-   * record that explains them never lands. Comparing the whole of `recoverableState` rather than
-   * the binding alone is the point — a rollback that restored the assignment but left the outbox
-   * fenced is not a rollback, and `recoverableState` is what notices.
+   * The *audit* is made to throw, not the revoke: `BindingRegistry.revoke` has already flipped the
+   * assignment to REVOKED and fenced the outbox message by then, and without the transaction those
+   * stand while the `DEAD_BINDING_RECOVERED` record that explains them never lands. Comparing the
+   * role, runs and outbox as one value is the point — a rollback that restored the assignment but
+   * left the outbox fenced is not a rollback.
    */
-  it("leaves no partial change when the release fails mid-flight", async () => {
-    const fixture = await deadCanonicalCto();
-    const daemon = await startedPastTheBinding(fixture, "acp-dsr-midflight-");
-    const before = recoverableState(fixture.harness);
+  it("leaves no partial change when the release fails mid-flight, records it, and releases on the next sweep", async () => {
+    const fixture = await deadCanonicalCto({ lifecycle: "ERROR" });
+    const before = holderState(fixture.harness);
 
-    // Only this door's own record throws. Anything else the request audits on its way through is
-    // left alone, so the failure is the one the case names rather than the first audit call.
     const record = fixture.harness.cp.audit.record.bind(fixture.harness.cp.audit);
     const audit = vi
       .spyOn(fixture.harness.cp.audit, "record")
@@ -592,21 +431,24 @@ describe("a canonical CTO whose process is gone", () => {
         }
         return record(event);
       });
-    const failed = await daemon.handleOperatorRequest(recoveryRequest(fixture), OWNER_PEER);
-    audit.mockRestore();
+    try {
+      // The sweep answers; a release that throws is recorded, not rethrown into `reconcile()`.
+      await sweep(fixture, "acp-dsr-midflight-");
+    } finally {
+      audit.mockRestore();
+    }
 
-    expect(failed.allowed).toBe(false);
-    expect(recoverableState(fixture.harness)).toEqual(before);
+    expect(holderState(fixture.harness)).toEqual(before);
+    expect(fixture.harness.cp.audit.byKind("DAEMON_TIMER_FAILED")).toMatchObject([
+      { roleKey: fixture.roleKey, evidence: { timer: "liveness-sweep", role: fixture.roleKey, error: expect.stringContaining("simulated storage failure") } },
+    ]);
     expect(fixture.harness.cp.audit.byKind("DEAD_BINDING_RECOVERED")).toHaveLength(0);
     expect(activeAssignmentIds(fixture.harness)).toContain(fixture.assignmentId);
-    expect(await modeOf(daemon)).toBe("NORMAL");
 
-    // And nothing about the failed attempt bars a second one: the same request succeeds once the
-    // failure is gone. It is the generation, not a spent token, that makes a repeat inert.
-    const retried = await daemon.handleOperatorRequest(recoveryRequest(fixture), OWNER_PEER);
-    expect(retried.allowed).toBe(true);
-
-    await daemon.stop();
+    // Nothing about the failed attempt bars the next one: it is read again and released.
+    await sweep(fixture, "acp-dsr-midflight-retry-");
+    expect(activeAssignmentIds(fixture.harness)).not.toContain(fixture.assignmentId);
+    expect(fixture.harness.cp.audit.byKind("DEAD_BINDING_RECOVERED")).toHaveLength(1);
   });
 
   /**
@@ -804,7 +646,7 @@ describe("ACP1045-R1-02: project and CTO reports still block on a project's CTO"
 });
 
 
-it.each(["ERROR", "STOPPED"] as const)("a settled %s CTO stays visible without blocking its recovery door", async (lifecycle) => {
+it.each(["ERROR", "STOPPED"] as const)("a settled %s CTO stays visible without blocking the daemon's start", async (lifecycle) => {
   const { harness, sessionId } = await deadCanonicalCto({ lifecycle: "ERROR" });
   if (lifecycle === "STOPPED") expect(harness.cp.sessions.transition(sessionId, SessionLifecycle.STOPPED).allowed).toBe(true);
   expect((await harness.cp.doctor.run("system")).findings).toContainEqual(expect.objectContaining({

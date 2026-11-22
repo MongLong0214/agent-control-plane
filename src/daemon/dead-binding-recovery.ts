@@ -8,11 +8,11 @@ import { Role, roleKeyFor } from "../domain/types.ts";
 import type { BindingRegistry } from "../session/binding-registry.ts";
 import type { SessionRegistry } from "../session/session-registry.ts";
 
-/** The project-scoped role this door recovers: one project's canonical CTO. */
+/** The project-scoped role this recovery covers: one project's canonical CTO. */
 export const DEAD_BINDING_RECOVERY_ROLE = Role.PRIMARY_CTO;
 
 /**
- * Every role this door recovers, written out rather than derived, and never "any role": a caller
+ * Every role this recovery covers, written out rather than derived, and never "any role": a caller
  * naming anything else is answered with a refusal rather than with a wider capability. Both
  * bindings lock a restart out when their process dies with the daemon — the canonical CTO of a
  * project, and the CEO, which has no project. Each is released only on the same proof.
@@ -132,54 +132,14 @@ export interface DeadBindingRecoveryRequest {
 const isNonEmptyString = (value: unknown): value is string =>
   typeof value === "string" && value.length > 0;
 
-/**
- * Parses the request with no defaults anywhere.
- *
- * Every field here names the target: which project, which session, which incarnation, which
- * generation. A default on any of them would let a caller who named nothing release whatever
- * happened to hold the role, which is the opposite of what this door is for — so an omitted or
- * malformed field is a refusal rather than a wildcard. The CEO's project is named too: an explicit
- * null, so an omitted project is refused for the CEO exactly as for the CTO.
- */
-export const parseDeadBindingRecoveryRequest = (
-  params: Record<string, unknown>,
-): Decision<DeadBindingRecoveryRequest> => {
-  const projectId = params["projectId"];
-  const role = params["role"];
-  const sessionId = params["sessionId"];
-  const sessionIncarnation = params["sessionIncarnation"];
-  const expectedBindingGeneration = params["expectedBindingGeneration"];
-  if (
-    !(role === Role.CEO ? projectId === null : isNonEmptyString(projectId)) ||
-    !isNonEmptyString(role) ||
-    !isNonEmptyString(sessionId) ||
-    !isNonEmptyString(sessionIncarnation) ||
-    !Number.isSafeInteger(expectedBindingGeneration) ||
-    (expectedBindingGeneration as number) < 1
-  ) {
-    return deny(
-      ReasonCode.INVALID_ARGUMENT,
-      "dead canonical binding recovery is missing a required field",
-      {},
-    );
-  }
-  return allow(ReasonCode.OK, {
-    projectId: projectId as string | null,
-    role,
-    sessionId,
-    sessionIncarnation,
-    expectedBindingGeneration: expectedBindingGeneration as number,
-  });
-};
-
 export interface DeadBindingRecoveryDeps {
   db: Db;
   audit: AuditLog;
   sessions: SessionRegistry;
   bindings: BindingRegistry;
   /**
-   * Seam for the liveness probe. The operator door passes nothing and gets the real syscall; the
-   * canonical self-claim passes the seam its own recorded start token was read through.
+   * Seam for the liveness probe. The daemon's liveness sweep passes nothing and gets the real
+   * syscall; the canonical self-claim passes the seam its own recorded start token was read through.
    */
   liveness?: {
     signal?: (pid: number) => void;
@@ -189,7 +149,7 @@ export interface DeadBindingRecoveryDeps {
    * Hold the released generation's queued peer messages instead of rejecting them. Only the
    * canonical self-claim sets it, because only it binds the same conversational actor's next
    * generation inside this same transaction and then carries or rejects every held row
-   * (`BindingRegistry.carryPeerMessagesToSameActorSuccessor`). The operator door passes nothing:
+   * (`BindingRegistry.carryPeerMessagesToSameActorSuccessor`). The liveness sweep passes nothing:
    * it binds no successor, so a held row would be left addressed to a generation nobody holds.
    *
    * `alreadyCarried` is filled by the revoke with the queued peer messages it rejected instead
@@ -202,7 +162,7 @@ export interface DeadBindingRecoveryDeps {
    * naming them in `runIds`. Only the canonical self-claim sets it: it binds the same conversational
    * actor's next generation inside this same transaction and moves exactly these runs to it
    * (`BindingRegistry.repointLiveRunsToSameActorSuccessor`) once the succession is proven, or
-   * refuses and rolls the release back. The operator door passes nothing: it binds no successor,
+   * refuses and rolls the release back. The liveness sweep passes nothing: it binds no successor,
    * so a binding that owns live runs is still refused there.
    */
   takeOverLiveRunsForSameActorSuccessor?: { readonly runIds: string[] };
@@ -231,29 +191,18 @@ export interface DeadBindingRecoveryReceipt {
  * CEO that died with the daemon left its binding ACTIVE, and since no CEO bootstrap or adoption
  * replaces an active binding, nothing could clear it. Released here, the same actor re-attaches at
  * the next generation through its own `restoreCeo` doors (`agentctl adopt hermes` or
- * `agentctl bootstrap hermes`); this door mints no actor and no binding for it.
+ * `agentctl bootstrap hermes`); this releases only, and mints no actor and no binding for it.
  *
- * This is the door a parked daemon serves for CTO_BINDING_POINTS_AT_DEAD_SESSION. It is
- * deliberately *not* `CtoLifecycle.recoveryTakeover`: that path spawns a replacement CTO and
- * mints it a new generation, which is normal work, and normal work is exactly what a parked
- * daemon must not perform. What this does is strictly smaller — it removes the stale claim on
- * the role and stops. Whoever takes the role afterwards does so through the ordinary
- * provisioning paths, once the daemon has passed its doctor and come up.
+ * The daemon's dead-session sweep (`Daemon.settleDeadSessions`, at start and on every watchdog
+ * tick) calls this for each ACTIVE canonical binding whose bound session is settled, so no person
+ * runs anything to release a dead holder. It is deliberately *not* `CtoLifecycle.recoveryTakeover`:
+ * that path spawns a replacement CTO and mints it a new generation, which is normal work. What
+ * this does is strictly smaller — it removes the stale claim on the role and stops. Whoever takes
+ * the role afterwards does so through the ordinary provisioning paths.
  *
- * No owner decision is minted, presented or consumed. This door used to require an
- * `OwnerApprovalReceipt` whose digest covered these exact parameters, admitted through the CLI
- * owner allowlist against a nonce the caller had to invent — and the CLI that carried it already
- * hard-coded `approved: true` with the comment "reaching this command *is* the owner's approval",
- * so the receipt restated the fact that the command had been run rather than adding a fact to it.
- * What bounds this door is not that ceremony but the liveness proof below: a binding is released
- * only when this machine can show, by `ESRCH` or by a mismatched process start time, that the
- * process holding it is gone. Widening that proof to buy back a gate was rejected — the proof is
- * the authority, and an unproven process stays bound no matter who asks.
- *
- * What that withdraws is real and is named here rather than left implied: the caller is now
- * whoever holds the operator socket's bearer credential, not additionally an actor named in
- * `ownerIdentities`. The door's range is unchanged — one role, one named generation, one provably
- * dead process — so what a caller gains is the ability to clear a binding nothing is using.
+ * What bounds the release is the liveness proof below: a binding is released only when this
+ * machine can show, by `ESRCH` or by a mismatched process start time, that the process holding it
+ * is gone. An unproven process stays bound; there is no manual release for an `UNKNOWN` probe.
  *
  * Everything still happens in one transaction: the generation/incarnation re-read, the revoke
  * (which fences the outbox inside the same transaction, in `BindingRegistry.revoke`), and the
@@ -268,7 +217,7 @@ export interface DeadBindingRecoveryReceipt {
  * (same conversational actor, same claimed conversation UUID) still ACTIVE on a predecessor
  * session whose process is gone. Nested, the denial comes back as data and the claim's outer
  * `txDecision` rolls back, so a release made there lands only together with the successor
- * generation. Changing the proof here changes both doors.
+ * generation. Changing the proof here changes both callers.
  *
  * Generation never moves backwards here because nothing is minted. `expectedBindingGeneration`
  * must equal the generation actually held, so a replayed request naming a superseded generation
@@ -282,6 +231,9 @@ export interface DeadBindingRecoveryReceipt {
  * (`RunEngine`'s continuity-hold hand-over reads it).
  */
 export const DEAD_CANONICAL_BINDING_RECOVERY_REASON_PREFIX = "dead canonical binding recovery: ";
+
+/** The actor the daemon's dead-session sweep writes into the `DEAD_BINDING_RECOVERED` record. */
+export const DEAD_BINDING_SWEEP_ACTOR = "daemon:liveness-sweep";
 
 export const recoverDeadCanonicalBinding = (
   actor: string,
@@ -298,7 +250,7 @@ export const recoverDeadCanonicalBinding = (
   if (roleKey === null) {
     return deny(
       ReasonCode.INVALID_ARGUMENT,
-      "this door recovers a project's canonical PRIMARY_CTO binding and the CEO binding, and no other role",
+      "this recovery covers a project's canonical PRIMARY_CTO binding and the CEO binding, and no other role",
       { role: request.role, projectId: request.projectId, supportedRoles: DEAD_BINDING_RECOVERY_ROLES },
     );
   }
@@ -355,26 +307,6 @@ export const recoverDeadCanonicalBinding = (
         },
       );
     }
-    // The CEO only: a surviving switch moves the actor's runtime and leaves the binding row, so
-    // the bound session can be dead while the CEO answers on another one. The bound session's
-    // death proves nothing about that runtime, so the release requires the two to be one. The
-    // CTO branch is left as it was.
-    if (
-      request.role === Role.CEO &&
-      (current.sessionId !== current.boundSessionId ||
-        current.sessionIncarnation !== current.boundSessionIncarnation)
-    ) {
-      return deny(
-        ReasonCode.INVALID_ARGUMENT,
-        "the CEO's live runtime is not the bound session; this door releases only a binding whose runtime is the dead one",
-        {
-          roleKey,
-          boundSessionId: current.boundSessionId,
-          liveSessionId: current.sessionId,
-        },
-      );
-    }
-
     const session = deps.sessions.get(request.sessionId);
     if (!session) {
       // A binding whose session row is gone is a real state, and it is also one in which no
@@ -410,7 +342,7 @@ export const recoverDeadCanonicalBinding = (
       return deny(
         ReasonCode.RECOVERY_TAKEOVER_REQUIRES_UNREACHABLE_OWNER,
         liveness === "ALIVE"
-          ? "the bound session's process is still running; this door releases only a dead one"
+          ? "the bound session's process is still running; this release covers only a dead one"
           : "the bound session's process could not be proven dead, and unproven is not recoverable",
         {
           projectId: request.projectId,
@@ -419,6 +351,36 @@ export const recoverDeadCanonicalBinding = (
           liveness,
         },
       );
+    }
+
+    // A surviving switch moves the actor's runtime and leaves the binding on the session it was
+    // bound to, so the bound session can be dead while the role's holder answers on another one.
+    // The bound session's death proves nothing about that holder: for a CTO and for the CEO alike,
+    // a binding whose current runtime differs from the bound one is released only once the current
+    // runtime is itself proven DEAD. ALIVE, UNKNOWN, an absent row and a different incarnation of
+    // that row all refuse, and nothing is changed.
+    const moved = current.sessionId !== current.boundSessionId ||
+      current.sessionIncarnation !== current.boundSessionIncarnation;
+    if (moved) {
+      const runtime = deps.sessions.get(current.sessionId);
+      const runtimeLiveness: SessionLiveness = runtime && runtime.incarnation === current.sessionIncarnation
+        ? probeSessionLiveness(runtime.osPid, runtime.osProcessStartedAt, deps.liveness ?? {})
+        : "UNKNOWN";
+      if (runtimeLiveness !== "DEAD") {
+        return deny(
+          ReasonCode.RECOVERY_TAKEOVER_REQUIRES_UNREACHABLE_OWNER,
+          runtimeLiveness === "ALIVE"
+            ? "the role's current runtime is not the bound session and is still running; this release covers only a dead holder"
+            : "the role's current runtime is not the bound session and could not be proven dead, and unproven is not recoverable",
+          {
+            projectId: request.projectId,
+            roleKey,
+            boundSessionId: current.boundSessionId,
+            runtimeSessionId: current.sessionId,
+            liveness: runtimeLiveness,
+          },
+        );
+      }
     }
 
     // No `allowBlockedRuns`. `revokePausedBinding` may pass it because it has already paused the
@@ -452,6 +414,7 @@ export const recoverDeadCanonicalBinding = (
         sessionIncarnation: session.incarnation,
         osPid: session.osPid,
         liveness,
+        ...(moved ? { runtimeSessionId: current.sessionId } : {}),
       },
     });
 

@@ -1,14 +1,19 @@
 import { spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { basename, dirname, join } from "node:path";
+import { existsSync, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import type { Decision } from "../core/errors.ts";
-import { readProcessArgv, readProcessStartToken } from "../core/process-argv.ts";
+import { readProcessStartToken } from "../core/process-argv.ts";
+import {
+  CTO_PROCESS_TABLE_UNREADABLE, assertNoOtherCtoProcess, ctoProcessesFor, ctoRoleScope, snapshotCtoProcesses, systemCtoProcessReader,
+  type CtoMatch, type CtoProcessReader, type CtoProcessSnapshot, type CtoRoleScope, type ExpectedProcess,
+} from "../cto/one-cto-per-project.ts";
+import { fallbackHandoff, firstPromptOf, handoffPackageOf, markHandoff, readHandoff, writeHandoff } from "../cto/cto-conversation.ts";
 import { residentWorkerCheckoutPath } from "../core/resident-allocation-paths.ts";
 import { daemonBuzzSigner } from "../outbox/ceo-buzz-signer.ts";
-import { BUZZ_CHANNEL_SERVER, CHANNEL_DEV_FLAG, channelLaunchArgs, confirmChannelStartup, launchFolderTrust, tmuxChannelDriver } from "../runtime/cto-channel-launch.ts";
+import { BUZZ_CHANNEL_SERVER, CHANNEL_DEV_FLAG, channelEmittedBy, channelLaunchArgs, confirmChannelStartup, launchFolderTrust, tmuxChannelDriver } from "../runtime/cto-channel-launch.ts";
 import { readHostProvisionerReason, recordedResidentExitStatus } from "../runtime/host-provisioner-reason.ts";
 
 /**
@@ -54,6 +59,18 @@ export const CTO_USAGE = `agentctl cto — a project CTO's lifecycle on this hos
       --expected-binding-generation auto, so its queued messages are kept. No new conversation and
       no handoff package. A resident is stopped and started again by ensure-resident with --resume
       (this resident path overlaps #1447, which replaces it)
+  agentctl cto relaunch <project> --fresh [--cwd <dir>] [--apply]
+      a canonical CTO's long conversation replaced by a new one, same tmux and channel: the daemon prepares
+      the switchover to a new conversation (canonicalCto.rotate, the handoff as its package; cto_handoff_write,
+      else a short one ACP writes), the old conversation's process is stopped by its exact pid, and the new
+      conversation starts (--session-id with the handoff as its first prompt; --resume once it has a
+      transcript) and claims the role at the next generation. Refused while the project has running work.
+      --apply first takes the daemon's hold on the project (ctoRefresh.hold) and keeps that connection open for
+      the whole run, so a second run cannot exist; a hold lost mid-run stops before the next change.
+      --cwd <dir> starts the new conversation in that existing folder instead of the old one's (never the home
+      folder; its acp-cto entry moves there and is removed from the old folder); it is kept with the handoff, so a
+      rerun without it uses the same folder. Roll forward only: after a failure, run the same command again; it continues on the same new
+      conversation and never goes back to the old one, which the switchover fences
   agentctl cto retire <project> --reason <text> [--delete-repo --yes-delete-repo <owner/name>] [--apply]
       wait for an idle CTO, then agentctl project retire (stops the session, releases the binding,
       archives its room, retires its roster route, takes it off the fleet), confirm the session,
@@ -73,21 +90,26 @@ export const CTO_USAGE = `agentctl cto — a project CTO's lifecycle on this hos
 export interface CtoExecResult { status: number | null; stdout: string; stderr: string }
 export interface CtoExecOptions { cwd?: string; input?: string; env?: Readonly<Record<string, string | undefined>>; timeoutMs?: number }
 export type CtoExec = (bin: string, args: readonly string[], options?: CtoExecOptions) => CtoExecResult;
-export interface CtoProcess { pid: number; ppid: number; command: string }
 export interface CtoFiles {
   exists(path: string): boolean;
   read(path: string): string;
-  /** Replaces the file whole (written beside it, then renamed into place), 0600 unless `mode` says otherwise. */
+  /** Replaces the file whole (written beside it, then renamed into place, its directory made if need be), 0600 unless `mode` says otherwise. */
   replace(path: string, body: string, mode?: number): void;
   /** Renames a file or a directory tree to a path that does not exist yet, creating its parent. */
   move(from: string, to: string): void;
   /** Removes a file or a directory tree. */
   remove(path: string): void;
   mtimeMs(path: string): number | null;
+  /** The path with every symlink resolved, and whether it is a directory; null when it does not exist. Without it a path is taken as given. */
+  real?(path: string): { path: string; directory: boolean } | null;
 }
 
 /** The operator socket, as `agentctl`'s own client speaks it. */
-export interface CtoOperator { request(method: string, params?: Record<string, unknown>, idempotencyKey?: string): Promise<Decision<unknown>> }
+export interface CtoOperator {
+  request(method: string, params?: Record<string, unknown>, idempotencyKey?: string): Promise<Decision<unknown>>;
+  /** A request whose allowed answer leaves the connection open: the daemon's hold lasts as long as it is. */
+  hold?(method: string, params?: Record<string, unknown>): Promise<{ decision: Decision<unknown>; open(): boolean; verify(): Promise<boolean>; release(): void }>;
+}
 
 export interface CtoRepository { repositoryId: string; identity: string; checkoutPath: string }
 
@@ -114,6 +136,12 @@ export interface CtoRecord {
 export interface CtoStateReader {
   projects(): CtoRecord[];
   project(projectId: string): CtoRecord | null;
+  /** The project's runs that are not finished, newest first. */
+  openRuns(projectId: string): Array<{ runId: string; state: string; kind: string }>;
+  /** The ids of the CTO's Buzz messages still queued (PENDING, or SENT and never completed), oldest first. */
+  queuedMessages?(projectId: string): string[];
+  /** The shared one-CTO rule's scope for the role, from the database (`ctoRoleScope`), with what this run adds. */
+  roleScope(projectId: string, extra?: { conversationIds?: readonly string[]; checkouts?: readonly string[] }): CtoRoleScope;
 }
 
 export interface CtoPorts {
@@ -125,10 +153,11 @@ export interface CtoPorts {
   operator: CtoOperator;
   state: CtoStateReader;
   run: CtoExec;
-  processes(): CtoProcess[];
+  /** The shared one-CTO process reader (`systemCtoProcessReader`): kernel argv, a table that fails closed. */
+  ctoProcesses: CtoProcessReader;
   startToken(pid: number): string | null;
-  /** A process's exact argv as the kernel holds it, or null; never `ps`'s space-joined text. */
-  argv(pid: number): readonly string[] | null;
+  /** Whether the kernel has no such pid (`kill(pid, 0)` throws ESRCH): the one proof that a process is gone. */
+  kernelGone(pid: number): boolean;
   signal(pid: number, signal: "SIGTERM"): void;
   files: CtoFiles;
   /** The Buzz public key of a key file, never its contents; null when it cannot be read. */
@@ -183,32 +212,91 @@ const allocationString = (record: CtoRecord, field: string): string | null => {
 const cloneOf = (record: CtoRecord): string | null =>
   allocationString(record, "clonePath") ?? record.repositories.find((r) => !r.checkoutPath.includes("/.acp-worker-checkouts/"))?.checkoutPath ?? null;
 
-/** Processes whose argv runs `uuid` as a Claude conversation, the rule the host provisioner uses. */
-const conversationProcesses = (ports: CtoPorts, uuid: string | null): CtoProcess[] => {
-  if (!uuid || !UUID.test(uuid)) return [];
-  const names = new RegExp(`(?:^|\\s)--(?:session-id|resume)\\s+${uuid}(?:\\s|$)`);
-  return ports.processes().filter((p) => names.test(p.command));
-};
-const carriesChannel = (command: string): boolean => command.includes(`${CHANNEL_DEV_FLAG} server:${BUZZ_CHANNEL_SERVER}`);
-const alive = (ports: CtoPorts, pid: number | null | undefined): boolean => Boolean(pid) && ports.processes().some((p) => p.pid === pid);
+const cwdOf = (record: CtoRecord | null): string | null => (record ? record.session?.workdir ?? cloneOf(record) : null);
 
-/** The tmux session one of whose panes is `pid` or an ancestor of it. */
-const tmuxOf = (ports: CtoPorts, pid: number): string | null => {
-  const listed = ports.run("tmux", ["list-panes", "-a", "-F", "#{pane_pid} #{session_name}"], { timeoutMs: 5_000 });
-  if (listed.status !== 0) return null;
-  const panes = new Map<number, string>();
-  for (const line of listed.stdout.split("\n")) {
-    const at = line.indexOf(" ");
-    if (at > 0) panes.set(Number(line.slice(0, at)), line.slice(at + 1));
+/** Whether a claude argv, element by element, loads the acp-buzz-channel development channel. */
+const argvCarriesChannel = (argv: readonly string[] | null | undefined): boolean => {
+  if (!argv) return false;
+  const wanted = `server:${BUZZ_CHANNEL_SERVER}`;
+  for (let at = 0; at < argv.length; at++) {
+    const element = argv[at]!;
+    if (element.startsWith(`${CHANNEL_DEV_FLAG}=`) && element.slice(CHANNEL_DEV_FLAG.length + 1).split(/[ ,]/).includes(wanted)) return true;
+    if (element !== CHANNEL_DEV_FLAG) continue;
+    for (let value = at + 1; value < argv.length && (value === at + 1 || !argv[value]!.startsWith("-")); value++) if (argv[value] === wanted) return true;
   }
-  const parents = new Map(ports.processes().map((p) => [p.pid, p.ppid]));
-  for (let current: number | undefined = pid, hops = 0; current && current > 1 && hops < 64; hops++) {
-    const session = panes.get(current);
-    if (session) return session;
-    current = parents.get(current);
-  }
-  return null;
+  return false;
 };
+
+/** The role's scope by the shared rule: the database's, plus the bound conversation and folder this run knows. */
+const roleScopeOf = (ports: CtoPorts, projectId: string): CtoRoleScope => {
+  const record = fresh(ports, projectId);
+  const cwd = cwdOf(record);
+  return ports.state.roleScope(projectId, { conversationIds: record?.conversation ? [record.conversation] : [], checkouts: cwd ? [cwd] : [] });
+};
+
+interface RoleProcesses { matches: CtoMatch[]; snapshot: CtoProcessSnapshot }
+/**
+ * The project's live CTO processes, by the one shared rule rather than a process reader or pattern of cto's own:
+ * `src/cto/one-cto-per-project.ts`, with real argv, the role's whole scope and the bound process. A process table that
+ * cannot be read is an error, never "nothing runs".
+ */
+const roleProcesses = async (ports: CtoPorts, projectId: string): Promise<RoleProcesses> => {
+  const read = await snapshotCtoProcesses(ports.ctoProcesses);
+  if (!read.ok) throw new Error(`${CTO_PROCESS_TABLE_UNREADABLE}: project ${projectId}: ${read.detail}`);
+  return { matches: ctoProcessesFor(roleScopeOf(ports, projectId), read.snapshot), snapshot: read.snapshot };
+};
+const withChannel = (role: RoleProcesses, pid: number): boolean => argvCarriesChannel(role.snapshot.claude.get(pid)?.argv);
+
+/** The one process a stop may signal, by its pid and its native start token. */
+interface StopTarget { pid: number; startToken: string; tmux: string | null }
+/**
+ * What a stop may signal, and nothing else: the bound session's recorded os_pid while the kernel still gives it the
+ * start ACP recorded, or, for a resident whose role is unbound, the one process the shared check matched. Never a
+ * match over command text. Null is nothing to stop; the pre-launch check decides whether a launch is then safe.
+ */
+/**
+ * A pid as the kernel says it is: GONE (provably: no such process, or only waiting to be reaped), ALIVE with its native
+ * start token, or UNAVAILABLE (alive, or not known not to be, and its token cannot be read). An unreadable token is never
+ * taken as exited.
+ */
+type Liveness = { state: "gone" } | { state: "alive"; token: string } | { state: "unavailable" };
+// GONE is the kernel's word alone (ESRCH): a failing `ps`, whatever it printed, never makes a pid gone.
+const livenessOf = async (ports: CtoPorts, pid: number): Promise<Liveness> => {
+  const token = ports.startToken(pid);
+  if (token !== null) return { state: "alive", token };
+  return ports.kernelGone(pid) ? { state: "gone" } : { state: "unavailable" };
+};
+
+const stopTargetOf = async (ports: CtoPorts, record: CtoRecord | null, role: RoleProcesses): Promise<StopTarget | null | { refused: string }> => {
+  // An ACTIVE binding: its recorded os_pid is the only thing a stop may signal, and nothing ever stands in for it.
+  if (record?.generation !== null && record?.generation !== undefined) {
+    const pid = record.session?.pid ?? null;
+    if (!pid) return null;
+    const live = await livenessOf(ports, pid);
+    if (live.state === "gone") return null;
+    if (live.state === "unavailable") {
+      return { refused: `the bound session's os_pid ${pid} is not provably gone and its start cannot be read, so its identity cannot be confirmed; nothing was stopped or launched` };
+    }
+    const recorded = record.session!.startedAt;
+    const row = role.snapshot.rows.find((one) => one.pid === pid);
+    if (recorded !== null && (recorded === live.token || (row !== undefined && row.startedAt === recorded))) {
+      return { pid, startToken: live.token, tmux: role.matches.find((one) => one.pid === pid)?.tmuxSession ?? null };
+    }
+    // Alive with another start, or none recorded: the bound session's identity cannot be confirmed, and no other
+    // process is taken in its place. Nothing is stopped and, since the one-cto and stop steps refuse, nothing launched.
+    return { refused: `the bound session's os_pid ${pid} is alive with a start that is not the one ACP recorded, so its identity cannot be confirmed; nothing was stopped or launched` };
+  }
+  // No ACTIVE binding at all: only a resident falls back to the one process the shared check matched.
+  if (record?.kind !== "resident") return null;
+  if (role.matches.length > 1) return { refused: `${role.matches.length} processes are this CTO role's (${role.matches.map((one) => one.pid).join(", ")}); nothing was signalled` };
+  const only = role.matches[0];
+  if (!only) return null;
+  const live = await livenessOf(ports, only.pid);
+  if (live.state === "gone") return null;
+  if (live.state === "unavailable") return { refused: `pid ${only.pid}, this CTO role's process, is not provably gone and its start cannot be read; nothing was signalled` };
+  return { pid: only.pid, startToken: live.token, tmux: only.tmuxSession };
+};
+
 const tmuxExists = (ports: CtoPorts, name: string): boolean =>
   ports.run("tmux", ["has-session", "-t", `=${name}`], { timeoutMs: 5_000 }).status === 0;
 
@@ -261,11 +349,11 @@ const fresh = (ports: CtoPorts, projectId: string): CtoRecord | null => ports.st
 const idleStep = (ports: CtoPorts, projectId: string): CtoStep => ({
   id: "idle",
   plan: `check the CTO is between turns: no process runs its conversation, or its transcript has not changed for ${IDLE_SECONDS}s`,
-  run: () => {
+  run: async () => {
     const record = fresh(ports, projectId);
     const uuid = record?.conversation ?? null;
-    const live = conversationProcesses(ports, uuid);
-    if (!record || live.length === 0) return ok({ running: false });
+    const role = await roleProcesses(ports, projectId);
+    if (!record || role.matches.length === 0) return ok({ running: false });
     const cwd = record.session?.workdir ?? cloneOf(record);
     const mtime = cwd ? ports.files.mtimeMs(transcriptOf(ports, cwd, uuid!)) : null;
     if (mtime === null) return refused(`conversation ${uuid} is running and its transcript cannot be found, so whether it is mid-turn is unknown`);
@@ -275,54 +363,64 @@ const idleStep = (ports: CtoPorts, projectId: string): CtoStep => ({
   },
 });
 
-/** Whether `pid` is the incarnation ACP recorded: the native start token, or `ps`'s lstart text for a row written that way. */
-const sameIncarnation = (ports: CtoPorts, pid: number, startedAt: string): boolean => {
-  if (ports.startToken(pid) === startedAt) return true;
-  if (!/^[A-Z][a-z]{2} [A-Z][a-z]{2} +\d{1,2} \d{2}:\d{2}:\d{2} \d{4}$/.test(startedAt)) return false;
-  return ports.run("ps", ["-o", "lstart=", "-p", String(pid)], { env: { ...ports.env, LC_ALL: "C" }, timeoutMs: 5_000 }).stdout.trim() === startedAt;
-};
-
 /**
- * SIGTERM to exactly the one process running the conversation, never to anything else, then its exit confirmed by its
- * start token changing. ACP's recorded pid, when that process is alive, must be the same process, and when it is that
- * pid it must be the incarnation ACP recorded (pid and start time). `keepChanneled` leaves a process that already
- * carries the channel running (cto add brings a CTO up; it does not restart one that is up).
+ * SIGTERM to exactly the stop target (`stopTargetOf`: the bound session's os_pid with the start ACP recorded, or a
+ * resident's one matched process), then its exit confirmed by its native start token changing. Nothing found by
+ * command text is ever signalled. `keepChanneled` leaves a target that already carries the channel running (cto add
+ * brings a CTO up; it does not restart one that is up). The stopped identity goes to `stopped`, which the launch's
+ * pre-launch check excuses (pid and start token) and nothing else.
  */
-const stopStep = (ports: CtoPorts, projectId: string, id = "stop", keepChanneled = false): CtoStep => ({
+const stopStep = (
+  ports: CtoPorts, projectId: string, id = "stop", keepChanneled = false, stopped: ExpectedProcess[] = [],
+  // Which process this run signals, chosen once; what is signalled is exactly that pid and start token, never a fresh reading of the binding.
+  pick?: (role: RoleProcesses) => Promise<StopTarget | null | { refused: string }>,
+  // --fresh: asked again right before the signal, after the reads above awaited; an outcome here is returned and nothing is signalled.
+  gate?: () => Promise<Outcome | null>,
+): CtoStep => ({
   id,
   plan: keepChanneled
-    ? "unless the CTO's conversation already runs with the acp-buzz-channel, send SIGTERM to the one claude process running it (its exact pid and start time), nothing else, and wait for it to exit"
-    : "send SIGTERM to the one claude process running the CTO's conversation (its exact pid and start time), nothing else, and wait for it to exit",
-  done: () => {
-    const live = conversationProcesses(ports, fresh(ports, projectId)?.conversation ?? null);
-    return live.length === 0 || (keepChanneled && live.every((p) => carriesChannel(p.command)));
+    ? "unless the CTO already runs with the acp-buzz-channel, send SIGTERM to its bound session's process (the recorded pid, checked by its native start token), nothing else, and wait for it to exit"
+    : "send SIGTERM to the CTO's bound session's process (the recorded pid, checked by its native start token; for an unbound resident, the one process the shared one-CTO check matches), nothing else, and wait for it to exit",
+  done: async () => {
+    const role = await roleProcesses(ports, projectId);
+    const target = await stopTargetOf(ports, fresh(ports, projectId), role);
+    if (target === null) return true;
+    return !("refused" in target) && keepChanneled && withChannel(role, target.pid);
   },
   run: async () => {
-    const record = fresh(ports, projectId);
-    const uuid = record?.conversation ?? null;
-    const live = conversationProcesses(ports, uuid);
-    if (live.length === 0) return ok({ running: false });
-    if (live.length > 1) return refused(`${live.length} processes run conversation ${uuid} (${live.map((p) => p.pid).join(", ")}); nothing was signalled`);
-    const target = live[0]!;
-    const recorded = record?.session?.pid ?? null;
-    if (recorded && recorded !== target.pid && alive(ports, recorded)) {
-      return refused(`ACP records pid ${recorded} for this CTO, which is alive, but pid ${target.pid} runs its conversation; nothing was signalled`);
+    const role = await roleProcesses(ports, projectId);
+    const target = pick ? await pick(role) : await stopTargetOf(ports, fresh(ports, projectId), role);
+    if (target === null) return ok({ running: false });
+    if ("refused" in target) return refused(target.refused);
+    // Exited is proven only by the kernel: the pid gone, or a readable token that is another process's.
+    const exited = async (): Promise<boolean | null> => {
+      const live = await livenessOf(ports, target.pid);
+      return live.state === "gone" || (live.state === "alive" && live.token !== target.startToken) ? true : live.state === "unavailable" ? null : false;
+    };
+    // The hold is verified first: that await takes event-loop turns in which the pid may be reused, so the token is read after it.
+    const gated = await gate?.();
+    if (gated) return gated;
+    // Immediately before the signal the token is read again: only the very identity selected is signalled. A pid the
+    // kernel no longer has is already stopped; a token that cannot be read, or that is another process's, refuses.
+    const now = ports.startToken(target.pid);
+    if (now === null && ports.kernelGone(target.pid)) return ok({ pid: target.pid, alreadyGone: true });
+    if (now !== target.startToken) {
+      return refused(now === null
+        ? `pid ${target.pid}'s start cannot be read right before the signal, so it cannot be confirmed as the process selected; nothing was signalled or launched`
+        : `pid ${target.pid} is another process than the one selected (its start changed); nothing was signalled or launched`);
     }
-    const recordedStart = record?.session?.startedAt ?? null;
-    if (recorded === target.pid && recordedStart && !sameIncarnation(ports, target.pid, recordedStart)) {
-      return refused(`pid ${target.pid} is not the incarnation ACP recorded for this CTO (its start time differs); nothing was signalled`);
-    }
-    const start = ports.startToken(target.pid);
-    if (start === null) return refused(`pid ${target.pid}'s start time cannot be read, so its exit could not be confirmed; nothing was signalled`);
     try { ports.signal(target.pid, "SIGTERM"); } catch (error) {
       // Gone between the read and the signal is the outcome this step wants; anything else is reported.
       if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
     }
-    for (const deadline = ports.now() + STOP_TIMEOUT_MS; ports.startToken(target.pid) === start;) {
-      if (ports.now() >= deadline) return refused(`pid ${target.pid} did not exit within ${STOP_TIMEOUT_MS / 1000}s of SIGTERM; nothing else was signalled`);
+    for (const deadline = ports.now() + STOP_TIMEOUT_MS; (await exited()) !== true;) {
+      if (ports.now() >= deadline) {
+        return refused(`pid ${target.pid} did not provably exit within ${STOP_TIMEOUT_MS / 1000}s of SIGTERM (it still runs, or its start could not be read); nothing else was signalled and nothing was launched`);
+      }
       await ports.sleep(POLL_MS);
     }
-    return ok({ pid: target.pid });
+    stopped.push({ pid: target.pid, startedAt: target.startToken });
+    return ok({ pid: target.pid, tmux: target.tmux });
   },
 });
 
@@ -330,7 +428,10 @@ const stopStep = (ports: CtoPorts, projectId: string, id = "stop", keepChanneled
 const residentLaunchStep = (ports: CtoPorts, projectId: string): CtoStep => ({
   id: "launch",
   plan: "start the resident through the host provisioner's ensure-resident, the fleet watcher's launcher: it writes the resident request, boot packet and fleet entry and starts claude with the acp-buzz-channel, resuming the conversation it has a record of",
-  done: () => conversationProcesses(ports, fresh(ports, projectId)?.conversation ?? null).some((p) => carriesChannel(p.command)),
+  done: async () => {
+    const role = await roleProcesses(ports, projectId);
+    return role.matches.some((one) => withChannel(role, one.pid));
+  },
   run: async () => {
     const request = readResidentRequest(ports, projectId);
     if (!request) return refused(`${residentRequestOf(ports, projectId)} is missing: the daemon writes it when it activates this resident, so ACP has not activated it on this host`);
@@ -363,7 +464,6 @@ const runtimeCliOf = (ports: CtoPorts): string => join(ports.stateDir, "current"
 /** The acp-cto entry a canonical CTO's claude starts: the same claim, at the role's next generation, from inside it. */
 const acpCtoEntryArgs = (ports: CtoPorts, projectId: string, uuid: string): string[] =>
   [runtimeCliOf(ports), "attach", "canonical-cto", "--claimed-session-id", uuid, "--project-id", projectId, "--expected-binding-generation", "auto"];
-const cwdOf = (record: CtoRecord): string | null => record.session?.workdir ?? cloneOf(record);
 /** The options a running session was started with that its resume keeps: each takes one value. */
 const CARRIED_OPTIONS = new Set(["--model", "--effort", "--name", "--remote-control", "--messaging-socket-path", "--permission-mode"]);
 const carriedOptions = (argv: readonly string[]): string[] => {
@@ -395,12 +495,43 @@ const channelOf = (ports: CtoPorts, record: CtoRecord): { keyFile: string; roomI
   return keyFile ? { keyFile, roomId: room } : `no key file here is the Buzz identity ACP holds for this CTO (${record.actorId}): looked at ${candidates.join(", ")}`;
 };
 
-interface CanonicalLauncher { tmux: string; argv: string[] }
-const readCanonicalLauncher = (ports: CtoPorts, projectId: string): CanonicalLauncher | null => {
+/** What a canonical launch starts: the binary, the resume and the options it keeps, and its channel's key and room. */
+interface CanonicalLauncher { tmux: string; cwd: string; claude: string; keyFile: string; roomId: string; resume: string[] }
+const quoteShell = (v: string): string => `'${v.replaceAll("'", "'\\''")}'`;
+/** The launcher script for one launch: `launchId` is this launch's own, passed to its channel server. */
+const writeCanonicalLauncher = (ports: CtoPorts, projectId: string, plan: CanonicalLauncher, launchId?: string, historyBefore?: number): string[] => {
+  const argv = [plan.claude,
+    ...channelLaunchArgs({
+      runtimeNode: runtimeNodeOf(ports), runtimeCli: runtimeCliOf(ports), projectId, keyFile: plan.keyFile, roomId: plan.roomId, stateDir: ports.stateDir,
+      ...(launchId ? { launchId } : {}), ...(historyBefore !== undefined ? { historyBefore } : {}),
+    }),
+    ...plan.resume];
+  ports.files.replace(canonicalLauncherOf(ports, projectId), `#!/bin/sh\n# cto-launch: ${JSON.stringify(plan)}\n` +
+    "unset ACP_OPERATOR_TOKEN ACP_MCP_TOKEN ACP_BUZZ_INGRESS_SECRET GH_TOKEN GITHUB_TOKEN\n" +
+    `cd ${quoteShell(plan.cwd)} || exit 1\nexec ${argv.map(quoteShell).join(" ")}\n`, 0o700);
+  return argv;
+};
+/** The launcher's recorded line, whatever version wrote it; null when there is none or it does not parse. */
+const launcherRecordOf = (ports: CtoPorts, projectId: string): Record<string, unknown> | null => {
   const file = canonicalLauncherOf(ports, projectId);
   if (!ports.files.exists(file)) return null;
   const line = ports.files.read(file).split("\n").find((l) => l.startsWith("# cto-launch: "));
-  try { return line ? JSON.parse(line.slice("# cto-launch: ".length)) as CanonicalLauncher : null; } catch { return null; }
+  try {
+    const value: unknown = line ? JSON.parse(line.slice("# cto-launch: ".length)) : null;
+    return value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null;
+  } catch { return null; }
+};
+const isStrings = (value: unknown): value is string[] => Array.isArray(value) && value.every((one) => typeof one === "string");
+/** This version's launcher record, or null: one with any of its metadata missing is regenerated, never used. */
+const readCanonicalLauncher = (ports: CtoPorts, projectId: string): CanonicalLauncher | null => {
+  const r = launcherRecordOf(ports, projectId);
+  return r && ["tmux", "cwd", "claude", "keyFile", "roomId"].every((key) => typeof r[key] === "string") && isStrings(r["resume"])
+    ? r as unknown as CanonicalLauncher : null;
+};
+/** What an earlier version's launcher (`{tmux, argv}`) carried: its tmux session and its full argv, for the options it kept. */
+const readLegacyLauncher = (ports: CtoPorts, projectId: string): { tmux: string | null; argv: string[] } | null => {
+  const r = launcherRecordOf(ports, projectId);
+  return r && isStrings(r["argv"]) && r["argv"].length > 0 ? { tmux: typeof r["tmux"] === "string" ? r["tmux"] : null, argv: r["argv"] } : null;
 };
 
 /**
@@ -411,30 +542,94 @@ const readCanonicalLauncher = (ports: CtoPorts, projectId: string): CanonicalLau
  * same actor and the daemon keeps its queued messages for the channel to deliver. Nothing here starts a new
  * conversation, writes a handoff package or runs a rotation. Everything that can refuse is checked before the stop.
  */
-const canonicalResumeSteps = (ports: CtoPorts, projectId: string, restart: boolean): CtoStep[] => {
+const canonicalResumeSteps = (
+  ports: CtoPorts, projectId: string, restart: boolean,
+  // --fresh: the conversation to start is the switchover's (`uuid`, known once `prepare` ran or found it), never the bound one.
+  options: { fresh?: { uuid: string | null; cwd: () => string | null; old: string; prepare: CtoStep; prepared: () => Promise<boolean>; gate: () => Promise<Outcome | null> } } = {},
+): CtoStep[] => {
   const planned = fresh(ports, projectId);
-  const uuid = planned?.conversation ?? null;
-  const cwd = planned ? cwdOf(planned) : null;
+  const wanted = (record: CtoRecord | null): string | null => (options.fresh ? options.fresh.uuid : record?.conversation ?? null);
+  const uuid = wanted(planned);
+  const cwd = options.fresh?.cwd() ?? (planned ? cwdOf(planned) : null);
   const launcher = canonicalLauncherOf(ports, projectId);
+  type McpEntry = { command?: string; args?: string[] };
+  /** The acp-cto entry Claude Code keeps for a folder: in `$CLAUDE_CONFIG_DIR/.claude.json` when set, else `~/.claude.json`, under the folder's realpath. */
+  const entryAt = (folder: string): McpEntry | undefined => {
+    const dir = ports.env["CLAUDE_CONFIG_DIR"] ?? "";
+    const config = join(dir === "" ? ports.home : dir, ".claude.json");
+    if (!ports.files.exists(config)) return undefined;
+    const key = ports.files.real?.(folder)?.path ?? folder;
+    try { return (JSON.parse(ports.files.read(config)) as { projects?: Record<string, { mcpServers?: Record<string, McpEntry> }> }).projects?.[key]?.mcpServers?.["acp-cto"]; } catch { return undefined; }
+  };
+  /**
+   * --fresh: the destination's acp-cto entry names another project, which this run must not repoint. Only the new folder's entry is ever
+   * written; the old folder's is left alone (it may be shared with a git root or subfolder, or be another project's). It names the old,
+   * now fenced conversation, so an attach through it is refused, which is harmless.
+   */
+  const mcpConflict = (target: string): string | null => {
+    const entry = options.fresh ? entryAt(target) : undefined;
+    if (!entry) return null;
+    const args = entry.args ?? [];
+    const owner = args.includes("--project-id") ? args[args.indexOf("--project-id") + 1] : undefined;
+    return owner === projectId ? null : `${target} already has an acp-cto entry that belongs to ${owner ?? "another project"}; nothing was changed`;
+  };
   const bound = (): { record: CtoRecord; uuid: string; cwd: string } | string => {
     const record = fresh(ports, projectId);
-    if (!record?.conversation || !UUID.test(record.conversation)) return "the role has no bound conversation to resume";
-    const folder = cwdOf(record);
-    return folder ? { record, uuid: record.conversation, cwd: folder } : "the CTO's working directory is not recorded";
+    const conversation = wanted(record);
+    if (!record || (conversation === null ? !options.fresh : !UUID.test(conversation))) return "the role has no bound conversation to resume";
+    const folder = options.fresh?.cwd() ?? cwdOf(record);
+    return folder ? { record, uuid: conversation ?? "", cwd: folder } : "the CTO's working directory is not recorded";
   };
-  const resumed = (record: CtoRecord | null): boolean => {
-    const live = conversationProcesses(ports, record?.conversation ?? null);
-    return live.some((p) => carriesChannel(p.command) && p.pid === record?.session?.pid);
+  // The process this run stopped: the only one the pre-launch check excuses.
+  const stopped: ExpectedProcess[] = [];
+  /** The role is held by a process the kernel still knows by its recorded start, and it carries the channel. */
+  const resumed = async (record: CtoRecord | null): Promise<boolean> => {
+    const pid = record?.generation !== null ? record?.session?.pid ?? null : null;
+    if (!pid || ports.startToken(pid) === null || ports.startToken(pid) !== record!.session!.startedAt) return false;
+    if (options.fresh && record!.conversation !== options.fresh.uuid) return false;
+    return argvCarriesChannel(await ports.ctoProcesses.argv(pid));
   };
-  return [idleStep(ports, projectId), {
+  /** A new conversation starts with --session-id and the handoff; once its transcript exists it is only ever resumed. */
+  const freshFlag = (at: { cwd: string; uuid: string }): "--session-id" | "--resume" => (ports.files.exists(transcriptOf(ports, at.cwd, at.uuid)) ? "--resume" : "--session-id");
+  /** --fresh: the new conversation's own live processes, by argv; never the old conversation's, whatever else they share. */
+  const namesNew = (role: RoleProcesses, pid: number): boolean => options.fresh?.uuid != null && (role.snapshot.claude.get(pid)?.argv ?? []).includes(options.fresh.uuid);
+  const newRunning = async (): Promise<boolean> => {
+    const role = await roleProcesses(ports, projectId);
+    return role.matches.some((one) => namesNew(role, one.pid) && withChannel(role, one.pid));
+  };
+  /**
+   * Stops the old conversation's process by its exact pid and start token, chosen once. With --fresh a process is chosen only if the
+   * binding still names the old conversation and its argv does not name the new one; otherwise nothing is signalled.
+   */
+  const stopOldStep = (): CtoStep => {
+    if (!options.fresh) return stopStep(ports, projectId, "stop", !restart, stopped);
+    const old = options.fresh.old;
+    const notOld = (record: CtoRecord | null, role: RoleProcesses, one: StopTarget): boolean => namesNew(role, one.pid) || record?.conversation !== old;
+    const pick = async (role: RoleProcesses) => {
+      const record = fresh(ports, projectId);
+      const picked = await stopTargetOf(ports, record, role);
+      return picked === null || "refused" in picked ? picked : notOld(record, role, picked) ? null : picked;
+    };
+    const stop = stopStep(ports, projectId, "stop", !restart, stopped, pick, options.fresh.gate);
+    return {
+      ...stop,
+      done: async () => {
+        const record = fresh(ports, projectId);
+        const role = await roleProcesses(ports, projectId);
+        const picked = await stopTargetOf(ports, record, role);
+        return (picked !== null && !("refused" in picked) && notOld(record, role, picked)) || stop.done!();
+      },
+    };
+  };
+  return [options.fresh ? { ...idleStep(ports, projectId), done: options.fresh.prepared } : idleStep(ports, projectId), {
     id: "trust",
     plan: `check Claude Code would find ${cwd ?? "the CTO's folder"} already trusted (launchFolderTrust); nothing is ever trusted here`,
     run: () => {
       const at = bound();
       if (typeof at === "string") return refused(at);
       const trust = launchFolderTrust(at.cwd, { home: ports.home, env: ports.env });
-      return trust.trusted ? ok({ folder: trust.folder })
-        : refused(`Claude Code would not find ${at.cwd} trusted (${trust.reason}); run ~/.claude/scripts/claude-trust-dir.sh ${at.cwd}, then run this again; nothing was stopped`);
+      if (trust.trusted) { const conflict = mcpConflict(at.cwd); return conflict ? refused(conflict) : ok({ folder: trust.folder }); }
+      return refused(`Claude Code would not find ${at.cwd} trusted (${trust.reason}); run ~/.claude/scripts/claude-trust-dir.sh ${at.cwd}, then run this again; nothing was stopped`);
     },
   }, {
     id: "channel",
@@ -445,69 +640,132 @@ const canonicalResumeSteps = (ports: CtoPorts, projectId: string, restart: boole
       const channel = channelOf(ports, at.record);
       return typeof channel === "string" ? refused(`${channel}; nothing was stopped`) : ok(channel);
     },
+  }, ...(options.fresh ? [options.fresh.prepare] : []), {
+    id: "one-cto",
+    plan: "check with the shared one-CTO rule (the role's whole scope, real argv) that no process of the role runs but the bound session's own, which the stop replaces",
+    run: async () => {
+      const role = await roleProcesses(ports, projectId);
+      const target = await stopTargetOf(ports, fresh(ports, projectId), role);
+      if (target !== null && "refused" in target) return refused(target.refused);
+      // --fresh: a process already running the new conversation is excused too; it is the one this run goes on to wait for.
+      const excused = [...(target ? [{ pid: target.pid, startedAt: target.startToken }] : []),
+        ...role.matches.filter((one) => namesNew(role, one.pid)).flatMap((one) => { const at = ports.startToken(one.pid); return at === null ? [] : [{ pid: one.pid, startedAt: at }]; })];
+      const one = await assertNoOtherCtoProcess(roleScopeOf(ports, projectId), ports.ctoProcesses, excused);
+      return one.ok ? ok(target ? { replaces: target.pid } : {}) : refused(`${one.message}; nothing was written, stopped or started`);
+    },
   }, {
     id: "launcher",
-    plan: `write ${launcher}: claude --resume ${uuid ?? "<the bound conversation>"} with the channel, keeping the running session's model, effort, name, remote-control name, messaging socket and permission mode, to be started in its tmux session`,
+    plan: `write ${launcher}: claude ${options.fresh ? "--session-id <the switchover's conversation> with the handoff as its first prompt (--resume once its transcript exists)" : `--resume ${uuid ?? "<the bound conversation>"}`} with the channel, keeping the running session's model, effort, name, remote-control name, messaging socket and permission mode, to be started in its tmux session`,
     // A launcher an earlier run wrote is kept once nothing runs the conversation: it holds what the stopped session carried.
-    done: () => {
+    done: async () => {
       const record = fresh(ports, projectId);
-      return conversationProcesses(ports, record?.conversation ?? null).length === 0 && readCanonicalLauncher(ports, projectId)?.argv.includes(record?.conversation ?? "\0") === true;
+      if (options.fresh && await newRunning()) return true;
+      const role = await roleProcesses(ports, projectId);
+      const launcherNow = readCanonicalLauncher(ports, projectId);
+      const written = launcherNow?.resume;
+      // --fresh: a launcher written for the other mode (the transcript has appeared, or vanished, since) is not the one to start.
+      const at = bound();
+      const mode = options.fresh && typeof at !== "string" ? freshFlag(at) : "--resume";
+      // The launcher cds to the folder it recorded: one written for another folder is not the one to start.
+      const sameFolder = typeof at === "string" || launcherNow?.cwd === at.cwd;
+      return role.matches.length === 0 && sameFolder && written?.[0] === mode && written.includes(wanted(record) ?? "\0");
     },
-    run: () => {
+    run: async () => {
       const at = bound();
       if (typeof at === "string") return refused(at);
+      if (!UUID.test(at.uuid)) return refused("the conversation to start is not known; nothing was written");
       const channel = channelOf(ports, at.record);
       if (typeof channel === "string") return refused(channel);
-      const live = conversationProcesses(ports, at.uuid);
-      if (live.length > 1) return refused(`${live.length} processes run conversation ${at.uuid}; nothing was written`);
-      const running = live[0] ?? null;
-      const argv = running ? ports.argv(running.pid) : null;
-      if (running && argv === null) return refused(`pid ${running.pid}'s argv cannot be read, so what its session was started with is unknown; nothing was written`);
-      const claude = claudeBinaryOf(ports, argv);
-      if (!claude) return refused("the claude binary is not known: set ACP_CLAUDE_BINARY (agentcpd's launcher pins ACP_RESOLVED_CLAUDE_BINARY)");
+      const role = await roleProcesses(ports, projectId);
+      const target = await stopTargetOf(ports, at.record, role);
+      if (target !== null && "refused" in target) return refused(target.refused);
+      // What the bound session was started with, from its kernel argv; nothing is read from command text.
+      const argv = target ? role.snapshot.claude.get(target.pid)?.argv ?? null : null;
+      if (target && argv === null) return refused(`pid ${target.pid}'s argv cannot be read, so what its session was started with is unknown; nothing was written`);
       const earlier = readCanonicalLauncher(ports, projectId);
-      const kept = argv ? carriedOptions(argv) : earlier ? carriedOptions(earlier.argv) : [];
-      const resume = [claude,
-        ...channelLaunchArgs({ runtimeNode: runtimeNodeOf(ports), runtimeCli: runtimeCliOf(ports), projectId, keyFile: channel.keyFile, roomId: channel.roomId, stateDir: ports.stateDir }),
-        "--resume", at.uuid, ...kept, ...(kept.includes("--permission-mode") ? [] : ["--permission-mode", "bypassPermissions"])];
-      const tmux = (running ? tmuxOf(ports, running.pid) : null) ?? earlier?.tmux ?? `cto-${projectId}`;
-      const quote = (v: string): string => `'${v.replaceAll("'", "'\\''")}'`;
-      ports.files.replace(launcher, `#!/bin/sh\n# cto-launch: ${JSON.stringify({ tmux, argv: resume })}\n` +
-        "unset ACP_OPERATOR_TOKEN ACP_MCP_TOKEN ACP_BUZZ_INGRESS_SECRET GH_TOKEN GITHUB_TOKEN\n" +
-        `cd ${quote(at.cwd)} || exit 1\nexec ${resume.map(quote).join(" ")}\n`, 0o700);
+      const legacy = earlier ? null : readLegacyLauncher(ports, projectId);
+      const claude = claudeBinaryOf(ports, argv ?? (earlier ? [earlier.claude] : legacy?.argv ?? null));
+      if (!claude) return refused("the claude binary is not known: set ACP_CLAUDE_BINARY (agentcpd's launcher pins ACP_RESOLVED_CLAUDE_BINARY)");
+      const kept = argv ? carriedOptions(argv) : earlier ? carriedOptions([earlier.claude, ...earlier.resume]) : legacy ? carriedOptions(legacy.argv) : [];
+      const perm = kept.includes("--permission-mode") ? [] : ["--permission-mode", "bypassPermissions"];
+      let resume = ["--resume", at.uuid, ...kept, ...perm];
+      if (options.fresh && freshFlag(at) === "--session-id") {
+        const stored = readHandoff(ports.files, ports.stateDir, projectId);
+        if (!stored) return refused("the handoff is not stored; nothing was written");
+        resume = ["--session-id", at.uuid, ...kept, ...perm, firstPromptOf({ projectId, previousConversation: stored.conversation, text: stored.text })];
+      }
+      const tmux = target?.tmux ?? earlier?.tmux ?? legacy?.tmux ?? `cto-${projectId}`;
+      // The reads above awaited: nothing is written once the hold is lost.
+      const gatedLauncher = await options.fresh?.gate();
+      if (gatedLauncher) return gatedLauncher;
+      // The launch writes its own id into this script before tmux starts it; this one is the plan a rerun starts from.
+      writeCanonicalLauncher(ports, projectId, { tmux, cwd: at.cwd, claude, keyFile: channel.keyFile, roomId: channel.roomId, resume });
       return ok({ launcher, tmux });
     },
   }, {
     id: "mcp",
     plan: `point the project's local acp-cto entry at conversation ${uuid ?? "<the bound conversation>"} with --expected-binding-generation auto, so the resumed claude makes the claim itself`,
-    done: () => {
+    done: async () => {
+      if (options.fresh && await newRunning()) return true;
       const at = bound();
       if (typeof at === "string") return false;
-      const config = join(ports.home, ".claude.json");
-      if (!ports.files.exists(config)) return false;
-      const entry = (JSON.parse(ports.files.read(config)) as { projects?: Record<string, { mcpServers?: Record<string, { command?: string; args?: string[] }> }> })
-        .projects?.[at.cwd]?.mcpServers?.["acp-cto"];
+      const entry = entryAt(at.cwd);
       return entry?.command === runtimeNodeOf(ports) && JSON.stringify(entry.args ?? []) === JSON.stringify(acpCtoEntryArgs(ports, projectId, at.uuid));
     },
-    run: () => {
+    run: async () => {
       const at = bound();
       if (typeof at === "string") return refused(at);
-      const claude = claudeBinaryOf(ports, readCanonicalLauncher(ports, projectId)?.argv ?? null);
+      if (!UUID.test(at.uuid)) return refused("the conversation to start is not known; nothing was changed");
+      const conflict = mcpConflict(at.cwd);
+      if (conflict) return refused(conflict);
+      const earlier = readCanonicalLauncher(ports, projectId);
+      const claude = claudeBinaryOf(ports, earlier ? [earlier.claude] : readLegacyLauncher(ports, projectId)?.argv ?? null);
       if (!claude) return refused("the claude binary is not known: set ACP_CLAUDE_BINARY");
       // Absent is fine; the add below is what has to succeed.
       ports.run(claude, ["mcp", "remove", "--scope", "local", "acp-cto"], { cwd: at.cwd, timeoutMs: 30_000 });
+      // The remove blocked the event loop: the hold is verified again before the add that follows it.
+      const gatedAdd = await options.fresh?.gate();
+      if (gatedAdd) return gatedAdd;
       const added = ports.run(claude, ["mcp", "add", "--scope", "local", "acp-cto", "--", runtimeNodeOf(ports), ...acpCtoEntryArgs(ports, projectId, at.uuid)], { cwd: at.cwd, timeoutMs: 30_000 });
-      return added.status === 0 ? ok() : refused(`claude mcp add acp-cto failed: ${firstLine(added.stderr)}`);
+      if (added.status !== 0) return refused(`claude mcp add acp-cto failed: ${firstLine(added.stderr)}`);
+      return ok();
     },
-  }, stopStep(ports, projectId, "stop", !restart), {
+  }, stopOldStep(), {
     id: "launch",
-    plan: `start ${launcher} in tmux and confirm the acp-buzz-channel came up, pressing nothing but its development-channels warning`,
-    done: () => conversationProcesses(ports, fresh(ports, projectId)?.conversation ?? null).some((p) => carriesChannel(p.command)),
+    plan: `check with the shared one-CTO rule that no process of the role runs but the one this run stopped, then start ${launcher} in tmux and confirm the acp-buzz-channel came up, pressing nothing but its development-channels warning`,
+    done: async () => {
+      if (options.fresh) return newRunning();
+      const role = await roleProcesses(ports, projectId);
+      return role.matches.some((one) => withChannel(role, one.pid));
+    },
     run: async () => {
       const planned = readCanonicalLauncher(ports, projectId);
       if (!planned) return refused(`${launcher} is missing or unreadable; run this again to write it`);
+      // The one definition of running, asked with the role's whole scope; only the process this run stopped is excused.
+      const one = await assertNoOtherCtoProcess(roleScopeOf(ports, projectId), ports.ctoProcesses, stopped);
+      if (!one.ok) return refused(`${one.message}; nothing was started`);
+      // The preflight awaited: the new conversation may have claimed, or the hold been lost, meanwhile.
+      const gated = await options.fresh?.gate();
+      if (gated) return gated;
+      // This launch's own id, in the script tmux is about to start and so in its channel server's every receipt.
+      const launchId = ports.newUuid();
+      // A fresh conversation is told that what was signed by its launch's second is history, never a current instruction. Every
+      // --fresh attempt sets the cutoff to its own launch: this step runs in one only while the new conversation has not claimed
+      // (a claimed swap skips every step). Once it has, the cutoff kept with its uuid is frozen, and a resume passes the same one.
+      const uuid = planned.resume[1] ?? "";
+      const stored = readHandoff(ports.files, ports.stateDir, projectId);
+      let historyBefore = !options.fresh && UUID.test(uuid) && stored?.history?.conversation === uuid ? stored.history.before : undefined;
+      if (options.fresh) {
+        historyBefore = Math.floor(ports.now() / 1000);
+        if (UUID.test(uuid)) markHandoff(ports.files, ports.stateDir, projectId, { history: { conversation: uuid, before: historyBefore } });
+      }
+      const argv = writeCanonicalLauncher(ports, projectId, planned, launchId, historyBefore);
       const tmuxRun = (args: string[]): CtoExecResult => ports.run("tmux", args, { timeoutMs: 10_000 });
-      const started = tmuxExists(ports, planned.tmux)
+      const inSession = tmuxExists(ports, planned.tmux);
+      // has-session blocked the event loop: the hold is verified again right before the tmux start.
+      const gatedStart = await options.fresh?.gate();
+      if (gatedStart) return gatedStart;
+      const started = inSession
         ? tmuxRun(["new-window", "-d", "-P", "-F", "#{pane_id}", "-t", `=${planned.tmux}:`, launcher])
         : tmuxRun(["new-session", "-d", "-s", planned.tmux, "-P", "-F", "#{pane_id}", launcher]);
       const pane = started.stdout.trim();
@@ -517,11 +775,18 @@ const canonicalResumeSteps = (ports: CtoPorts, projectId: string, restart: boole
         if (answer.status !== 0) throw new Error(firstLine(answer.stderr) || `${bin} exited ${answer.status ?? "on timeout"}`);
         return answer.stdout;
       };
-      const startup = await confirmChannelStartup(tmuxChannelDriver({ tmux: "tmux", target: pane, startCommand: launcher, run }));
+      // A backlog flood can scroll the registered line away; a receipt carrying this launch's id proves it too, and nothing older does.
+      const registered = channelEmittedBy(ports.stateDir, projectId, launchId, (path) => ports.files.read(path));
+      // Immediately before the one keystroke (after the pane reads awaited), a lost hold or a changed role presses nothing.
+      const driver = { ...tmuxChannelDriver({ tmux: "tmux", target: pane, startCommand: launcher, run, registered }), ...(options.fresh ? { proceed: async () => (await options.fresh!.gate()) === null } : {}) };
+      const startup = await confirmChannelStartup(driver);
+      if (!startup.ok && startup.failure === "ABORTED") {
+        return refused(`the hold on this swap was lost or the role changed before the channel's startup warning was confirmed (${planned.tmux}, ${pane}); nothing was pressed and the launched session was left as it is`, { tmux: planned.tmux, pane });
+      }
       if (!startup.ok) {
         return refused(`the resumed conversation was started in tmux ${planned.tmux} (${pane}) and its channel did not come up (${startup.failure}, screen ${startup.screen}); it was left running there`, { tmux: planned.tmux, pane });
       }
-      return ok({ argv: planned.argv, tmux: planned.tmux, pane, confirmed: startup.confirmed });
+      return ok({ argv, tmux: planned.tmux, pane, launchId, confirmed: startup.confirmed });
     },
   }, {
     id: "claimed",
@@ -530,7 +795,7 @@ const canonicalResumeSteps = (ports: CtoPorts, projectId: string, restart: boole
     run: async () => {
       for (const deadline = ports.now() + CLAIM_WAIT_MS; ;) {
         const record = fresh(ports, projectId);
-        if (resumed(record)) return ok({ conversation: record!.conversation, generation: record!.generation, pid: record!.session!.pid });
+        if (await resumed(record)) return ok({ conversation: record!.conversation, generation: record!.generation, pid: record!.session!.pid });
         if (ports.now() >= deadline) return refused(`the resumed conversation runs with its channel and has not claimed the role within ${CLAIM_WAIT_MS / 1000}s; it was left running`);
         await ports.sleep(2_000);
       }
@@ -578,9 +843,13 @@ const channelMapStep = (ports: CtoPorts, projectId: string, wantRouted: boolean)
 // ---------------------------------------------------------------------------------------------------------------
 // Subcommands.
 
-const listCtos = (ports: CtoPorts): number => {
+const listCtos = async (ports: CtoPorts): Promise<number> => {
+  const read = await snapshotCtoProcesses(ports.ctoProcesses);
+  if (!read.ok) { ports.write({ refused: `${CTO_PROCESS_TABLE_UNREADABLE}: ${read.detail}` }); return 1; }
   const rows = ports.state.projects().filter((r) => r.kind !== "none" || r.generation !== null).map((record) => {
-    const live = conversationProcesses(ports, record.conversation);
+    const cwd = cwdOf(record);
+    const scope = ports.state.roleScope(record.projectId, { conversationIds: record.conversation ? [record.conversation] : [], checkouts: cwd ? [cwd] : [] });
+    const live = ctoProcessesFor(scope, read.snapshot);
     const route = rosterRoute(ports, record.room);
     return {
       project: record.projectId,
@@ -588,7 +857,7 @@ const listCtos = (ports: CtoPorts): number => {
       kind: record.kind,
       generation: record.generation,
       conversation: record.conversation,
-      session: live.length === 0 ? null : live.map((p) => ({ pid: p.pid, tmux: tmuxOf(ports, p.pid), channel: carriesChannel(p.command) })),
+      session: live.length === 0 ? null : live.map((one) => ({ pid: one.pid, tmux: one.tmuxSession, channel: argvCarriesChannel(read.snapshot.claude.get(one.pid)?.argv), matchedBy: one.matchedBy })),
       room: record.room,
       roomRouted: routeActive(route) && route!.acp_project_id === record.projectId,
       lastBuzzAt: record.lastBuzzAt,
@@ -653,6 +922,158 @@ const addPlan = (ports: CtoPorts, projectId: string, options: { repo: string | n
   if (options.canonical) steps.push(...canonicalResumeSteps(ports, projectId, false));
   else steps.push(residentLaunchStep(ports, projectId));
   return steps;
+};
+
+/** Runs the daemon is executing or merging: the project is busy, and a new conversation would orphan them. */
+const LIVE_RUN_STATES = new Set(["ACTIVE", "MERGING", "POST_MERGE_VERIFYING", "CEO_APPROVED"]);
+
+/** The slice of `canonicalCto.status` the swap reads. */
+interface SwitchoverStatus { holderSessionUuid: string | null; generation: number; rotations: Array<{ toSessionUuid: string; state: string }> }
+
+/**
+ * --fresh, roll forward only: refuse while the project has running work, keep the handoff, have the daemon prepare the
+ * switchover old -> U (canonicalCto.rotate, which is also what entitles U to claim), stop the old conversation's own
+ * process and start U with the handoff as its first prompt. A pending switchover is reused with its U, so running this
+ * again repeats the steps on the same U; the old conversation is fenced by the switchover and is never gone back to.
+ */
+const freshSteps = (ports: CtoPorts, record: CtoRecord, next: string, hold: { open(): boolean; verify(): Promise<boolean> } | null, cwdFlag: string | null = null): CtoStep[] => {
+  const projectId = record.projectId;
+  const old = record.conversation!;
+  const target: { uuid: string | null; cwd: () => string | null; old: string; prepare: CtoStep; prepared: () => Promise<boolean>; gate: () => Promise<Outcome | null> } =
+    { uuid: null, cwd: () => null, old, prepare: undefined as unknown as CtoStep, prepared: async () => false, gate: async () => null };
+  // The folder the new conversation starts in: --cwd, else the one an earlier attempt of this same swap kept with the handoff.
+  target.cwd = () => {
+    if (cwdFlag !== null) return cwdFlag;
+    const stored = readHandoff(ports.files, ports.stateDir, projectId);
+    return stored?.conversation === old && stored.completed !== true ? stored.cwd ?? null : null;
+  };
+  const readStatus = async (): Promise<SwitchoverStatus | null> => {
+    try {
+      const answer = await ports.operator.request("canonicalCto.status", { projectId });
+      return answer.allowed ? answer.value as SwitchoverStatus : null;
+    } catch { return null; }
+  };
+  const pendingOf = (status: SwitchoverStatus | null): string | null => status?.rotations.find((r) => r.state === "PENDING")?.toSessionUuid ?? null;
+  target.prepared = async () => {
+    const pending = pendingOf(await readStatus());
+    if (pending !== null) target.uuid = pending;
+    return pending !== null;
+  };
+  const boundNow = (): string | null => fresh(ports, projectId)?.conversation ?? null;
+  // The swap's conversation U holds the role, and this run began with another: the swap is complete (another run may have seen it
+  // through), and what is left is only to record that. A run that began with U itself is one more swap, unless the last never completed.
+  const lateClaimed = (): boolean => {
+    const stored = readHandoff(ports.files, ports.stateDir, projectId);
+    const to = stored?.next ?? target.uuid;
+    return to !== null && to !== undefined && boundNow() === to && (to !== old || stored?.completed !== true);
+  };
+  // Before anything is changed: the hold is still held, and the binding still names the conversation this run began with.
+  // The hold is verified at check time (hold.verify turns the event loop first), never read from a flag an event sets: a synchronous
+  // subprocess call blocks the loop, and a connection that closed during it still reads as open until the loop runs.
+  target.gate = async () => hold !== null && !(await hold.verify())
+    ? refused("the hold on this swap was lost (the daemon's connection closed); nothing further was changed")
+    : boundNow() === old ? null
+    : lateClaimed() ? ok({ skipped: "the new conversation holds the role" })
+    : refused(`the bound conversation is ${boundNow() ?? "none"}, not ${old} that this run began with; nothing was changed`);
+  target.prepare = {
+    id: "switchover",
+    plan: "ask the daemon for the switchover old -> a new conversation (canonicalCto.rotate, with the handoff as its package) unless one is pending, whose conversation is then reused; the new conversation is written into the handoff file first, and a lost answer is followed by a status read, never a blind retry",
+    // Prepared and written down: a pending switchover whose conversation the handoff file does not name yet is not done.
+    done: async () => (await target.prepared()) && readHandoff(ports.files, ports.stateDir, projectId)?.next === target.uuid,
+    run: async () => {
+      const before = await readStatus();
+      if (before === null) return refused("canonicalCto.status could not be read; no switchover was prepared");
+      const stored = readHandoff(ports.files, ports.stateDir, projectId);
+      if (!stored) return refused("the handoff is not stored; no switchover was prepared");
+      // The status read awaited: the hold may have been lost, or the role taken, since this step began.
+      const gatedBefore = await target.gate();
+      if (gatedBefore) return gatedBefore;
+      // Immediately before rotate: it is asked only while the old conversation still holds the role.
+      if (before.holderSessionUuid !== old) {
+        return before.holderSessionUuid !== null && before.holderSessionUuid === (stored.next ?? target.uuid)
+          ? ok({ claimed: before.holderSessionUuid })
+          : refused(`the role is held by ${before.holderSessionUuid ?? "no conversation"}, not ${old} that this run began with; nothing was changed`);
+      }
+      // A pending switchover is reused with its conversation, which is written down before any later step can stop or start anything.
+      const reused = pendingOf(before);
+      if (reused !== null) {
+        markHandoff(ports.files, ports.stateDir, projectId, { next: reused });
+        target.uuid = reused;
+        return ok({ oldConversation: old, newConversation: reused, reused: true });
+      }
+      // A conversation an earlier attempt wrote down and the daemon never recorded is used again; one it recorded is not.
+      const used = new Set(before.rotations.map((r) => r.toSessionUuid));
+      const to = stored.next && !used.has(stored.next) ? stored.next : next;
+      const gatedRotate = await target.gate();
+      if (gatedRotate) return gatedRotate;
+      markHandoff(ports.files, ports.stateDir, projectId, { next: to });
+      // Between the handoff write and the daemon's rotate: the write blocked the loop, and rotate is the change that cannot be undone.
+      const gatedAsk = await target.gate();
+      if (gatedAsk) return gatedAsk;
+      let said = "";
+      try {
+        const answer = await ports.operator.request("canonicalCto.rotate",
+          { projectId, toSessionUuid: to, expectedGeneration: before.generation, handoff: handoffPackageOf(stored.text) }, `cto:${ports.newUuid()}`);
+        if (!answer.allowed) said = answer.message;
+      } catch (error) { said = error instanceof Error ? error.message : String(error); }
+      // Whatever came back, only the daemon's own record says whether it was prepared.
+      const pending = pendingOf(await readStatus());
+      if (pending === null) return refused(`the switchover was not prepared${said ? ` (${said})` : ""}; the old conversation is unchanged`);
+      // The status read awaited: the hold may have been lost, and a successor may hold the role, since rotate was asked.
+      const gatedAfter = await target.gate();
+      if (gatedAfter) return gatedAfter;
+      // The daemon's record names the target, whoever asked for it: that, and not what this run asked for, is written down.
+      markHandoff(ports.files, ports.stateDir, projectId, { next: pending });
+      target.uuid = pending;
+      return ok({ oldConversation: old, newConversation: pending, ...(said ? { rotateAnswer: said } : {}) });
+    },
+  };
+  const steps: CtoStep[] = [{
+    id: "no-live-run",
+    plan: "refuse while the project has a running, merging or approved run (a prepared switchover is past this check)",
+    done: target.prepared,
+    run: () => {
+      const live = ports.state.openRuns(projectId).filter((r) => LIVE_RUN_STATES.has(r.state));
+      return live.length === 0 ? ok() : refused(`the project has running work (${live.map((r) => `${r.runId} ${r.state}`).join(", ")}); nothing was changed`);
+    },
+  }, {
+    id: "handoff",
+    plan: `use the handoff stored for ${old} (cto_handoff_write), else write ACP's from the binding and open runs (under 2 KB); it records the old conversation id`,
+    done: async () => {
+      const stored = readHandoff(ports.files, ports.stateDir, projectId);
+      return (await target.prepared()) && stored?.conversation === old && stored.next === target.uuid && (cwdFlag === null || stored.cwd === cwdFlag);
+    },
+    run: async () => {
+      let stored = readHandoff(ports.files, ports.stateDir, projectId);
+      if (stored?.conversation !== old) {
+        const text = fallbackHandoff({ projectId, conversation: old, generation: record.generation, openRuns: ports.state.openRuns(projectId), queuedMessages: ports.state.queuedMessages?.(projectId) ?? [] });
+        const written = writeHandoff(ports.files, ports.stateDir, { projectId, conversation: old, source: "acp", text, now: new Date(ports.now()).toISOString() });
+        if (!written.ok) return refused(written.reason);
+        stored = written.handoff;
+      }
+      if (cwdFlag !== null) markHandoff(ports.files, ports.stateDir, projectId, { cwd: cwdFlag });
+      // The first read of the daemon's record: a pending switchover's conversation is written down now, before anything else can happen to it.
+      const pending = pendingOf(await readStatus());
+      if (pending !== null) { const gated = await target.gate(); if (gated) return gated; markHandoff(ports.files, ports.stateDir, projectId, { next: pending }); target.uuid = pending; }
+      return ok({ source: stored.source, oldConversation: old, ...(pending !== null ? { newConversation: pending } : {}) });
+    },
+  }, ...canonicalResumeSteps(ports, projectId, true, { fresh: target })];
+  // Every step acts only while the binding still names the old conversation this run began with: a swap whose conversation has
+  // claimed is complete (every step is then skipped), and any other conversation holding the role changes nothing.
+  return [...steps.map((step) => ({
+    ...step,
+    done: async () => lateClaimed() || (step.done ? step.done() : false),
+    run: async () => (await target.gate()) ?? step.run(),
+  })), {
+    id: "complete",
+    plan: "record that the swap was seen through, so the next --fresh is a new swap",
+    done: () => readHandoff(ports.files, ports.stateDir, projectId)?.completed === true,
+    run: async () => {
+      if (hold !== null && !(await hold.verify())) return refused("the hold on this swap was lost (the daemon's connection closed); nothing further was changed");
+      markHandoff(ports.files, ports.stateDir, projectId, { completed: true });
+      return ok();
+    },
+  }];
 };
 
 const relaunchPlan = (ports: CtoPorts, record: CtoRecord): CtoStep[] => {
@@ -814,8 +1235,8 @@ const retirePlan = (ports: CtoPorts, record: CtoRecord, options: { reason: strin
     id: "tmux",
     plan: `end tmux session ${tmuxNameOf(projectId)} once nothing in it runs the conversation`,
     done: () => !tmuxExists(ports, tmuxNameOf(projectId)),
-    run: () => {
-      if (conversationProcesses(ports, fresh(ports, projectId)?.conversation ?? record.conversation).length > 0) return refused("the conversation is still running; nothing was killed");
+    run: async () => {
+      if ((await roleProcesses(ports, projectId)).matches.length > 0) return refused("a process of this CTO role is still running; nothing was killed");
       const killed = ports.run("tmux", ["kill-session", "-t", `=${tmuxNameOf(projectId)}`], { timeoutMs: 5_000 });
       return killed.status === 0 || !tmuxExists(ports, tmuxNameOf(projectId)) ? ok() : refused(`tmux kill-session failed: ${firstLine(killed.stderr)}`);
     },
@@ -889,7 +1310,7 @@ const retirePlan = (ports: CtoPorts, record: CtoRecord, options: { reason: strin
 };
 
 /** Prints the plan; applied, runs it in order, stopping at the first failure. */
-export const executeCtoPlan = async (ports: CtoPorts, header: Record<string, unknown>, steps: CtoStep[], apply: boolean, rerun: string): Promise<number> => {
+export const executeCtoPlan = async (ports: CtoPorts, header: Record<string, unknown>, steps: CtoStep[], apply: boolean, rerun: string | (() => Promise<string | null>)): Promise<number> => {
   ports.write({ ...header, mode: apply ? "apply" : "dry-run", steps: steps.map((s) => s.id) });
   if (!apply) {
     for (const step of steps) {
@@ -910,7 +1331,10 @@ export const executeCtoPlan = async (ports: CtoPorts, header: Record<string, unk
     }
     if (!outcome.ok) {
       ports.write({ step: step.id, result: "failed", reason: outcome.reason, ...(outcome.detail ? { detail: outcome.detail } : {}) });
-      ports.write({ result: "stopped", at: step.id, rerun });
+      // A recovery command that may replace a successor's conversation is not printed: a null rerun says why instead.
+      const again = typeof rerun === "function" ? await rerun() : rerun;
+      ports.write(again !== null ? { result: "stopped", at: step.id, rerun: again }
+        : { result: "stopped", at: step.id, note: "the hold on this swap was lost, so another run may have taken over; no recovery command is printed, because running it could replace that run's conversation. Read the role's bound conversation (agentctl cto status) and start a new --fresh only if it is still the one this run began with" });
       return 1;
     }
     ports.write({ step: step.id, result: "done", ...(outcome.detail ? { detail: outcome.detail } : {}) });
@@ -919,11 +1343,11 @@ export const executeCtoPlan = async (ports: CtoPorts, header: Record<string, unk
   return 0;
 };
 
-const BOOLEAN_FLAGS = new Set(["--apply", "--canonical", "--delete-repo"]);
-const VALUE_FLAGS = new Set(["--reason", "--repo", "--yes-delete-repo"]);
+const BOOLEAN_FLAGS = new Set(["--apply", "--canonical", "--delete-repo", "--fresh"]);
+const VALUE_FLAGS = new Set(["--cwd", "--reason", "--repo", "--yes-delete-repo"]);
 const ALLOWED: Record<string, readonly string[]> = {
   add: ["--apply", "--repo", "--canonical"],
-  relaunch: ["--apply"],
+  relaunch: ["--apply", "--fresh", "--cwd"],
   retire: ["--apply", "--reason", "--delete-repo", "--yes-delete-repo"],
 };
 
@@ -935,7 +1359,7 @@ const refuse = (ports: CtoPorts, message: string): number => {
 export const runCtoCommand = async (args: readonly string[], ports: CtoPorts): Promise<number> => {
   const [sub, ...rest] = args;
   if (!sub || sub === "help" || sub === "--help") { ports.write({ usage: CTO_USAGE }); return sub ? 0 : 2; }
-  if (sub === "list") return rest.length === 0 ? listCtos(ports) : refuse(ports, "cto list takes no arguments");
+  if (sub === "list") return rest.length === 0 ? await listCtos(ports) : refuse(ports, "cto list takes no arguments");
   const allowed = ALLOWED[sub];
   if (!allowed) return refuse(ports, `unknown cto subcommand: ${sub}`);
   const positional: string[] = [];
@@ -976,6 +1400,45 @@ export const runCtoCommand = async (args: readonly string[], ports: CtoPorts): P
   if (sub === "relaunch") {
     if (record.retiredAt) return refuse(ports, `project ${projectId} is retired`);
     if (record.kind === "none") return refuse(ports, `project ${projectId} has no CTO allocation or entitlement to relaunch`);
+    const cwdFlag = value("--cwd");
+    // The folder as the host has it (symlinks resolved): checked here, before anything is written, a dry run included.
+    let cwdReal: string | null = null;
+    if (cwdFlag !== null) {
+      if (!flags.has("--fresh")) return refuse(ports, "--cwd is only valid together with --fresh; nothing was changed");
+      if (!isAbsolute(cwdFlag)) return refuse(ports, `--cwd ${cwdFlag} must be an absolute path; nothing was changed`);
+      const homeRefusal = `--cwd ${cwdFlag} is the home folder, which Claude Code never trusts; nothing was changed`;
+      if (resolve(cwdFlag) === resolve(ports.home)) return refuse(ports, homeRefusal);
+      const there = ports.files.real ? ports.files.real(cwdFlag) : ports.files.exists(cwdFlag) ? { path: resolve(cwdFlag), directory: true } : null;
+      if (!there) return refuse(ports, `--cwd ${cwdFlag} does not exist; nothing was changed`);
+      if (!there.directory) return refuse(ports, `--cwd ${cwdFlag} is not a directory; nothing was changed`);
+      if (there.path === (ports.files.real?.(ports.home)?.path ?? resolve(ports.home))) return refuse(ports, homeRefusal);
+      cwdReal = there.path;
+    }
+    if (flags.has("--fresh")) {
+      if (record.kind !== "canonical" || !record.conversation) return refuse(ports, "--fresh needs a canonical CTO with a bound conversation");
+      // The folder is named in the retry until the handoff file keeps it, which is after the first steps; naming it after is the same folder.
+      // A swap already started in a folder is never moved to another: the stored folder is the one to rerun with.
+      const started = readHandoff(ports.files, ports.stateDir, projectId);
+      if (cwdReal !== null && started?.conversation === record.conversation && started.completed !== true && started.next && started.cwd && started.cwd !== cwdReal) {
+        return refuse(ports, `swap to ${started.next} already started in ${started.cwd}; rerun without --cwd or with --cwd ${started.cwd}; nothing was changed`);
+      }
+      const again = `agentctl cto relaunch ${projectId} --fresh${cwdReal !== null ? ` --cwd ${/^[A-Za-z0-9._/:=@-]+$/.test(cwdReal) ? cwdReal : `'${cwdReal.replaceAll("'", "'\\''")}'`}` : ""} --apply`;
+      // A second run at the same time cannot exist: --apply takes the daemon's hold on this project first and keeps that connection
+      // open for the whole run (the daemon releases it when the connection closes). Nothing is rolled back; the recovery is this command again.
+      let hold: { decision: Decision<unknown>; open(): boolean; verify(): Promise<boolean>; release(): void } | null = null;
+      if (apply) {
+        if (!ports.operator.hold) return refuse(ports, "this operator client cannot hold a project; nothing was changed");
+        hold = await ports.operator.hold("ctoRefresh.hold", { projectId, holderPid: process.pid });
+        if (!hold.decision.allowed) return refuse(ports, `${hold.decision.message}; run again later: ${again}`);
+      }
+      try {
+        // Read again under the hold: a run that held it before may have changed what the role is bound to.
+        const current = fresh(ports, projectId);
+        if (current?.kind !== "canonical" || !current.conversation) return refuse(ports, "--fresh needs a canonical CTO with a bound conversation");
+        return await executeCtoPlan(ports, { command: "relaunch", project: projectId, kind: current.kind, fresh: true, oldConversation: current.conversation },
+          freshSteps(ports, current, ports.newUuid(), hold, cwdReal), apply, async () => (hold !== null && !(await hold.verify()) ? null : again));
+      } finally { hold?.release(); }
+    }
     return executeCtoPlan(ports, { command: "relaunch", project: projectId, kind: record.kind }, relaunchPlan(ports, record), apply, rerun);
   }
   // retire
@@ -1071,6 +1534,13 @@ export const openCtoState = async (databasePath: string): Promise<CtoStateReader
       const row = db.prepare(`SELECT project_id, name, retired_at FROM projects WHERE project_id = ?`).get(projectId) as ProjectRow | undefined;
       return row ? recordOf(db, row) : null;
     }),
+    openRuns: (projectId) => withDb((db) => (db.prepare(
+      `SELECT run_id AS runId, state, kind FROM runs WHERE (project_id = ? OR owner_role_key = ?) AND state NOT IN ('COMPLETED','FAILED','CANCELLED') ORDER BY created_at DESC, run_id LIMIT 10`)
+      .all(projectId, `PRIMARY_CTO:${projectId}`) as Array<{ runId: string; state: string; kind: string }>)),
+    queuedMessages: (projectId) => withDb((db) => (db.prepare(
+      `SELECT message_id AS id FROM outbox WHERE role_key = ? AND kind IN ('OWNER_MESSAGE','PEER_MESSAGE') AND status IN ('PENDING','SENT') ORDER BY created_at, rowid`)
+      .all(`PRIMARY_CTO:${projectId}`) as Array<{ id: string }>).map((row) => row.id)),
+    roleScope: (projectId, extra) => withDb((db) => ctoRoleScope(<T>(sql: string, params: readonly unknown[]) => db.prepare(sql).all(...params) as T[], projectId, extra)),
   };
 };
 
@@ -1093,20 +1563,21 @@ export const createCtoPorts = async (input: {
   return {
     home, stateDir, databasePath: input.databasePath, env, operator: input.operator, run: runner,
     state: await openCtoState(input.databasePath),
-    processes: () => runner("ps", ["-axww", "-o", "pid=,ppid=,command="], { env: { ...env, LC_ALL: "C" }, timeoutMs: 10_000 }).stdout.split("\n").flatMap((line) => {
-      const match = /^\s*(\d+)\s+(\d+)\s(.*)$/.exec(line);
-      return match ? [{ pid: Number(match[1]), ppid: Number(match[2]), command: match[3]!.trim() }] : [];
-    }),
+    ctoProcesses: systemCtoProcessReader(),
     startToken: readProcessStartToken,
-    argv: readProcessArgv,
+    kernelGone: (pid) => {
+      try { process.kill(pid, 0); return false; } catch (error) { return (error as NodeJS.ErrnoException).code === "ESRCH"; }
+    },
     signal: (pid, signal) => { process.kill(pid, signal); },
     files: {
       exists: existsSync,
       read: (path) => readFileSync(path, "utf8"),
-      replace: (path, body, mode = 0o600) => { const tmp = `${path}.${process.pid}.${randomUUID()}.tmp`; writeFileSync(tmp, body, { mode }); renameSync(tmp, path); },
+      // The directory is made first: <state>/cto-refresh does not exist until a handoff is first written, by ACP or by the CTO.
+      replace: (path, body, mode = 0o600) => { mkdirSync(dirname(path), { recursive: true, mode: 0o700 }); const tmp = `${path}.${process.pid}.${randomUUID()}.tmp`; writeFileSync(tmp, body, { mode }); renameSync(tmp, path); },
       move: (from, to) => { mkdirSync(dirname(to), { recursive: true, mode: 0o700 }); renameSync(from, to); },
       remove: (path) => rmSync(path, { recursive: true, force: true }),
       mtimeMs: (path) => { try { return statSync(path).mtimeMs; } catch { return null; } },
+      real: (path) => { try { const at = realpathSync(path); return { path: at, directory: statSync(at).isDirectory() }; } catch { return null; } },
     },
     publicKeyOf: (keyFile) => { try { return daemonBuzzSigner(readFileSync(keyFile, "utf8")); } catch { return null; } },
     now: () => Date.now(),

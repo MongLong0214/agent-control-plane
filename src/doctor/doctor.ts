@@ -2,7 +2,7 @@ import { execFile } from "node:child_process";
 import { accessSync, constants, existsSync, statSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { promisify } from "node:util";
-import { totalmem } from "node:os";
+import { homedir, totalmem } from "node:os";
 
 import type { Clock } from "../core/clock.ts";
 import { type Decision, allow, deny } from "../core/errors.ts";
@@ -10,6 +10,7 @@ import { ReasonCode } from "../core/reason-codes.ts";
 import type { CapacityMonitor } from "../capacity/capacity-monitor.ts";
 import { RefreshTrigger } from "../capacity/capacity-monitor.ts";
 import { BUZZ_BIND_CHALLENGE_TTL_MS } from "../buzz/buzz-bind-challenge.ts";
+import { BUZZ_CHANNEL_SERVER_NAME } from "../buzz/buzz-channel.ts";
 import type { ClaimRegistry } from "../claims/claim-registry.ts";
 import {
   CanonicalCtoRestoreCondition,
@@ -25,6 +26,8 @@ import { contractChangeRunsWithoutGrant } from "../registry/manifest-activation-
 import { inspectDatabaseStatePaths, inspectPrivatePath } from "../db/state-preflight.ts";
 import { probeSessionLiveness } from "../daemon/dead-binding-recovery.ts";
 import { RoleScopeUnreadable, type CtoProcessReader, ctoProcessesFor, ctoRoleScope, snapshotCtoProcesses, systemCtoProcessReader } from "../cto/one-cto-per-project.ts";
+import { ctoTranscriptPath, longReasons, measureConversation, refreshLimitsFromEnv } from "../cto/cto-conversation.ts";
+import { isRetiredModel } from "../domain/fixed-role-runtime.ts";
 import { Role, RunState, SessionLifecycle, roleKeyFor } from "../domain/types.ts";
 import type { GitHubKernel } from "../github/github-kernel.ts";
 import { git, isClean, tryRevParse } from "../git/git.ts";
@@ -98,6 +101,8 @@ const MAX_REPORTED_LOOKUP_ERRORS = 10;
 
 /** How long a Buzz message may stay PENDING for a CTO before the doctor says no channel is delivering it. */
 export const BUZZ_CHANNEL_PENDING_AFTER_MS = 120_000;
+/** How long a Buzz message may stay PENDING or SENT for a CTO that has no live process with the channel before the doctor says it is being missed. */
+export const BUZZ_CHANNEL_MISSED_AFTER_MS = 600_000;
 
 export type Severity = "INFO" | "WARN" | "ERROR" | "CRITICAL";
 
@@ -552,6 +557,13 @@ export class Doctor {
     this.#ctoProcessReader = reader;
   }
 
+  #homeDir = homedir();
+
+  /** Where CTO transcripts are read from; the real home folder unless a test says otherwise. */
+  useHomeDir(home: string): void {
+    this.#homeDir = home;
+  }
+
   async run(
     scope: DoctorScope = "system",
     target?: string,
@@ -571,6 +583,7 @@ export class Doctor {
     if (scope === "system" || scope === "cto" || scope === "project") {
       findings.push(...this.checkBindings(target ?? null, scope));
       findings.push(...(await this.checkOneCtoPerProject(target ?? null)));
+      findings.push(...this.checkCtoConversationsLong(target ?? null));
     }
     if (scope === "system" || scope === "run") {
       findings.push(...this.checkRuns(target ?? null));
@@ -640,6 +653,10 @@ export class Doctor {
     if (!session) return deny(ReasonCode.NOT_FOUND, "unknown session", { sessionId });
     if (session.lifecycle !== SessionLifecycle.READY) {
       return deny(ReasonCode.SESSION_NOT_READY, `session is ${session.lifecycle}`, { sessionId });
+    }
+    // #1477 — a session on a retired model is not ready, however its binding ended: nothing is launched on one.
+    if (isRetiredModel(session.model)) {
+      return deny(ReasonCode.SESSION_NOT_READY, `session runs the retired model ${session.model}`, { sessionId, model: session.model });
     }
     return allow(ReasonCode.OK, undefined);
   }
@@ -740,8 +757,55 @@ export class Doctor {
     const read = await snapshotCtoProcesses(this.#ctoProcessReader);
     if (!read.ok) return [this.ctoProcessesUnknown(projectId, read.detail)];
     const findings: Finding[] = [];
+    const missedCutoff = new Date(Date.parse(this.clock.nowIso()) - BUZZ_CHANNEL_MISSED_AFTER_MS).toISOString();
     for (const scope of scopes) {
       const processes = ctoProcessesFor(scope, read.snapshot);
+      // Messages for this CTO that waited past the bound while no CTO claude process of the project has a live buzz-channel
+      // server child (`buzz-channel.js --project-id <project>`): nothing delivers them to a session or completes them on its
+      // reply, so they are being missed, not merely slow. A claude argv that only names the channel is not a running server.
+      let channelled = false;
+      for (const parent of processes) {
+        if (channelled || !read.snapshot.claude.has(parent.pid)) continue;
+        for (const child of read.snapshot.rows) {
+          if (child.ppid !== parent.pid || !/buzz-channel\.js/u.test(child.command)) continue;
+          const argv = await this.#ctoProcessReader.argv(child.pid);
+          const server = argv?.findIndex((arg) => arg.endsWith("/buzz-channel.js")) ?? -1;
+          const project = argv?.indexOf("--project-id") ?? -1;
+          if (argv && server >= 0 && project > server && argv[project + 1] === scope.projectId && await this.#ctoProcessReader.alive(child.pid)) {
+            channelled = true;
+            break;
+          }
+        }
+      }
+      const missed = channelled ? [] : this.db.all<{ message_id: string; status: string; created_at: string }>(
+        `SELECT message_id, status, created_at FROM outbox
+          WHERE role_key = ? AND kind IN ('OWNER_MESSAGE','PEER_MESSAGE') AND status IN ('PENDING','SENT') AND created_at <= ?
+          ORDER BY created_at, rowid`,
+        [`PRIMARY_CTO:${scope.projectId}`, missedCutoff],
+      );
+      if (missed.length > 0) {
+        findings.push({
+          code: "BUZZ_CHANNEL_MESSAGES_PENDING",
+          severity: "ERROR",
+          scope: `project:${scope.projectId}`,
+          blocking: false,
+          confidence: "HIGH",
+          observedEvidence: {
+            condition: "NO_LIVE_CHANNEL_PROCESS",
+            roleKey: `PRIMARY_CTO:${scope.projectId}`,
+            count: missed.length,
+            pending: missed.filter((row) => row.status === "PENDING").length,
+            sent: missed.filter((row) => row.status !== "PENDING").length,
+            oldestCreatedAt: missed[0]!.created_at,
+            messageIds: missed.slice(0, 20).map((row) => row.message_id),
+            liveCtoProcesses: processes.map((one) => one.pid),
+          },
+          recommendedAction:
+            `messages for this CTO are being missed: ${missed.length} Buzz message(s) have waited more than ${BUZZ_CHANNEL_MISSED_AFTER_MS / 60_000} minutes (PENDING or SENT, never completed) ` +
+            `and no live CTO process of this project loads the ${BUZZ_CHANNEL_SERVER_NAME} channel; relaunch the CTO with its channel (agentctl cto relaunch <project> --apply). ` +
+            "The messages stay queued; an old one is history, so confirm current state with the CEO before acting on it",
+        });
+      }
       if (processes.length < 2) continue;
       findings.push({
         code: "CTO_PROCESSES_DUPLICATED",
@@ -751,6 +815,35 @@ export class Doctor {
         confidence: "HIGH",
         observedEvidence: { processes },
         recommendedAction: "nothing is requested of anyone: more than one live claude process resumes this project's CTO conversation, sits in its checkout or is its bound session; which one stays is an open decision",
+      });
+    }
+    return findings;
+  }
+
+  /** A CTO whose conversation transcript is at least 20 MB or compacted at least 3 times. Never blocking; unreadable says nothing. */
+  private checkCtoConversationsLong(projectId: string | null): Finding[] {
+    const findings: Finding[] = [];
+    const limits = refreshLimitsFromEnv(process.env);
+    for (const project of this.projectsCovered(projectId)) {
+      if (project.retiredAt !== null) continue;
+      const binding = this.bindings.activePrimaryCto(project.projectId);
+      const session = binding ? this.sessions.get(binding.sessionId) : null;
+      if (!binding || !session?.workdir) continue;
+      const conversation = this.db.get<{ target_locator: string }>(
+        `SELECT tb.target_locator FROM actor_target_bindings tb JOIN assignments a ON a.actor_id = tb.target_actor_id
+          WHERE a.role_key = ? AND a.status = 'ACTIVE' AND a.binding_generation = ?`, [binding.roleKey, binding.bindingGeneration])?.target_locator;
+      if (!conversation) continue;
+      const measure = measureConversation(ctoTranscriptPath(this.#homeDir, session.workdir, conversation));
+      const reasons = measure ? longReasons(measure, limits) : [];
+      if (!measure || reasons.length === 0) continue;
+      findings.push({
+        code: "CTO_CONVERSATION_LONG",
+        severity: "INFO",
+        scope: `project:${project.projectId}`,
+        blocking: false,
+        confidence: "HIGH",
+        observedEvidence: { conversation, generation: binding.bindingGeneration, bytes: measure.bytes, compactions: measure.compactions, reasons, limits },
+        recommendedAction: "the CTO may write a handoff (cto_handoff_write); the coordinator swaps it for a fresh conversation, when no run is live, with agentctl cto relaunch <project> --fresh --apply",
       });
     }
     return findings;
@@ -854,7 +947,7 @@ export class Doctor {
           blocking: !systemReport,
           confidence: "HIGH",
           observedEvidence: { sessionId: binding.sessionId, lifecycle: session?.lifecycle ?? "missing" },
-          recommendedAction: "run a recovery takeover for this project",
+          recommendedAction: "nothing is requested of anyone: the daemon releases this binding itself once its process is proven gone; a holder that owns live runs stays until continuity pauses and revokes it",
         });
       }
       // O4 — a live-looking holder whose credential nobody holds: interactive, pinless, spawned by an earlier
@@ -1196,8 +1289,8 @@ export class Doctor {
         const terminal = session.lifecycle === SessionLifecycle.ERROR || session.lifecycle === SessionLifecycle.STOPPED;
         if (!sessionId && terminal && !activeBinding && !unfinishedWork) continue;
         // Match checkBindings' project-availability policy: a settled PRIMARY_CTO with no unfinished
-        // work can be released through the operator door after startup, and so can a settled CEO,
-        // whose binding is the door's other role (`DEAD_BINDING_RECOVERY_ROLES`). A settled
+        // work is released by the daemon's liveness sweep, and so is a settled CEO's binding
+        // (`DEAD_BINDING_RECOVERY_ROLES`). A settled
         // session's project PRIMARY_CTO runs do not hold the daemon down either, whether its binding is
         // still ACTIVE or already revoked: blocking on them keeps shut the claim socket its same actor
         // reattaches through, whose self-claim moves those runs to the next generation
@@ -1220,7 +1313,7 @@ export class Doctor {
           confidence: "HIGH",
           observedEvidence: { pid: session.osPid, lifecycle: session.lifecycle },
           // #1189 (CEO msg_390e287c) — the resolving command is information, not an instruction; under 200 characters.
-          recommendedAction: "nothing is requested of anyone: this session's process is gone; releasing its binding is an operator-socket action (agentctl binding recover-dead[-ceo]), and work it owns is an open decision",
+          recommendedAction: "nothing is requested of anyone: this session's process is gone; the daemon releases its binding itself once that is proven, and work it owns is an open decision",
         });
       }
     }

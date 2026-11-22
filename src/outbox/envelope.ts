@@ -13,17 +13,13 @@ export interface FencedEnvelope {
 
 export const MessageKind = {
   RUN_DISPATCH: "RUN_DISPATCH",
-  TASK_ASSIGN: "TASK_ASSIGN",
-  REVIEW_REQUEST: "REVIEW_REQUEST",
   REVISION_REQUEST: "REVISION_REQUEST",
   HANDOFF_PACKAGE: "HANDOFF_PACKAGE",
-  RECOVERY_PACKAGE: "RECOVERY_PACKAGE",
   DRAIN_REQUEST: "DRAIN_REQUEST",
   ESCALATION_REPLY: "ESCALATION_REPLY",
   /** CEO instruction to resubmit the current attached bootstrap PLAN for blind review; no approval. */
   RESUME_REVIEW: "RESUME_REVIEW",
   CEO_NOTIFICATION: "CEO_NOTIFICATION",
-  CANCEL_REQUEST: "CANCEL_REQUEST",
   /**
    * An owner's message addressed to whoever holds a role, consumed by that holder itself.
    *
@@ -72,8 +68,6 @@ export type MessageKind = (typeof MessageKind)[keyof typeof MessageKind];
  */
 export const RETARGETABLE_KINDS: ReadonlySet<MessageKind> = new Set<MessageKind>([
   MessageKind.RUN_DISPATCH,
-  MessageKind.TASK_ASSIGN,
-  MessageKind.CANCEL_REQUEST,
   MessageKind.CEO_NOTIFICATION,
 ]);
 

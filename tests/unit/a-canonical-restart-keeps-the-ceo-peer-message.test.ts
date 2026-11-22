@@ -1,4 +1,5 @@
 import Database from "better-sqlite3";
+import { spawnSync } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { createConnection } from "node:net";
 import { join } from "node:path";
@@ -29,6 +30,7 @@ import {
 import { createCtoBindingRuntime } from "../../src/daemon/cto-binding-runtime.ts";
 import { type DaemonNoticeBody, deliverOwedPeerMessageNotices } from "../../src/runtime/acp-daemon-notice.ts";
 import { runBoundedChild } from "../helpers/bounded-child.ts";
+import { Daemon } from "../../src/daemon/daemon.ts";
 import { recoverDeadCanonicalBinding } from "../../src/daemon/dead-binding-recovery.ts";
 import { Role, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
 import { buzzMessageNonce } from "../../src/ingress/buzz-message.ts";
@@ -1359,6 +1361,79 @@ describe("a canonical restart keeps the CEO's queued peer message (2026-10-03)",
   });
 });
 
+/** A pid that is gone: `spawnSync` returns after the child exited and was reaped, so `kill(pid, 0)` answers ESRCH. */
+const reapedPid = (): number => {
+  const finished = spawnSync("/usr/bin/true", [], { stdio: "ignore", timeout: 30_000 });
+  const pid = finished.pid;
+  if (finished.signal !== null || typeof pid !== "number" || pid <= 0) throw new Error("could not obtain a reaped child pid");
+  expect(() => process.kill(pid, 0)).toThrow();
+  return pid;
+};
+
+describe("the daemon's liveness sweep releases a dead canonical CTO before its conversation restarts (#1448)", () => {
+  /** Records the dead process on the first generation's session, then runs the daemon's own sweep once. */
+  const sweepReleasesTheDeadCto = async (fixture: Fixture) => {
+    const { harness } = fixture;
+    harness.cp.db.run(`UPDATE sessions SET os_pid = ?, os_process_started_at = NULL WHERE session_id = ?`, [
+      reapedPid(),
+      fixture.first.sessionId,
+    ]);
+    const report = await new Daemon(harness.cp, { stateDir: tempDir("acp-sweep-restart-") }).reconcile();
+    expect(report.sessionsMarkedError).toContain(fixture.first.sessionId);
+    expect(harness.cp.bindings.active(fixture.ctoRoleKey)).toBeNull();
+    expect(harness.cp.audit.byKind("DEAD_BINDING_RECOVERED")).toHaveLength(1);
+  };
+
+  it("keeps the queued CEO message PENDING, and the restarted conversation is handed it with its turn still open", async () => {
+    const fixture = await startFixture();
+    try {
+      const event = await fixture.ceoSays("살아 있는 동안 보낸 CEO 지시");
+      const [queued] = fixture.peerRows();
+
+      await sweepReleasesTheDeadCto(fixture);
+      // Released by the sweep, not rejected: the row is exactly as it was and its turn is open.
+      expect(fixture.peerRows()).toEqual([queued]);
+      expect(fixture.turnClaim(event.id)["noReplyAt"]).toBeUndefined();
+
+      const successor = await restart(fixture, 2);
+      expect(successor.binding.bindingGeneration).toBe(2);
+      const ledger = ownerMessageLedger(fixture.harness.cp);
+      const holder = fixture.holderOf(successor.sessionId);
+      const taken = ledger.claim(holder);
+      expect(taken.allowed, JSON.stringify(taken)).toBe(true);
+      expect(handedOver(taken.allowed ? taken.value : null)).toMatchObject({
+        claimed: { messageId: queued!.message_id, text: "살아 있는 동안 보낸 CEO 지시", principal: "peer" },
+        withheld: [],
+      });
+      expect(ledger.complete(queued!.message_id, holder).reasonCode).toBe(ReasonCode.OK);
+      expect(fixture.peerRows()[0]).toMatchObject({ status: "ACKED", target_session_id: successor.sessionId, binding_generation: 2 });
+    } finally {
+      await fixture.close();
+    }
+  });
+
+  it("redelivers a message the dead CTO had taken but not acknowledged, with the same id", async () => {
+    const fixture = await startFixture();
+    try {
+      const event = await fixture.ceoSays("unACKed peer work");
+      const ledger = ownerMessageLedger(fixture.harness.cp);
+      const first = ledger.claim(fixture.holderOf(fixture.first.sessionId));
+      const id = handedOver(first.allowed ? first.value : null).claimed!.messageId;
+
+      await sweepReleasesTheDeadCto(fixture);
+      const successor = await restart(fixture, 2);
+
+      expect(fixture.peerRows()[0]).toMatchObject({ status: "SENT", binding_generation: 2, message_id: id });
+      expect(fixture.turnClaim(event.id)["noReplyAt"]).toBeUndefined();
+      const holder = fixture.holderOf(successor.sessionId);
+      expect(handedOver((ledger.claim(holder) as { value: unknown }).value).claimed).toMatchObject({ messageId: id, text: "unACKed peer work" });
+      expect(ledger.complete(id, holder).allowed).toBe(true);
+    } finally {
+      await fixture.close();
+    }
+  });
+});
+
 describe("schema v40: the carry record arrives by an additive migration", () => {
   const statePath = (): string => {
     const root = join(tempDir("acp-carry-v40-"), "state");
@@ -1596,11 +1671,11 @@ describe("schema v40: the carry record arrives by an additive migration", () => 
       ["msg_peer_pending", MessageKind.PEER_MESSAGE, "PENDING"],
       ["msg_owner_pending", MessageKind.OWNER_MESSAGE, "PENDING"],
       // Not holder-claimed: recorded all the same, since the kind is no more fixed than the status.
-      ["msg_dispatch_sent", MessageKind.RUN_DISPATCH, "SENT"],
-      ["msg_dispatch_pending", MessageKind.RUN_DISPATCH, "PENDING"],
+      ["msg_dispatch_sent", MessageKind.HANDOFF_PACKAGE, "SENT"],
+      ["msg_dispatch_pending", MessageKind.HANDOFF_PACKAGE, "PENDING"],
     ];
     for (const [id, kind, status] of rows) {
-      row.run(id, `key:${id}`, kind, kind === MessageKind.RUN_DISPATCH ? "{}" : pointer(id), `fp:${id}`, NOW, NOW, status);
+      row.run(id, `key:${id}`, kind, kind === MessageKind.HANDOFF_PACKAGE ? "{}" : pointer(id), `fp:${id}`, NOW, NOW, status);
     }
     // An admitted Buzz event whose turn was already answered, and one still open.
     const inbound = legacy.prepare(
@@ -1868,7 +1943,7 @@ describe("finding 01: a holder-claimed message that ever left PENDING is never h
         .toThrow(/OUTBOX_DEPARTED_ROW_NO_DELETE/);
       const target = external.prepare(`SELECT rowid AS r FROM outbox WHERE message_id = ?`).get(id) as { r: number };
       const decoy: Record<string, unknown> = {
-        ...row, message_id: "msg_decoy", idempotency_key: "decoy", kind: MessageKind.TASK_ASSIGN,
+        ...row, message_id: "msg_decoy", idempotency_key: "decoy", kind: MessageKind.HANDOFF_PACKAGE,
         status: "REJECTED", payload_json: "{}",
       };
       const decoyColumns = Object.keys(decoy);
@@ -1949,13 +2024,13 @@ describe("finding 01: a holder-claimed message that ever left PENDING is never h
       };
 
       // One goes out through the generic sweep, as a generic kind, and the lease reclaim puts it back.
-      flip(swept!.message_id, MessageKind.TASK_ASSIGN);
+      flip(swept!.message_id, MessageKind.CEO_NOTIFICATION);
       expect(harness.cp.outbox.claimDeliverable().map((message) => message.messageId)).toEqual([swept!.message_id]);
       expect(rowOf(fixture, swept!.message_id)).toMatchObject({ status: "IN_FLIGHT" });
       harness.clock.advance(5 * 60 * 1000 + 1);
       expect(harness.cp.outbox.reclaimStaleLeases()).toBe(1);
       // The other is moved PENDING -> IN_FLIGHT -> PENDING by raw statements, as a generic kind.
-      flip(handled!.message_id, MessageKind.TASK_ASSIGN);
+      flip(handled!.message_id, MessageKind.CEO_NOTIFICATION);
       harness.cp.db.run(
         `UPDATE outbox SET status = 'IN_FLIGHT', claim_token = 'tok-raw', claimed_at = ? WHERE message_id = ?`,
         [harness.clock.nowIso(), handled!.message_id],
@@ -2178,7 +2253,7 @@ describe("finding 01: a holder-claimed message that ever left PENDING is never h
         const target = external.prepare(`SELECT rowid AS r FROM outbox WHERE message_id = ?`).get(first!.message_id) as
           { r: number };
         const decoy: Record<string, unknown> = {
-          ...original, message_id: "msg_decoy", idempotency_key: "decoy", kind: MessageKind.TASK_ASSIGN,
+          ...original, message_id: "msg_decoy", idempotency_key: "decoy", kind: MessageKind.HANDOFF_PACKAGE,
           status: "REJECTED", payload_json: "{}",
         };
         const columns = Object.keys(decoy);

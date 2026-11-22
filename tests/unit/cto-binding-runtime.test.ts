@@ -90,15 +90,17 @@ it.each(["success", "external-nesting", "reentrant-target", "after-commit-fault"
   });
   // A Claude target names its session and nothing about its executable: the verifier observes the
   // executing image and compares it to nothing, so there is no "wrong attestation" mode here. The
-  // `withdrawn-executor-pins` mode is a deployment that still provisions the three pins targets
-  // used to carry, with values that disagree with the image and that the old schema would have
-  // refused. It must bind exactly as `success` does — the pins are accepted and never read.
-  const withdrawnPins = mode === "withdrawn-executor-pins"
-    ? { requiredExecutorVersion: "9.9.9-not-the-image", expectedExecutorRealpath: "relative/not-the-image",
-      expectedExecutorSha256: "not-a-digest" }
-    : {};
-  const runtime = createCtoBindingRuntime(cp, JSON.stringify([{ provider: "claude", sessionId: target.sessionId,
-    incarnation: target.incarnation, nativeSessionUuid: nativeUuid, ...withdrawnPins }]));
+  // `withdrawn-executor-pins` mode carries one of the three pin keys targets used to accept; the
+  // schema is strict, so each is refused at startup.
+  const claudeTargetJson = (extra: Record<string, unknown>) => JSON.stringify([{ provider: "claude",
+    sessionId: target.sessionId, incarnation: target.incarnation, nativeSessionUuid: nativeUuid, ...extra }]);
+  if (mode === "withdrawn-executor-pins") {
+    for (const pin of ["requiredExecutorVersion", "expectedExecutorRealpath", "expectedExecutorSha256"]) {
+      expect(() => createCtoBindingRuntime(cp, claudeTargetJson({ [pin]: "x" }))).toThrow("ACP_CTO_BINDING_TARGETS_JSON is invalid");
+    }
+    return;
+  }
+  const runtime = createCtoBindingRuntime(cp, claudeTargetJson({}));
   // Nothing is minted before the bind. The runtime exposes `bind` and nothing else, and the only
   // credential in play is the CEO's own session secret against its own live binding.
   expect(Object.keys(runtime)).toEqual(["bind", "release"]);
@@ -180,7 +182,7 @@ it.each(["success", "external-nesting", "reentrant-target", "after-commit-fault"
   expect(cp.db.get<{ n: number }>("SELECT count(*) AS n FROM sessions")!.n).toBe(beforeSessions);
   if (!["wrong-pid", "wrong-native-uuid"].includes(mode)) expect(hashedImage).toHaveBeenCalled();
   expect(unhashedImage).not.toHaveBeenCalled();
-  if (!["success", "external-nesting", "reentrant-target", "denied-flood", "non-owner-flood", "withdrawn-executor-pins"].includes(mode)) {
+  if (!["success", "external-nesting", "reentrant-target", "denied-flood", "non-owner-flood"].includes(mode)) {
     expect(result.allowed).toBe(false);
     expect(cp.bindings.activePrimaryCto("project-a")).toBeNull();
     expect(cp.db.get<{ n: number }>("SELECT count(*) AS n FROM actor_target_attestations")!.n).toBe(0);

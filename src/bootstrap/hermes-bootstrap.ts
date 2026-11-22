@@ -544,6 +544,8 @@ const openBootstrapDoor = async (
   };
 
   const candidate = createServer((socket) => {
+    // A peer that closed before it was answered must not end the daemon with an unhandled EPIPE.
+    socket.on("error", () => undefined);
     sockets.add(socket);
     socket.once("close", () => sockets.delete(socket));
     serveBootstrapProof(socket, () => token, () => { proofConsumed = true; }, onProof, (decision) => {

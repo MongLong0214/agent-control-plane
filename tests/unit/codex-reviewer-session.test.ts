@@ -36,7 +36,7 @@ describe("Codex provider-issued reviewer sessions", () => {
       providerCredentialDir: legacy,
       codexHome: join(tempDir("acp-codex-no-user-home-"), ".codex"),
     });
-    await expect(adapter.startSession({ model: "gpt-6.1-sol", workdir: packetRoot,
+    await expect(adapter.startSession({ model: "gpt-6.2-sol", workdir: packetRoot,
       purpose: "blind-review", isolation: { packetRoot, denyReadPaths: [],
         emptyEnvironment: true, network: "provider-only", tools: "none" } })).rejects.toBeInstanceOf(PacketReviewerScopeUnconfigured);
     expect(calls).toBe(0);
@@ -52,7 +52,7 @@ describe("Codex provider-issued reviewer sessions", () => {
     });
     const adapter = new CodexCliAdapter({ clock: new ManualClock("2026-08-13T00:00:00.000Z"),
       capacityFile: join(packetRoot, "gpt.json"), reviewerCodexHome: packetRoot });
-    await expect(adapter.startSession({ model: "gpt-6.1-sol", workdir: packetRoot,
+    await expect(adapter.startSession({ model: "gpt-6.2-sol", workdir: packetRoot,
       purpose: "blind-review", isolation: { packetRoot, denyReadPaths: [],
         emptyEnvironment: true, network: "provider-only", tools: "none" } })).rejects.toThrow("private");
     expect(calls).toBe(0);
@@ -62,7 +62,7 @@ describe("Codex provider-issued reviewer sessions", () => {
     const packetRoot = tempDir("acp-codex-concurrent-private-");
     const isolation = { packetRoot, denyReadPaths: [], emptyEnvironment: true as const,
       network: "provider-only" as const, tools: "none" as const };
-    const spec = { model: "gpt-6.1-sol", workdir: packetRoot, purpose: "blind-review", isolation };
+    const spec = { model: "gpt-6.2-sol", workdir: packetRoot, purpose: "blind-review", isolation };
     let release!: () => void;
     const held = new Promise<void>((resolve) => { release = resolve; });
     let calls = 0;
@@ -104,7 +104,7 @@ describe("Codex provider-issued reviewer sessions", () => {
       tools: "none" as const,
     };
     const spec = {
-      model: "gpt-6.1-sol",
+      model: "gpt-6.2-sol",
       effort: "xhigh",
       workdir: packetRoot,
       purpose: "blind-review",
@@ -228,7 +228,7 @@ describe("a reviewer that was isolated and then did not answer", () => {
       reviewerCodexHome: freshHome(),
     });
     return adapter.startSession({
-      model: "gpt-6.1-sol", workdir: packetRoot, purpose: "blind-review",
+      model: "gpt-6.2-sol", workdir: packetRoot, purpose: "blind-review",
       isolation: { packetRoot, denyReadPaths: [], emptyEnvironment: true,
         network: "provider-only", tools: "none" },
     });

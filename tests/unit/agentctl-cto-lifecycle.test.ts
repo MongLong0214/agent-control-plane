@@ -2,18 +2,23 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { afterAll, describe, expect, it, vi } from "vitest";
 
-import { main } from "../../src/cli/agentctl.ts";
+import { createOperatorClient, main } from "../../src/cli/agentctl.ts";
 import {
-  CTO_SUBCOMMANDS, IDLE_SECONDS, checkoutHeldWork, hostRunner, runCtoCommand, workerHeldWork,
-  type CtoExec, type CtoExecOptions, type CtoExecResult, type CtoPorts, type CtoProcess, type CtoRecord,
+  CTO_SUBCOMMANDS, IDLE_SECONDS, checkoutHeldWork, createCtoPorts, hostRunner, runCtoCommand, workerHeldWork,
+  type CtoExec, type CtoExecOptions, type CtoExecResult, type CtoPorts, type CtoRecord,
 } from "../../src/cli/cto-command.ts";
 import { allow, deny, type Decision } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { createCtoMcpPort, createCtoServer } from "../../src/mcp/cto-server.ts";
-import { CHANNEL_REGISTERED_LINE } from "../../src/runtime/cto-channel-launch.ts";
+import { CHANNEL_REGISTERED_LINE, DEV_CHANNELS_WARNING } from "../../src/runtime/cto-channel-launch.ts";
+import type { CtoProcessReader, CtoRoleScope } from "../../src/cto/one-cto-per-project.ts";
+
+/** A process of the fake host: its kernel argv (else its command split on spaces) and its working directory. */
+interface FakeProcess { pid: number; ppid: number; command: string; argv?: string[]; cwd?: string }
 import { formatHostProvisionerReason, hostProvisionerReason, hostReasonKind, hostRefusalText } from "../../src/runtime/host-provisioner-reason.ts";
 import { cleanupTempDirs, commitAll, gitSync, tempDir } from "../helpers/fixtures.ts";
-import { realpathSync, rmSync, writeFileSync } from "node:fs";
+import { createServer, type Server, type Socket } from "node:net";
+import { mkdirSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { makeHarness } from "../helpers/harness.ts";
 
@@ -56,8 +61,18 @@ interface World {
   /** Every subprocess the command ran, in order. */
   ran: string[];
   record: CtoRecord;
+  openRuns: Array<{ runId: string; state: string; kind: string }>;
+  /** The daemon's canonical switchovers (canonicalCto.status/rotate): what it recorded, what rotate was asked, and whether its answer is lost. */
+  switchovers: Array<{ toSessionUuid: string; state: "PENDING" | "ACKED" }>;
+  rotateCalls: Array<{ params: Record<string, unknown>; handoffFile: string | undefined }>;
+  rotate: { answer: "ok" | "lost" | "denied" | "competing" };
+  /** The daemon's hold on the project (ctoRefresh.hold): refused because another run holds it, or the connection it is kept on is open. */
+  hold: { refused: boolean; open: boolean; calls: Array<Record<string, unknown>>; released: number };
+  /** Interleavings: what another run does to the world right after a process-table reading, or just before the daemon answers a status read. */
+  onTable?: () => void;
+  onStatus?: () => void;
   files: Map<string, string>;
-  procs: CtoProcess[];
+  procs: FakeProcess[];
   tmux: Set<string>;
   repo: { exists: boolean };
   /** What the primary clone answers about the worker's commits: a commit no remote-tracking branch has, or a fetch that fails. */
@@ -80,7 +95,32 @@ interface World {
   /** tmux panes: the pane's process and its session. */
   panes: Map<number, string>;
   /** The launcher tmux last started, and whether the conversation it resumes claims the role. */
-  launched: { command: string | null; claims: boolean };
+  launched: { command: string | null; claims: boolean; fails?: boolean };
+  /** The launch's pane: the registered line; the warning and then a backlog flood that scrolls that line away; or still loading. */
+  pane: "registered" | "flood" | "loading";
+  /** The old channel process appends a receipt (a later time, no launch id) while the launch asks tmux for its session. */
+  oldReceiptDuringLaunch: boolean;
+  /** Pids alive in the kernel that `ps` does not list (a process table that could not be read whole). */
+  hiddenFromPs: Set<number>;
+  /** `ps` cannot be spawned at all. */
+  psFails: boolean;
+  /** Earlier conversations of the role, as the database's role scope lists them. */
+  roleConversations: string[];
+  /** Pids whose native start token cannot be read although they run. */
+  tokenUnavailable: Set<number>;
+  /** Pids that outlive SIGTERM. */
+  survivesSigterm: Set<number>;
+  /** Pids the kernel now reports under another start token (a reused pid), whatever else is scripted. */
+  tokenOverride: Map<number, string>;
+  /** Pids whose token read answers null this many times once they have been signalled. */
+  tokenGlitchAfterSignal: Map<number, number>;
+  signalled: Set<number>;
+  /** The folder each `claude mcp` call ran in, with its line. */
+  mcpCalls: string[];
+  /** The shared reader's alive() answers false for every pid: the old reading of `ps -o stat= -p` exiting 1. */
+  psStatFails: boolean;
+  /** Per pid, what each token read answers once the plan's first step has reported: by read number, from 1. */
+  tokenAfterIdle: Map<number, (read: number) => string | null>;
 }
 
 const results = (w: World): Array<[string, string]> => w.out.filter((l) => typeof l["result"] === "string" && typeof l["step"] === "string").map((l) => [l["step"] as string, l["result"] as string]);
@@ -95,15 +135,18 @@ const makeWorld = (overrides: Partial<CtoRecord> = {}, env: Record<string, strin
   ]);
   const mtimes = new Map([[TRANSCRIPT, NOW - (IDLE_SECONDS + 60) * 1000]]);
   const w = {
-    out: [], changes: [], ran: [], files, mtimes, tmux: new Set([TMUX]), repo: { exists: true }, worker: { unpublished: false, fetchFails: false }, operatorAnswers: [], provisionerAnswers: [],
+    out: [], changes: [], ran: [], mcpCalls: [], files, mtimes, tmux: new Set([TMUX]), repo: { exists: true }, worker: { unpublished: false, fetchFails: false }, operatorAnswers: [], provisionerAnswers: [],
     dirty: new Set<string>(), archiveUnpublished: false, daemonRejects: false, retireExecutions: 0, rotateRuns: [],
-    argv: new Map<number, string[]>(), panes: new Map([[100, TMUX]]), launched: { command: null, claims: true },
+    argv: new Map<number, string[]>(), panes: new Map([[100, TMUX]]), launched: { command: null, claims: true }, pane: "registered", oldReceiptDuringLaunch: false, hiddenFromPs: new Set<number>(), psFails: false, roleConversations: [],
+    tokenUnavailable: new Set<number>(), tokenOverride: new Map<number, string>(), survivesSigterm: new Set<number>(), tokenGlitchAfterSignal: new Map<number, number>(), signalled: new Set<number>(),
+    psStatFails: false, tokenAfterIdle: new Map<number, (read: number) => string | null>(),
     procs: [
       { pid: 100, ppid: 1, command: "/bin/sh /state/resident-e2e-sort-fixture.sh" },
       { pid: CLAUDE, ppid: 100, command: `/bin/claude --model opus ${CHANNEL} --resume ${CONVERSATION} --name e2e CTO` },
       // The acp-cto relay names the conversation too, but is not the conversation's process.
       { pid: 16970, ppid: CLAUDE, command: `/node agentctl.js attach resident-cto --claimed-session-id ${CONVERSATION} --project-id ${P}` },
     ],
+    openRuns: [], switchovers: [], rotateCalls: [], rotate: { answer: "ok" }, hold: { refused: false, open: false, calls: [], released: 0 },
     record: {
       projectId: P, name: P, retiredAt: null, kind: "resident",
       repositories: [{ repositoryId: "repo_1", identity: `github:${REPO}`, checkoutPath: WORKER }],
@@ -128,6 +171,7 @@ const makeWorld = (overrides: Partial<CtoRecord> = {}, env: Record<string, strin
     return allow(ReasonCode.OK, { projectId: P });
   };
   const daemonCache = new Map<string, Decision<unknown>>();
+  const tokenReads = new Map<number, number>();
   const tempRefs = new Set<string>();
   let clock = NOW;
   let uuids = 0;
@@ -139,16 +183,39 @@ const makeWorld = (overrides: Partial<CtoRecord> = {}, env: Record<string, strin
     // A launch: tmux starts the launcher, which resumes the conversation with its channel; the conversation claims the role.
     if (bin === "tmux" && (args[0] === "new-session" || args[0] === "new-window")) {
       w.changes.push(line);
+      if (w.launched.fails) return answer(1, "", "no server running");
       if (args[0] === "new-session") w.tmux.add(args[args.indexOf("-s") + 1]!);
       w.launched.command = args[args.length - 1]!;
-      w.procs.push({ pid: 30000, ppid: 1, command: `${LOCAL_CLAUDE} --mcp-config {} ${CHANNEL} --resume ${w.record.conversation}` });
-      if (w.launched.claims) w.record = { ...w.record, generation: 4, session: { pid: 30000, startedAt: "t3", workdir: null } };
+      // The conversation the launcher starts: --resume or --session-id, as its script says.
+      const started = /'--(?:resume|session-id)' '([0-9a-f-]{36})'/.exec(files.get(w.launched.command) ?? "")?.[1] ?? w.record.conversation;
+      w.procs.push({ pid: 30000, ppid: 1, command: `${LOCAL_CLAUDE} --mcp-config {} ${CHANNEL} --resume ${started}`, argv: [LOCAL_CLAUDE, "--mcp-config", "{}", ...CHANNEL.split(" "), "--resume", started!] });
+      if (w.launched.claims) {
+        w.record = { ...w.record, conversation: started, generation: 4, session: { pid: 30000, startedAt: "start-30000", workdir: null } };
+        for (const one of w.switchovers) if (one.toSessionUuid === started) one.state = "ACKED";
+      }
       return answer(0, "%9\n");
     }
     if (bin === "tmux" && args[0] === "display-message") return answer(0, args[4] === "#{pane_id}" ? "%9\n" : `${w.launched.command}\n`);
-    if (bin === "tmux" && args[0] === "capture-pane") return answer(0, `${CHANNEL_REGISTERED_LINE}\n`);
-    if (bin === LOCAL_CLAUDE && args[0] === "mcp") { w.changes.push(line); return answer(args[1] === "remove" ? 1 : 0); }
-    if (bin === "tmux" && args[0] === "has-session") return answer(w.tmux.has(args[2]!.slice(1)) ? 0 : 1);
+    if (bin === "tmux" && args[0] === "capture-pane") {
+      if (w.pane === "registered") return answer(0, `${CHANNEL_REGISTERED_LINE}\n`);
+      if (w.pane === "loading") return answer(0, "Loading...\n");
+      return answer(0, w.changes.includes("tmux send-keys -t %9 Enter") ? `${Array.from({ length: 40 }, (_, i) => `← acp-buzz-channel: backlog ${i}`).join("\n")}\n` : `${DEV_CHANNELS_WARNING}\n`);
+    }
+    if (bin === "tmux" && args[0] === "send-keys") {
+      w.changes.push(line);
+      // This launch's channel delivers its backlog into the session and appends emitted receipts carrying its launch id.
+      const launchId = /\\?"--launch-id\\?",\\?"([^"\\]+)/.exec(files.get(w.launched.command ?? "") ?? "")?.[1];
+      files.set(`${STATE}/buzz-channel/${P}.receipts.jsonl`, `${JSON.stringify({ type: "emitted", eventId: "e1", room: ROOM, senderPubkey: "p", emittedAt: 1, ...(launchId ? { launchId } : {}) })}\n`);
+      return answer(0);
+    }
+    if (bin === LOCAL_CLAUDE && args[0] === "mcp") { w.changes.push(line); w.mcpCalls.push(`${options.cwd} ${args[1]}`); return answer(args[1] === "remove" ? 1 : 0); }
+    if (bin === "tmux" && args[0] === "has-session") {
+      if (w.oldReceiptDuringLaunch) {
+        const file = `${STATE}/buzz-channel/${P}.receipts.jsonl`;
+        files.set(file, `${files.get(file) ?? ""}${JSON.stringify({ type: "emitted", eventId: "old", room: ROOM, senderPubkey: "p", emittedAt: 9_999_999_999 })}\n`);
+      }
+      return answer(w.tmux.has(args[2]!.slice(1)) ? 0 : 1);
+    }
     if (bin === "tmux" && args[0] === "kill-session") { w.changes.push(line); w.tmux.delete(args[2]!.slice(1)); return answer(0); }
     if (bin === "git" && args[2] === "status") return answer(0, w.dirty.has(args[1]!) ? "?? scratch.txt\n" : "");
     if (bin === "git" && args[2] === "log") return answer(0, "");
@@ -199,10 +266,28 @@ const makeWorld = (overrides: Partial<CtoRecord> = {}, env: Record<string, strin
   w.ports = {
     home: HOME, stateDir: STATE, databasePath: `${STATE}/state.sqlite`, env,
     operator: {
+      hold: async (_method: string, params: Record<string, unknown> = {}) => {
+        w.hold.calls.push(params);
+        if (w.hold.refused) return { decision: deny(ReasonCode.CTO_REFRESH_IN_PROGRESS, "another cto relaunch --fresh holds project e2e-sort-fixture (pid 4242); nothing was changed"), open: () => false, verify: async () => false, release: () => undefined };
+        w.hold.open = true;
+        return { decision: allow(ReasonCode.OK, { projectId: params["projectId"] }), open: () => w.hold.open, verify: async () => w.hold.open, release: () => { w.hold.open = false; w.hold.released++; } };
+      },
       // The daemon: it authenticates every request, answers reads, and replays a mutation's answer for a key it has seen.
       request: async (method: string, params: Record<string, unknown> = {}, idempotencyKey?: string) => {
         if (w.daemonRejects) return deny(ReasonCode.OPERATOR_UNAUTHENTICATED, "operator authentication failed");
         if (method === "daemon.status") return allow(ReasonCode.OK, { mode: "RUNNING" });
+        if (method === "canonicalCto.status") w.onStatus?.();
+        if (method === "canonicalCto.status") return allow(ReasonCode.OK, { holderSessionUuid: w.record.conversation, generation: w.record.generation, rotations: structuredClone(w.switchovers) });
+        if (method === "canonicalCto.rotate") {
+          w.changes.push(`operator ${method}`);
+          w.rotateCalls.push({ params, handoffFile: files.get(`${STATE}/cto-refresh/handoff-${P}.json`) });
+          if (w.rotate.answer === "denied") return deny(ReasonCode.CONFLICT, "the switchover is refused");
+          // Another rotate (the owner's own, say) won: its conversation is the one pending, and ours is refused.
+          if (w.rotate.answer === "competing") { w.switchovers.push({ toSessionUuid: "dddddddd-bbbb-4ccc-8ddd-eeeeeeeeeeee", state: "PENDING" }); return deny(ReasonCode.CONFLICT, "a canonical switchover of this project is pending"); }
+          w.switchovers.push({ toSessionUuid: params["toSessionUuid"] as string, state: "PENDING" });
+          if (w.rotate.answer === "lost") throw new Error("operator socket closed before the answer");
+          return allow(ReasonCode.OK, { outcome: "SWITCHOVER_PENDING" });
+        }
         const key = idempotencyKey ?? `operator:${JSON.stringify({ method, params })}`;
         const cached = daemonCache.get(key);
         if (cached) return cached;
@@ -213,18 +298,59 @@ const makeWorld = (overrides: Partial<CtoRecord> = {}, env: Record<string, strin
         return answered;
       },
     },
-    state: { projects: () => (w.record.retiredAt ? [] : [structuredClone(w.record)]), project: (id: string) => (id === P ? structuredClone(w.record) : null) },
+    state: {
+      projects: () => (w.record.retiredAt ? [] : [structuredClone(w.record)]),
+      project: (id: string) => (id === P ? structuredClone(w.record) : null),
+      openRuns: () => structuredClone(w.openRuns),
+      // The shared rule's scope as the database gives it: the role's conversations, its live checkouts, its bound process.
+      roleScope: (id: string, extra: { conversationIds?: readonly string[]; checkouts?: readonly string[] } = {}): CtoRoleScope => ({
+        projectId: id,
+        conversationIds: [...new Set([...(w.record.conversation ? [w.record.conversation] : []), ...w.roleConversations, ...(extra.conversationIds ?? [])])],
+        checkouts: [...new Set([...w.record.repositories.map((r) => r.checkoutPath), ...(extra.checkouts ?? [])])],
+        bound: w.record.generation !== null && w.record.session?.pid ? [{ pid: w.record.session.pid, startedAt: w.record.session.startedAt }] : [],
+      }),
+    },
     run: subprocess,
-    processes: () => w.procs.slice(),
-    startToken: (pid: number) => (w.procs.some((p) => p.pid === pid) ? `start-${pid}` : null),
+    // The shared one-CTO reader: the kernel's argv, the table ps gives (this test process included), working directories.
+    ctoProcesses: {
+      table: async () => {
+        if (w.psFails) throw Object.assign(new Error("spawn /bin/ps ENOENT"), { code: "ENOENT" });
+        const rows = [{ pid: process.pid, ppid: 1, uid: process.getuid?.() ?? 0, startedAt: "Fri Jan  1 00:00:00 2027", command: "node vitest" },
+          ...w.procs.filter((p) => !w.hiddenFromPs.has(p.pid)).map((p) => ({ pid: p.pid, ppid: p.ppid, uid: process.getuid?.() ?? 0, startedAt: `lstart-${p.pid}`, command: p.command }))];
+        // A concurrent run acts right after this reading was taken.
+        w.onTable?.();
+        return rows;
+      },
+      argv: (pid: number) => { const p = w.procs.find((x) => x.pid === pid); return p ? (p.argv ?? p.command.split(" ")) : null; },
+      cwds: async (pids: readonly number[]) => new Map(pids.flatMap((pid) => { const p = w.procs.find((x) => x.pid === pid); return p ? [[pid, p.cwd ?? "/"] as [number, string]] : []; })),
+      tmuxPanes: async () => new Map(w.panes),
+      alive: (pid: number) => !w.psStatFails && w.procs.some((p) => p.pid === pid),
+      startToken: (pid: number) => (w.procs.some((p) => p.pid === pid) ? `start-${pid}` : null),
+    } satisfies CtoProcessReader,
+    // The kernel: a pid it no longer has (kill(pid, 0) would throw ESRCH).
+    kernelGone: (pid: number) => !w.procs.some((p) => p.pid === pid),
+    startToken: (pid: number) => {
+      if (!w.procs.some((p) => p.pid === pid) || w.tokenUnavailable.has(pid)) return null;
+      const forced = w.tokenOverride.get(pid);
+      if (forced !== undefined) return forced;
+      const script = w.tokenAfterIdle.get(pid);
+      if (script && w.out.some((l) => l["step"] === "idle" && l["result"] === "done")) {
+        tokenReads.set(pid, (tokenReads.get(pid) ?? 0) + 1);
+        return script(tokenReads.get(pid)!);
+      }
+      const glitches = w.signalled.has(pid) ? w.tokenGlitchAfterSignal.get(pid) ?? 0 : 0;
+      if (glitches > 0) { w.tokenGlitchAfterSignal.set(pid, glitches - 1); return null; }
+      return `start-${pid}`;
+    },
     signal: (pid: number) => {
       w.changes.push(`SIGTERM ${pid}`);
+      w.signalled.add(pid);
+      if (w.survivesSigterm.has(pid)) return;
       w.procs = w.procs.filter((p) => p.pid !== pid && p.ppid !== pid);
       // A pane whose own process was claude ends with it, and so does its session.
       const session = w.panes.get(pid);
       if (session) { w.panes.delete(pid); w.tmux.delete(session); }
     },
-    argv: (pid: number) => w.argv.get(pid) ?? null,
     files: {
       exists,
       read: (path: string) => { const body = files.get(path); if (body === undefined) throw new Error(`ENOENT ${path}`); return body; },
@@ -232,6 +358,7 @@ const makeWorld = (overrides: Partial<CtoRecord> = {}, env: Record<string, strin
       move: (from: string, to: string) => { w.changes.push(`move ${from} -> ${to}`); move(from, to); },
       remove: (path: string) => { w.changes.push(`remove ${path}`); for (const k of [...files.keys()]) if (k === path || k.startsWith(`${path}/`)) files.delete(k); },
       mtimeMs: (path: string) => (files.has(path) ? mtimes.get(path) ?? NOW : null),
+      real: (path: string) => { try { const at = realpathSync(path); return { path: at, directory: statSync(at).isDirectory() }; } catch { return null; } },
     },
     // A fake key file holds its own public key.
     publicKeyOf: (keyFile: string) => files.get(keyFile) ?? null,
@@ -582,17 +709,17 @@ describe("review r3: temporary refs that cannot be cleared", () => {
 
 /** Owner requirement R1 (#1437): one long-lived conversation per project is its PRIMARY_CTO, so a canonical CTO is resumed, never rotated. */
 describe("a canonical relaunch resumes the role's bound conversation", () => {
-  /** Logic Pro MCP's shape: its claude is the tmux pane's own process, it runs without the channel, and its role is unbound. */
+  /** Logic Pro MCP's shape: its claude is the tmux pane's own process, it runs without the channel, and its role is bound to it. */
   const canonicalWorld = (options: { trusted?: boolean; conversation?: string | null } = {}): { w: World; cwd: string } => {
     const cwd = realpathSync(tempDir("acp-cto-canonical-"));
     const config = tempDir("acp-cto-claude-config-");
     writeFileSync(join(config, ".claude.json"), JSON.stringify({ projects: options.trusted === false ? {} : { [cwd]: { hasTrustDialogAccepted: true } } }));
-    const w = makeWorld({ kind: "canonical", resident: null, generation: null, session: null, conversation: options.conversation === undefined ? CONVERSATION : options.conversation,
+    const w = makeWorld({ kind: "canonical", resident: null, generation: 3, session: { pid: CLAUDE, startedAt: `start-${CLAUDE}`, workdir: cwd },
+      conversation: options.conversation === undefined ? CONVERSATION : options.conversation,
       repositories: [{ repositoryId: "repo_1", identity: `github:${REPO}`, checkoutPath: cwd }] }, { ACP_OPERATOR_TOKEN: "operator-test-credential", CLAUDE_CONFIG_DIR: config });
     const argv = [LOCAL_CLAUDE, "--resume", CONVERSATION, "--model", "claude-opus-5-5", "--effort", "medium", "--name", "Logic CTO",
       "--remote-control", "Logic CTO", "--permission-mode", "bypassPermissions", "--mcp-config", "/x/canonical-mcp.json"];
-    w.procs = [{ pid: CLAUDE, ppid: 1, command: argv.join(" ") }];
-    w.argv.set(CLAUDE, argv);
+    w.procs = [{ pid: CLAUDE, ppid: 1, command: argv.join(" "), argv }];
     w.panes = new Map([[CLAUDE, "logic-claude-handoff"]]);
     w.tmux = new Set(["logic-claude-handoff"]);
     const transcript = `${HOME}/.claude/projects/${cwd.replace(/[^A-Za-z0-9]/g, "-")}/${CONVERSATION}.jsonl`;
@@ -600,7 +727,7 @@ describe("a canonical relaunch resumes the role's bound conversation", () => {
     w.mtimes.set(transcript, NOW - (IDLE_SECONDS + 60) * 1000);
     return { w, cwd };
   };
-  const RESUME_STEPS = ["idle", "trust", "channel", "launcher", "mcp", "stop", "launch", "claimed"];
+  const RESUME_STEPS = ["idle", "trust", "channel", "one-cto", "launcher", "mcp", "stop", "launch", "claimed"];
 
   it("stops the exact claude process and resumes the bound conversation with the channel in its tmux session, claiming with auto; no rotation", async () => {
     const { w } = canonicalWorld();
@@ -615,6 +742,8 @@ describe("a canonical relaunch resumes the role's bound conversation", () => {
     expect(launch.argv).toEqual(expect.arrayContaining(["--mcp-config", "--dangerously-load-development-channels", "server:acp-buzz-channel"]));
     expect(launch.argv.slice(launch.argv.indexOf("--name"), launch.argv.indexOf("--name") + 2)).toEqual(["--name", "Logic CTO"]);
     expect(launch.argv).not.toContain("/x/canonical-mcp.json");
+    // Not a fresh conversation: the channel is given no switch time, and shows its backlog as it always did.
+    expect(launch.argv.join(" ")).not.toContain("--history-before");
     expect(launch.tmux).toBe("logic-claude-handoff");
     expect(w.changes.some((c) => c.startsWith("tmux new-session -d -s logic-claude-handoff "))).toBe(true);
     expect(w.changes).toContain(`${LOCAL_CLAUDE} mcp add --scope local acp-cto -- ${STATE}/current/dist/bin/node ${STATE}/current/dist/cli/agentctl.js attach canonical-cto --claimed-session-id ${CONVERSATION} --project-id ${P} --expected-binding-generation auto`);
@@ -658,6 +787,989 @@ describe("a canonical relaunch resumes the role's bound conversation", () => {
     expect(await runCtoCommand(["relaunch", P, "--handoff", "/h.json", "--apply"], w.ports)).toBe(2);
     expect(w.changes).toEqual([]);
   });
+
+  describe("relaunch --fresh: the daemon's switchover, then the new conversation, rolling forward only", () => {
+    const FRESH_STEPS = ["no-live-run", "handoff", "idle", "trust", "channel", "switchover", "one-cto", "launcher", "mcp", "stop", "launch", "claimed", "complete"];
+    const handoffFile = (w: World): { conversation: string; source: string; text: string; next?: string; completed?: boolean; history?: { conversation: string; before: number } } => JSON.parse(w.files.get(`${STATE}/cto-refresh/handoff-${P}.json`)!);
+    const launched = (w: World): string[] => (w.out.find((l) => l["step"] === "launch" && l["result"] === "done")!["detail"] as { argv: string[] }).argv;
+
+    it("with no pending switchover: prepares one (old to U, the current generation, the handoff as package, U already in the handoff file) and launches U with --session-id and the handoff", async () => {
+      const { w } = canonicalWorld();
+      w.files.set(`${STATE}/cto-refresh/handoff-${P}.json`, JSON.stringify({ schema: "acp.cto-handoff.v1", projectId: P, conversation: CONVERSATION, source: "cto", text: "Finish run_3 first.", writtenAt: "2026-11-20T00:00:00Z" }));
+      expect(await runCtoCommand(["relaunch", P, "--fresh", "--apply"], w.ports)).toBe(0);
+      expect(results(w).map(([step]) => step)).toEqual(FRESH_STEPS);
+      expect(w.rotateCalls).toHaveLength(1);
+      const U = w.rotateCalls[0]!.params["toSessionUuid"] as string;
+      expect(w.rotateCalls[0]!.params).toMatchObject({ projectId: P, expectedGeneration: 3, handoff: { projectStatus: "Finish run_3 first." } });
+      // U was written down before the daemon was asked, and the swap was seen through.
+      expect(JSON.parse(w.rotateCalls[0]!.handoffFile!)).toMatchObject({ conversation: CONVERSATION, next: U });
+      expect(handoffFile(w)).toMatchObject({ next: U, completed: true });
+      const argv = launched(w);
+      expect(argv.slice(argv.indexOf("--session-id"), argv.indexOf("--session-id") + 2)).toEqual(["--session-id", U]);
+      expect(argv).not.toContain("--resume");
+      expect(argv.at(-1)).toContain("Finish run_3 first.");
+      expect(w.changes).toContain(`${LOCAL_CLAUDE} mcp add --scope local acp-cto -- ${STATE}/current/dist/bin/node ${STATE}/current/dist/cli/agentctl.js attach canonical-cto --claimed-session-id ${U} --project-id ${P} --expected-binding-generation auto`);
+      expect(w.changes).toContain(`SIGTERM ${CLAUDE}`);
+      expect(w.record).toMatchObject({ conversation: U, generation: 4 });
+    });
+
+    it("with a pending switchover to U: prepare is not called and U is reused", async () => {
+      const { w } = canonicalWorld();
+      const U = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+      w.switchovers = [{ toSessionUuid: U, state: "PENDING" }];
+      expect(await runCtoCommand(["relaunch", P, "--fresh", "--apply"], w.ports)).toBe(0);
+      expect(w.rotateCalls).toEqual([]);
+      // Prepare is skipped: the reused conversation was written down by the very first step, which read the daemon's record.
+      expect(results(w).find(([step]) => step === "switchover")).toEqual(["switchover", "skipped"]);
+      expect(w.out.find((l) => l["step"] === "handoff" && l["result"] === "done")!["detail"]).toMatchObject({ newConversation: U });
+      expect(handoffFile(w)).toMatchObject({ next: U });
+      const argv = launched(w);
+      expect(argv.slice(argv.indexOf("--session-id"), argv.indexOf("--session-id") + 2)).toEqual(["--session-id", U]);
+      expect(w.record.conversation).toBe(U);
+    });
+
+    it("never signals a process whose argv names U, and starts no second one", async () => {
+      const { w } = canonicalWorld();
+      const U = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+      w.switchovers = [{ toSessionUuid: U, state: "PENDING" }];
+      // The role's recorded process is the one running U (it has not claimed yet).
+      const argv = [LOCAL_CLAUDE, "--session-id", U, ...CHANNEL.split(" ")];
+      w.procs = [{ pid: CLAUDE, ppid: 1, command: argv.join(" "), argv }];
+      expect(await runCtoCommand(["relaunch", P, "--fresh", "--apply"], w.ports)).toBe(1);
+      expect(w.changes.filter((c) => c.startsWith("SIGTERM"))).toEqual([]);
+      expect(w.changes.some((c) => c.startsWith("tmux new-"))).toBe(false);
+      expect(w.procs.map((p) => p.pid)).toEqual([CLAUDE]);
+      expect(results(w).find(([step]) => step === "stop")).toEqual(["stop", "skipped"]);
+      expect(results(w).at(-1)).toEqual(["claimed", "failed"]);
+    });
+
+    it("a re-run after a launch failure relaunches the same U, and asks the daemon for nothing more", async () => {
+      const { w } = canonicalWorld();
+      w.launched.fails = true;
+      expect(await runCtoCommand(["relaunch", P, "--fresh", "--apply"], w.ports)).toBe(1);
+      expect(results(w).at(-1)).toEqual(["launch", "failed"]);
+      const U = w.rotateCalls[0]!.params["toSessionUuid"] as string;
+      expect(w.switchovers).toEqual([{ toSessionUuid: U, state: "PENDING" }]);
+      expect(w.changes).toContain(`SIGTERM ${CLAUDE}`);
+      w.launched.fails = false;
+      w.out.length = 0; w.changes.length = 0;
+      expect(await runCtoCommand(["relaunch", P, "--fresh", "--apply"], w.ports)).toBe(0);
+      expect(w.rotateCalls).toHaveLength(1);
+      expect(w.changes.filter((c) => c.startsWith("SIGTERM"))).toEqual([]);
+      const argv = launched(w);
+      expect(argv.slice(argv.indexOf("--session-id"), argv.indexOf("--session-id") + 2)).toEqual(["--session-id", U]);
+      expect(w.record).toMatchObject({ conversation: U, generation: 4 });
+    });
+
+    it("a new conversation whose transcript exists is resumed, with no second first prompt", async () => {
+      const { w, cwd } = canonicalWorld();
+      const U = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+      w.switchovers = [{ toSessionUuid: U, state: "PENDING" }];
+      w.files.set(`${HOME}/.claude/projects/${cwd.replace(/[^A-Za-z0-9]/g, "-")}/${U}.jsonl`, "{}");
+      expect(await runCtoCommand(["relaunch", P, "--fresh", "--apply"], w.ports)).toBe(0);
+      const argv = launched(w);
+      expect(argv.slice(argv.indexOf("--resume"), argv.indexOf("--resume") + 2)).toEqual(["--resume", U]);
+      expect(argv).not.toContain("--session-id");
+      expect(argv.join(" ")).not.toContain("--- handoff ---");
+    });
+
+    it("a lost rotate answer is followed by a status read-back, not a second rotate", async () => {
+      const { w } = canonicalWorld();
+      w.rotate.answer = "lost";
+      expect(await runCtoCommand(["relaunch", P, "--fresh", "--apply"], w.ports)).toBe(0);
+      expect(w.rotateCalls).toHaveLength(1);
+      expect(w.record.conversation).toBe(w.rotateCalls[0]!.params["toSessionUuid"]);
+      expect(w.out.find((l) => l["step"] === "switchover" && l["result"] === "done")!["detail"]).toMatchObject({ rotateAnswer: expect.stringContaining("closed before the answer") });
+    });
+
+    it("a refused rotate that left nothing pending stops before anything is stopped, and says the old conversation is unchanged", async () => {
+      const { w } = canonicalWorld();
+      w.rotate.answer = "denied";
+      expect(await runCtoCommand(["relaunch", P, "--fresh", "--apply"], w.ports)).toBe(1);
+      expect(results(w).at(-1)).toEqual(["switchover", "failed"]);
+      expect(JSON.stringify(w.out)).toContain("the old conversation is unchanged");
+      expect(w.changes.filter((c) => c.startsWith("SIGTERM") || c.startsWith("tmux new-"))).toEqual([]);
+    });
+
+    it("refuses while the project has running work, before anything is written or asked of the daemon", async () => {
+      const { w } = canonicalWorld();
+      w.openRuns = [{ runId: "run_1", state: "ACTIVE", kind: "IMPLEMENT" }];
+      expect(await runCtoCommand(["relaunch", P, "--fresh", "--apply"], w.ports)).toBe(1);
+      expect(results(w)).toEqual([["no-live-run", "failed"]]);
+      expect(w.changes).toEqual([]);
+      expect(w.rotateCalls).toEqual([]);
+    });
+
+    it("on failure prints the one recovery command, --fresh --apply, which never goes back to the old conversation", async () => {
+      const { w } = canonicalWorld();
+      w.launched.claims = false;
+      expect(await runCtoCommand(["relaunch", P, "--fresh", "--apply"], w.ports)).toBe(1);
+      expect(last(w)).toEqual({ result: "stopped", at: "claimed", rerun: `agentctl cto relaunch ${P} --fresh --apply` });
+      expect(JSON.stringify(w.out)).not.toContain("--conversation");
+      expect(w.out.find((l) => l["command"] === "relaunch")).toMatchObject({ fresh: true, oldConversation: CONVERSATION });
+      // The claim comes late; running the same command again only confirms it: nothing is stopped, started or asked.
+      const U = w.rotateCalls[0]!.params["toSessionUuid"] as string;
+      w.record = { ...w.record, conversation: U, generation: 4 };
+      w.switchovers[0]!.state = "ACKED";
+      w.out.length = 0; w.changes.length = 0;
+      expect(await runCtoCommand(["relaunch", P, "--fresh", "--apply"], w.ports)).toBe(0);
+      // Only the record that the swap was seen through is written.
+      expect(w.changes).toEqual([`replace ${STATE}/cto-refresh/handoff-${P}.json`]);
+      expect(w.rotateCalls).toHaveLength(1);
+      expect(handoffFile(w).completed).toBe(true);
+    });
+
+    it("a conversation that wrote its transcript and exited unclaimed is resumed on the rerun, not started again with --session-id and the handoff", async () => {
+      const { w, cwd } = canonicalWorld();
+      w.launched.claims = false;
+      expect(await runCtoCommand(["relaunch", P, "--fresh", "--apply"], w.ports)).toBe(1);
+      const U = w.rotateCalls[0]!.params["toSessionUuid"] as string;
+      expect(launched(w)).toContain("--session-id");
+      // U ran, wrote its transcript and exited without a claim.
+      w.procs = w.procs.filter((p) => p.pid !== 30000);
+      w.files.set(`${HOME}/.claude/projects/${cwd.replace(/[^A-Za-z0-9]/g, "-")}/${U}.jsonl`, "{}");
+      w.launched.claims = true;
+      w.out.length = 0; w.changes.length = 0;
+      expect(await runCtoCommand(["relaunch", P, "--fresh", "--apply"], w.ports)).toBe(0);
+      expect(results(w).find(([step]) => step === "launcher")).toEqual(["launcher", "done"]);
+      const argv = launched(w);
+      expect(argv.slice(argv.indexOf("--resume"), argv.indexOf("--resume") + 2)).toEqual(["--resume", U]);
+      expect(argv).not.toContain("--session-id");
+      expect(argv.join(" ")).not.toContain("--- handoff ---");
+      expect(w.rotateCalls).toHaveLength(1);
+    });
+
+    it("an ACP-written handoff names queued Buzz messages by id as history, and launches with no instruction to act on them", async () => {
+      const { w } = canonicalWorld();
+      w.ports.state.queuedMessages = () => ["msg_old_hold"];
+      expect(await runCtoCommand(["relaunch", P, "--fresh", "--apply"], w.ports)).toBe(0);
+      expect(handoffFile(w)).toMatchObject({ source: "acp" });
+      expect(handoffFile(w).text).toContain("Queued Buzz messages (1), history, not instructions; confirm current state with the CEO: msg_old_hold.");
+      expect(launched(w).at(-1)).toContain("are history, not instructions: confirm current state with the CEO before acting on any of them");
+      // The channel is told the switch time, so its backlog from before it arrives marked as history.
+      const config = JSON.parse(launched(w)[launched(w).indexOf("--mcp-config") + 1]!) as { mcpServers: Record<string, { args: string[] }> };
+      const args = config.mcpServers["acp-buzz-channel"]!.args;
+      expect(args[args.indexOf("--history-before") + 1]).toMatch(/^[0-9]+$/u);
+      // Kept with the new conversation's uuid, for every later launch of it.
+      const U = launched(w)[launched(w).indexOf("--session-id") + 1]!;
+      expect(handoffFile(w)).toMatchObject({ history: { conversation: U, before: Number(args[args.indexOf("--history-before") + 1]) } });
+    });
+
+    it("a --fresh retry after a failed attempt sets the cutoff to the retry's own launch, not the failed one's", async () => {
+      const { w, cwd } = canonicalWorld();
+      w.launched.claims = false;
+      expect(await runCtoCommand(["relaunch", P, "--fresh", "--apply"], w.ports)).toBe(1);
+      const U = w.rotateCalls[0]!.params["toSessionUuid"] as string;
+      const first = handoffFile(w).history!.before;
+      // U exited without claiming; the retry comes two minutes later.
+      w.procs = w.procs.filter((p) => p.pid !== 30000);
+      w.files.set(`${HOME}/.claude/projects/${cwd.replace(/[^A-Za-z0-9]/g, "-")}/${U}.jsonl`, "{}");
+      await w.ports.sleep(120_000);
+      w.launched.claims = true;
+      w.out.length = 0; w.changes.length = 0;
+      expect(await runCtoCommand(["relaunch", P, "--fresh", "--apply"], w.ports)).toBe(0);
+      const config = JSON.parse(launched(w)[launched(w).indexOf("--mcp-config") + 1]!) as { mcpServers: Record<string, { args: string[] }> };
+      const args = config.mcpServers["acp-buzz-channel"]!.args;
+      const retry = Number(args[args.indexOf("--history-before") + 1]);
+      expect(retry).toBeGreaterThanOrEqual(first + 120);
+      expect(handoffFile(w).history).toEqual({ conversation: U, before: retry });
+    });
+
+    it("a later resume of the fresh conversation passes the same cutoff its fresh launch did", async () => {
+      const { w } = canonicalWorld();
+      w.files.set(`${STATE}/cto-refresh/handoff-${P}.json`, JSON.stringify({
+        schema: "acp.cto-handoff.v1", projectId: P, conversation: "00000000-0000-4000-8000-000000000000", source: "acp", text: "t",
+        writtenAt: "2026-11-20T00:00:00Z", next: CONVERSATION, completed: true, history: { conversation: CONVERSATION, before: 1_795_000_000 },
+      }));
+      expect(await runCtoCommand(["relaunch", P, "--apply"], w.ports)).toBe(0);
+      const config = JSON.parse(launched(w)[launched(w).indexOf("--mcp-config") + 1]!) as { mcpServers: Record<string, { args: string[] }> };
+      const args = config.mcpServers["acp-buzz-channel"]!.args;
+      expect(args.slice(args.indexOf("--history-before"), args.indexOf("--history-before") + 2)).toEqual(["--history-before", "1795000000"]);
+    });
+
+    it("a pending switchover found with no local handoff is written down at once: U's late claim is then recognized, and nothing is prepared or stopped again", async () => {
+      const { w } = canonicalWorld();
+      const U = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+      w.switchovers = [{ toSessionUuid: U, state: "PENDING" }];
+      w.launched.claims = false;
+      expect(w.files.has(`${STATE}/cto-refresh/handoff-${P}.json`)).toBe(false);
+      expect(await runCtoCommand(["relaunch", P, "--fresh", "--apply"], w.ports)).toBe(1);
+      expect(w.rotateCalls).toEqual([]);
+      expect(handoffFile(w)).toMatchObject({ conversation: CONVERSATION, source: "acp", next: U });
+      // U claims late, as the process the role is bound to.
+      w.record = { ...w.record, conversation: U, generation: 4 };
+      w.switchovers[0]!.state = "ACKED";
+      w.out.length = 0; w.changes.length = 0;
+      expect(await runCtoCommand(["relaunch", P, "--fresh", "--apply"], w.ports)).toBe(0);
+      expect(w.rotateCalls).toEqual([]);
+      expect(w.changes.filter((c) => c.startsWith("SIGTERM") || c.startsWith("tmux new-"))).toEqual([]);
+      expect(handoffFile(w).completed).toBe(true);
+    });
+
+    /** What U's claim looks like to everything else: the old process gone, U's running with the channel, the role bound to U at the next generation. */
+    const claimByNew = (w: World, U: string): void => {
+      const argv = [LOCAL_CLAUDE, "--session-id", U, ...CHANNEL.split(" ")];
+      w.procs = [{ pid: 30000, ppid: 1, command: argv.join(" "), argv }];
+      w.record = { ...w.record, conversation: U, generation: 4, session: { pid: 30000, startedAt: "start-30000", workdir: null } };
+      for (const one of w.switchovers) if (one.toSessionUuid === U) one.state = "ACKED";
+    };
+    const U1 = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+    const mutations = (w: World): string[] => w.changes.filter((c) => c.startsWith("SIGTERM") || c.startsWith("tmux new-") || c.includes(" mcp ") || c.startsWith("operator canonicalCto.rotate"));
+
+    it("A: signals only the identity it checked: another run stops the old process and U claims right after the stop's reading, and U is not signalled", async () => {
+      const { w } = canonicalWorld();
+      w.switchovers = [{ toSessionUuid: U1, state: "PENDING" }];
+      let reads = 0;
+      // The third process-table reading after the mcp step is the stop's own selection.
+      w.onTable = () => { if (w.out.some((l) => l["step"] === "mcp" && l["result"]) && ++reads === 3) claimByNew(w, U1); };
+      expect(await runCtoCommand(["relaunch", P, "--fresh", "--apply"], w.ports)).toBe(0);
+      expect(reads).toBeGreaterThanOrEqual(3);
+      expect(w.changes.filter((c) => c.startsWith("SIGTERM"))).toEqual([]);
+      expect(w.procs.map((p) => p.pid)).toEqual([30000]);
+      expect(handoffFile(w)).toMatchObject({ next: U1, completed: true });
+    });
+
+    it("B: a pending switchover with no handoff whose U claims after the channel step is a finished swap: nothing is prepared, stopped or started, and the run exits 0", async () => {
+      const { w } = canonicalWorld();
+      w.switchovers = [{ toSessionUuid: U1, state: "PENDING" }];
+      let fired = false;
+      w.onStatus = () => { if (!fired && w.out.some((l) => l["step"] === "channel" && l["result"])) { fired = true; claimByNew(w, U1); } };
+      expect(await runCtoCommand(["relaunch", P, "--fresh", "--apply"], w.ports)).toBe(0);
+      expect(fired).toBe(true);
+      expect(mutations(w)).toEqual([]);
+      expect(w.rotateCalls).toEqual([]);
+      expect(handoffFile(w)).toMatchObject({ conversation: CONVERSATION, next: U1, completed: true });
+      expect(w.record.conversation).toBe(U1);
+    });
+
+    it("C: a role that another, unknown conversation holds after this run began changes nothing and exits non-zero, before rotate and again after it", async () => {
+      const OTHER = "cccccccc-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+      const before = canonicalWorld().w;
+      let fired = false;
+      before.onStatus = () => { if (!fired && before.out.some((l) => l["step"] === "channel" && l["result"])) { fired = true; before.record = { ...before.record, conversation: OTHER, generation: 4 }; } };
+      expect(await runCtoCommand(["relaunch", P, "--fresh", "--apply"], before.ports)).toBe(1);
+      expect(fired).toBe(true);
+      expect(mutations(before)).toEqual([]);
+      expect(JSON.stringify(before.out)).toContain(`the bound conversation is ${OTHER}`);
+      // The same, right after the daemon accepted rotate.
+      const after = canonicalWorld().w;
+      const rotate = after.ports.operator.request;
+      after.ports.operator.request = async (method, params, key) => {
+        const answer = await rotate(method, params, key);
+        if (method === "canonicalCto.rotate") after.record = { ...after.record, conversation: OTHER };
+        return answer;
+      };
+      expect(await runCtoCommand(["relaunch", P, "--fresh", "--apply"], after.ports)).toBe(1);
+      expect(mutations(after).filter((c) => !c.startsWith("operator canonicalCto.rotate"))).toEqual([]);
+      expect(after.procs.some((p) => p.pid === CLAUDE)).toBe(true);
+    });
+
+    it("D: a hold lost during the switchover's own status read: rotate is not asked and the handoff is not rewritten", async () => {
+      const { w } = canonicalWorld();
+      w.files.set(`${STATE}/cto-refresh/handoff-${P}.json`, JSON.stringify({ schema: "acp.cto-handoff.v1", projectId: P, conversation: CONVERSATION, source: "cto", text: "Go on.", writtenAt: "2026-11-20T00:00:00Z" }));
+      // After the channel step: the first status read is the step's done, the second is run's own, which awaits before it mutates.
+      let reads = 0;
+      w.onStatus = () => { if (w.out.some((l) => l["step"] === "channel" && l["result"]) && ++reads === 2) w.hold.open = false; };
+      expect(await runCtoCommand(["relaunch", P, "--fresh", "--apply"], w.ports)).toBe(1);
+      expect(reads).toBeGreaterThanOrEqual(2);
+      expect(w.rotateCalls).toHaveLength(0);
+      expect(mutations(w)).toEqual([]);
+      expect(handoffFile(w).next).toBeUndefined();
+      expect(JSON.stringify(w.out)).toContain("the hold on this swap was lost");
+    });
+
+    it("E: a hold lost during the stop's own process reading: the old CTO is not signalled and U is not launched", async () => {
+      const { w } = canonicalWorld();
+      w.switchovers = [{ toSessionUuid: U1, state: "PENDING" }];
+      let reads = 0;
+      // The third process-table reading after the mcp step is the stop's own selection, awaited before the signal.
+      w.onTable = () => { if (w.out.some((l) => l["step"] === "mcp" && l["result"]) && ++reads === 3) w.hold.open = false; };
+      expect(await runCtoCommand(["relaunch", P, "--fresh", "--apply"], w.ports)).toBe(1);
+      expect(reads).toBeGreaterThanOrEqual(3);
+      expect(w.changes.filter((c) => c.startsWith("SIGTERM") || c.startsWith("tmux new-"))).toEqual([]);
+      expect(w.procs.some((p) => p.pid === CLAUDE)).toBe(true);
+      expect(JSON.stringify(w.out)).toContain("the hold on this swap was lost");
+    });
+
+    const handoffWrites = (w: World): number => w.changes.filter((c) => c === `replace ${STATE}/cto-refresh/handoff-${P}.json`).length;
+
+    it("F: a run that lost the hold to a successor prints no recovery command that would replace the successor's conversation", async () => {
+      const { w } = canonicalWorld();
+      const OTHER = "cccccccc-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+      let reads = 0;
+      // The hold closes during the switchover's own status read; the successor then holds the role.
+      w.onStatus = () => { if (w.out.some((l) => l["step"] === "channel" && l["result"]) && ++reads === 2) { w.hold.open = false; w.record = { ...w.record, conversation: OTHER, generation: 4 }; } };
+      expect(await runCtoCommand(["relaunch", P, "--fresh", "--apply"], w.ports)).toBe(1);
+      expect(reads).toBeGreaterThanOrEqual(2);
+      expect(last(w)).toMatchObject({ result: "stopped", at: "switchover" });
+      expect(last(w)["rerun"]).toBeUndefined();
+      expect(JSON.stringify(w.out)).not.toContain("--fresh --apply");
+      expect(mutations(w)).toEqual([]);
+    });
+
+    it("G: a hold lost during the status read after rotate: the handoff file is not replaced again", async () => {
+      const { w } = canonicalWorld();
+      w.files.set(`${STATE}/cto-refresh/handoff-${P}.json`, JSON.stringify({ schema: "acp.cto-handoff.v1", projectId: P, conversation: CONVERSATION, source: "cto", text: "Go on.", writtenAt: "2026-11-20T00:00:00Z" }));
+      let writes = -1;
+      const status = w.onStatus;
+      w.onStatus = () => { status?.(); if (writes < 0 && w.rotateCalls.length > 0) { writes = handoffWrites(w); w.hold.open = false; } };
+      expect(await runCtoCommand(["relaunch", P, "--fresh", "--apply"], w.ports)).toBe(1);
+      expect(w.rotateCalls).toHaveLength(1);
+      expect(writes).toBeGreaterThanOrEqual(0);
+      expect(handoffWrites(w)).toBe(writes);
+      expect(mutations(w).filter((c) => !c.startsWith("operator canonicalCto.rotate"))).toEqual([]);
+    });
+
+    it("H: a hold lost during the launcher step's process-table read: cto-launch-<project>.sh is not replaced", async () => {
+      const { w } = canonicalWorld();
+      w.switchovers = [{ toSessionUuid: U1, state: "PENDING" }];
+      let reads = 0;
+      // After one-cto: the launcher's done reads the table twice, its run's own read is the third.
+      w.onTable = () => { if (w.out.some((l) => l["step"] === "one-cto" && l["result"]) && !w.out.some((l) => l["step"] === "launcher" && l["result"]) && ++reads === 3) w.hold.open = false; };
+      expect(await runCtoCommand(["relaunch", P, "--fresh", "--apply"], w.ports)).toBe(1);
+      expect(reads).toBeGreaterThanOrEqual(3);
+      expect(w.changes.filter((c) => c.includes(`cto-launch-${P}.sh`))).toEqual([]);
+      expect(mutations(w)).toEqual([]);
+    });
+
+    it("I: a hold lost during the first pane capture of the launch: Enter is not sent to the startup warning", async () => {
+      const { w } = canonicalWorld();
+      w.pane = "flood";
+      w.switchovers = [{ toSessionUuid: U1, state: "PENDING" }];
+      const run = w.ports.run;
+      let captures = 0;
+      w.ports.run = (bin, args, options) => { if (bin === "tmux" && args[0] === "capture-pane" && ++captures === 1) w.hold.open = false; return run(bin, args, options); };
+      expect(await runCtoCommand(["relaunch", P, "--fresh", "--apply"], w.ports)).toBe(1);
+      expect(captures).toBeGreaterThanOrEqual(1);
+      expect(w.changes.filter((c) => c.startsWith("tmux send-keys"))).toEqual([]);
+      expect(JSON.stringify(w.out)).toContain("nothing was pressed");
+    });
+
+    // The production hold client over a real Unix socket: the daemon's end is destroyed inside a synchronous subprocess call, which is
+    // when the kernel has the close and the event loop (so the socket's close event, and open()) does not.
+    describe("a hold that closes during a synchronous call", () => {
+      const withRealHold = async (w: World, body: (cut: () => void) => Promise<void>): Promise<void> => {
+        let held: Socket | null = null;
+        const server: Server = createServer((socket) => {
+          socket.setEncoding("utf8");
+          socket.on("error", () => undefined);
+          socket.once("data", () => { held = socket; socket.write(`${JSON.stringify(allow(ReasonCode.OK, {}))}\n`); });
+        });
+        const path = join(tempDir("acp-hold-"), "h.sock");
+        await new Promise<void>((done) => server.listen(path, done));
+        w.ports.operator.hold = createOperatorClient({ socketPath: path, token: "operator-test-credential" }).hold!;
+        try { await body(() => { (held as Socket | null)?.destroy(); }); } finally { (held as Socket | null)?.destroy(); await new Promise<void>((done) => server.close(() => done())); }
+      };
+      const onRun = (w: World, when: (bin: string, args: readonly string[]) => boolean, then: () => void): void => {
+        const run = w.ports.run;
+        let done = false;
+        w.ports.run = (bin, args, options) => { if (!done && when(bin, args)) { done = true; then(); } return run(bin, args, options); };
+      };
+      const stopped = (w: World): boolean => w.out.some((l) => l["step"] === "stop" && l["result"] === "done");
+
+      // The fake hold, with `during` run inside its n-th verify (the awaited wait a gate takes), the hold itself staying open.
+      const duringVerify = (w: World, when: () => boolean, during: () => void): void => {
+        const hold = w.ports.operator.hold!;
+        let fired = false;
+        w.ports.operator.hold = async (method, params) => {
+          const held = await hold(method, params);
+          return { ...held, verify: async () => { if (!fired && when()) { fired = true; during(); } return held.verify(); } };
+        };
+      };
+
+      it("O: the pid is reused during the stop's awaited hold check: the replacement is not signalled", async () => {
+        const { w } = canonicalWorld();
+        w.switchovers = [{ toSessionUuid: U1, state: "PENDING" }];
+        let reused = false;
+        // The first verify after the mcp step is the stop's entry gate, the second is the stop's own, right before its signal.
+        let verifies = 0;
+        duringVerify(w, () => w.out.some((l) => l["step"] === "mcp" && l["result"]) && ++verifies === 2, () => { reused = true; w.tokenOverride.set(CLAUDE, "start-of-the-replacement"); });
+        expect(await runCtoCommand(["relaunch", P, "--fresh", "--apply"], w.ports)).toBe(1);
+        expect(reused).toBe(true);
+        expect(w.changes.filter((c) => c.startsWith("SIGTERM"))).toEqual([]);
+        expect(JSON.stringify(w.out)).toContain("another process than the one selected");
+      });
+
+      it("P: the pane changes during the awaited hold check before Enter: nothing is pressed", async () => {
+        const { w } = canonicalWorld();
+        w.pane = "flood";
+        w.launched.claims = false;
+        w.switchovers = [{ toSessionUuid: U1, state: "PENDING" }];
+        // Once tmux started the launch the only verify is the one right before the keystroke.
+        duringVerify(w, () => w.changes.some((c) => c.startsWith("tmux new-")), () => { w.pane = "loading"; });
+        expect(await runCtoCommand(["relaunch", P, "--fresh", "--apply"], w.ports)).toBe(1);
+        expect(w.pane).toBe("loading");
+        expect(w.changes.filter((c) => c.startsWith("tmux send-keys"))).toEqual([]);
+      });
+
+      it("J: between claude mcp remove and claude mcp add, mcp add is not run", async () => {
+        const { w } = canonicalWorld();
+        w.switchovers = [{ toSessionUuid: U1, state: "PENDING" }];
+        await withRealHold(w, async (cut) => {
+          onRun(w, (bin, args) => bin === LOCAL_CLAUDE && args[0] === "mcp" && args[1] === "remove", cut);
+          expect(await runCtoCommand(["relaunch", P, "--fresh", "--apply"], w.ports)).toBe(1);
+        });
+        expect(w.mcpCalls.filter((c) => c.endsWith(" remove"))).toHaveLength(1);
+        expect(w.mcpCalls.filter((c) => c.endsWith(" add"))).toEqual([]);
+        expect(mutations(w).filter((c) => c.startsWith("SIGTERM") || c.startsWith("tmux new-"))).toEqual([]);
+      });
+
+      it("K: right before the tmux start, after has-session, nothing is started", async () => {
+        const { w } = canonicalWorld();
+        w.switchovers = [{ toSessionUuid: U1, state: "PENDING" }];
+        await withRealHold(w, async (cut) => {
+          onRun(w, (bin, args) => bin === "tmux" && args[0] === "has-session" && stopped(w), cut);
+          expect(await runCtoCommand(["relaunch", P, "--fresh", "--apply"], w.ports)).toBe(1);
+        });
+        expect(w.changes.filter((c) => c.startsWith("tmux new-"))).toEqual([]);
+        expect(last(w)["rerun"]).toBeUndefined();
+      });
+
+      it("L: right before send-keys Enter, after the final pane capture, nothing is pressed", async () => {
+        // The dry run counts the pane captures the confirmation makes before it presses; the real run cuts inside the last of them.
+        const dry = canonicalWorld().w;
+        dry.pane = "flood";
+        // The launched conversation does not claim until its warning is accepted, so the role is still the old one at the keystroke.
+        dry.launched.claims = false;
+        dry.switchovers = [{ toSessionUuid: U1, state: "PENDING" }];
+        let before = 0;
+        const dryRun = dry.ports.run;
+        dry.ports.run = (bin, args, options) => { if (bin === "tmux" && args[0] === "capture-pane" && !dry.changes.some((c) => c.startsWith("tmux send-keys"))) before++; return dryRun(bin, args, options); };
+        await runCtoCommand(["relaunch", P, "--fresh", "--apply"], dry.ports);
+        expect(before).toBeGreaterThanOrEqual(3);
+        const { w } = canonicalWorld();
+        w.pane = "flood";
+        w.launched.claims = false;
+        w.switchovers = [{ toSessionUuid: U1, state: "PENDING" }];
+        await withRealHold(w, async (cut) => {
+          let captures = 0;
+          // The `before`-th capture is the extra read taken after the hold check, whose own window is a documented limit; the one before
+          // it is the final read the hold check follows.
+          onRun(w, (bin, args) => bin === "tmux" && args[0] === "capture-pane" && ++captures === before - 1, cut);
+          expect(await runCtoCommand(["relaunch", P, "--fresh", "--apply"], w.ports)).toBe(1);
+          expect(captures).toBe(before - 1);
+        });
+        expect(w.changes.filter((c) => c.startsWith("tmux send-keys"))).toEqual([]);
+        expect(JSON.stringify(w.out)).toContain("nothing was pressed");
+      });
+
+      it("M: a run whose hold closed during the synchronous call it then failed on prints no rerun", async () => {
+        const { w } = canonicalWorld();
+        w.switchovers = [{ toSessionUuid: U1, state: "PENDING" }];
+        w.launched.fails = true;
+        await withRealHold(w, async (cut) => {
+          onRun(w, (bin, args) => bin === "tmux" && (args[0] === "new-session" || args[0] === "new-window"), cut);
+          expect(await runCtoCommand(["relaunch", P, "--fresh", "--apply"], w.ports)).toBe(1);
+        });
+        expect(last(w)).toMatchObject({ result: "stopped", at: "launch" });
+        expect(last(w)["rerun"]).toBeUndefined();
+        expect(JSON.stringify(w.out)).not.toContain("--fresh --apply");
+      });
+
+      it("N: between the handoff write and canonicalCto.rotate, rotate is not asked", async () => {
+        const { w } = canonicalWorld();
+        w.files.set(`${STATE}/cto-refresh/handoff-${P}.json`, JSON.stringify({ schema: "acp.cto-handoff.v1", projectId: P, conversation: CONVERSATION, source: "cto", text: "Go on.", writtenAt: "2026-11-20T00:00:00Z" }));
+        await withRealHold(w, async (cut) => {
+          const replace = w.ports.files.replace;
+          let done = false;
+          w.ports.files.replace = (path, body) => {
+            replace(path, body);
+            if (!done && path.includes("handoff-") && w.out.some((l) => l["step"] === "channel" && l["result"])) { done = true; cut(); }
+          };
+          expect(await runCtoCommand(["relaunch", P, "--fresh", "--apply"], w.ports)).toBe(1);
+          expect(done).toBe(true);
+        });
+        expect(w.rotateCalls).toHaveLength(0);
+        expect(mutations(w)).toEqual([]);
+      });
+    });
+
+    describe("--cwd: the new conversation starts in another folder", () => {
+      const withFolder = (): { w: World; cwd: string; dir: string } => {
+        const { w, cwd } = canonicalWorld();
+        const dir = realpathSync(tempDir("acp-cto-newdir-"));
+        const config = w.ports.env["CLAUDE_CONFIG_DIR"]!;
+        writeFileSync(join(config, ".claude.json"), JSON.stringify({ projects: { [cwd]: { hasTrustDialogAccepted: true }, [dir]: { hasTrustDialogAccepted: true } } }));
+        w.files.set(`${dir}/.keep`, "");
+        w.files.set(`${STATE}/cto-refresh/handoff-${P}.json`, JSON.stringify({ schema: "acp.cto-handoff.v1", projectId: P, conversation: CONVERSATION, source: "cto", text: "Go on.", writtenAt: "2026-11-20T00:00:00Z" }));
+        return { w, cwd, dir };
+      };
+      const unchanged = (w: World): void => { expect(w.changes).toEqual([]); expect(w.rotateCalls).toHaveLength(0); expect(w.files.get(`${STATE}/cto-refresh/handoff-${P}.json`)).not.toContain('"cwd"'); };
+
+      it("the plan names the folder, the trust step checks it, the launcher goes there and the mcp entry moves", async () => {
+        const { w, cwd, dir } = withFolder();
+        expect(await runCtoCommand(["relaunch", P, "--fresh", "--cwd", dir], w.ports)).toBe(0);
+        expect(JSON.stringify(w.out)).toContain(dir);
+        expect(await runCtoCommand(["relaunch", P, "--fresh", "--cwd", dir, "--apply"], w.ports)).toBe(0);
+        expect(w.out.find((l) => l["step"] === "trust" && l["result"] === "done")!["detail"]).toMatchObject({ folder: dir });
+        expect(w.files.get(w.launched.command!)).toContain(dir);
+        expect(w.files.get(w.launched.command!)).not.toContain(cwd);
+        // Only the new folder's entry is written; the old folder's is never touched.
+        expect(w.mcpCalls).toEqual([`${dir} remove`, `${dir} add`]);
+        expect(JSON.parse(w.files.get(`${STATE}/cto-refresh/handoff-${P}.json`)!)).toMatchObject({ cwd: dir });
+      });
+
+      it("the trust step refuses an untrusted folder and nothing is stopped or written", async () => {
+        const { w, dir } = withFolder();
+        writeFileSync(join(w.ports.env["CLAUDE_CONFIG_DIR"]!, ".claude.json"), JSON.stringify({ projects: {} }));
+        expect(await runCtoCommand(["relaunch", P, "--fresh", "--cwd", dir, "--apply"], w.ports)).toBe(1);
+        expect(JSON.stringify(w.out)).toContain(dir);
+        expect(w.changes.filter((c) => !c.startsWith("replace "))).toEqual([]);
+      });
+
+      it("the new conversation's transcript is looked for under the new folder", async () => {
+        const { w, dir } = withFolder();
+        const U = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+        w.switchovers = [{ toSessionUuid: U, state: "PENDING" }];
+        w.files.set(`${HOME}/.claude/projects/${dir.replace(/[^A-Za-z0-9]/g, "-")}/${U}.jsonl`, "{}");
+        expect(await runCtoCommand(["relaunch", P, "--fresh", "--cwd", dir, "--apply"], w.ports)).toBe(0);
+        const argv = (w.out.find((l) => l["step"] === "launch" && l["result"] === "done")!["detail"] as { argv: string[] }).argv;
+        expect(argv).toContain("--resume");
+        expect(argv).not.toContain("--session-id");
+      });
+
+      it("refuses a folder that does not exist, the home folder, and --cwd without --fresh; nothing changes", async () => {
+        const { w, dir } = withFolder();
+        for (const args of [["--fresh", "--cwd", `${dir}/missing`], ["--fresh", "--cwd", HOME], ["--cwd", dir]]) {
+          expect(await runCtoCommand(["relaunch", P, ...args, "--apply"], w.ports)).toBe(2);
+          expect(last(w)).toMatchObject({ nothingChanged: true });
+          unchanged(w);
+        }
+        expect(w.hold.calls).toEqual([]);
+      });
+
+      const seed = (w: World, projects: Record<string, unknown>, at: string): void => { w.files.set(`${at}/.claude.json`, JSON.stringify({ projects })); };
+      const theirs = { command: "node", args: ["cli.js", "attach", "canonical-cto", "--claimed-session-id", CONVERSATION, "--project-id", "prj_other"] };
+
+      it("another project's entry in the new folder, read from $CLAUDE_CONFIG_DIR, is never overwritten: refused, nothing stopped or written", async () => {
+        const { w, dir } = withFolder();
+        // ~/.claude.json holds nothing there; Claude reads the config dir's file, so that is where the entry is.
+        seed(w, {}, HOME);
+        seed(w, { [dir]: { mcpServers: { "acp-cto": theirs } } }, w.ports.env["CLAUDE_CONFIG_DIR"]!);
+        expect(await runCtoCommand(["relaunch", P, "--fresh", "--cwd", dir, "--apply"], w.ports)).toBe(1);
+        expect(w.mcpCalls).toEqual([]);
+        expect(w.changes.filter((c) => c.startsWith("SIGTERM") || c.startsWith("tmux new-"))).toEqual([]);
+      });
+
+      it("an entry in the new folder that already names this project is repointed, not refused", async () => {
+        const { w, dir } = withFolder();
+        seed(w, { [dir]: { mcpServers: { "acp-cto": { ...theirs, args: ["cli.js", "attach", "--project-id", P] } } } }, w.ports.env["CLAUDE_CONFIG_DIR"]!);
+        expect(await runCtoCommand(["relaunch", P, "--fresh", "--cwd", dir, "--apply"], w.ports)).toBe(0);
+        expect(w.mcpCalls).toEqual([`${dir} remove`, `${dir} add`]);
+      });
+
+      it("a --cwd naming another folder than the one a pending swap started in is refused, nothing changed", async () => {
+        const { w, dir } = withFolder();
+        const other = realpathSync(tempDir("acp-cto-newdir2-"));
+        w.launched.claims = false;
+        expect(await runCtoCommand(["relaunch", P, "--fresh", "--cwd", dir, "--apply"], w.ports)).toBe(1);
+        const before = [w.changes.length, w.files.get(`${STATE}/cto-refresh/handoff-${P}.json`)];
+        expect(await runCtoCommand(["relaunch", P, "--fresh", "--cwd", other, "--apply"], w.ports)).toBe(2);
+        const U = JSON.parse(w.files.get(`${STATE}/cto-refresh/handoff-${P}.json`)!).next as string;
+        expect(last(w)).toEqual({ refused: `swap to ${U} already started in ${dir}; rerun without --cwd or with --cwd ${dir}; nothing was changed`, nothingChanged: true });
+        expect([w.changes.length, w.files.get(`${STATE}/cto-refresh/handoff-${P}.json`)]).toEqual(before);
+      });
+
+      it("home through a symlink, and a regular file, are refused before any write, a dry run included", async () => {
+        const { w, dir } = withFolder();
+        const home = realpathSync(tempDir("acp-cto-home-"));
+        const alias = join(realpathSync(tempDir("acp-cto-homelink-")), "home");
+        symlinkSync(home, alias);
+        const file = join(dir, "a-file");
+        writeFileSync(file, "x");
+        w.files.set(file, "x");
+        w.files.set(`${alias}/.keep`, "");
+        for (const [target, apply] of [[alias, false], [alias, true], [file, false], [file, true]] as const) {
+          expect(await runCtoCommand(["relaunch", P, "--fresh", "--cwd", target, ...(apply ? ["--apply"] : [])], { ...w.ports, home })).toBe(2);
+          expect(last(w)).toMatchObject({ nothingChanged: true });
+          unchanged(w);
+        }
+      });
+
+      it("the retry command names --cwd when the run stops before the folder is kept", async () => {
+        const { w, dir } = withFolder();
+        w.openRuns = [{ runId: "run_1", state: "ACTIVE", kind: "IMPLEMENT" }];
+        expect(await runCtoCommand(["relaunch", P, "--fresh", "--cwd", dir, "--apply"], w.ports)).toBe(1);
+        expect(last(w)).toEqual({ result: "stopped", at: "no-live-run", rerun: `agentctl cto relaunch ${P} --fresh --cwd ${dir} --apply` });
+      });
+
+      it("the retry command quotes the folder for sh, so $USER stays literal", async () => {
+        const { w } = withFolder();
+        const odd = join(realpathSync(tempDir("acp-cto-odd-")), "project-$USER's");
+        mkdirSync(odd);
+        w.openRuns = [{ runId: "run_1", state: "ACTIVE", kind: "IMPLEMENT" }];
+        expect(await runCtoCommand(["relaunch", P, "--fresh", "--cwd", odd, "--apply"], w.ports)).toBe(1);
+        expect(last(w)).toMatchObject({ rerun: `agentctl cto relaunch ${P} --fresh --cwd '${odd.replaceAll("'", "'\\''")}' --apply` });
+      });
+
+      it("a launcher written for another folder is rewritten, not reused", async () => {
+        const { w, cwd, dir } = withFolder();
+        w.launched.fails = true;
+        expect(await runCtoCommand(["relaunch", P, "--fresh", "--apply"], w.ports)).toBe(1);
+        w.launched.fails = false;
+        expect(await runCtoCommand(["relaunch", P, "--fresh", "--cwd", dir, "--apply"], w.ports)).toBe(0);
+        expect(w.files.get(w.launched.command!)).toContain(`cd '${dir}'`);
+        expect(w.files.get(w.launched.command!)).not.toContain(cwd);
+      });
+
+      it("a rerun without --cwd for the same pending conversation uses the stored folder", async () => {
+        const { w, dir } = withFolder();
+        w.launched.claims = false;
+        expect(await runCtoCommand(["relaunch", P, "--fresh", "--cwd", dir, "--apply"], w.ports)).toBe(1);
+        w.launched.claims = true;
+        w.mcpCalls.length = 0;
+        expect(await runCtoCommand(["relaunch", P, "--fresh", "--apply"], w.ports)).toBe(0);
+        expect(w.files.get(w.launched.command!)).toContain(dir);
+        expect(w.mcpCalls.every((c) => c.startsWith(dir) || c.endsWith("remove"))).toBe(true);
+      });
+    });
+
+    it("takes the daemon's hold first and keeps it for the whole run; a dry run takes none", async () => {
+      const { w } = canonicalWorld();
+      expect(await runCtoCommand(["relaunch", P, "--fresh"], w.ports)).toBe(0);
+      expect(w.hold.calls).toEqual([]);
+      expect(await runCtoCommand(["relaunch", P, "--fresh", "--apply"], w.ports)).toBe(0);
+      expect(w.hold.calls).toEqual([{ projectId: P, holderPid: process.pid }]);
+      expect(w.hold.released).toBe(1);
+    });
+
+    it("refuses when the daemon refuses the hold, and nothing is mutated", async () => {
+      const { w } = canonicalWorld();
+      w.hold.refused = true;
+      expect(await runCtoCommand(["relaunch", P, "--fresh", "--apply"], w.ports)).toBe(2);
+      expect(JSON.stringify(w.out)).toContain("holds project");
+      expect(JSON.stringify(w.out)).toContain(`agentctl cto relaunch ${P} --fresh --apply`);
+      expect(w.changes).toEqual([]);
+      expect(w.rotateCalls).toEqual([]);
+      expect(w.files.has(`${STATE}/cto-refresh/handoff-${P}.json`)).toBe(false);
+    });
+
+    it("a hold lost mid-run aborts before the next mutation and prints no rerun command, which could replace a successor", async () => {
+      const { w } = canonicalWorld();
+      let fired = false;
+      // The connection closes (the daemon restarted, say) right after the channel step.
+      w.onStatus = () => { if (!fired && w.out.some((l) => l["step"] === "channel" && l["result"])) { fired = true; w.hold.open = false; } };
+      expect(await runCtoCommand(["relaunch", P, "--fresh", "--apply"], w.ports)).toBe(1);
+      expect(fired).toBe(true);
+      expect(mutations(w)).toEqual([]);
+      expect(last(w)).toMatchObject({ result: "stopped", at: "switchover" });
+      expect(last(w)["rerun"]).toBeUndefined();
+      expect(String(last(w)["note"])).toContain("no recovery command is printed");
+    });
+
+    it("(a) a conversation that claims during the launch preflight is not launched a second time", async () => {
+      const { w } = canonicalWorld();
+      w.switchovers = [{ toSessionUuid: U1, state: "PENDING" }];
+      let reads = 0;
+      // The second process-table reading after the stop is the launch's own preflight; U claims right after it.
+      w.onTable = () => { if (w.out.some((l) => l["step"] === "stop" && l["result"]) && ++reads === 2) claimByNew(w, U1); };
+      expect(await runCtoCommand(["relaunch", P, "--fresh", "--apply"], w.ports)).toBe(0);
+      expect(reads).toBeGreaterThanOrEqual(2);
+      expect(w.changes.filter((c) => c.startsWith("tmux new-"))).toEqual([]);
+      expect(handoffFile(w)).toMatchObject({ next: U1, completed: true });
+    });
+
+    it("(b) a swap another run saw through, whose conversation holds the role, is a success for a run that began with the old one", async () => {
+      const { w } = canonicalWorld();
+      let fired = false;
+      w.onStatus = () => {
+        if (fired || !w.out.some((l) => l["step"] === "channel" && l["result"])) return;
+        fired = true;
+        // The other run: prepared U, launched it, saw it claim, and marked the handoff completed.
+        claimByNew(w, U1);
+        w.files.set(`${STATE}/cto-refresh/handoff-${P}.json`, JSON.stringify({ ...handoffFile(w), next: U1, completed: true }));
+      };
+      w.switchovers = [{ toSessionUuid: U1, state: "ACKED" }];
+      expect(await runCtoCommand(["relaunch", P, "--fresh", "--apply"], w.ports)).toBe(0);
+      expect(fired).toBe(true);
+      expect(mutations(w)).toEqual([]);
+      expect(w.record.conversation).toBe(U1);
+    });
+
+    it("(c) the target the daemon's read-back names is the one written down, whoever asked for it", async () => {
+      const { w } = canonicalWorld();
+      const V = "dddddddd-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+      w.rotate.answer = "competing";
+      w.launched.claims = false;
+      expect(await runCtoCommand(["relaunch", P, "--fresh", "--apply"], w.ports)).toBe(1);
+      expect(handoffFile(w).next).toBe(V);
+      const argv = launched(w);
+      expect(argv.slice(argv.indexOf("--session-id"), argv.indexOf("--session-id") + 2)).toEqual(["--session-id", V]);
+    });
+
+    it("a dry run prints the plan and asks the daemon for nothing but a read", async () => {
+      const { w } = canonicalWorld();
+      expect(await runCtoCommand(["relaunch", P, "--fresh"], w.ports)).toBe(0);
+      expect(w.out.find((l) => l["command"] === "relaunch")!["steps"]).toEqual(FRESH_STEPS);
+      expect(w.rotateCalls).toEqual([]);
+      expect(w.changes).toEqual([]);
+    });
+
+    it("takes a canonical CTO only, and no --conversation", async () => {
+      const resident = makeWorld({}, { ACP_OPERATOR_TOKEN: "operator-test-credential" });
+      expect(await runCtoCommand(["relaunch", P, "--fresh"], resident.ports)).toBe(2);
+      expect(await runCtoCommand(["relaunch", P, "--conversation", CONVERSATION], resident.ports)).toBe(2);
+    });
+  });
+});
+
+describe("the production file port", () => {
+  it("makes the directory of a file it replaces: the first handoff, written by ACP, is the first thing in <state>/cto-refresh", async () => {
+    const dir = tempDir("acp-cto-state-");
+    const ports = await createCtoPorts({ databasePath: join(dir, "state.sqlite"), operator: { request: async () => allow(ReasonCode.OK, {}) }, env: { HOME: dir } });
+    const path = join(dir, "cto-refresh", `handoff-${P}.json`);
+    expect(ports.files.exists(join(dir, "cto-refresh"))).toBe(false);
+    ports.files.replace(path, "{}\n");
+    expect(ports.files.read(path)).toBe("{}\n");
+  });
+});
+
+/** deploy135, live: two relaunches the channel served were reported as failed, and a stop read as already done while its CTO ran. */
+describe("deploy135 live defects", () => {
+  it("1: a relaunch whose backlog flood scrolls the registered line away counts as registered by the channel's emitted receipt", async () => {
+    const cwd = realpathSync(tempDir("acp-cto-flood-"));
+    const w = makeWorld({ kind: "canonical", resident: null, generation: 3, session: { pid: CLAUDE, startedAt: `start-${CLAUDE}`, workdir: cwd } });
+    const config = tempDir("acp-cto-flood-config-");
+    writeFileSync(join(config, ".claude.json"), JSON.stringify({ projects: { [cwd]: { hasTrustDialogAccepted: true } } }));
+    w.record = { ...w.record, repositories: [{ repositoryId: "repo_1", identity: `github:${REPO}`, checkoutPath: cwd }] };
+    w.ports = { ...w.ports, env: { ...w.ports.env, CLAUDE_CONFIG_DIR: config } };
+    w.procs = [{ pid: CLAUDE, ppid: 1, command: `${LOCAL_CLAUDE} --resume ${CONVERSATION}`, argv: [LOCAL_CLAUDE, "--resume", CONVERSATION] }];
+    const transcript = `${HOME}/.claude/projects/${cwd.replace(/[^A-Za-z0-9]/g, "-")}/${CONVERSATION}.jsonl`;
+    w.files.set(transcript, "{}");
+    w.mtimes.set(transcript, NOW - (IDLE_SECONDS + 60) * 1000);
+    w.pane = "flood";
+    expect(await runCtoCommand(["relaunch", P, "--apply"], w.ports)).toBe(0);
+    expect(results(w).find(([s]) => s === "launch")).toEqual(["launch", "done"]);
+    expect(w.changes.filter((c) => c.startsWith("tmux send-keys"))).toEqual(["tmux send-keys -t %9 Enter"]);
+  });
+
+  it("#1463 r1: an old channel's receipt appended while the launch asks for its tmux session does not count: the screen still loads", async () => {
+    const cwd = realpathSync(tempDir("acp-cto-old-receipt-"));
+    const w = makeWorld({ kind: "canonical", resident: null, generation: 3, session: { pid: CLAUDE, startedAt: `start-${CLAUDE}`, workdir: cwd } });
+    const config = tempDir("acp-cto-old-receipt-config-");
+    writeFileSync(join(config, ".claude.json"), JSON.stringify({ projects: { [cwd]: { hasTrustDialogAccepted: true } } }));
+    w.record = { ...w.record, repositories: [{ repositoryId: "repo_1", identity: `github:${REPO}`, checkoutPath: cwd }] };
+    w.ports = { ...w.ports, env: { ...w.ports.env, CLAUDE_CONFIG_DIR: config } };
+    w.procs = [{ pid: CLAUDE, ppid: 1, command: `${LOCAL_CLAUDE} --resume ${CONVERSATION}`, argv: [LOCAL_CLAUDE, "--resume", CONVERSATION] }];
+    const transcript = `${HOME}/.claude/projects/${cwd.replace(/[^A-Za-z0-9]/g, "-")}/${CONVERSATION}.jsonl`;
+    w.files.set(transcript, "{}");
+    w.mtimes.set(transcript, NOW - (IDLE_SECONDS + 60) * 1000);
+    w.pane = "loading";
+    w.oldReceiptDuringLaunch = true;
+    expect(await runCtoCommand(["relaunch", P, "--apply"], w.ports)).toBe(1);
+    expect(results(w).at(-1)).toEqual(["launch", "failed"]);
+  }, 60_000);
+
+  it("#1463 r1: a recorded os_pid alive with another start refuses: nothing is stopped and nothing launched, not even the process that does match", async () => {
+    // The reviewer's shape: the binding's os_pid 16590 now belongs to some other process, and the CTO's conversation runs as pid 20000.
+    const w = makeWorld({ generation: 4, session: { pid: CLAUDE, startedAt: "start-before-the-pid-was-reused", workdir: CLONE } });
+    w.procs = [{ pid: CLAUDE, ppid: 1, command: "/usr/libexec/some-daemon" }, { pid: 20000, ppid: 1, command: `claude --resume ${CONVERSATION}`, cwd: CLONE }];
+    expect(await runCtoCommand(["relaunch", P, "--apply"], w.ports)).toBe(1);
+    expect(results(w).at(-1)).toEqual(["stop", "failed"]);
+    expect(JSON.stringify(w.out)).toContain("cannot be confirmed");
+    expect(w.changes).toEqual([]);
+    expect(w.procs.map((p) => p.pid)).toEqual([CLAUDE, 20000]);
+  });
+
+  // myeotnyeon: pid 84604, `claude --resume 36276d16-…` (a bare argv[0]), binding ACTIVE gen 4 with os_pid 84604.
+  const MYEOTNYEON = "36276d16-29e8-4946-bb88-3e5c1895e0d7";
+  const myeotnyeon = (): World => {
+    const w = makeWorld({ conversation: MYEOTNYEON, generation: 4, session: { pid: 84604, startedAt: "start-84604", workdir: CLONE } });
+    w.procs = [{ pid: 84604, ppid: 3327, command: `claude --resume ${MYEOTNYEON} --messaging-socket-path ${STATE}/cc-session-acp-myeotnyeon.sock --remote-control myeotnyeon CTO --permission-mode bypassPermissions --dangerously-skip-permissions` }];
+    w.files.set(TRANSCRIPT.replace(CONVERSATION, MYEOTNYEON), "{}");
+    w.mtimes.set(TRANSCRIPT.replace(CONVERSATION, MYEOTNYEON), NOW - (IDLE_SECONDS + 60) * 1000);
+    return w;
+  };
+
+  it("2: a stop is not already done while the bound session's os_pid is alive, even when the process table does not show it", async () => {
+    const w = myeotnyeon();
+    w.hiddenFromPs.add(84604);
+    expect(await runCtoCommand(["relaunch", P], w.ports)).toBe(0);
+    expect(w.out.find((l) => l["step"] === "stop")).toMatchObject({ already: false });
+    expect(await runCtoCommand(["relaunch", P, "--apply"], w.ports)).toBe(0);
+    expect(w.changes[0]).toBe("SIGTERM 84604");
+  });
+
+  it("2: with that exact argv and binding, the stop is planned and stops pid 84604", async () => {
+    const w = myeotnyeon();
+    expect(await runCtoCommand(["relaunch", P], w.ports)).toBe(0);
+    expect(w.out.find((l) => l["step"] === "stop")).toMatchObject({ already: false });
+  });
+
+});
+
+/** #1436 final review of cto-command.ts: the three shapes the reviewer reproduced. */
+describe("one CTO per project, through the shared check (#1463)", () => {
+  /** A canonical CTO whose role is bound to the claude process running `argv`. */
+  const canonical = (argv: string[], bound: boolean): { w: World; cwd: string } => {
+    const cwd = realpathSync(tempDir("acp-cto-one-"));
+    const config = tempDir("acp-cto-one-config-");
+    writeFileSync(join(config, ".claude.json"), JSON.stringify({ projects: { [cwd]: { hasTrustDialogAccepted: true } } }));
+    const w = makeWorld({ kind: "canonical", resident: null, generation: bound ? 3 : null, session: bound ? { pid: CLAUDE, startedAt: `start-${CLAUDE}`, workdir: cwd } : null,
+      repositories: [{ repositoryId: "repo_1", identity: `github:${REPO}`, checkoutPath: cwd }] }, { ACP_OPERATOR_TOKEN: "operator-test-credential", CLAUDE_CONFIG_DIR: config });
+    w.procs = [{ pid: CLAUDE, ppid: 1, command: argv.join(" "), argv, cwd: "/elsewhere" }];
+    w.panes = new Map([[CLAUDE, "logic-claude-handoff"]]);
+    w.tmux = new Set(["logic-claude-handoff"]);
+    const transcript = `${HOME}/.claude/projects/${cwd.replace(/[^A-Za-z0-9]/g, "-")}/${CONVERSATION}.jsonl`;
+    w.files.set(transcript, "{}");
+    w.mtimes.set(transcript, NOW - (IDLE_SECONDS + 60) * 1000);
+    return { w, cwd };
+  };
+  const launched = (w: World): string[] => w.changes.filter((c) => /^tmux new-(session|window)/.test(c));
+
+  it("P1 510: a bound holder started with --resume=<uuid> is stopped before the resume starts", async () => {
+    const { w } = canonical([LOCAL_CLAUDE, `--resume=${CONVERSATION}`, "--permission-mode", "bypassPermissions"], true);
+    expect(await runCtoCommand(["relaunch", P, "--apply"], w.ports)).toBe(0);
+    expect(w.changes).toContain(`SIGTERM ${CLAUDE}`);
+    expect(launched(w)).toHaveLength(1);
+  });
+
+  for (const [shape, argv, cwdIsCheckout, earlier] of [
+    ["an unbound holder started with --resume=<uuid>", [LOCAL_CLAUDE, `--resume=${CONVERSATION}`], false, false],
+    ["an earlier conversation of the role", [LOCAL_CLAUDE, "--resume", "11111111-2222-4333-8444-555555555555"], false, true],
+    ["an interactive claude in the project's checkout, naming no conversation", [LOCAL_CLAUDE, "--permission-mode", "bypassPermissions"], true, false],
+  ] as const) {
+    it(`P1 510: ${shape} refuses the launch with CTO_ALREADY_RUNNING, and no second claude starts`, async () => {
+      const { w, cwd } = canonical([...argv], false);
+      if (cwdIsCheckout) w.procs[0]!.cwd = cwd;
+      if (earlier) w.roleConversations.push("11111111-2222-4333-8444-555555555555");
+      expect(await runCtoCommand(["relaunch", P, "--apply"], w.ports)).toBe(1);
+      expect(results(w).at(-1)).toEqual(["one-cto", "failed"]);
+      expect(JSON.stringify(w.out)).toContain("CTO_ALREADY_RUNNING");
+      expect(w.changes).toEqual([]);
+      expect(launched(w)).toEqual([]);
+      expect(w.changes.filter((c) => c.startsWith("SIGTERM"))).toEqual([]);
+    });
+  }
+
+  it("P1 1096: a process reader that cannot spawn ps stops the relaunch before anything is stopped or launched", async () => {
+    const { w } = canonical([LOCAL_CLAUDE, "--resume", CONVERSATION], true);
+    w.psFails = true;
+    expect(await runCtoCommand(["relaunch", P, "--apply"], w.ports)).toBe(1);
+    expect(JSON.stringify(w.out)).toContain("CTO_PROCESS_TABLE_UNREADABLE");
+    expect(w.changes.filter((c) => c.startsWith("SIGTERM") || /^tmux new-/.test(c))).toEqual([]);
+  });
+
+  it("P1 317: prompt text \"Explain --resume <uuid> please\" is one argv element, and that process is never stopped", async () => {
+    const w = makeWorld({ generation: null, session: null });
+    w.procs = [{ pid: 40000, ppid: 1, command: `claude -p Explain --resume ${CONVERSATION} please`, argv: ["claude", "-p", `Explain --resume ${CONVERSATION} please`], cwd: "/tmp/elsewhere" }];
+    expect(await runCtoCommand(["relaunch", P, "--apply"], w.ports)).toBe(0);
+    expect(w.changes.filter((c) => c.startsWith("SIGTERM"))).toEqual([]);
+    expect(w.procs.some((p) => p.pid === 40000)).toBe(true);
+  });
+});
+
+/** #1463 review r2: a token that cannot be read is never proof of exit, and a binding is never stepped around. */
+describe("#1463 r2: gone, alive and unavailable are three states", () => {
+  const canonicalBound = (): World => {
+    const cwd = realpathSync(tempDir("acp-cto-r2-"));
+    const config = tempDir("acp-cto-r2-config-");
+    writeFileSync(join(config, ".claude.json"), JSON.stringify({ projects: { [cwd]: { hasTrustDialogAccepted: true } } }));
+    const w = makeWorld({ kind: "canonical", resident: null, generation: 3, session: { pid: CLAUDE, startedAt: `start-${CLAUDE}`, workdir: cwd },
+      repositories: [{ repositoryId: "repo_1", identity: `github:${REPO}`, checkoutPath: cwd }] }, { ACP_OPERATOR_TOKEN: "operator-test-credential", CLAUDE_CONFIG_DIR: config });
+    w.procs = [{ pid: CLAUDE, ppid: 1, command: `${LOCAL_CLAUDE} --resume ${CONVERSATION}`, argv: [LOCAL_CLAUDE, "--resume", CONVERSATION], cwd }];
+    const transcript = `${HOME}/.claude/projects/${cwd.replace(/[^A-Za-z0-9]/g, "-")}/${CONVERSATION}.jsonl`;
+    w.files.set(transcript, "{}");
+    w.mtimes.set(transcript, NOW - (IDLE_SECONDS + 60) * 1000);
+    return w;
+  };
+  const launches = (w: World): string[] => w.changes.filter((c) => /^tmux new-(session|window)/.test(c) || c === "provisioner ensure-resident");
+
+  it("P1 346: a pid that survives SIGTERM and whose token reads null once is not taken as exited; nothing launches beside it", async () => {
+    const w = canonicalBound();
+    w.survivesSigterm.add(CLAUDE);
+    w.tokenGlitchAfterSignal.set(CLAUDE, 1);
+    expect(await runCtoCommand(["relaunch", P, "--apply"], w.ports)).toBe(1);
+    expect(results(w).at(-1)).toEqual(["stop", "failed"]);
+    expect(JSON.stringify(w.out)).toContain("did not provably exit");
+    expect(launches(w)).toEqual([]);
+  });
+
+  it("P1 234: a bound os_pid whose start cannot be read refuses, and the resident fallback never signals pid 20000 in its place", async () => {
+    const w = makeWorld({ generation: 4, session: { pid: CLAUDE, startedAt: `start-${CLAUDE}`, workdir: CLONE } });
+    w.procs = [{ pid: CLAUDE, ppid: 1, command: "/bin/claude --model opus", cwd: "/elsewhere" }, { pid: 20000, ppid: 1, command: `claude --resume ${CONVERSATION}`, cwd: CLONE }];
+    w.tokenUnavailable.add(CLAUDE);
+    expect(await runCtoCommand(["relaunch", P], w.ports)).toBe(0);
+    expect(w.out.find((l) => l["step"] === "stop")).toMatchObject({ already: false });
+    w.out.length = 0;
+    expect(await runCtoCommand(["relaunch", P, "--apply"], w.ports)).toBe(1);
+    expect(results(w).at(-1)).toEqual(["stop", "failed"]);
+    expect(JSON.stringify(w.out)).toContain("cannot be read");
+    expect(w.changes).toEqual([]);
+  });
+
+  it("P1 234: a bound os_pid that is provably gone is nothing to stop; another matching process is never signalled in its place", async () => {
+    const w = makeWorld({ generation: 4, session: { pid: 16591, startedAt: "start-16591", workdir: CLONE } });
+    w.procs = [{ pid: 20000, ppid: 1, command: `claude --resume ${CONVERSATION}`, cwd: CLONE }];
+    await runCtoCommand(["relaunch", P, "--apply"], w.ports);
+    expect(w.changes.filter((c) => c.startsWith("SIGTERM"))).toEqual([]);
+  });
+
+  it("P1 234: the fallback to the shared check's match is an unbound resident's only", async () => {
+    const w = makeWorld({ generation: null, session: null });
+    w.procs = [{ pid: 20000, ppid: 1, command: `claude --resume ${CONVERSATION}`, cwd: CLONE }];
+    expect(await runCtoCommand(["relaunch", P, "--apply"], w.ports)).toBe(0);
+    expect(w.changes[0]).toBe("SIGTERM 20000");
+  });
+
+  it("P2 509: a launcher an earlier version wrote ({tmux, argv}) is regenerated, keeping what it carried, and the relaunch goes on", async () => {
+    const w = canonicalBound();
+    w.procs = [];
+    w.record = { ...w.record, generation: null, session: null };
+    const legacy = { tmux: "logic-claude-handoff", argv: [LOCAL_CLAUDE, "--mcp-config", "{}", "--dangerously-load-development-channels", "server:acp-buzz-channel", "--resume", CONVERSATION, "--name", "Logic CTO", "--permission-mode", "bypassPermissions"] };
+    w.files.set(`${STATE}/cto-launch-${P}.sh`, `#!/bin/sh\n# cto-launch: ${JSON.stringify(legacy)}\nexec true\n`);
+    expect(await runCtoCommand(["relaunch", P, "--apply"], w.ports)).toBe(0);
+    expect(results(w).find(([s]) => s === "launcher")).toEqual(["launcher", "done"]);
+    const launch = w.out.find((l) => l["step"] === "launch" && l["result"] === "done")!["detail"] as { argv: string[]; tmux: string };
+    expect(launch.argv.slice(launch.argv.indexOf("--name"), launch.argv.indexOf("--name") + 2)).toEqual(["--name", "Logic CTO"]);
+    expect(launch.tmux).toBe("logic-claude-handoff");
+  });
+});
+
+/** #1463 final review: the reviewer's two repros, by name. */
+describe("#1463 final review repros", () => {
+  const canonicalBound = (): World => {
+    const cwd = realpathSync(tempDir("acp-cto-final-"));
+    const config = tempDir("acp-cto-final-config-");
+    writeFileSync(join(config, ".claude.json"), JSON.stringify({ projects: { [cwd]: { hasTrustDialogAccepted: true } } }));
+    const w = makeWorld({ kind: "canonical", resident: null, generation: 3, session: { pid: CLAUDE, startedAt: `start-${CLAUDE}`, workdir: cwd },
+      repositories: [{ repositoryId: "repo_1", identity: `github:${REPO}`, checkoutPath: cwd }] }, { ACP_OPERATOR_TOKEN: "operator-test-credential", CLAUDE_CONFIG_DIR: config });
+    w.procs = [{ pid: CLAUDE, ppid: 1, command: `${LOCAL_CLAUDE} --resume ${CONVERSATION}`, argv: [LOCAL_CLAUDE, "--resume", CONVERSATION], cwd }];
+    const transcript = `${HOME}/.claude/projects/${cwd.replace(/[^A-Za-z0-9]/g, "-")}/${CONVERSATION}.jsonl`;
+    w.files.set(transcript, "{}");
+    w.mtimes.set(transcript, NOW - (IDLE_SECONDS + 60) * 1000);
+    return w;
+  };
+  const launchesOrSignals = (w: World): string[] => w.changes.filter((c) => /^tmux new-(session|window)|^SIGTERM|^provisioner ensure-resident/.test(c));
+
+  it("a surviving CTO with one null token after SIGTERM while ps -o stat exits 1 is not exited, and pid 30000 never launches beside it", async () => {
+    const w = canonicalBound();
+    w.survivesSigterm.add(CLAUDE);
+    w.tokenGlitchAfterSignal.set(CLAUDE, 1);
+    w.psStatFails = true;
+    expect(await runCtoCommand(["relaunch", P, "--apply"], w.ports)).toBe(1);
+    expect(results(w).at(-1)).toEqual(["stop", "failed"]);
+    expect(w.changes.filter((c) => /^tmux new-/.test(c))).toEqual([]);
+    expect(w.procs.some((p) => p.pid === 30000)).toBe(false);
+  });
+
+  // After the plan's first step, the stop's done() and its target selection read the token once each; the read right
+  // before the signal is the 3rd.
+  it("pid 16590 replaced after its selection, with the last token read unavailable: the replacement is never signalled", async () => {
+    const w = makeWorld();
+    w.tokenAfterIdle.set(CLAUDE, (read) => (read <= 2 ? `start-${CLAUDE}` : null));
+    expect(await runCtoCommand(["relaunch", P, "--apply"], w.ports)).toBe(1);
+    expect(results(w).at(-1)).toEqual(["stop", "failed"]);
+    expect(launchesOrSignals(w)).toEqual([]);
+  });
+
+  it("pid 16590 replaced after its selection, with a different token read right before the signal: refused, nothing signalled", async () => {
+    const w = makeWorld();
+    w.tokenAfterIdle.set(CLAUDE, (read) => (read <= 2 ? `start-${CLAUDE}` : "start-of-the-replacement"));
+    expect(await runCtoCommand(["relaunch", P, "--apply"], w.ports)).toBe(1);
+    expect(results(w).at(-1)).toEqual(["stop", "failed"]);
+    expect(launchesOrSignals(w)).toEqual([]);
+  });
 });
 
 describe("agentctl cto list", () => {
@@ -666,7 +1778,7 @@ describe("agentctl cto list", () => {
     expect(await runCtoCommand(["list"], w.ports)).toBe(0);
     expect(w.out).toEqual([{ ctos: [expect.objectContaining({
       project: P, kind: "resident", generation: 3, conversation: CONVERSATION, room: ROOM, roomRouted: true,
-      session: [{ pid: CLAUDE, tmux: TMUX, channel: true }],
+      session: [{ pid: CLAUDE, tmux: TMUX, channel: true, matchedBy: ["conversation", "bound-pid"] }],
     })] }]);
   });
 });

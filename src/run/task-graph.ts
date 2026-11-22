@@ -12,6 +12,7 @@ import { newTaskId } from "../core/ids.ts";
 import { readProcessStartToken } from "../core/process-argv.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import type { AuditLog } from "../db/audit.ts";
+import { isRetiredModel } from "../domain/fixed-role-runtime.ts";
 import type { Db } from "../db/database.ts";
 import type { SupersessionBinding } from "./candidate-integration.ts";
 import { recordedWriteTarget } from "./task-write-target.ts";
@@ -741,7 +742,9 @@ export class TaskGraph {
 
   /**
    * The provider and model a worker execution is admitted and recorded under: the bound worker
-   * session's own. A receipt that states either must state the session's.
+   * session's own. A receipt that states either must state the session's. An execution is never
+   * opened on a retired model (`isRetiredModel`, every gpt-6.1-*), named by the receipt or inherited
+   * from the session: owner directive of 2026-11-21.
    */
   private workerIdentity(
     input: Pick<WorkerExecutionStart, "runId" | "taskId" | "workerSessionId" | "provider" | "model">,
@@ -756,6 +759,20 @@ export class TaskGraph {
         taskId: input.taskId,
         workerSessionId: input.workerSessionId,
       });
+    }
+    const retired = [input.model, session.model].find((model) => model !== undefined && isRetiredModel(model));
+    if (retired !== undefined) {
+      return deny(
+        ReasonCode.INVALID_ARGUMENT,
+        `the execution's model ${retired} is retired; provision a gpt-6.2-sol worker for this task`,
+        {
+          runId: input.runId,
+          taskId: input.taskId,
+          workerSessionId: input.workerSessionId,
+          model: input.model ?? null,
+          sessionModel: session.model,
+        },
+      );
     }
     if (
       (input.provider !== undefined && input.provider !== session.provider) ||

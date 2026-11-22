@@ -5,6 +5,7 @@ import { recordBootstrapServingRuntime } from "../bootstrap/bootstrap-runtime-ob
 import { readBuzzSubscriberConfig } from '../buzz/buzz-mention-subscriber.ts';
 import { CanonicalSessionRegistry } from '../registry/canonical-session-registry.ts';
 import { canonicalCtoRotations, drainingRotationFor, inFlightFromPreviousHolder, liveRunIdsOwnedBySession } from "../registry/canonical-cto-rotation.ts";
+import { CTO_REFRESH_HOLD_METHOD, createCtoRefreshHolds } from "./cto-refresh-hold.ts";
 import { outboxDeliveryReadback, type OutboxMessage } from "../outbox/outbox.ts";
 import type { CeoNoticeAttempt } from "../outbox/ceo-notification-route.ts";
 import { randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
@@ -857,6 +858,8 @@ export interface LocalOperatorSocketOptions {
    * server-configured CLI owner allowlist; absent on a parked daemon.
    */
   canonicalCto?: CanonicalCtoOperator;
+  /** `ctoRefresh.hold`: takes the project's refresh hold for the connection that asked, owner only; absent on a parked daemon. */
+  ctoRefreshHold?: (projectId: string, socket: Socket, holderPid: number | null) => Decision<unknown>;
   // No `claimCanonicalCto` option on this bearer-token-authenticated socket (#760): a process may
   // prove who it is, but it cannot approve itself, so the claiming connection cannot sit on this
   // credential surface at all, not even behind its own kernel-credential check layered on top. It
@@ -924,7 +927,10 @@ export const startSessionLaunchChannel = async (
         // under the daemon lock. A losing daemon can therefore never unlink the winner's
         // live launch socket while it is merely attempting startup.
         removeStaleSocket(socketPath);
-        candidate = createServer((socket) => serveSessionLaunchCredential(socket, pending, options.mcpToken, options.audit));
+        candidate = createServer((socket) => {
+          ignorePeerSocketErrors(socket);
+          serveSessionLaunchCredential(socket, pending, options.mcpToken, options.audit);
+        });
         await listenSocket(candidate, socketPath);
         if (closed) {
           await closeSocketServer(candidate);
@@ -1460,19 +1466,6 @@ export const startLocalMcpListeners = async (
       // binding-scoped re-check at delivery time reintroduces that dependency through the back
       // door, and moving the admitted project away took the session's other project with it.
       server.server.onclose = ctoConversation.attach(server, connectionAuth());
-      // `role_wake_endpoint_register` is kept for clients that still call it, and does nothing but
-      // answer: no frame is ever written to an endpoint, so none is recorded either.
-      server.registerTool(
-        "role_wake_endpoint_register",
-        {
-          description:
-            "Retained for older clients: accepted and ignored. Nothing is written to a session; messages are taken with " +
-            "role_owner_message_claim.",
-          inputSchema: { endpoint: z.string().min(1), acceptance: z.literal("relay-v1").optional() },
-        },
-        async (_args: { endpoint: string; acceptance?: "relay-v1" }) =>
-          respond(ctoConversation.acknowledgeRegistration(server)),
-      );
       /*
        * The owner-message tools, registered in this same composition — not on a second
        * server, and not against a durable endpoint registry.
@@ -1561,9 +1554,9 @@ export const startLocalMcpListeners = async (
       // notification is sent once that answer is written, so it is behind it on the wire.
       //
       // Two relays end a restore with a request of their own: this build's asks a `ping` under
-      // `CANONICAL_CTO_RESTORED_PING_PREFIX`, and an earlier build's replays its wake registration,
-      // `role_wake_endpoint_register`, which this daemon still answers. Either is the point at which
-      // the relay stops refusing the client, so either is followed by the notification. One restore
+      // `CANONICAL_CTO_RESTORED_PING_PREFIX`, and an older build's replays `role_wake_endpoint_register`,
+      // which the SDK answers with an unknown-tool error. Either answer is the point at which the
+      // relay stops refusing the client, so either is followed by the notification. One restore
       // is told once: after `notifications/initialized` the first trigger answered sends it, and a
       // later one on the same connection does not.
       const triggers = new Set<string | number>();
@@ -1766,7 +1759,10 @@ export const startBuzzActorIngressListener = async (
   const ingress = new BuzzActorIngress(guard, cp.sessions);
   const socketPath = join(stateDir, "buzz-actor.ingress.sock");
   removeStaleSocket(socketPath);
-  const server = createServer((socket) => serveBuzzActorBinding(socket, ingress));
+  const server = createServer((socket) => {
+    ignorePeerSocketErrors(socket);
+    serveBuzzActorBinding(socket, ingress);
+  });
 
   try {
     await listenSocket(server, socketPath);
@@ -1806,6 +1802,7 @@ export const startTelegramExternalIngress = async (
   const socketPath = join(stateDir, TELEGRAM_EXTERNAL_SOCKET_NAME);
   removeStaleSocket(socketPath);
   const server = createServer((socket) => {
+    ignorePeerSocketErrors(socket);
     trackConnection(server, socket);
     serveTelegramExternalUpdate(socket, lane);
   });
@@ -1980,7 +1977,10 @@ export const startBuzzMessageIngressListener = async (
   const { ingress, port } = seam;
   const socketPath = join(stateDir, "buzz-message.ingress.sock");
   removeStaleSocket(socketPath);
-  const server = createServer((socket) => serveBuzzMessageTurn(cp, socket, ingress, port));
+  const server = createServer((socket) => {
+    ignorePeerSocketErrors(socket);
+    serveBuzzMessageTurn(cp, socket, ingress, port);
+  });
 
   try {
     await listenSocket(server, socketPath);
@@ -2954,7 +2954,8 @@ export const startDaemonBuzzMentionSubscriber = (
   const baseSink = createDaemonBuzzMentionSink(cp, policy, messageIngress, options);
   // A CTO session's Buzz channel reports what it showed its session in files beside this daemon's
   // state; the queue below moves those messages. A receipt can land before the mention is admitted,
-  // so every admission asks for the receipts to be applied again.
+  // so every admission asks for the receipts to be applied again; a start replays every mention it
+  // missed, and that burst is one pass, not one per mention.
   const channelQueue = watchChannelReceipts(
     stateDir,
     (projectId) => roleKeyFor(Role.PRIMARY_CTO, { projectId }),
@@ -2966,7 +2967,7 @@ export const startDaemonBuzzMentionSubscriber = (
     ...baseSink,
     admit: async (request) => {
       const verdict = await baseSink.admit(request);
-      channelQueue.apply();
+      channelQueue.request();
       return verdict;
     },
   };
@@ -3382,10 +3383,15 @@ export const startDaemonOperatorSocket = (
   const bootstrap = options.bootstrapHermes;
   const adopt = options.adoptHermesIncumbent;
   const canonicalCto = options.canonicalCto;
+  const ctoRefreshHolds = createCtoRefreshHolds();
   return startOperatorSocket(daemon, stateDir, credential, {
     ...options,
     // v58 — the bearer authenticates the CLI; only the server-configured owner may rotate or read a rotation.
     ...(canonicalCto ? { canonicalCto: ownerOnlyCanonicalCtoOperator(cp, operatorActor, canonicalCto) } : {}),
+    // The refresh hold is the owner's too; one in-memory map for this daemon's life.
+    ctoRefreshHold: (projectId, socket, holderPid) => cp.ownerAuthority.isAllowedActor("cli", operatorActor)
+      ? ctoRefreshHolds.acquire(projectId, socket, holderPid)
+      : deny(ReasonCode.INGRESS_ACTOR_NOT_ALLOWLISTED, "a CTO refresh hold requires an allowlisted CLI owner", {}),
     ...(bootstrap ? { bootstrapHermes: (params: Record<string, unknown>) => {
       if (cp.bindings.history(Role.CEO).length > 0 &&
           !cp.ownerAuthority.isAllowedActor("cli", operatorActor)) {
@@ -4113,9 +4119,12 @@ export const startOperatorSocket = async (
   };
   const socketPath = join(stateDir, "agentcpd.operator.sock");
   removeStaleSocket(socketPath);
-  const server = createServer((socket) =>
-    serveOperatorRequest(socket, daemon, binding, handshakeTimeoutMs, requestTimeoutMs, options),
-  );
+  const server = createServer((socket) => {
+    ignorePeerSocketErrors(socket);
+    // A CTO refresh hold keeps its connection open: closing the listener must end it too, or shutdown waits on it for ever.
+    trackConnection(server, socket);
+    serveOperatorRequest(socket, daemon, binding, handshakeTimeoutMs, requestTimeoutMs, options);
+  });
   try {
     await listenSocket(server, socketPath);
   } catch (err) {
@@ -4167,6 +4176,7 @@ const startMcpSocket = async (
 ): Promise<Server> => {
   removeStaleSocket(path);
   const server = createServer((socket) => {
+    ignorePeerSocketErrors(socket);
     trackConnection(server, socket);
     void authenticateSocket(socket, token, handshakeTimeoutMs).then(async (accepted) => {
       if (!accepted) return;
@@ -4245,6 +4255,15 @@ const removeStaleSocket = (path: string): void => {
  * lock release. Closing a tracked server ends its connections as well.
  */
 const TRACKED_CONNECTIONS = new WeakMap<Server, Set<Socket>>();
+
+/**
+ * An error on one accepted connection (EPIPE writing to a peer that already closed, ECONNRESET) is that peer's
+ * and never the daemon's: with no `error` listener Node rethrows it as an uncaught exception and the daemon exits.
+ * Every accepted socket gets this first, before any handler can write; the handlers' own `error` listeners still run.
+ */
+const ignorePeerSocketErrors = (socket: Socket): void => {
+  socket.on("error", () => undefined);
+};
 
 const trackConnection = (server: Server, socket: Socket): void => {
   const open = TRACKED_CONNECTIONS.get(server) ?? new Set<Socket>();
@@ -4382,6 +4401,25 @@ const serveOperatorRequest = (
             error: error instanceof Error ? error.message : String(error),
           }));
         }
+      }
+      if (method === CTO_REFRESH_HOLD_METHOD) {
+        if (!options.ctoRefreshHold) return finish(deny(ReasonCode.OPERATOR_METHOD_NOT_ALLOWED, "CTO refresh holds are not enabled on this socket", {}));
+        if (!daemon.lock.held()) return finish(deny(ReasonCode.DAEMON_LOCK_LOST, "daemon lock is not held for a CTO refresh hold", {}));
+        const params = operatorRequestParams(value);
+        const projectId = params?.["projectId"];
+        const holderPid = params?.["holderPid"];
+        if (typeof projectId !== "string" || projectId.length === 0 || (holderPid !== undefined && !Number.isSafeInteger(holderPid))) {
+          return finish(deny(ReasonCode.INVALID_ARGUMENT, "ctoRefresh.hold takes a projectId and, optionally, the holder's pid", {}));
+        }
+        const held = options.ctoRefreshHold(projectId, socket, typeof holderPid === "number" ? holderPid : null);
+        if (!held.allowed) return finish(held);
+        // Answered, and the connection stays open: it is the hold, and closing it releases it.
+        settled = true;
+        if (timeout) clearTimeout(timeout);
+        frame.dispose();
+        socket.write(`${JSON.stringify(held)}\n`);
+        socket.resume();
+        return;
       }
       // `actor.claimCanonicalCto` does not dispatch here (#760): a process may prove who it is,
       // but it cannot approve itself, so the claiming connection is kept off this bearer-token
@@ -6398,12 +6436,6 @@ export const configuredCanonicalSessions = (raw: string): readonly CanonicalAdop
 export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => {
   // Classify the complete environment-only group before reading config or acquiring resources.
   // Blank values are absent; nonblank values are retained exactly for the claim boundary.
-  //
-  // Three, not six. `ACP_CANONICAL_REQUIRED_EXECUTOR_VERSION`, `…_EXPECTED_EXECUTOR_REALPATH` and
-  // `…_EXPECTED_EXECUTOR_SHA256` used to belong to the group; the claim no longer compares the
-  // executing image against anything, so nothing reads them. They are not refused either: a
-  // deployment that still provisions them starts exactly as one that does not, and they count
-  // neither toward the group being present nor toward it being partial.
   const CANONICAL_ACTIVATION_VARS = [
     "ACP_CANONICAL_SESSIONS_JSON",
     "ACP_CANONICAL_CTO_PEER_PROTOCOL",

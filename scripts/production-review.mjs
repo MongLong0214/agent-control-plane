@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * Independent production-readiness review by GPT-6.1 Sol.
+ * Independent production-readiness review by GPT-6.2 Sol.
  *
  * Splits the implementation into the areas the PRD gives distinct authority to, and asks
  * for structured findings per area. The reviewer reads the repository itself under a
@@ -41,7 +41,7 @@ import { frontierReviewPolicy } from "../src/review/frontier-simplify-policy.ts"
 const repoRoot = fileURLToPath(new URL("..", import.meta.url));
 
 // The model is pinned by owner directive; see the record on this file before changing it.
-const MODEL = "gpt-6.1-sol";
+const MODEL = "gpt-6.2-sol";
 const REASONING_EFFORT = "xhigh";
 
 const SCHEMA = {

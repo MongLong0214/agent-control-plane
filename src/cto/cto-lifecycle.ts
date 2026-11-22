@@ -1688,8 +1688,8 @@ export class CtoLifecycle {
   /**
    * Where no binding is active, whether the role's latest holder was an adopted canonical CTO: an
    * actor with a `SELF_CLAIM_EXECUTOR_KIND` target at the highest `binding_generation` this role
-   * key has ever been granted, ACTIVE or REVOKED. A released canonical binding (`binding
-   * recover-dead`, or the dead-binding recovery before the re-claim lands) leaves no actor to ask,
+   * key has ever been granted, ACTIVE or REVOKED. A released canonical binding (the daemon's
+   * liveness sweep, or the dead-binding recovery before the re-claim lands) leaves no actor to ask,
    * and this lineage is the durable fact that the role is still canonical. A role with no history,
    * or whose latest holder is not canonical, answers null and is provisioned as before.
    *
