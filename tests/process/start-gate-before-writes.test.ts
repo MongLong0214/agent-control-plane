@@ -16,6 +16,8 @@ import {
   utimesSync,
   writeFileSync,
 } from "node:fs";
+import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -284,6 +286,65 @@ describe("a start the doctor will refuse leaves the database as it found it (mig
 
     expectRefusedUntouched(result, database, before, "TRUSTED_GATE_CREDENTIAL_MISSING");
   }, 120_000);
+
+  it("#1496: a refused start tells the CEO through the Hermes Gateway, outside the database, and a backoff retry does not resend", async () => {
+    const { home, root, database } = newHome();
+    currentDatabase(database);
+    const lineage = `sha256:${"c".repeat(64)}`;
+    const identity = { session_id: "gw-session", lineage_root_digest: lineage, process_pid: 777, process_started_at: "gw-start" };
+    const posts: Array<{ path: string; auth: string | undefined; body: Record<string, unknown> }> = [];
+    const gateway = createServer((req: IncomingMessage, res: ServerResponse) => {
+      res.setHeader("Content-Type", "application/json");
+      if (req.method === "GET") return void res.end(JSON.stringify(identity));
+      let raw = "";
+      req.on("data", (chunk: Buffer) => (raw += chunk.toString("utf8")));
+      req.on("end", () => {
+        const body = JSON.parse(raw) as Record<string, unknown>;
+        posts.push({ path: req.url ?? "", auth: req.headers.authorization, body });
+        res.end(JSON.stringify({
+          event_id: body["event_id"], payload_digest: body["payload_digest"],
+          receipt: { receipt_id: "rcpt-1", status: "completed", session_id: identity.session_id, lineage_root_digest: lineage },
+        }));
+      });
+    });
+    await new Promise<void>((resolveListen) => gateway.listen(0, "127.0.0.1", resolveListen));
+    const port = (gateway.address() as AddressInfo).port;
+    const env = {
+      ACP_DAEMON_NOTICE_ENABLED: "1",
+      ACP_TELEGRAM_EXTERNAL_SECRET: "process-lane-secret",
+      ACP_HERMES_GATEWAY_ENDPOINT: `127.0.0.1:${port}`,
+      ACP_HERMES_GATEWAY_API_KEY: "process-gateway-key",
+      ACP_HERMES_LINEAGE_ROOT_DIGEST: lineage,
+      ACP_HERMES_EXECUTABLE: "/opt/hermes/bin/hermes",
+      ACP_HERMES_PROFILE: "ceo",
+      ACP_HERMES_HOME: join(home, ".hermes"),
+      ACP_HERMES_EXECUTOR_RUNTIME_IDENTITY: "hermes-runtime",
+    };
+    try {
+      const before = imageOf(database);
+      const first = await runToExit(home, env);
+
+      expectRefusedUntouched(first, database, before, "TRUSTED_GATE_CREDENTIAL_MISSING");
+      expect(posts).toHaveLength(1);
+      expect(posts[0]!.auth).toBe("Bearer process-gateway-key");
+      const loop = crashLoopOf(root) as CrashLoop & { lastRefusal: { refusalId: string; notice: { outcome: string; receiptId: string } } };
+      expect(loop.lastRefusal.notice).toMatchObject({ outcome: "delivered", receiptId: "rcpt-1" });
+      expect(posts[0]!.body["text"]).toContain(loop.lastRefusal.refusalId);
+      expect(first.stderr).toContain(loop.lastRefusal.refusalId);
+
+      // Hold the refusal's record inside its backoff: the retry reads it and sends nothing.
+      writeFileSync(join(root, "crash-loop.json"), JSON.stringify({ ...loop, retryNotBefore: new Date(Date.now() + 600_000).toISOString() }), { mode: 0o600 });
+      const retry = startDaemon(home, env);
+      await retry.waitFor("backoff:");
+      retry.child.kill("SIGTERM");
+      await retry.exited;
+      expect(retry.stderr()).toContain(ReasonCode.DAEMON_BACKOFF_ACTIVE);
+      expect(posts).toHaveLength(1);
+      expect(imageOf(database)).toEqual(before);
+    } finally {
+      await new Promise<void>((resolveClose) => gateway.close(() => resolveClose()));
+    }
+  }, 180_000);
 
   it("item 2: a SIGTERM during the refusal's backoff writes nothing", async () => {
     const { home, database } = newHome();

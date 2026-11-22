@@ -184,6 +184,7 @@ import type { AuthenticatedOperatorPeer, Daemon, StartStallNoticeRoute } from ".
 import { StartTracker, gracefulStop } from "./graceful-stop.ts";
 import type { SingleInstanceLock } from "./single-instance.ts";
 import { refuseStartBeforeOpening, takeStartLock } from "./start-gate.ts";
+import { refusalNoticeRouteFrom } from "./start-refusal-notice.ts";
 import { executeCanonicalSelfClaimOperator } from "./canonical-self-claim-operator.ts";
 import {
   startAdoptedCeoToolListener,
@@ -6576,7 +6577,18 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
   process.once("exit", () => {
     if (!cleanupStarted) startLock.release();
   });
-  const refusedBeforeOpening = await refuseStartBeforeOpening(config);
+  // #1496 — the route a gate-refused start tells the CEO through, resolved from the environment the same way
+  // `startEnabledCeoNotificationRoute` resolves it, and never through the database or the outbox.
+  const adoptionValues = configuredHermesAdoptionValues(hermesAdoptionConfiguration);
+  const refusalNoticeRoute = refusalNoticeRouteFrom({
+    noticeEnabled: process.env["ACP_DAEMON_NOTICE_ENABLED"] === "1",
+    adoption: adoptionValues
+      ? { apiKey: adoptionValues.ACP_HERMES_GATEWAY_API_KEY!, port: adoptionValues.gatewayPort,
+          lineageRootDigest: adoptionValues.ACP_HERMES_LINEAGE_ROOT_DIGEST! }
+      : null,
+    laneSecret: process.env["ACP_TELEGRAM_EXTERNAL_SECRET"],
+  });
+  const refusedBeforeOpening = await refuseStartBeforeOpening(config, undefined, { route: refusalNoticeRoute });
   if (refusedBeforeOpening !== null) {
     // Given back before the backoff is waited out: a daemon that refuses does not hold the lock while it sleeps.
     startLock.release();

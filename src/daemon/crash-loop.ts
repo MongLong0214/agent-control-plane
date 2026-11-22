@@ -18,14 +18,31 @@ export interface CrashLoopFile {
    * of the database changed, not even its journal mode, and no `-wal` or `-shm` was created.
    */
   lastRefusal?: {
+    /**
+     * Minted when the refusal is recorded and carried by the CEO notice that tells of it, so the receiver can
+     * match a notice to this record. A retry inside the backoff reads it and never mints another.
+     */
+    refusalId: string;
+    host: string;
     at: string;
     reasonCode: string;
     stage: "before-open";
     doctorStatus: string;
     blockingFindings: Array<{ code: string; severity: string; scope: string }>;
     databaseWritten: false;
+    /** What became of the CEO notice for this refusal. Written after the refusal, by `recordRefusalNotice`. */
+    notice?: RefusalNoticeOutcome;
   };
 }
+
+/**
+ * The outcome of the one CEO notice a gate-refused start sends. Kept here and nowhere else: the notice
+ * never goes through the database or the outbox, so this file is the only record that it was tried.
+ */
+export type RefusalNoticeOutcome =
+  | { outcome: "delivered"; at: string; eventId: string; receiptId: string }
+  | { outcome: "failed"; at: string; reason: string; eventId?: string }
+  | { outcome: "route-unconfigured"; at: string; reason: string };
 
 export const crashLoopPath = (stateDir: string): string => join(stateDir, "crash-loop.json");
 
@@ -92,6 +109,18 @@ export const countStartupFailure = (
   mkdirSync(stateDir, { recursive: true, mode: 0o700 });
   replaceRecord(stateDir, JSON.stringify(next));
   return { next, backoffSeconds };
+};
+
+/**
+ * Adds the CEO notice's outcome to the refusal it belongs to and changes nothing else, so the count and
+ * the backoff the supervisor reads are the ones the refusal wrote. A record that no longer names this
+ * `refusalId` (another refusal replaced it) is left alone.
+ */
+export const recordRefusalNotice = (stateDir: string, refusalId: string, notice: RefusalNoticeOutcome): boolean => {
+  const current = readJson<CrashLoopFile>(crashLoopPath(stateDir));
+  if (!current?.lastRefusal || current.lastRefusal.refusalId !== refusalId) return false;
+  replaceRecord(stateDir, JSON.stringify({ ...current, lastRefusal: { ...current.lastRefusal, notice } }));
+  return true;
 };
 
 export const clearCrashLoopFile = (stateDir: string): void => {

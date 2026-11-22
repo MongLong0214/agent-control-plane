@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 
@@ -20,7 +21,8 @@ import { TrustedCredentialStore } from "../github/credential-store.ts";
 import { DatabaseSnapshotUnavailable, withDatabaseSnapshotAsync } from "../db/database-snapshot.ts";
 import { ensurePrivateDirectory, inspectDatabaseStatePaths, inspectPrivatePath } from "../db/state-preflight.ts";
 import { readCheckoutRegistrations } from "../verify/worktree.ts";
-import { backoffSecondsFor, countStartupFailure, readCrashLoopFile } from "./crash-loop.ts";
+import { backoffSecondsFor, countStartupFailure, readCrashLoopFile, recordRefusalNotice, type RefusalNoticeOutcome } from "./crash-loop.ts";
+import { type RefusalNoticeOptions, deliverRefusalNotice, refusalHost } from "./start-refusal-notice.ts";
 import { SingleInstanceLock } from "./single-instance.ts";
 
 /**
@@ -249,10 +251,16 @@ export interface StartRefusedBeforeOpening {
  * A retry that arrives inside the backoff of an earlier refusal of this kind is refused again here, from
  * `crash-loop.json` alone: the daemon's own backoff refusal writes an audit row, which is a write this
  * path exists not to make. A refusal is counted in `crash-loop.json` and nowhere else.
+ *
+ * #1496 — a refusal that was recorded sends one notice to the CEO (`start-refusal-notice.ts`), outside the
+ * database and the outbox, and writes what became of it back into `lastRefusal.notice`. The notice carries
+ * the `refusalId` minted here. The backoff retry above returns before this point, so it never sends again.
+ * The notice is bounded and cannot change the refusal: whatever it answers, the refusal is the same.
  */
 export const refuseStartBeforeOpening = async (
   config: StartGateConfig,
   nowIso: () => string = () => systemClock.nowIso(),
+  notice: RefusalNoticeOptions | null = null,
 ): Promise<StartRefusedBeforeOpening | null> => {
   const stateDir = dirname(config.databasePath);
   const startedAt = nowIso();
@@ -283,24 +291,51 @@ export const refuseStartBeforeOpening = async (
     .map((finding) => ({ code: finding.code, severity: finding.severity, scope: finding.scope }));
   let recorded: { failures: number; backoffSeconds: number } | null = null;
   let recordError: string | null = null;
+  const refusalId = randomUUID();
+  const host = notice?.host ?? refusalHost();
+  let lastRefusal: NonNullable<ReturnType<typeof readCrashLoopFile>["lastRefusal"]> | null = null;
+  let retryNotBefore: string | null = null;
   try {
-    const counted = countStartupFailure(stateDir, startedAt, {
+    lastRefusal = {
+      refusalId,
+      host,
       at: startedAt,
       reasonCode,
       stage: "before-open",
       doctorStatus: judged.status,
       blockingFindings,
       databaseWritten: false,
-    });
+    };
+    const counted = countStartupFailure(stateDir, startedAt, lastRefusal);
     recorded = { failures: counted.next.failures, backoffSeconds: counted.backoffSeconds };
+    retryNotBefore = counted.next.retryNotBefore ?? null;
   } catch (error) {
     // The refusal still stands and is still reported on stderr; only its record could not be kept.
     recordError = safeErrorMessage(error);
+  }
+  // Only a refusal that was written down is told: the notice names a record the receiver can match it to.
+  let ceoNotice: RefusalNoticeOutcome | { outcome: "not-sent"; reason: string };
+  if (recorded === null || lastRefusal === null) {
+    ceoNotice = { outcome: "not-sent", reason: "crash-loop.json was not written" };
+  } else {
+    ceoNotice = await deliverRefusalNotice(
+      lastRefusal,
+      { failures: recorded.failures, retryNotBefore },
+      notice ?? { route: { configured: false, reason: "no CEO notice route was supplied to the start gate" } },
+      nowIso,
+    );
+    try {
+      recordRefusalNotice(stateDir, refusalId, ceoNotice);
+    } catch (error) {
+      ceoNotice = { outcome: "failed", at: nowIso(), reason: `${ceoNotice.outcome}, but crash-loop.json could not record it: ${safeErrorMessage(error)}` };
+    }
   }
   return {
     decision: deny(reasonCode, "startup doctor refused this start before it opened the database", {
       beforeOpen: true,
       databaseWritten: false,
+      refusalId,
+      ceoNotice,
       doctorStatus: judged.status,
       blockingFindings,
       notJudged: judged.notJudged,
