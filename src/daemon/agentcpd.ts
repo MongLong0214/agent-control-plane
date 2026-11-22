@@ -6438,9 +6438,20 @@ export const configuredCanonicalSessions = (raw: string): readonly CanonicalAdop
 /**
  * A test hook, inert unless `ACP_TEST_RAISE_SIGTERM_AT` names the point: the process sends itself SIGTERM
  * there, so a test can place a stop in a window no external signal can be aimed at.
+ *   - `after-lock`: the instant the lock is published.
+ *   - `before-check`: before the last stop check, and then the event loop is let turn for a moment, so the
+ *     handler has run by the time the check looks (the stop is "seen at the last check").
+ *   - `after-check`: after that check, with the very next statement the open of the database (the stop is
+ *     "handled after the check").
  */
-const raiseTestSignalAt = (point: "after-lock" | "after-yield"): void => {
+type TestSignalPoint = "after-lock" | "before-check" | "after-check";
+const raiseTestSignalAt = (point: TestSignalPoint): void => {
   if (process.env["ACP_TEST_RAISE_SIGTERM_AT"] === point) process.kill(process.pid, "SIGTERM");
+};
+const raiseTestSignalAndLetItLand = async (point: TestSignalPoint): Promise<void> => {
+  if (process.env["ACP_TEST_RAISE_SIGTERM_AT"] !== point) return;
+  process.kill(process.pid, "SIGTERM");
+  await new Promise<void>((resolveWait) => setTimeout(resolveWait, 200));
 };
 
 export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => {
@@ -6565,16 +6576,26 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
     startLock.release();
     return refuseBeforeOpening(refusedBeforeOpening);
   }
-  // A turn of the event loop before anything is opened, then a look at whether a stop arrived while the gate
-  // ran. The gate's promises can settle without the loop ever turning; if a stop did arrive, the process
-  // leaves here without having opened the database. One that arrives after this look is held by `databaseOpened`.
+  // The last stop check, immediately before the writable open of the database. Two cases, kept apart:
+  //   (i)  A stop the process has seen by here (its handler ran, so `stopRequested` is set): the database is
+  //        not opened. The lock is released and the process leaves; nothing of the database has moved, not
+  //        its bytes, its journal mode, its sidecars or its audit rows.
+  //   (ii) A stop that lands after this check: the open below is synchronous, and a signal that arrives
+  //        while it runs, or between this look and it, cannot be dispatched until it returns. That window
+  //        cannot be closed in Node, and it is not tried: the stop is handled as a stop after the open,
+  //        handed to exactly one normal graceful shutdown (below), which waits for the start to settle and
+  //        then runs the normal stop path. Whatever the open and the start wrote stays written, and the
+  //        existing rule that a rollback refuses a database that has moved is unchanged.
+  // The yield is a turn of the event loop so that a stop which arrived while the gate ran (whose promises can
+  // settle without the loop turning) has been dispatched before the look.
+  await raiseTestSignalAndLetItLand("before-check");
   await new Promise<void>((resolveYield) => setImmediate(resolveYield));
   if (stopRequested) {
     startLock.release();
     process.exit(0);
   }
   databaseOpened = true;
-  raiseTestSignalAt("after-yield");
+  raiseTestSignalAt("after-check");
 
   const cp = new ControlPlane({ ...config, databaseMigrationLock: startLock, servingEntrypoint: realpathSync(fileURLToPath(import.meta.url)) });
   cp.review.attach({ servingRuntimeEventId: recordBootstrapServingRuntime(cp.audit, import.meta.url) });
@@ -6610,6 +6631,9 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
     });
   } catch (err) {
     cp.close();
+    // The handle is closed and the lock given back here, whether or not a stop was recorded after the open:
+    // the error leaves the process, and a stop that was waiting for the hand-over has nothing left to wait for.
+    startLock.release();
     throw err;
   }
 
@@ -6659,6 +6683,9 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
       // are the two things open, and both are closed before the refusal leaves.
       await sessionLaunch.close();
       cp.close();
+      // As above: closed and released on this path, with a recorded stop or without one, and no row written
+      // beyond what this path already writes (no stop row: no daemon was ever constructed).
+      startLock.release();
       throw err;
     }
   }
@@ -6737,7 +6764,18 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
   let hermesBootstrap: HermesBootstrapAuthority | null = null;
   let telegram: TelegramLongPollListener | null = null;
   let telegramExternal: LocalTelegramExternalIngress | null = null;
-  let startCompleted = false;
+  // The in-flight `daemon.start()`, seen from the shutdown. A stop that arrives while it runs (a signal after
+  // the handlers exist, or one recorded before they did) must not take the process out from under it: that
+  // left no DAEMON_STARTED row for a start that was about to succeed, and the live handle never closed. The
+  // shutdown waits for the start to settle, success or failure, and then runs the one normal stop path. The
+  // one thing it does not wait out is a start that has parked for the bootstrap door: that start settles only
+  // when the stop wakes it, so the park is the point at which the stop goes ahead.
+  let startOutcome: "pending" | "allowed" | "denied" | "threw" = "pending";
+  let startSettled: Promise<void> = Promise.resolve();
+  let markParked: () => void = () => undefined;
+  const parked = new Promise<void>((resolveParked) => {
+    markParked = resolveParked;
+  });
 
   let shuttingDown: Promise<void> | null = null;
   const shutdown = async (signal: string): Promise<void> => {
@@ -6748,6 +6786,7 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
     if (shuttingDown) return shuttingDown;
     shuttingDown = (async () => {
     process.stdout.write(`\nshutting down on ${signal}\n`);
+    await Promise.race([startSettled, parked]);
     if (hermesAutoAdoptionTimer) clearInterval(hermesAutoAdoptionTimer);
     await telegram?.close();
     ownerReplies?.close();
@@ -6765,8 +6804,13 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
     const stopped = await daemon.stop();
     // Before `start()` returns, the control plane is still unwinding it — `daemon.stop()` has
     // released the lock, which is what a supervisor is waiting for, and closing the database
-    // out from under that unwind would only turn a clean stop into an error.
-    if (startCompleted) cp.close();
+    // out from under that unwind would only turn a clean stop into an error. A parked start is woken by
+    // the stop and settles at once; once it has, whatever its outcome, nothing is unwinding and the handle
+    // is closed here, so a stop never leaves the process with the live database still open.
+    if (startOutcome === "pending") {
+      await Promise.race([startSettled, new Promise<void>((resolveWait) => setTimeout(resolveWait, 5_000))]);
+    }
+    if (startOutcome !== "pending") cp.close();
     // #1070 ACP-WORKER-03-FC — an incomplete stop is reported, never exited as clean. The lock and the
     // durable fence beside it stay, so exiting here does not let a successor take authority while a
     // worker git process group may still run; the exit status tells the supervisor why.
@@ -6790,22 +6834,37 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
   // The full handlers are in place before the early ones come off, so there is no instant with none. A stop
   // that arrived while the database was already open is run now, as the stop it was.
   dropEarlyStop();
-  if (stopRequested) void shutdown("SIGTERM");
 
-  const started = await daemon.start({
-    bootstrapDoor: () =>
-      startBootstrapOperatorDoor(
+  const startPromise = daemon.start({
+    bootstrapDoor: () => {
+      markParked();
+      return startBootstrapOperatorDoor(
         daemon,
         stateDir,
         { token: operatorToken, peerId: `cli:${operatorActor}`, actor: operatorActor },
         { mcpToken },
-      ),
+      );
+    },
     stallNotice: startStallNoticeRoute(cp, {
       environment: process.env,
       hermesConfiguration: hermesAdoptionConfiguration,
       ports: { authorityHeld: () => daemon.lock.held() },
     }),
   });
+  startSettled = startPromise.then(
+    (decision) => {
+      startOutcome = decision.allowed ? "allowed" : "denied";
+    },
+    () => {
+      startOutcome = "threw";
+    },
+  );
+  // A stop recorded while the database was already open is handed over here, to the one shutdown: it waits
+  // for the start just begun, then stops. SIGTERM and SIGINT together are still one shutdown (the guard).
+  if (stopRequested) void shutdown("SIGTERM");
+  const started = await startPromise;
+  // The start has settled; a shutdown that is already running owns what happens next, and never returns.
+  if (shuttingDown) await shuttingDown;
   if (!started.allowed) {
     process.stderr.write(`${JSON.stringify(started, null, 2)}\n`);
     process.stderr.write(
@@ -6818,7 +6877,6 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
     process.exit(1);
   }
 
-  startCompleted = true;
   try {
     hermesBootstrap = createHermesBootstrapAuthority(cp, {
       stateDir,

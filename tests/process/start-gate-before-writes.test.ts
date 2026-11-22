@@ -489,30 +489,129 @@ describe("a start the doctor will refuse leaves the database as it found it (mig
     expect(readdirSync(scratch).filter((name) => name.startsWith("acp-db-snapshot-"))).toEqual([]);
   }, 120_000);
 
-  it("structural (b): a SIGTERM raised after the last yield is honoured, as a normal start followed at once by a normal stop", async () => {
+  /**
+   * The stop contract has two cases, and these rows keep them apart. A stop the process has seen at its last
+   * check, immediately before the writable open, leaves the database exactly as it was and gives the lock
+   * back. A stop that lands after that check cannot be kept from the open (the open is synchronous, and no
+   * handler runs during it); it is handed to exactly one normal graceful shutdown, which lets the start in
+   * flight settle and then runs the normal stop. Exit code 0 is not evidence for either: the database is read.
+   */
+  it("stop (i): a stop seen at the last check leaves the database unchanged and the lock released", async () => {
     const { home, root, database } = newHome("/tmp");
     currentDatabase(database);
     installGitHubAppCredential(root);
     const auditBefore = countOf(database, "SELECT COUNT(*) AS n FROM audit_events");
+    // Reading it opened it, and a WAL database left its sidecars: they are the test's, not the file's.
+    for (const suffix of ["-wal", "-shm"]) rmSync(`${database}${suffix}`, { force: true });
     const before = imageOf(database);
 
-    // Raised after the final look at the stop flag and after `databaseOpened` is set: nothing before the
-    // open can see it, and the open is the very next statement.
-    const run = startDaemon(home, { ACP_TEST_RAISE_SIGTERM_AT: "after-yield" });
-    const exit = await run.exited;
+    const run = startDaemon(home, { ACP_TEST_RAISE_SIGTERM_AT: "before-check" });
+    await run.exited;
 
-    // Stopped, with the lock given back, and not left running until something kills it.
-    expect(exit.status).toBe(0);
+    expect(imageOf(database)).toEqual(before);
+    expect(existsSync(`${database}-wal`)).toBe(false);
+    expect(existsSync(`${database}-shm`)).toBe(false);
+    expect(countOf(database, "SELECT COUNT(*) AS n FROM audit_events")).toBe(auditBefore);
     expect(existsSync(join(root, "agentcpd.lock"))).toBe(false);
-    // Either it never opened the database (unchanged), or it ran a normal start and a normal stop: the stop
-    // is on record. A start with no stop after it is the defect.
-    const auditAfter = countOf(database, "SELECT COUNT(*) AS n FROM audit_events");
-    if (auditAfter === auditBefore) {
-      expect(imageOf(database)).toEqual(before);
-    } else {
-      expect(countOf(database, "SELECT COUNT(*) AS n FROM audit_events WHERE kind = 'DAEMON_RUNTIME_OBSERVED'")).toBe(1);
-      expect(countOf(database, "SELECT COUNT(*) AS n FROM audit_events WHERE kind = 'DAEMON_STOPPED'")).toBe(1);
+  }, 180_000);
+
+  /** What a finished process left beside the database, read before anything here opens it (opening it makes sidecars). */
+  const leftovers = (root: string, database: string) => ({
+    wal: existsSync(`${database}-wal`),
+    shm: existsSync(`${database}-shm`),
+    lock: existsSync(join(root, "agentcpd.lock")),
+  });
+  const closedAndReleased = { wal: false, shm: false, lock: false };
+
+  const auditCount = (database: string, kind: string): number =>
+    countOf(database, `SELECT COUNT(*) AS n FROM audit_events WHERE kind = '${kind}'`);
+
+  it("stop (ii): a stop handled after the last check is one normal start and one normal stop, the handle closed and the lock released", async () => {
+    const { home, root, database } = newHome("/tmp");
+    currentDatabase(database);
+    installGitHubAppCredential(root);
+
+    const run = startDaemon(home, { ACP_TEST_RAISE_SIGTERM_AT: "after-check" });
+    await run.exited;
+    const left = leftovers(root, database);
+
+    // One start that settled, and one stop after it.
+    expect(auditCount(database, "DAEMON_RUNTIME_OBSERVED")).toBe(1);
+    expect(auditCount(database, "DAEMON_STARTED")).toBe(1);
+    expect(auditCount(database, "DAEMON_STOPPED")).toBe(1);
+    expect(run.stdout().match(/shutting down on/g)?.length).toBe(1);
+    // The live handle was closed (a write-ahead log left behind is what a process that never closed leaves),
+    // and the lock is given back.
+    expect(left).toEqual(closedAndReleased);
+  }, 180_000);
+
+  it("stop (ii): SIGTERM and SIGINT together are one shutdown, and the handle is still closed and the lock still released", async () => {
+    const { home, root, database } = newHome("/tmp");
+    currentDatabase(database);
+    installGitHubAppCredential(root);
+
+    const run = startDaemon(home, { ACP_TEST_RAISE_SIGTERM_AT: "after-check" });
+    // A second stop, a different signal, once the database is open.
+    const deadline = Date.now() + 90_000;
+    for (;;) {
+      if (existsSync(database) && existsSync(`${database}-wal`)) break;
+      if (Date.now() > deadline) throw new Error(`the database was never opened; stderr: ${run.stderr().slice(-400)}`);
+      await new Promise<void>((resolveWait) => setTimeout(resolveWait, 20));
     }
+    run.child.kill("SIGINT");
+    await run.exited;
+    const left = leftovers(root, database);
+
+    expect(run.stdout().match(/shutting down on/g)?.length).toBe(1);
+    expect(auditCount(database, "DAEMON_STOPPED")).toBe(1);
+    expect(auditCount(database, "DAEMON_STARTED")).toBe(1);
+    expect(left).toEqual(closedAndReleased);
+  }, 180_000);
+
+  it("stop (ii): a start that fails is not recorded as a start, and the stop after it still closes the handle and releases the lock", async () => {
+    const { home, root, database } = newHome("/tmp");
+    currentDatabase(database);
+    installGitHubAppCredential(root);
+    // A start the daemon itself refuses once the database is open: its own backoff is still running.
+    writeFileSync(
+      join(root, "crash-loop.json"),
+      JSON.stringify({ failures: 4, firstAt: new Date().toISOString(), retryNotBefore: new Date(Date.now() + 600_000).toISOString() }),
+      { mode: 0o600 },
+    );
+
+    const run = startDaemon(home, { ACP_TEST_RAISE_SIGTERM_AT: "after-check" });
+    await run.exited;
+    const left = leftovers(root, database);
+
+    expect(auditCount(database, "DAEMON_STARTED")).toBe(0);
+    expect(auditCount(database, "DAEMON_START_REFUSED")).toBe(1);
+    expect(auditCount(database, "DAEMON_STOPPED")).toBe(1);
+    expect(run.stdout().match(/shutting down on/g)?.length).toBe(1);
+    expect(left).toEqual(closedAndReleased);
+  }, 180_000);
+
+  it("stop (ii): malformed canonical-session configuration with a recorded stop closes the handle, releases the lock, and writes nothing more", async () => {
+    const { home, root, database } = newHome("/tmp");
+    currentDatabase(database);
+    installGitHubAppCredential(root);
+
+    const run = startDaemon(home, {
+      ACP_TEST_RAISE_SIGTERM_AT: "after-check",
+      ACP_CANONICAL_SESSIONS_JSON: "[{bad",
+      ACP_CANONICAL_CTO_PEER_PROTOCOL: "1",
+      ACP_CANONICAL_CTO_BUZZ_PURPOSE: "purpose",
+      ACP_BUZZ_CHANNEL: "room",
+    });
+    await run.exited;
+    const left = leftovers(root, database);
+
+    // The error path closes the handle and gives the lock back; no daemon was built, so there is no stop row,
+    // and nothing beyond the runtime observation this path already wrote.
+    expect(left).toEqual(closedAndReleased);
+    expect(auditCount(database, "DAEMON_RUNTIME_OBSERVED")).toBe(1);
+    expect(auditCount(database, "DAEMON_STARTED")).toBe(0);
+    expect(auditCount(database, "DAEMON_STOPPED")).toBe(0);
+    expect(countOf(database, "SELECT COUNT(*) AS n FROM audit_events")).toBe(1);
   }, 180_000);
 
   it("round 2 item 5: a start that finds agentcpd.lock held writes nothing and says so", async () => {
