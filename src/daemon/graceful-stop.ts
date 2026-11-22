@@ -120,6 +120,12 @@ export interface GracefulStopSteps {
   stopDaemon(): Promise<{ complete: boolean }>;
   /** Closes the live database handle. */
   closeDatabase(): void;
+  /**
+   * Writes the fence for workers whose exit is not confirmed, when the stop did not (or could not) write
+   * its own: a close that failed, or a stop that threw before it had a verdict. Unknown groups: it holds
+   * until an operator removes it, which is the point.
+   */
+  fenceUnconfirmed(): void;
   /** Gives the lock back. Only called once the handle is closed. */
   releaseLock(): void;
 }
@@ -142,22 +148,48 @@ export const gracefulStop = async (
   steps.begin();
   await tracker.untilStoppable();
   let stopped: { complete: boolean } | null = null;
-  // Whether a stop that failed had already fenced workers it could not confirm gone. Such a stop is incomplete
-  // whatever else failed with it, and the lock stays.
-  let incomplete = false;
+  let failure: { error: unknown } | null = null;
+  // Whether worker exit is, or may be, unconfirmed: the stop said so, or failed in a way that says nothing, or
+  // the handle could not be closed. In every such case the lock marker AND a fence are kept, so a successor is
+  // refused the same way. Failing closed: only a stop that returned complete, or one that failed after it had
+  // confirmed the workers gone (an audit write), may let the lock go.
+  let unconfirmed = false;
+  let fenceNeeded = false;
   try {
     await steps.closeListeners();
     stopped = await steps.stopDaemon();
     await tracker.untilSettled(options.settleBoundMs ?? 5_000);
   } catch (error) {
-    if (error instanceof StopFailure && !error.complete) incomplete = true;
-    throw error;
-  } finally {
-    // The close comes first, and the lock is let go only if it succeeded: a close that throws (a query still
-    // running on the handle) leaves the lock held, and nothing below it runs. The process leaves non-zero,
-    // and the kernel releases what the process held; the lock's marker stays for whoever finds it.
-    steps.closeDatabase();
-    if (!incomplete && (stopped === null || stopped.complete)) steps.releaseLock();
+    failure = { error };
+    if (error instanceof StopFailure) {
+      // The stop had already decided, and fenced if it had to. A failure of its audit write is not a verdict.
+      if (!error.complete) unconfirmed = true;
+    } else {
+      unconfirmed = true;
+      fenceNeeded = true;
+    }
   }
-  return stopped;
+  if (stopped !== null && !stopped.complete) unconfirmed = true;
+  // The close comes first, and the lock is let go only if it succeeded: a close that throws (a query still
+  // running on the handle) leaves the lock held, and a fence beside it. The process leaves non-zero, and the
+  // kernel releases what the process held; the marker and the fence stay for whoever finds them.
+  let closeFailure: { error: unknown } | null = null;
+  try {
+    steps.closeDatabase();
+  } catch (error) {
+    closeFailure = { error };
+    unconfirmed = true;
+    fenceNeeded = true;
+  }
+  if (fenceNeeded) {
+    try {
+      steps.fenceUnconfirmed();
+    } catch {
+      // The lock is kept either way; a fence that could not be written is the one thing this cannot repair.
+    }
+  }
+  if (!unconfirmed) steps.releaseLock();
+  if (closeFailure !== null) throw closeFailure.error;
+  if (failure !== null) throw failure.error;
+  return stopped!;
 };

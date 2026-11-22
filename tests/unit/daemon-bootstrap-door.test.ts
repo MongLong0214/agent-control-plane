@@ -978,6 +978,7 @@ describe("a stop closes off the bootstrap promotion first", () => {
       closeListeners: async () => undefined,
       stopDaemon: () => daemon.stop({ leaveLockHeld: true }),
       closeDatabase: () => undefined,
+      fenceUnconfirmed: () => undefined,
       releaseLock: () => daemon.lock.release(),
     });
     // The healthy observation, while the drain is running.

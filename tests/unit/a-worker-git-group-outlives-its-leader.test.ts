@@ -2,10 +2,12 @@ import { spawn } from "node:child_process";
 import { chmodSync, existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { delimiter, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import Database from "better-sqlite3";
 import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
 
 import { readProcessStartToken } from "../../src/core/process-argv.ts";
 import { Daemon } from "../../src/daemon/daemon.ts";
+import { StartTracker, gracefulStop } from "../../src/daemon/graceful-stop.ts";
 import { SingleInstanceLock } from "../../src/daemon/single-instance.ts";
 import { GitChildren } from "../../src/run/worker-git.ts";
 import { WorkerTurnEvent, WorkerTurnRunner } from "../../src/run/worker-turn.ts";
@@ -329,4 +331,66 @@ describe("#1070 ACP-WORKER-03-FC an unconfirmed group fences the lock beyond the
     expect(alive(unrelated.pid!), "the unrelated process was touched").toBe(true);
     lock.release();
   });
+});
+
+describe("the cleanup fails closed when the worker drain's verdict is lost", () => {
+  it("a live worker group, a reap that fails and a rejected TASK_WORKER_TURNS_DRAINED row: the marker and the fence stay, and a successor is refused", async () => {
+    const { h, world, runner, daemon, successor } = daemonWorld();
+    const git = forkingGit("update-ref -m agent-control-plane: worker commit", "exits", `'${realGit()}' -C '${world.repoPath}' update-ref refs/heads/${world.branch} $('${realGit()}' -C '${world.repoPath}' commit-tree HEAD^{tree} -p HEAD -m late)`);
+    const path = process.env["PATH"];
+    process.env["PATH"] = `${git.bin}${delimiter}${path ?? ""}`;
+    let executionId = "";
+    try {
+      const started = await runner.start({
+        runId: world.runId, taskId: world.taskId, claimId: world.claimId,
+        ownerSessionId: world.cto.sessionId, ownerBindingGeneration: world.cto.generation,
+      });
+      if (!started.allowed) throw new Error(started.message);
+      executionId = started.value.executionId;
+      await waitFor(git.descendantPaused, "the descendant to pause");
+      const leader = git.parent();
+      const descendant = git.child();
+      groups.push(leader);
+      await waitFor(() => !alive(leader), "the group's leader to exit");
+      expect(alive(descendant)).toBe(true);
+
+      // The reap fails: the registries cannot empty the group, so it is still live when the verdict is read.
+      vi.spyOn(GitChildren.prototype, "close").mockResolvedValue({ reaped: false, killed: [], unreaped: [], indexLockReleased: false });
+      // And the row the drain writes just before it returns cannot be written.
+      const raw = new Database(join(h.root, "state.sqlite"));
+      raw.exec(
+        `CREATE TRIGGER zz_refuse_drained BEFORE INSERT ON audit_events WHEN NEW.kind = '${WorkerTurnEvent.SHUTDOWN_DRAINED}'
+         BEGIN SELECT RAISE(ABORT, 'the drain row is refused'); END`,
+      );
+      raw.close();
+
+      const tracker = new StartTracker();
+      tracker.track(Promise.resolve());
+      let released = false;
+      await expect(
+        gracefulStop(tracker, {
+          begin: () => daemon.beginStop(),
+          closeListeners: async () => undefined,
+          stopDaemon: () => daemon.stop({ leaveLockHeld: true }),
+          closeDatabase: () => undefined,
+          fenceUnconfirmed: () => daemon.lock.fence(null, h.cp.clock.nowIso()),
+          releaseLock: () => {
+            released = true;
+            daemon.lock.release();
+          },
+        }),
+      ).rejects.toMatchObject({ complete: false });
+
+      expect(released, "the lock was released with a worker group still alive").toBe(false);
+      expect(daemon.lock.held()).toBe(true);
+      expect(existsSync(daemon.lock.fencePath)).toBe(true);
+      expect(successor(), "a successor took the lock while the worker's group was alive").toBeNull();
+      expect(alive(descendant)).toBe(true);
+    } finally {
+      vi.restoreAllMocks();
+      git.release();
+      process.env["PATH"] = path;
+      if (executionId) await runner.settled(executionId);
+    }
+  }, 120_000);
 });

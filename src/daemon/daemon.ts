@@ -4147,7 +4147,17 @@ export class Daemon {
     // #512 (ACP-WORKER-03) — before this daemon gives up its authority, every worker turn it owns is
     // aborted and drained. A process that would not be confirmed gone stays recorded as outstanding,
     // durably, so the next start reconciles it and no retry of its task runs first.
-    const workers = await this.cp.workerTurns.shutdown();
+    //
+    // A drain that threw, or returned no usable verdict, is a drain that did not confirm its workers gone:
+    // it is treated as exactly that (fenced, lock kept), never as permission to release the lock.
+    let drainFailure: unknown = null;
+    let workers: Awaited<ReturnType<ControlPlane["workerTurns"]["shutdown"]>> | null = null;
+    try {
+      workers = await this.cp.workerTurns.shutdown();
+    } catch (error) {
+      drainFailure = error;
+    }
+    const verdictKnown = workers !== null && typeof workers?.gitStopped === "boolean";
     this.wakeBootstrap("ABANDONED");
     for (const timer of this.#timers) clearInterval(timer);
     this.#timers = [];
@@ -4160,25 +4170,36 @@ export class Daemon {
     // and the lock goes stale, acquisition still refuses while any named group may still run, and
     // reclaims once each is gone — matched by group id and its leader's start time, so a reused id
     // never fences forever. A stop that names no group fences until an operator removes the fence.
-    const lockRetained = !workers.gitStopped;
-    // ACP-WORKER-03-FC-EMPTY: an incomplete stop that names no group is fenced as an unknown one.
+    const lockRetained = !verdictKnown || !workers!.gitStopped;
+    // ACP-WORKER-03-FC-EMPTY: an incomplete stop that names no group (or has no verdict to name any) is
+    // fenced as an unknown one.
     const fencedGroups = lockRetained
-      ? (workers.unconfirmedGroups && workers.unconfirmedGroups.length > 0 ? workers.unconfirmedGroups : null)
+      ? (verdictKnown && workers!.unconfirmedGroups && workers!.unconfirmedGroups.length > 0 ? workers!.unconfirmedGroups : null)
       : [];
     if (lockRetained) this.lock.fence(fencedGroups, this.cp.clock.nowIso());
     // The fence is down, and what it says is decided: from here a failure to write the audit row must not
     // hide it. It is reported with the answer, so the caller keeps the lock for a stop that was incomplete.
+    let auditFailure: unknown = null;
     try {
       this.cp.audit.record({
         kind: "DAEMON_STOPPED",
         evidence: {
-          pid: process.pid, drained: workers.drained, executions: workers.outstanding, gitStopped: workers.gitStopped, lockRetained,
+          pid: process.pid,
+          drained: verdictKnown ? workers!.drained : false,
+          executions: verdictKnown ? workers!.outstanding : [],
+          gitStopped: verdictKnown ? workers!.gitStopped : false,
+          lockRetained,
           fencedGroups: fencedGroups === null ? null : fencedGroups.map((group) => group.pgid),
         },
       });
     } catch (error) {
-      throw new StopFailure(error, !lockRetained);
+      auditFailure = error;
     }
+    // Whatever failed, the answer about the workers is settled and reported with it: a drain that threw or
+    // lost an audit row, and the stop's own row, are failures of the stop, and none of them can make an
+    // unconfirmed stop read as complete.
+    const failure = drainFailure ?? (verdictKnown ? workers!.auditError : null) ?? auditFailure;
+    if (failure !== null && failure !== undefined) throw new StopFailure(failure, !lockRetained);
     if (!lockRetained && options.leaveLockHeld !== true) this.lock.release();
     return { complete: !lockRetained };
   }

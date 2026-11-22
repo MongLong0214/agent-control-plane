@@ -6817,6 +6817,9 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
           if (process.env["ACP_TEST_FAIL_DATABASE_CLOSE"] === "1") throw new Error("the database is busy: a query is still running");
           cp.close();
         },
+        // Worker exit unconfirmed, or the handle would not close: a fence beside the kept lock, so a successor
+        // is refused the way it is for a group the drain could not reap. Unknown groups hold until removed.
+        fenceUnconfirmed: () => daemon.lock.fence(null, cp.clock.nowIso()),
         releaseLock: () => startLock.release(),
       });
       return stopped;

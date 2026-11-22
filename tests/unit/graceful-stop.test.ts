@@ -5,7 +5,7 @@ import Database from "better-sqlite3";
 import { afterAll, describe, expect, it, vi } from "vitest";
 
 import { Daemon } from "../../src/daemon/daemon.ts";
-import { StartTracker, gracefulStop, type GracefulStopSteps } from "../../src/daemon/graceful-stop.ts";
+import { StartTracker, StopFailure, gracefulStop, type GracefulStopSteps } from "../../src/daemon/graceful-stop.ts";
 import { SingleInstanceLock } from "../../src/daemon/single-instance.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 import { makeHarness } from "../helpers/harness.ts";
@@ -32,6 +32,9 @@ const steps = (events: string[], options: { complete?: boolean } = {}): Graceful
   },
   closeDatabase: () => {
     events.push("closeDatabase");
+  },
+  fenceUnconfirmed: () => {
+    events.push("fence");
   },
   releaseLock: () => {
     events.push("releaseLock");
@@ -149,7 +152,7 @@ describe("a stop waits for the start that is writing, and closes before it lets 
     await stopping;
   });
 
-  it("a step that fails, the daemon's own stop and its audit write among them, still closes the database and only then releases the lock", async () => {
+  it("a stop that fails with no verdict fails closed: the database is closed, a fence is written, and the lock stays", async () => {
     const events: string[] = [];
     const tracker = new StartTracker();
     tracker.track(Promise.resolve());
@@ -159,7 +162,25 @@ describe("a stop waits for the start that is writing, and closes before it lets 
         ...steps(events),
         stopDaemon: async () => {
           events.push("stopDaemon failed");
-          throw new Error("DAEMON_STOPPED could not be written");
+          throw new Error("the drain threw");
+        },
+      }),
+    ).rejects.toThrow("the drain threw");
+
+    expect(events).toEqual(["begin", "closeListeners", "stopDaemon failed", "closeDatabase", "fence"]);
+  });
+
+  it("a stop that failed only after it confirmed its workers gone (its audit write) closes the database and releases the lock", async () => {
+    const events: string[] = [];
+    const tracker = new StartTracker();
+    tracker.track(Promise.resolve());
+
+    await expect(
+      gracefulStop(tracker, {
+        ...steps(events),
+        stopDaemon: async () => {
+          events.push("stopDaemon failed");
+          throw new StopFailure(new Error("DAEMON_STOPPED could not be written"), true);
         },
       }),
     ).rejects.toThrow("DAEMON_STOPPED could not be written");
@@ -181,7 +202,7 @@ describe("a stop waits for the start that is writing, and closes before it lets 
       }),
     ).rejects.toThrow("close failed");
 
-    expect(events).toEqual(["begin", "closeListeners", "DAEMON_STOPPED"]);
+    expect(events).toEqual(["begin", "closeListeners", "DAEMON_STOPPED", "fence"]);
   });
 });
 
@@ -201,6 +222,7 @@ describe("the lock is let go only when it is safe to", () => {
           events.push("closeDatabase threw");
           throw new Error("the database is busy: a query is still running");
         },
+        fenceUnconfirmed: () => lock.fence(null, new Date().toISOString()),
         releaseLock: () => {
           events.push("releaseLock");
           lock.release();
@@ -210,9 +232,44 @@ describe("the lock is let go only when it is safe to", () => {
 
     expect(events).not.toContain("releaseLock");
     expect(lock.held()).toBe(true);
-    // A second holder is turned away while the handle may still be open.
+    // The marker is kept and a fence stands beside it: a second holder is refused, and stays refused after
+    // this process is gone, until the fence is removed.
+    expect(existsSync(lock.fencePath)).toBe(true);
     const second = new SingleInstanceLock(join(dir, "agentcpd.lock"));
     expect(second.acquire(new Date().toISOString()).allowed).toBe(false);
+    lock.release();
+    expect(new SingleInstanceLock(join(dir, "agentcpd.lock")).acquire(new Date().toISOString()).allowed).toBe(false);
+  });
+
+  it("a real close that throws on an active iterator, after a confirmed drain, writes the fence and refuses a successor", async () => {
+    const dir = tempDir("acp-graceful-stop-iterator-");
+    const lock = new SingleInstanceLock(join(dir, "agentcpd.lock"));
+    expect(lock.acquire(new Date().toISOString()).allowed).toBe(true);
+    const handle = new Database(join(dir, "live.sqlite"));
+    handle.exec("CREATE TABLE t (n INTEGER); INSERT INTO t VALUES (1), (2), (3)");
+    // A query still running on the handle: `close()` refuses.
+    const rows = handle.prepare("SELECT n FROM t").iterate();
+    rows.next();
+    const tracker = new StartTracker();
+    tracker.track(Promise.resolve());
+
+    await expect(
+      gracefulStop(tracker, {
+        begin: () => undefined,
+        closeListeners: async () => undefined,
+        stopDaemon: async () => ({ complete: true }),
+        closeDatabase: () => handle.close(),
+        fenceUnconfirmed: () => lock.fence(null, new Date().toISOString()),
+        releaseLock: () => lock.release(),
+      }),
+    ).rejects.toThrow(/busy|iterat|running/i);
+
+    expect(handle.open).toBe(true);
+    expect(lock.held()).toBe(true);
+    expect(existsSync(lock.fencePath)).toBe(true);
+    expect(new SingleInstanceLock(join(dir, "agentcpd.lock")).acquire(new Date().toISOString()).allowed).toBe(false);
+    rows.return?.();
+    handle.close();
     lock.release();
   });
 
@@ -247,6 +304,7 @@ describe("the lock is let go only when it is safe to", () => {
         closeDatabase: () => {
           events.push("closeDatabase");
         },
+        fenceUnconfirmed: () => undefined,
         releaseLock: () => {
           events.push("releaseLock");
           daemon.lock.release();
