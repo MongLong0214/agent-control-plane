@@ -129,8 +129,10 @@ export const runBuzzChannel = async (argv: readonly string[]): Promise<number> =
       onReceipt: (receipt) => {
         try {
           appendChannelReceipt(args.stateDir, args.projectId, receipt, args.launchId ?? undefined);
+          return true;
         } catch {
           log("a receipt could not be written; the message stays pending in the control plane's queue");
+          return false;
         }
       },
       onDiagnostic: log,

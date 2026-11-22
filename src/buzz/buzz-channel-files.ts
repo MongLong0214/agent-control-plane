@@ -24,16 +24,63 @@ const ensureDir = (stateDir: string): void => {
   mkdirSync(channelDir(stateDir), { recursive: true, mode: 0o700 });
 };
 
-/** One receipt as one line, stamped with the launch the server was started by; `O_APPEND` makes concurrent writers' lines whole. */
-export const appendChannelReceipt = (stateDir: string, projectId: string, receipt: ChannelReceipt, launchId?: string): void => {
+/**
+ * What makes two receipts the same one, by what reads them: the launcher matches `registered` and `emitted` receipts on the
+ * launch id they carry, so those are per launch (a registration also by its time); the daemon settles a reply by its event.
+ */
+const identityOf = (receipt: ChannelReceipt, stampedLaunchId: unknown): string => {
+  const launch = typeof stampedLaunchId === "string" ? stampedLaunchId : "";
+  return receipt.type === "registered"
+    ? `registered|${receipt.registeredAt}|${launch}`
+    : receipt.type === "emitted"
+      ? `emitted|${receipt.room}|${receipt.eventId}|${launch}`
+      : `replied|${receipt.room}|${receipt.event.id}`;
+};
+
+/**
+ * One receipt as one line, stamped with the launch the server was started by; `O_APPEND` makes concurrent writers' lines whole.
+ *
+ * It returns only when this receipt reads back from the file through `readChannelReceipts`, the daemon's own reader, and
+ * throws otherwise, so a caller that records "written" on a return records something the daemon will see:
+ *   - a receipt already there for the same event (and launch, for the kinds the launcher reads by launch) is success and writes nothing, so a retry never doubles it;
+ *   - a last line with no newline is a writer that died mid-line: this receipt starts on a new line, so the fragment stays one
+ *     skipped line. When that fragment is this very receipt, whole but for its newline (a short write), only the newline is
+ *     written;
+ *   - a writer that appends a fragment between that check and this write joins it to this line, which then does not read back:
+ *     the read-back after the write throws, and a retry appends on a clean line;
+ *   - a receipt that would not read back (not the shape the reader accepts) or that was only partly written throws.
+ *
+ * The whole file is read for the check and the read-back, as the daemon reads it on every pass; `trimChannelReceipts`
+ * bounds it when a server starts. `beforeWrite` is a test seam: it runs between the check and the write.
+ */
+export const appendChannelReceipt = (
+  stateDir: string,
+  projectId: string,
+  receipt: ChannelReceipt,
+  launchId?: string,
+  beforeWrite?: () => void,
+): void => {
+  const line = JSON.stringify(launchId === undefined ? receipt : { ...receipt, launchId });
+  if (!isChannelReceipt(JSON.parse(line) as unknown)) throw new Error("the receipt would not read back");
+  const want = identityOf(receipt, launchId);
+  const matches = (value: unknown): boolean => isChannelReceipt(value) && identityOf(value, (value as { launchId?: unknown }).launchId) === want;
   ensureDir(stateDir);
-  const fd = openSync(
-    channelReceiptPath(stateDir, projectId),
-    fsConstants.O_WRONLY | fsConstants.O_APPEND | fsConstants.O_CREAT | fsConstants.O_NOFOLLOW,
-    0o600,
-  );
+  const path = channelReceiptPath(stateDir, projectId);
+  const fd = openSync(path, fsConstants.O_RDWR | fsConstants.O_APPEND | fsConstants.O_CREAT | fsConstants.O_NOFOLLOW, 0o600);
   try {
-    writeSync(fd, `${JSON.stringify(launchId === undefined ? receipt : { ...receipt, launchId })}\n`);
+    if (readChannelReceipts(path).receipts.some(matches)) return;
+    const text = readFileSync(path, "utf8");
+    const tail = text === "" || text.endsWith("\n") ? "" : text.slice(text.lastIndexOf("\n") + 1);
+    let finishesThis = false;
+    try {
+      finishesThis = tail !== "" && matches(JSON.parse(tail) as unknown);
+    } catch {
+      finishesThis = false;
+    }
+    beforeWrite?.();
+    const bytes = Buffer.from(finishesThis ? "\n" : `${tail === "" ? "" : "\n"}${line}\n`, "utf8");
+    if (writeSync(fd, bytes) !== bytes.length) throw new Error("the receipt was only partly written");
+    if (!readChannelReceipts(path).receipts.some(matches)) throw new Error("the receipt did not read back");
   } finally {
     closeSync(fd);
   }
