@@ -19,7 +19,9 @@ import {
   daemonNoticeSettlement,
   sealDaemonNotice,
 } from "../runtime/acp-daemon-notice.ts";
-import { createHermesGatewayDaemonNoticeSender } from "../runtime/hermes-gateway-conversation.ts";
+import {
+  DAEMON_NOTICES_PATH, createHermesGatewayDaemonNoticeSender, probeDaemonNoticeRoute,
+} from "../runtime/hermes-gateway-conversation.ts";
 import { createHermesGatewayIdentityReader } from "../runtime/hermes-gateway-identity.ts";
 import type { CrashLoopFile, RefusalNoticeOutcome } from "./crash-loop.ts";
 
@@ -74,6 +76,13 @@ export interface RefusalNoticeOptions {
 
 /** The one reason a destination the active CEO binding does not name is refused, whatever differed. */
 export const DESTINATION_MISMATCH = "destination does not match the active CEO binding";
+/** The one reason a Gateway that does not confirm the signed daemon-notice route is told nothing. */
+export const NO_NOTICE_ROUTE = "receiver has no signed daemon-notice route";
+
+/** A refusal to send, with what was observed beside the reason (recorded as `detail`). */
+class NoticeNotSent extends Error {
+  constructor(message: string, readonly detail?: string) { super(message); }
+}
 
 /** The active CEO binding as a private copy of the database says it is, with the process it names. */
 interface ActiveCeoBinding {
@@ -202,11 +211,17 @@ export const refusalNoticeRouteFrom = (input: {
       if (identity.lineage_root_digest !== lineageRootDigest || !matchesBinding(binding, identity, input.ports ?? {})) {
         throw new Error(DESTINATION_MISMATCH);
       }
+      // Then, before anything is sent: the receiver says it has the route. Not confirmed is not sent, and this
+      // notice goes nowhere else (not `/events`, not Buzz).
+      const route = await probeDaemonNoticeRoute({ port, signal });
+      if (!route.supported) throw new NoticeNotSent(NO_NOTICE_ROUTE, route.detail);
       return { ...identity };
     },
     // The sender asks `preDispatch` synchronously before it writes the request, and answers NOT_SENT when told no.
-    send: async (body, dispatch) =>
-      createHermesGatewayDaemonNoticeSender({ apiKey, port, preDispatch: dispatch.begin, signal: dispatch.signal })(body),
+    // The endpoint is named, never read from an origin the notice does not have.
+    send: async (body, dispatch) => createHermesGatewayDaemonNoticeSender({
+      apiKey, port, path: DAEMON_NOTICES_PATH, preDispatch: dispatch.begin, signal: dispatch.signal,
+    })(body),
   };
 };
 
@@ -324,6 +339,7 @@ export const deliverRefusalNotice = async (
     return await Promise.race([
       attempt().catch((error: unknown): RefusalNoticeOutcome => ({
         outcome: "failed", at: nowIso(), ...(eventId ? { eventId } : {}), reason: reasonOf(error),
+        ...(error instanceof NoticeNotSent && error.detail ? { detail: error.detail } : {}),
       })),
       bound,
     ]);

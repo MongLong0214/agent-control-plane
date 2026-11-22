@@ -41,7 +41,7 @@ export interface CrashLoopFile {
  */
 export type RefusalNoticeOutcome =
   | { outcome: "delivered"; at: string; eventId: string; receiptId: string }
-  | { outcome: "failed"; at: string; reason: string; eventId?: string }
+  | { outcome: "failed"; at: string; reason: string; detail?: string; eventId?: string }
   /** The request was out when the bound expired: the receiver may or may not have it. Neither is claimed. */
   | { outcome: "unknown"; at: string; reason: string; eventId: string }
   | { outcome: "route-unconfigured"; at: string; reason: string };

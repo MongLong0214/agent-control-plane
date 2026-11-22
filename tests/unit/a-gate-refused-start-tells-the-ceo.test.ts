@@ -5,7 +5,9 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterAll, describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it, vi } from "vitest";
+
+import { BuzzCliTransport } from "../../src/buzz/buzz-adapter.ts";
 
 import { readProcessStartToken } from "../../src/core/process-argv.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
@@ -318,15 +320,34 @@ describe("a gate-refused start tells the CEO outside the database (#1496)", () =
   });
 });
 
-/** A loopback Gateway: the identity it reports, and every POST it was asked to take. */
-const loopbackGateway = async (identity: DaemonNoticeDestination) => {
+const NOTICE_PATH = "/v1/canonical-surface/daemon-notices";
+
+/**
+ * A loopback Gateway, as aiohttp serves the contract: the identity it reports; the daemon-notice route is
+ * POST-only, so `HEAD` on it answers 405 with `Allow: POST` (404 when the receiver has no such route); and
+ * `/events` takes only an ordinary event, so a signed notice there is the 400 the deployed build gives.
+ * `requests` is every request it saw, `posts` every POST body that reached a route that takes it.
+ */
+const loopbackGateway = async (identity: DaemonNoticeDestination, options: { noticeRoute?: boolean } = {}) => {
+  const noticeRoute = options.noticeRoute ?? true;
   const posts: DaemonNoticeBody[] = [];
+  const requests: Array<{ method: string; path: string; headers: string[] }> = [];
   const server = createServer((req: IncomingMessage, res: ServerResponse) => {
     res.setHeader("Content-Type", "application/json");
+    requests.push({ method: req.method ?? "", path: req.url ?? "", headers: Object.keys(req.headers).sort() });
     if (req.method === "GET") return void res.end(JSON.stringify(identity));
+    if (req.method === "HEAD") {
+      if (noticeRoute && req.url === NOTICE_PATH) res.setHeader("Allow", "POST");
+      res.statusCode = noticeRoute && req.url === NOTICE_PATH ? 405 : 404;
+      return void res.end();
+    }
     let raw = "";
     req.on("data", (chunk: Buffer) => (raw += chunk.toString("utf8")));
     req.on("end", () => {
+      if (!(noticeRoute && req.url === NOTICE_PATH)) {
+        res.statusCode = req.url === "/v1/canonical-surface/events" ? 400 : 404;
+        return void res.end(JSON.stringify({ error: { code: "canonical_invalid_request" } }));
+      }
       const body = JSON.parse(raw) as DaemonNoticeBody;
       posts.push(body);
       res.end(JSON.stringify({
@@ -339,6 +360,7 @@ const loopbackGateway = async (identity: DaemonNoticeDestination) => {
   await new Promise<void>((resolveListen) => server.listen(0, "127.0.0.1", resolveListen));
   return {
     posts,
+    requests,
     port: (server.address() as AddressInfo).port,
     close: () => new Promise<void>((resolveClose) => { server.closeAllConnections(); server.close(() => resolveClose()); }),
   };
@@ -384,6 +406,91 @@ describe("the notice goes only to the Gateway the active CEO binding names (#149
         outcome: "failed", reason: DESTINATION_MISMATCH,
       });
       expect(imageOf(root, database)).toEqual(before);
+    } finally {
+      await gateway.close();
+    }
+  });
+
+  it("an origin-less notice goes to the daemon-notice route, probed first with a HEAD that carries no credential, and nowhere else", async () => {
+    const { root, database, config, startToken } = adoptedState();
+    const gateway = await loopbackGateway({ session_id: LIVE, lineage_root_digest: DIGEST, process_pid: process.pid,
+      process_started_at: startToken });
+    try {
+      const before = imageOf(root, database);
+
+      await refuseStartBeforeOpening(config, clockAt(0), { route: routeFor(gateway, database), host: "h" });
+
+      expect(gateway.requests.map((request) => `${request.method} ${request.path}`)).toEqual([
+        "GET /v1/canonical-surface/identity",
+        `HEAD ${NOTICE_PATH}`,
+        // The sender reads the identity again as the last thing before the POST, as it always has.
+        "GET /v1/canonical-surface/identity",
+        `POST ${NOTICE_PATH}`,
+      ]);
+      expect(gateway.requests[1]!.headers).not.toContain("authorization");
+      expect(gateway.requests[3]!.headers).toEqual(expect.arrayContaining(["authorization", "content-type", "content-length"]));
+      expect(gateway.posts).toHaveLength(1);
+      const sent = gateway.posts[0]!;
+      expect(Object.keys(sent).sort()).toEqual(
+        ["binding", "destination", "event_id", "payload_digest", "principal", "protocol", "signature", "text"],
+      );
+      expect(noticePayload(sent)).not.toHaveProperty("origin");
+      expect(readCrashLoopFile(root, clockAt(0)()).lastRefusal?.notice).toMatchObject({ outcome: "delivered" });
+      expect(imageOf(root, database)).toEqual(before);
+
+      // Never again for this refusalId: a retry inside the backoff reads it from crash-loop.json and sends nothing.
+      const retry = await refuseStartBeforeOpening(config, clockAt(1_000), { route: routeFor(gateway, database), host: "h" });
+      expect(retry!.decision.reasonCode).toBe(ReasonCode.DAEMON_BACKOFF_ACTIVE);
+      expect(gateway.requests).toHaveLength(4);
+    } finally {
+      await gateway.close();
+    }
+  });
+
+  it("a receiver with no daemon-notice route is sent nothing: not the notice route, not /events, not Buzz", async () => {
+    const { root, database, config, startToken } = adoptedState();
+    const gateway = await loopbackGateway({ session_id: LIVE, lineage_root_digest: DIGEST, process_pid: process.pid,
+      process_started_at: startToken }, { noticeRoute: false });
+    const buzz = Object.getOwnPropertyNames(BuzzCliTransport.prototype)
+      .filter((name) => name !== "constructor" && typeof (BuzzCliTransport.prototype as unknown as Record<string, unknown>)[name] === "function")
+      .map((name) => vi.spyOn(BuzzCliTransport.prototype as unknown as Record<string, () => unknown>, name));
+    try {
+      const before = imageOf(root, database);
+
+      const refused = await refuseStartBeforeOpening(config, clockAt(0), { route: routeFor(gateway, database), host: "h" });
+
+      expect(refused!.decision.reasonCode).toBe(ReasonCode.DOCTOR_BLOCKED);
+      expect(gateway.requests.map((request) => `${request.method} ${request.path}`)).toEqual([
+        "GET /v1/canonical-surface/identity",
+        `HEAD ${NOTICE_PATH}`,
+      ]);
+      expect(gateway.posts).toHaveLength(0);
+      expect(readCrashLoopFile(root, clockAt(0)()).lastRefusal?.notice).toMatchObject({
+        outcome: "failed", reason: "receiver has no signed daemon-notice route", detail: "HEAD answered 404",
+      });
+      expect(buzz.length).toBeGreaterThan(0);
+      for (const spy of buzz) expect(spy).not.toHaveBeenCalled();
+      expect(imageOf(root, database)).toEqual(before);
+    } finally {
+      vi.restoreAllMocks();
+      await gateway.close();
+    }
+  });
+
+  it("a destination that is not the binding's is sent nothing, and is not even probed", async () => {
+    const { root, database, config, startToken } = adoptedState();
+    const gateway = await loopbackGateway({ session_id: LIVE, lineage_root_digest: DIGEST, process_pid: 2_147_000_000,
+      process_started_at: startToken });
+    try {
+      await refuseStartBeforeOpening(config, clockAt(0), { route: routeFor(gateway, database), host: "h" });
+
+      expect(gateway.requests.map((request) => `${request.method} ${request.path}`)).toEqual([
+        "GET /v1/canonical-surface/identity",
+      ]);
+      expect(gateway.posts).toHaveLength(0);
+      expect(readCrashLoopFile(root, clockAt(0)()).lastRefusal?.notice).toMatchObject({
+        outcome: "failed", reason: DESTINATION_MISMATCH,
+      });
     } finally {
       await gateway.close();
     }

@@ -11,7 +11,7 @@ import {
 
 const PATH = "/v1/canonical-surface/events";
 /** U6 B1 — the Gateway route that may answer a CEO notification as a reply to the owner's `/acp` message. */
-const DAEMON_NOTICES_PATH = "/v1/canonical-surface/daemon-notices";
+export const DAEMON_NOTICES_PATH = "/v1/canonical-surface/daemon-notices";
 const MAX_REPLY_BYTES = 16_384;
 const MAX_REQUEST_BYTES = 16_384;
 /** U6 B1 — the largest body the daemon-notice route takes; a notice with an origin is sent there whole. */
@@ -173,7 +173,50 @@ export interface HermesGatewayDaemonNoticeOptions {
   timeoutMs?: number;
   /** A caller that has stopped waiting: ends the identity lookup, and the request if it is already out. */
   signal?: AbortSignal;
+  /**
+   * The endpoint, named by the caller. Without it the route is read from the signed text as the outbox's CEO
+   * notifications need it (`daemonNoticePath`: an origin sends it to the daemon-notice route, anything else to
+   * `/events`). A caller that sends a notice no request originated names the daemon-notice route itself and does
+   * not leave it to an origin it does not have.
+   */
+  path?: string;
 }
+
+/**
+ * Whether the Gateway at `port` serves the signed daemon-notice route, without sending it anything: one `HEAD` to
+ * the route, no body and no credential. The route is `POST`-only, so a Gateway that has it answers 405 with
+ * `Allow: POST` and a Gateway that has not answers 404. `OPTIONS` cannot say: the Gateway's CORS middleware
+ * answers it 403 for every path. Any other answer, or none, is "not confirmed", and the caller sends nothing.
+ */
+export const probeDaemonNoticeRoute = (options: { port?: number; signal?: AbortSignal; timeoutMs?: number }):
+  Promise<{ supported: boolean; detail: string }> => new Promise((resolve) => {
+  const port = options.port ?? DEFAULT_HERMES_GATEWAY_PORT;
+  let done = false;
+  const cleanups: Array<() => void> = [];
+  const finish = (supported: boolean, detail: string, req?: ReturnType<typeof request>) => {
+    if (done) return;
+    done = true;
+    for (const cleanup of cleanups) cleanup();
+    resolve({ supported, detail });
+    req?.destroy();
+  };
+  if (!Number.isSafeInteger(port) || port < 1 || port > 65535 || options.signal?.aborted) {
+    return finish(false, "probe not made");
+  }
+  const req = request({ hostname: HERMES_GATEWAY_HOST, family: 4, port, path: DAEMON_NOTICES_PATH, method: "HEAD",
+    agent: false }, (res) => {
+    const status = res.statusCode ?? 0;
+    const allow = String(res.headers["allow"] ?? "").split(",").map((method) => method.trim().toUpperCase());
+    res.resume();
+    finish((status === 405 || (status >= 200 && status < 300)) && allow.includes("POST"),
+      `HEAD answered ${status}${allow.includes("POST") ? " with Allow: POST" : ""}`, req);
+  });
+  req.on("error", () => finish(false, "HEAD failed"));
+  const timer = setTimeout(() => finish(false, "HEAD timed out", req), options.timeoutMs ?? 1_500);
+  cleanups.push(() => clearTimeout(timer));
+  options.signal?.addEventListener("abort", () => finish(false, "HEAD aborted", req), { once: true });
+  req.end();
+});
 
 /**
  * `acp-daemon-notice/v1`: one signed daemon notice to the CEO's existing canonical conversation, with
@@ -201,7 +244,7 @@ export const createHermesGatewayDaemonNoticeSender = (options: HermesGatewayDaem
       return { kind: "NOT_SENT", reason: "INVALID" };
     }
     const body = JSON.stringify(notice);
-    const path = daemonNoticePath(notice.text);
+    const path = options.path ?? daemonNoticePath(notice.text);
     if (Buffer.byteLength(body) > (path === DAEMON_NOTICES_PATH ? DAEMON_NOTICE_MAX_REQUEST_BYTES : MAX_REQUEST_BYTES)) {
       return { kind: "NOT_SENT", reason: "INVALID" };
     }

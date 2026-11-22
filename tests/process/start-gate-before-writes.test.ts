@@ -300,6 +300,8 @@ describe("a start the doctor will refuse leaves the database as it found it (mig
     const gateway = createServer((req: IncomingMessage, res: ServerResponse) => {
       res.setHeader("Content-Type", "application/json");
       if (req.method === "GET") return void res.end(JSON.stringify(identity));
+      // The daemon-notice route is POST-only: the daemon's probe is a HEAD, answered 405 with Allow: POST.
+      if (req.method === "HEAD") { res.statusCode = req.url === "/v1/canonical-surface/daemon-notices" ? 405 : 404; res.setHeader("Allow", "POST"); return void res.end(); }
       let raw = "";
       req.on("data", (chunk: Buffer) => (raw += chunk.toString("utf8")));
       req.on("end", () => {
@@ -331,6 +333,7 @@ describe("a start the doctor will refuse leaves the database as it found it (mig
       expectRefusedUntouched(first, database, before, "TRUSTED_GATE_CREDENTIAL_MISSING");
       expect(posts).toHaveLength(1);
       expect(posts[0]!.auth).toBe("Bearer process-gateway-key");
+      expect(posts[0]!.path).toBe("/v1/canonical-surface/daemon-notices");
       const loop = crashLoopOf(root) as CrashLoop & { lastRefusal: { refusalId: string; notice: { outcome: string; receiptId: string } } };
       expect(loop.lastRefusal.notice).toMatchObject({ outcome: "delivered", receiptId: "rcpt-1" });
       expect(posts[0]!.body["text"]).toContain(loop.lastRefusal.refusalId);
