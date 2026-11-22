@@ -39,8 +39,8 @@ export const V58_ADDED_TRIGGERS = [
 ];
 export const V58_CHANGED_GUARDS = ["actor_target_bindings_immutable"];
 
-/** The one trigger v60 adds, named independently of the migration. */
-export const V60_ADDED_TRIGGERS = ["runs_review_completion_bootstrap_only"];
+/** The two triggers v60 adds, named independently of the migration. */
+export const V60_ADDED_TRIGGERS = ["runs_review_completion_bootstrap_only", "runs_kind_immutable"];
 
 /** A fixture built from a current database that claims to predate v60 holds no review-completion trigger. */
 export const takeBackV60 = (raw: Database.Database): void => {

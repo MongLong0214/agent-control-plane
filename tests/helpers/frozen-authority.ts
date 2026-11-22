@@ -89,7 +89,7 @@ export const FROZEN_BLOBS: ReadonlyArray<{ path: string; sha256: string; gitBlob
     // v58 (the canonical CTO switchover table) freezes v57's, and v59 (tasks.plan_key) freezes v58's, and v60 (the
     // review-completion trigger) freezes v59's.
     // Replayed lineage and compiled upgrades still bind the unchanged historical SQL, trace and receipt pins below.
-    sha256: "b4c420dbff4f3bd9051b5e30c4265158ae5c10736dfaef2bef414b4ba83f6b8e",
+    sha256: "107ba53ab68bcef1d103f135e8423b988eda2baa3f987b989b87bedc9c10c2df",
   },
   {
     path: "src/db/schema-v37.sql",

@@ -1819,12 +1819,24 @@ END;
 
 -- CP-HI-02 — only a PROJECT_BOOTSTRAP run completes from CEO review; every other kind completes through
 -- merge and post-merge verification. The two state guards list the edge for every kind, as they do the cancel above.
--- It decides on OLD.kind: `kind` is mutable, so one UPDATE must not reclassify a run and complete it.
+-- It refuses unless the run is PROJECT_BOOTSTRAP both before and after the UPDATE: `OLD.kind` alone lets a bootstrap run
+-- be reclassified and completed in one statement, and `NEW.kind` alone lets a run be reclassified into bootstrap.
 CREATE TRIGGER IF NOT EXISTS runs_review_completion_bootstrap_only
 BEFORE UPDATE OF state ON runs
-WHEN NEW.state = 'COMPLETED' AND OLD.state = 'READY_FOR_CEO_REVIEW' AND OLD.kind IS NOT 'PROJECT_BOOTSTRAP'
+WHEN NEW.state = 'COMPLETED' AND OLD.state = 'READY_FOR_CEO_REVIEW'
+ AND (OLD.kind IS NOT 'PROJECT_BOOTSTRAP' OR NEW.kind IS NOT 'PROJECT_BOOTSTRAP')
 BEGIN
   SELECT RAISE(ABORT, 'RUN_STATE_TRANSITION_ILLEGAL');
+END;
+
+-- CP-HI-02 — a run's kind decides which edges it may take, so it is born with the run and never rewritten. Without this,
+-- three statements in one transaction (kind → PROJECT_BOOTSTRAP, state → COMPLETED, kind restored) complete any run
+-- straight from CEO review.
+CREATE TRIGGER IF NOT EXISTS runs_kind_immutable
+BEFORE UPDATE OF kind ON runs
+WHEN NEW.kind IS NOT OLD.kind
+BEGIN
+  SELECT RAISE(ABORT, 'RUN_KIND_IMMUTABLE');
 END;
 
 -- ---------------------------------------------------------------------------

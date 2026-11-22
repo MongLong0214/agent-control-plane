@@ -4481,12 +4481,13 @@ const v59: SchemaMigration = {
 };
 
 /**
- * v60 (#1452) adds `runs_review_completion_bootstrap_only`: READY_FOR_CEO_REVIEW → COMPLETED stays listed in both state
- * guards for every kind, and this trigger admits it only for a PROJECT_BOOTSTRAP run, as v54's trigger narrows the
- * post-approval cancel. It names no other object and moves no row, so it can be renumbered behind another step: only
+ * v60 (#1452) adds `runs_review_completion_bootstrap_only` and `runs_kind_immutable`. READY_FOR_CEO_REVIEW → COMPLETED stays
+ * listed in both state guards for every kind, and the first trigger admits it only for a run that is PROJECT_BOOTSTRAP before
+ * and after the UPDATE, as v54's trigger narrows the post-approval cancel; the second makes `runs.kind` immutable so the kind
+ * cannot be swapped around a completion. They name no other object and move no row, so it can be renumbered behind another step: only
  * `version`, the id and the prior version below change.
  */
-const V60_ADDED_TRIGGERS = ["runs_review_completion_bootstrap_only"] as const;
+const V60_ADDED_TRIGGERS = ["runs_review_completion_bootstrap_only", "runs_kind_immutable"] as const;
 const v60: SchemaMigration = {
   id: "v60-review-completion-bootstrap-only",
   fromVersion: 59,
@@ -4755,6 +4756,7 @@ const REQUIRED_SCHEMA_TRIGGERS: ReadonlyArray<RequiredTrigger> = [
   { name: "runs_cancel_after_approval_requires_no_grant", sentinel: "RUN_STATE_TRANSITION_ILLEGAL", introducedIn: 54 },
   // #1452 — v60 alone installs it.
   { name: "runs_review_completion_bootstrap_only", sentinel: "RUN_STATE_TRANSITION_ILLEGAL", introducedIn: 60 },
+  { name: "runs_kind_immutable", sentinel: "RUN_KIND_IMMUTABLE", introducedIn: 60 },
   { name: "manifest_first_activation_grants_born_unconsumed", sentinel: "MANIFEST_GRANT_IMMUTABLE", introducedIn: 45 },
   { name: "manifest_first_activation_grants_born_on_null", sentinel: "MANIFEST_FIRST_ACTIVATION_DENIED", introducedIn: 45 },
   { name: "manifest_first_activation_grants_no_replace", sentinel: "MANIFEST_GRANT_NO_REPLACE", introducedIn: 45 },

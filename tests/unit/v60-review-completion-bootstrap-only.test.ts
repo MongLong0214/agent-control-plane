@@ -16,6 +16,7 @@ afterAll(cleanupTempDirs);
 /** v59's receipt as the build before its freeze computed it, from schema.sql at 744e9bef. */
 const V59_CHECKSUM = "sha256:3729cfa5817040d8967779ae0af8772cd7e79c2042ea4a6c3cb1f34d1245705e";
 const TRIGGER = "runs_review_completion_bootstrap_only";
+const KIND_TRIGGER = "runs_kind_immutable";
 
 const insertRun = (raw: Database.Database, runId: string, kind: string): void => {
   raw.prepare(`INSERT INTO runs (run_id, kind, execution_mode, priority, state, goal, contract_digest, created_at)
@@ -63,8 +64,9 @@ describe("v59 → v60 review completion is PROJECT_BOOTSTRAP's alone", () => {
     writeFileSync(path, at60!);
     expect(userVersionOf(path)).toBe(60);
     const afterSchema = schemaRowsOf(path);
-    expect(afterSchema.filter((row) => row.name !== TRIGGER)).toEqual(beforeSchema);
+    expect(afterSchema.filter((row) => row.name !== TRIGGER && row.name !== KIND_TRIGGER)).toEqual(beforeSchema);
     expect(afterSchema.filter((row) => row.name === TRIGGER)).toHaveLength(1);
+    expect(afterSchema.filter((row) => row.name === KIND_TRIGGER)).toHaveLength(1);
 
     const raw = new Database(path);
     try {
@@ -83,20 +85,60 @@ describe("v59 → v60 review completion is PROJECT_BOOTSTRAP's alone", () => {
     } finally { raw.close(); }
   });
 
-  it("decides on the kind before the update: one UPDATE cannot reclassify a non-bootstrap run and complete it", () => {
-    const path = releasedChainImage(privateStatePath("acp-v60-reclassify-"), 59);
+  /** A v60 database holding a READY_FOR_CEO_REVIEW run of each kind, with the authority marker answering yes. */
+  const migrated = (prefix: string): Database.Database => {
+    const path = releasedChainImage(privateStatePath(prefix), 59);
     approveMigration(path, "v60 review completion bootstrap only");
     new Db(path).close();
     const raw = new Database(path);
+    insertRun(raw, "run_standard", RunKind.STANDARD_WORK);
+    insertRun(raw, "run_contract", RunKind.CONTRACT_CHANGE);
+    insertRun(raw, "run_bootstrap", RunKind.PROJECT_BOOTSTRAP);
+    raw.function("acp_run_state_transition_authorized", { varargs: true }, () => 1);
+    return raw;
+  };
+  const stateOf = (raw: Database.Database, runId: string): unknown => raw.prepare("SELECT state FROM runs WHERE run_id = ?").pluck().get(runId);
+  const kindOf = (raw: Database.Database, runId: string): unknown => raw.prepare("SELECT kind FROM runs WHERE run_id = ?").pluck().get(runId);
+
+  it("decides on the kind before AND after the update: one UPDATE cannot move a run into or out of PROJECT_BOOTSTRAP and complete it", () => {
+    const raw = migrated("acp-v60-onestatement-");
     try {
-      insertRun(raw, "run_standard", RunKind.STANDARD_WORK);
-      insertRun(raw, "run_contract", RunKind.CONTRACT_CHANGE);
-      raw.function("acp_run_state_transition_authorized", { varargs: true }, () => 1);
-      const reclassify = raw.prepare("UPDATE runs SET kind = 'PROJECT_BOOTSTRAP', state = 'COMPLETED' WHERE run_id = ?");
+      // The completion trigger alone: the kind trigger is dropped so it cannot be the one that refuses.
+      raw.exec(`DROP TRIGGER ${KIND_TRIGGER}`);
+      const into = raw.prepare("UPDATE runs SET kind = 'PROJECT_BOOTSTRAP', state = 'COMPLETED' WHERE run_id = ?");
       for (const runId of ["run_standard", "run_contract"]) {
-        expect(() => reclassify.run(runId), runId).toThrow(/RUN_STATE_TRANSITION_ILLEGAL/);
-        expect(raw.prepare("SELECT state FROM runs WHERE run_id = ?").pluck().get(runId)).toBe(RunState.READY_FOR_CEO_REVIEW);
+        expect(() => into.run(runId), runId).toThrow(/RUN_STATE_TRANSITION_ILLEGAL/);
+        expect(stateOf(raw, runId)).toBe(RunState.READY_FOR_CEO_REVIEW);
       }
+      // (a) the reverse: a bootstrap run reclassified and completed in one statement.
+      expect(() => raw.prepare("UPDATE runs SET kind = 'STANDARD_WORK', state = 'COMPLETED' WHERE run_id = 'run_bootstrap'").run())
+        .toThrow(/RUN_STATE_TRANSITION_ILLEGAL/);
+      expect(stateOf(raw, "run_bootstrap")).toBe(RunState.READY_FOR_CEO_REVIEW);
+      expect(kindOf(raw, "run_bootstrap")).toBe(RunKind.PROJECT_BOOTSTRAP);
+      // (d) an ordinary bootstrap completion still goes through.
+      raw.prepare("UPDATE runs SET state = 'COMPLETED' WHERE run_id = 'run_bootstrap'").run();
+      expect(stateOf(raw, "run_bootstrap")).toBe(RunState.COMPLETED);
+    } finally { raw.close(); }
+  });
+
+  it("makes runs.kind immutable: the three-statement bypass is refused at the first kind change, and so is any plain kind change", () => {
+    const raw = migrated("acp-v60-kind-immutable-");
+    try {
+      // (b) kind → PROJECT_BOOTSTRAP, state → COMPLETED, kind restored, in one transaction.
+      raw.exec("BEGIN");
+      expect(() => raw.prepare("UPDATE runs SET kind = 'PROJECT_BOOTSTRAP' WHERE run_id = 'run_standard'").run()).toThrow(/RUN_KIND_IMMUTABLE/);
+      raw.exec("ROLLBACK");
+      expect(kindOf(raw, "run_standard")).toBe(RunKind.STANDARD_WORK);
+      expect(stateOf(raw, "run_standard")).toBe(RunState.READY_FOR_CEO_REVIEW);
+      // (c) a plain kind change on any run, in either direction.
+      for (const runId of ["run_standard", "run_contract", "run_bootstrap"]) {
+        const before = kindOf(raw, runId);
+        const other = before === RunKind.CONTRACT_CHANGE ? "STANDARD_WORK" : "CONTRACT_CHANGE";
+        expect(() => raw.prepare("UPDATE runs SET kind = ? WHERE run_id = ?").run(other, runId), runId).toThrow(/RUN_KIND_IMMUTABLE/);
+        expect(kindOf(raw, runId)).toBe(before);
+      }
+      // Writing the same kind back is not a change.
+      raw.prepare("UPDATE runs SET kind = kind WHERE run_id = 'run_standard'").run();
     } finally { raw.close(); }
   });
 
