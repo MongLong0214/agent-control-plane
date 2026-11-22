@@ -1819,9 +1819,10 @@ END;
 
 -- CP-HI-02 — only a PROJECT_BOOTSTRAP run completes from CEO review; every other kind completes through
 -- merge and post-merge verification. The two state guards list the edge for every kind, as they do the cancel above.
+-- It decides on OLD.kind: `kind` is mutable, so one UPDATE must not reclassify a run and complete it.
 CREATE TRIGGER IF NOT EXISTS runs_review_completion_bootstrap_only
 BEFORE UPDATE OF state ON runs
-WHEN NEW.state = 'COMPLETED' AND OLD.state = 'READY_FOR_CEO_REVIEW' AND NEW.kind IS NOT 'PROJECT_BOOTSTRAP'
+WHEN NEW.state = 'COMPLETED' AND OLD.state = 'READY_FOR_CEO_REVIEW' AND OLD.kind IS NOT 'PROJECT_BOOTSTRAP'
 BEGIN
   SELECT RAISE(ABORT, 'RUN_STATE_TRANSITION_ILLEGAL');
 END;

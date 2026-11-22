@@ -83,6 +83,23 @@ describe("v59 → v60 review completion is PROJECT_BOOTSTRAP's alone", () => {
     } finally { raw.close(); }
   });
 
+  it("decides on the kind before the update: one UPDATE cannot reclassify a non-bootstrap run and complete it", () => {
+    const path = releasedChainImage(privateStatePath("acp-v60-reclassify-"), 59);
+    approveMigration(path, "v60 review completion bootstrap only");
+    new Db(path).close();
+    const raw = new Database(path);
+    try {
+      insertRun(raw, "run_standard", RunKind.STANDARD_WORK);
+      insertRun(raw, "run_contract", RunKind.CONTRACT_CHANGE);
+      raw.function("acp_run_state_transition_authorized", { varargs: true }, () => 1);
+      const reclassify = raw.prepare("UPDATE runs SET kind = 'PROJECT_BOOTSTRAP', state = 'COMPLETED' WHERE run_id = ?");
+      for (const runId of ["run_standard", "run_contract"]) {
+        expect(() => reclassify.run(runId), runId).toThrow(/RUN_STATE_TRANSITION_ILLEGAL/);
+        expect(raw.prepare("SELECT state FROM runs WHERE run_id = ?").pluck().get(runId)).toBe(RunState.READY_FOR_CEO_REVIEW);
+      }
+    } finally { raw.close(); }
+  });
+
   it("refuses a drifted trigger rather than replacing an unknown definition", () => {
     const path = releasedChainImage(privateStatePath("acp-v60-drift-"), 59);
     const raw = new Database(path);
