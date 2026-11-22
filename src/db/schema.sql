@@ -652,18 +652,10 @@ CREATE TABLE IF NOT EXISTS finalization_attempts (
 CREATE INDEX IF NOT EXISTS finalization_attempts_running_deadline
   ON finalization_attempts(state, deadline_at);
 
--- CP-HI-02 — §29's state machine is enforced in the database, not only in the service that usually writes it.
--- §29 is a persisted state machine. The service owns authority/evidence/outbox work,
--- while this guard rejects topology bypasses even from a raw SQLite caller.
--- #1189 (schema v54) — CANCELLED is reachable from READY_FOR_CEO_REVIEW (B14), and from CEO_APPROVED,
--- MERGING and POST_MERGE_VERIFYING only for a CONTRACT_CHANGE holding no activation grant (B15,
--- `runs_cancel_after_approval_requires_no_grant` below). Like every edge it needs the authority marker.
--- That nothing merged is RunEngine.cancel's check, not a guard's: a guard reading github_receipts
--- would tie these triggers to every rebuild of that table (v49 refuses such a trigger).
--- #1189 B5 (schema v55) — CEO_APPROVED and MERGING may go back to REVISION_REQUIRED: an approved candidate
--- refused before anything merged. Like every edge it needs the authority marker (below); that no merge_execute
--- receipt exists is RunEngine.returnApprovedCandidate's check, not this guard's, because a guard reading
--- github_receipts would tie these triggers to every rebuild of that table (v49 refuses such a trigger).
+-- CP-HI-02 — §29's state machine is enforced in the database, even against a raw SQLite caller.
+-- The two state guards list every edge some kind may take. The kind triggers
+-- (`runs_cancel_after_approval_requires_no_grant`, `runs_review_completion_bootstrap_only`) narrow edges by kind,
+-- and the authority guard also requires the connection marker.
 CREATE TRIGGER IF NOT EXISTS runs_state_transition_guard
 BEFORE UPDATE OF state ON runs
 WHEN NEW.state <> OLD.state
@@ -1823,6 +1815,28 @@ WHEN NEW.state = 'CANCELLED' AND OLD.state IN ('CEO_APPROVED','MERGING','POST_ME
   OR EXISTS (SELECT 1 FROM manifest_first_activation_grants f WHERE f.run_id = OLD.run_id))
 BEGIN
   SELECT RAISE(ABORT, 'RUN_STATE_TRANSITION_ILLEGAL');
+END;
+
+-- CP-HI-02 — only a PROJECT_BOOTSTRAP run completes from CEO review; every other kind completes through
+-- merge and post-merge verification. The two state guards list the edge for every kind, as they do the cancel above.
+-- It refuses unless the run is PROJECT_BOOTSTRAP both before and after the UPDATE: `OLD.kind` alone lets a bootstrap run
+-- be reclassified and completed in one statement, and `NEW.kind` alone lets a run be reclassified into bootstrap.
+CREATE TRIGGER IF NOT EXISTS runs_review_completion_bootstrap_only
+BEFORE UPDATE OF state ON runs
+WHEN NEW.state = 'COMPLETED' AND OLD.state = 'READY_FOR_CEO_REVIEW'
+ AND (OLD.kind IS NOT 'PROJECT_BOOTSTRAP' OR NEW.kind IS NOT 'PROJECT_BOOTSTRAP')
+BEGIN
+  SELECT RAISE(ABORT, 'RUN_STATE_TRANSITION_ILLEGAL');
+END;
+
+-- CP-HI-02 — a run's kind decides which edges it may take, so it is born with the run and never rewritten. Without this,
+-- three statements in one transaction (kind → PROJECT_BOOTSTRAP, state → COMPLETED, kind restored) complete any run
+-- straight from CEO review.
+CREATE TRIGGER IF NOT EXISTS runs_kind_immutable
+BEFORE UPDATE OF kind ON runs
+WHEN NEW.kind IS NOT OLD.kind
+BEGIN
+  SELECT RAISE(ABORT, 'RUN_KIND_IMMUTABLE');
 END;
 
 -- ---------------------------------------------------------------------------
