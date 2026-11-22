@@ -1,4 +1,4 @@
-import { closeSync, constants as fsConstants, existsSync, mkdirSync, openSync, readFileSync, renameSync, statSync, writeFileSync, writeSync } from "node:fs";
+import { closeSync, constants as fsConstants, existsSync, fstatSync, mkdirSync, openSync, readFileSync, readSync, renameSync, statSync, writeFileSync, writeSync } from "node:fs";
 import { join } from "node:path";
 
 import { isChannelReceipt, type ChannelEventEntry, type ChannelReceipt, type ChannelState, type ChannelStateStore } from "./buzz-channel.ts";
@@ -24,16 +24,32 @@ const ensureDir = (stateDir: string): void => {
   mkdirSync(channelDir(stateDir), { recursive: true, mode: 0o700 });
 };
 
-/** One receipt as one line, stamped with the launch the server was started by; `O_APPEND` makes concurrent writers' lines whole. */
+/**
+ * One receipt as one line, stamped with the launch the server was started by; `O_APPEND` makes concurrent writers' lines whole.
+ *
+ * A file whose last line has no newline (a writer that died mid-line) would join this receipt to the fragment and lose both,
+ * so such an append starts on a new line: the fragment stays one skipped line and the receipt reads back. A receipt that would
+ * not read back (it is not the shape the reader accepts) or that was only partly written is an error, never a success the
+ * caller records as written.
+ */
 export const appendChannelReceipt = (stateDir: string, projectId: string, receipt: ChannelReceipt, launchId?: string): void => {
+  const line = JSON.stringify(launchId === undefined ? receipt : { ...receipt, launchId });
+  if (!isChannelReceipt(JSON.parse(line) as unknown)) throw new Error("the receipt would not read back");
   ensureDir(stateDir);
   const fd = openSync(
     channelReceiptPath(stateDir, projectId),
-    fsConstants.O_WRONLY | fsConstants.O_APPEND | fsConstants.O_CREAT | fsConstants.O_NOFOLLOW,
+    fsConstants.O_RDWR | fsConstants.O_APPEND | fsConstants.O_CREAT | fsConstants.O_NOFOLLOW,
     0o600,
   );
   try {
-    writeSync(fd, `${JSON.stringify(launchId === undefined ? receipt : { ...receipt, launchId })}\n`);
+    const size = fstatSync(fd).size;
+    let lead = "";
+    if (size > 0) {
+      const last = Buffer.alloc(1);
+      if (readSync(fd, last, 0, 1, size - 1) === 1 && last[0] !== 0x0a) lead = "\n";
+    }
+    const bytes = Buffer.from(`${lead}${line}\n`, "utf8");
+    if (writeSync(fd, bytes) !== bytes.length) throw new Error("the receipt was only partly written");
   } finally {
     closeSync(fd);
   }

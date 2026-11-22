@@ -17,7 +17,7 @@ import {
   type ChannelState,
   type ChannelStateStore,
 } from "../../src/buzz/buzz-channel.ts";
-import { fileChannelStateStore } from "../../src/buzz/buzz-channel-files.ts";
+import { appendChannelReceipt, channelReceiptPath, fileChannelStateStore, readChannelReceipts } from "../../src/buzz/buzz-channel-files.ts";
 import type { BuzzRelaySocketFactory, BuzzRelaySocketHandlers } from "../../src/buzz/buzz-mention-subscriber.ts";
 
 /**
@@ -337,6 +337,37 @@ describe("a mention of this CTO reaches its session once, as untrusted data", ()
     await h.deliver(connection, expired);
     await h.deliver(connection, mention(ceo, "newer still", NOW - 40));
     await h.deliver(connection, expired);
+    expect(h.receipts.filter((r) => r.type === "replied")).toHaveLength(1);
+  });
+
+  it("restores an already-reported reply to thread memory on its replay, so a CEO follow-up naming it is still delivered", async () => {
+    const NOW = 200_000;
+    const asked = mention(ceo, "hold the deploy", NOW - 150_000);
+    const expired = sign(cto, [["h", ROOM], ["e", asked.id, "", "reply"], ["p", ceoPub]], "held", NOW - 140_000);
+    const h = harness({ now: NOW, answeredSince: () => NOW - 200_000, failOnce: new Set(["stuck"]) });
+    const connection = await h.connect();
+    await h.deliver(connection, expired);
+    // A newer event moves the cursor on, and the reply, past the retention horizon, is forgotten although its receipt is written.
+    await h.deliver(connection, mention(ceo, "newer", NOW - 50));
+    // A notification that fails near the subscription's start pins the resume point back, so the next replay is retained again.
+    await h.deliver(connection, mention(ceo, "stuck", NOW - 145_000));
+    await h.deliver(connection, expired);
+    const followUp = sign(ceo, [["h", ROOM], ["e", asked.id, "", "root"], ["e", expired.id, "", "reply"]], "go ahead after all", NOW - 10);
+    await h.deliver(connection, followUp);
+    expect(h.notifications.map((n) => n.content)).toEqual(["newer", "go ahead after all"]);
+    expect(h.receipts.filter((r) => r.type === "replied")).toHaveLength(1);
+  });
+
+  it("writes one replied receipt when the relay echoes a reply before it acknowledges the publish", async () => {
+    const h = harness();
+    const connection = await h.connect();
+    const asked = mention(ceo, "status?", 1_001);
+    await h.deliver(connection, asked);
+    const pending = h.relay.reply({ room: ROOM, eventId: asked.id, kind: "report", text: "green on main" });
+    const published = connection.sent.find((f) => f[0] === "EVENT") as [string, ReturnType<typeof sign>];
+    await h.deliver(connection, published[1]);
+    connection.push(["OK", published[1].id, true, ""]);
+    await expect(pending).resolves.toMatchObject({ ok: true });
     expect(h.receipts.filter((r) => r.type === "replied")).toHaveLength(1);
   });
 
@@ -993,5 +1024,29 @@ describe("a relay that goes quiet is replaced", () => {
     h.scheduler.advance(KEEPALIVE_ANSWER_MS);
     expect(first.closed).toBe(false);
     expect(h.connections).toHaveLength(1);
+  });
+});
+
+describe("the receipts file after a partial append", () => {
+  const receipt = (n: number) => ({ type: "emitted" as const, eventId: `e${n}`, room: ROOM, senderPubkey: ceoPub, emittedAt: n });
+
+  it("starts an append on a new line when the last line is incomplete, so the receipt reads back", () => {
+    const dir = mkdtempSync(join(tmpdir(), "buzz-channel-partial-"));
+    scratch.push(dir);
+    appendChannelReceipt(dir, "demo", receipt(1));
+    // A writer died mid-line: the file ends with half a receipt and no newline.
+    writeFileSync(channelReceiptPath(dir, "demo"), `${JSON.stringify(receipt(1))}\n{"type":"emitted","eventI`, { flag: "w" });
+    appendChannelReceipt(dir, "demo", receipt(2));
+    appendChannelReceipt(dir, "demo", receipt(3));
+    const read = readChannelReceipts(channelReceiptPath(dir, "demo"));
+    expect(read.receipts.map((r) => (r as { eventId: string }).eventId)).toEqual(["e1", "e2", "e3"]);
+    expect(read.skipped).toEqual([2]);
+  });
+
+  it("refuses to write what would not read back, so the channel never counts it as reported", () => {
+    const dir = mkdtempSync(join(tmpdir(), "buzz-channel-shape-"));
+    scratch.push(dir);
+    expect(() => appendChannelReceipt(dir, "demo", { type: "replied", event: {}, room: ROOM } as never)).toThrow(/read back/u);
+    expect(readChannelReceipts(channelReceiptPath(dir, "demo")).receipts).toEqual([]);
   });
 });

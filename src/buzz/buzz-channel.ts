@@ -833,6 +833,8 @@ export class BuzzChannelRelay {
 
   /** Writes one `replied` receipt and remembers, for this process, that it was written; a refused or failed write is retried on a replay. */
   #reportReply(receipt: Extract<ChannelReceipt, { type: "replied" }>): void {
+    // One event id, one receipt per process: the relay's echo can arrive before the publish is acknowledged, and both paths come here.
+    if (this.#reported.has(receipt.event.id)) return;
     let written: void | boolean;
     try {
       written = this.#o.onReceipt?.(receipt);
@@ -847,13 +849,13 @@ export class BuzzChannelRelay {
    * completes what it answered by the same checks. Whatever sent it (the reply tool, the buzz CLI), and whether or not an
    * earlier process remembered it: a remembered one is reported again once, because its receipt may have been trimmed or
    * never written. The daemon settles per row, so a repeat is harmless. Once this process has written the receipt, a
-   * replay is never reported again, even after the event itself has been forgotten.
+   * replay writes no other, but it is still restored to thread memory when it was forgotten, so a follow-up naming it is heard.
    *
    * A remembered reply's activity time is left alone: re-setting it from an old replay ages the thread out and drops a later
    * follow-up in it.
    */
   #ownReply(event: RelayEvent): void {
-    if (event.kind !== BUZZ_MENTION_KIND || this.#reported.has(event.id)) return;
+    if (event.kind !== BUZZ_MENTION_KIND) return;
     const rooms = tagValues(event, "h");
     const room = rooms.length === 1 ? rooms[0]! : "";
     const parentEventId = replyParentOf(event);
