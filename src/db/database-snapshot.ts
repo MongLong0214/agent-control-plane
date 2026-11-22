@@ -1,5 +1,6 @@
 import Database from "better-sqlite3";
 import { chmodSync, copyFileSync, existsSync, mkdtempSync, rmSync, statSync } from "node:fs";
+import { chmod, copyFile, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -26,6 +27,26 @@ export class DatabaseSnapshotUnavailable extends Error {
   }
 }
 
+/**
+ * Opens the copy read-write, in a directory that is only the copy's: SQLite rolls a hot journal back and
+ * replays a write-ahead log only on a connection that may write, and a hot journal is what a daemon killed
+ * mid-transaction leaves. The recovery lands in the copy. The originals are not open at all, so the real
+ * open still finds them exactly as they were and recovers them as it always did. Reads from here on are
+ * held to reads.
+ */
+const openRecoveredCopy = (target: string): Database.Database => {
+  const copy = new Database(target, { fileMustExist: true });
+  try {
+    // Forces recovery now, so a copy that cannot be read fails here and not mid-query.
+    copy.pragma("schema_version", { simple: true });
+    copy.pragma("query_only = ON");
+    return copy;
+  } catch (error) {
+    copy.close();
+    throw error;
+  }
+};
+
 export const withDatabaseSnapshot = <T>(databasePath: string, read: (copy: Database.Database) => T): T => {
   let directory: string | null = null;
   let copy: Database.Database | null = null;
@@ -42,15 +63,7 @@ export const withDatabaseSnapshot = <T>(databasePath: string, read: (copy: Datab
         chmodSync(`${target}${suffix}`, 0o600);
       }
     }
-    // Opened read-write, in a directory that is only the copy's: SQLite rolls a hot journal back and
-    // replays a write-ahead log only on a connection that may write, and a hot journal is what a daemon
-    // killed mid-transaction leaves. The recovery lands in the copy. The originals are not open at all, so
-    // the real open still finds them exactly as they were and recovers them as it always did. Reads from
-    // here on are held to reads.
-    copy = new Database(target, { fileMustExist: true });
-    // Forces recovery now, so a copy that cannot be read fails here and not mid-query.
-    copy.pragma("schema_version", { simple: true });
-    copy.pragma("query_only = ON");
+    copy = openRecoveredCopy(target);
   } catch (error) {
     try {
       copy?.close();
@@ -67,6 +80,63 @@ export const withDatabaseSnapshot = <T>(databasePath: string, read: (copy: Datab
       copy.close();
     } finally {
       rmSync(directory, { recursive: true, force: true });
+    }
+  }
+};
+
+/**
+ * `withDatabaseSnapshot` for a caller whose process has to stay answerable while the copy is made.
+ *
+ * The copy of a large database is the longest thing the start does before it opens anything, and made with
+ * synchronous calls it holds the event loop for all of it: a SIGTERM that lands in that stretch is not
+ * dispatched until the copy, the gate and everything after it have run, by which time the live database is
+ * open. Here the copy is made on the thread pool, so the loop turns and a signal handler runs while it goes.
+ * A process that leaves in the middle leaves no copy behind: the directory is removed on `exit` as well.
+ */
+export const withDatabaseSnapshotAsync = async <T>(
+  databasePath: string,
+  read: (copy: Database.Database) => T | Promise<T>,
+): Promise<T> => {
+  let directory: string | null = null;
+  let copy: Database.Database | null = null;
+  const removeOnExit = (): void => {
+    if (directory !== null) rmSync(directory, { recursive: true, force: true });
+  };
+  process.once("exit", removeOnExit);
+  const finish = (): void => {
+    process.off("exit", removeOnExit);
+    removeOnExit();
+  };
+  try {
+    directory = mkdtempSync(join(tmpdir(), "acp-db-snapshot-"));
+    await chmod(directory, 0o700);
+    const target = join(directory, "snapshot.sqlite");
+    await copyFile(databasePath, target);
+    await chmod(target, 0o600);
+    for (const suffix of ["-wal", "-journal"]) {
+      const sidecar = `${databasePath}${suffix}`;
+      if (existsSync(sidecar) && (await stat(sidecar)).size > 0) {
+        await copyFile(sidecar, `${target}${suffix}`);
+        await chmod(`${target}${suffix}`, 0o600);
+      }
+    }
+    copy = openRecoveredCopy(target);
+  } catch (error) {
+    try {
+      copy?.close();
+    } catch {
+      /* closing a copy that never opened */
+    }
+    finish();
+    throw new DatabaseSnapshotUnavailable(databasePath, error);
+  }
+  try {
+    return await read(copy);
+  } finally {
+    try {
+      copy.close();
+    } finally {
+      finish();
     }
   }
 };

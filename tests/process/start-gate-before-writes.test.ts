@@ -432,6 +432,44 @@ describe("a start the doctor will refuse leaves the database as it found it (mig
     expect(imageOf(database)).toEqual(before);
   }, 120_000);
 
+  it("final review: a SIGTERM during the snapshot copy of a large database leaves before the live database is opened", async () => {
+    const { home, root, database } = newHome();
+    currentDatabase(database, "DELETE");
+    installGitHubAppCredential(root);
+    // 512 MiB: the copy is the longest stretch before anything is opened. A valid credential and no
+    // registered checkouts, so the gate passes and a start that went on would open the file.
+    const raw = new Database(database);
+    raw.exec("CREATE TABLE gate_padding (b BLOB)");
+    for (let row = 0; row < 4; row += 1) raw.prepare("INSERT INTO gate_padding VALUES (zeroblob(?))").run(128 * 1024 * 1024);
+    raw.close();
+    expect(statSync(database).size).toBeGreaterThan(512 * 1024 * 1024);
+    const auditBefore = countOf(database, "SELECT COUNT(*) AS n FROM audit_events");
+    const before = imageOf(database);
+    expect(before.header).toBe("0101");
+    const scratch = mkdtempSync(join(tmpdir(), "acp-gate-scratch-"));
+    homes.push(scratch);
+
+    const run = startDaemon(home, { TMPDIR: scratch });
+    // As soon as the copy exists, which is while it is still being made.
+    const deadline = Date.now() + 90_000;
+    const copying = (): boolean =>
+      readdirSync(scratch).some((name) => existsSync(join(scratch, name, "snapshot.sqlite")));
+    while (!copying()) {
+      if (Date.now() > deadline) throw new Error(`no snapshot copy appeared; stderr: ${run.stderr().slice(-400)}`);
+      await new Promise<void>((resolveWait) => setTimeout(resolveWait, 2));
+    }
+    run.child.kill("SIGTERM");
+    const exit = await run.exited;
+
+    expect(exit.status === 0 || exit.signal === "SIGTERM").toBe(true);
+    // Nothing of the live database moved: not its bytes, not its journal mode, no sidecar, no audit row.
+    expect(existsSync(join(root, "agentcpd.lock"))).toBe(false);
+    expect(imageOf(database)).toEqual(before);
+    expect(countOf(database, "SELECT COUNT(*) AS n FROM audit_events")).toBe(auditBefore);
+    // And the copy it was making is gone.
+    expect(readdirSync(scratch).filter((name) => name.startsWith("acp-db-snapshot-"))).toEqual([]);
+  }, 180_000);
+
   it("round 2 item 5: a start that finds agentcpd.lock held writes nothing and says so", async () => {
     const { home, root, database } = newHome();
     currentDatabase(database);

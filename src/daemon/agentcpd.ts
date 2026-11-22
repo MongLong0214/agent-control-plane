@@ -6526,7 +6526,9 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
   // gate's probes ended the process by default, `exit` never fired, and `agentcpd.lock/holder.json` stayed
   // behind for the installer to wait on forever. It writes nothing: no database is open yet, and when one
   // is, a start that was never served has no stop to record.
+  let stopRequested = false;
   const earlyStop = (): void => {
+    stopRequested = true;
     startLock.release();
     process.exit(0);
   };
@@ -6543,6 +6545,15 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
     startLock.release();
     dropEarlyStop();
     return refuseBeforeOpening(refusedBeforeOpening);
+  }
+  // A turn of the event loop before anything is opened, then a look at whether a stop arrived while the gate
+  // ran. The gate's promises can settle without the loop ever turning, which would let a signal that landed
+  // during it wait behind the open of the live database (a switch to WAL, a runtime observation, a started
+  // daemon). If one did arrive, the process leaves here without having opened it.
+  await new Promise<void>((resolveYield) => setImmediate(resolveYield));
+  if (stopRequested) {
+    startLock.release();
+    process.exit(0);
   }
 
   const cp = new ControlPlane({ ...config, databaseMigrationLock: startLock, servingEntrypoint: realpathSync(fileURLToPath(import.meta.url)) });

@@ -17,7 +17,7 @@ import {
 } from "../doctor/doctor.ts";
 import { git, isClean, listWorktrees, tryRevParse } from "../git/git.ts";
 import { TrustedCredentialStore } from "../github/credential-store.ts";
-import { DatabaseSnapshotUnavailable, withDatabaseSnapshot } from "../db/database-snapshot.ts";
+import { DatabaseSnapshotUnavailable, withDatabaseSnapshotAsync } from "../db/database-snapshot.ts";
 import { ensurePrivateDirectory, inspectDatabaseStatePaths, inspectPrivatePath } from "../db/state-preflight.ts";
 import { readCheckoutRegistrations } from "../verify/worktree.ts";
 import { backoffSecondsFor, countStartupFailure, readCrashLoopFile } from "./crash-loop.ts";
@@ -33,7 +33,7 @@ import { SingleInstanceLock } from "./single-instance.ts";
  * sealed before an approved migration refuses the database as stale (ROLLBACK_PAIR_STALE_DATABASE).
  *
  * What is judged here reads only files and read-only git, and, for the registered checkouts, a private copy
- * of the database's own files (`withDatabaseSnapshot`). Nothing is opened for writing, no sidecar is
+ * of the database's own files (`withDatabaseSnapshotAsync`). Nothing is opened for writing, no sidecar is
  * created, no repository index is refreshed, and a refusal is reported on stderr and in `crash-loop.json`
  * only. The caller holds `agentcpd.lock` for all of it (`takeStartLock`), so a second start learns that
  * another process holds the lock before it has read or written anything.
@@ -66,7 +66,7 @@ const safeErrorMessage = (err: unknown): string =>
   (err instanceof Error ? err.message : String(err)).replace(/[\r\n\t]/g, " ").slice(0, 500);
 
 /**
- * The registered checkouts, read from a private copy of the database (`withDatabaseSnapshot`): the main
+ * The registered checkouts, read from a private copy of the database (`withDatabaseSnapshotAsync`): the main
  * file and any write-ahead log or hot journal that holds more than the file does, so a registration that
  * is still only in the log is seen. The originals are never opened for writing, and no sidecar is created
  * beside them.
@@ -75,12 +75,12 @@ const safeErrorMessage = (err: unknown): string =>
  * start that cannot say what it is about to open should not open it. A schema too old to register
  * checkouts has none to probe, which is not a failure.
  */
-const registeredCheckouts = (
+const registeredCheckouts = async (
   databasePath: string,
-): { checkouts: RegisteredCheckout[] } | { notJudged: string } | { unavailable: string } => {
+): Promise<{ checkouts: RegisteredCheckout[] } | { notJudged: string } | { unavailable: string }> => {
   if (!existsSync(databasePath)) return { checkouts: [] };
   try {
-    return withDatabaseSnapshot(databasePath, (copy) => {
+    return await withDatabaseSnapshotAsync(databasePath, (copy) => {
       const columns = (table: string): Set<string> =>
         new Set((copy.prepare(`PRAGMA table_info("${table}")`).all() as Array<{ name: string }>).map((row) => row.name));
       const repositories = columns("repositories");
@@ -183,7 +183,7 @@ export const judgeStartBeforeOpening = async (config: StartGateConfig): Promise<
     ...gitHubGateFindings({ credentialInstalled: credentials.available(), permissionsOk: credentials.permissionsOk() }),
   );
 
-  const registered = registeredCheckouts(config.databasePath);
+  const registered = await registeredCheckouts(config.databasePath);
   if ("notJudged" in registered) notJudged.push(`repository and worktree probes: ${registered.notJudged}`);
   else if ("unavailable" in registered) {
     findings.push({
