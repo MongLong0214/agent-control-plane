@@ -718,6 +718,12 @@ const DATABASE_HIGH_WATER_GUARD = "ACP_ROLLBACK_DATABASE_HIGH_WATER";
  * the flag.
  */
 const REPLACEMENT_DATABASE_GUARD = "ACP_ROLLBACK_REPLACEMENT_DATABASE";
+/**
+ * How long the sealed state-admin restore may run before the install gives up on it. The restore
+ * copies one database image into place and renames it, so it is seconds for any real image; ten
+ * minutes is a bound on a stuck child, not an expected duration.
+ */
+const RESTORE_TIMEOUT_MS = 600_000;
 const REPLACEMENT_SOURCE_FORMAT = "agent-control-plane.rollback-replacement/v1";
 
 const quoteIdentifier = (name: string): string => `"${name.replaceAll('"', '""')}"`;
@@ -2699,11 +2705,24 @@ export const applyRollbackPair = (
       // refusal compensates the three steps above and leaves the database as it is.
       if (staged.replacement !== undefined) checkLiveDatabase();
       databaseReplaced = true;
-      execFileSync(
-        installedNode,
-        [installedStateAdmin, "restore", staged.databasePath, "--database", databaseDestination, "--confirm-restore"],
-        { encoding: "utf8", stdio: "pipe" },
-      );
+      try {
+        execFileSync(
+          installedNode,
+          [installedStateAdmin, "restore", staged.databasePath, "--database", databaseDestination, "--confirm-restore"],
+          { encoding: "utf8", stdio: "pipe", timeout: RESTORE_TIMEOUT_MS, killSignal: "SIGKILL" },
+        );
+      } catch (restoreError) {
+        // A restore that outlives its bound is a refusal, not a wait: the install ends here and the
+        // handler below puts the previous generation back, the database from the recovery point.
+        if ((restoreError as { code?: string }).code === "ETIMEDOUT") {
+          throw acpError(
+            ReasonCode.INTERNAL_ERROR,
+            `the sealed state-admin restore did not finish within ${RESTORE_TIMEOUT_MS / 1000} seconds`,
+            { databaseDestination, timeoutMs: RESTORE_TIMEOUT_MS },
+          );
+        }
+        throw restoreError;
+      }
       // Exit zero is a claim, not a result. Whatever the sealed state-admin did, the destination
       // now has to be the image that was staged, byte for byte, or this rollback did not happen.
       const restoredDigest = hashFile(databaseDestination);
