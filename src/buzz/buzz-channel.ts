@@ -209,7 +209,8 @@ export interface BuzzChannelOptions {
   readonly ownerPubkeys: readonly string[];
   /** Hands one notification to the session. Resolves once it is written to the transport. */
   readonly onNotification: (notification: ChannelNotification) => Promise<void>;
-  readonly onReceipt?: (receipt: ChannelReceipt) => void;
+  /** Writes a receipt for the daemon. Answering `false`, or throwing, says it was not written: a reply is then reported again when the relay replays it. */
+  readonly onReceipt?: (receipt: ChannelReceipt) => void | boolean;
   readonly onDiagnostic?: (line: string) => void;
   readonly openSocket?: BuzzRelaySocketFactory;
   readonly scheduler?: ChannelScheduler;
@@ -368,6 +369,8 @@ export class BuzzChannelRelay {
    * thread it belongs to, and whether it was delivered. Dedupe and parents are both read from this one map.
    */
   readonly #events = new Map<string, KnownEvent>();
+  /** Own replies whose `replied` receipt was written by this process: a replay of one is never reported again, whether or not it is still remembered. */
+  readonly #reported = new Set<string>();
   /** The `since` of the subscription that is open now: it can still return anything written at or after it. */
   #activeSince: number | null = null;
   readonly #subId: string;
@@ -545,7 +548,7 @@ export class BuzzChannelRelay {
     this.#events.set(event.id, { at: event.created_at, author: this.pubkey, room: input.room, root, exactRoot: true, delivered: false });
     this.#touchThread(root, input.room, Math.min(event.created_at, this.#sched.nowSeconds()));
     this.#persist();
-    this.#o.onReceipt?.({
+    this.#reportReply({
       type: "replied",
       event,
       room: input.room,
@@ -828,26 +831,39 @@ export class BuzzChannelRelay {
     return true;
   }
 
+  /** Writes one `replied` receipt and remembers, for this process, that it was written; a refused or failed write is retried on a replay. */
+  #reportReply(receipt: Extract<ChannelReceipt, { type: "replied" }>): void {
+    let written: void | boolean;
+    try {
+      written = this.#o.onReceipt?.(receipt);
+    } catch {
+      written = false;
+    }
+    if (written !== false) this.#reported.add(receipt.event.id);
+  }
+
   /**
-   * A reply this CTO posted by a path other than the reply tool (the buzz CLI, say), seen on the relay: remembered as the
-   * reply tool remembers its own, and reported with the same `replied` receipt, so the daemon completes what it answered by
-   * the same checks. One already remembered (the reply tool's, or one an earlier process reported) is not reported again,
-   * and its remembered activity time is left alone: re-setting it from an old replay ages the thread out and drops a later
-   * follow-up in it.
+   * A reply this CTO posted, seen on the relay, and reported with the `replied` receipt the reply tool writes, so the daemon
+   * completes what it answered by the same checks. Whatever sent it (the reply tool, the buzz CLI), and whether or not an
+   * earlier process remembered it: a remembered one is reported again once, because its receipt may have been trimmed or
+   * never written. The daemon settles per row, so a repeat is harmless. Once this process has written the receipt, a
+   * replay is never reported again, even after the event itself has been forgotten.
    *
-   * Limit: a reply is reported once ever. If the receipts trim drops its `replied` receipt before the daemon has applied it,
-   * nothing writes it again, and the message it answered stays SENT.
+   * A remembered reply's activity time is left alone: re-setting it from an old replay ages the thread out and drops a later
+   * follow-up in it.
    */
   #ownReply(event: RelayEvent): void {
-    if (event.kind !== BUZZ_MENTION_KIND || this.#events.has(event.id)) return;
+    if (event.kind !== BUZZ_MENTION_KIND || this.#reported.has(event.id)) return;
     const rooms = tagValues(event, "h");
     const room = rooms.length === 1 ? rooms[0]! : "";
     const parentEventId = replyParentOf(event);
     if (room === "" || !this.#o.rooms.includes(room) || parentEventId === null) return;
-    const root = threadRootOf(event);
-    this.#events.set(event.id, { at: event.created_at, author: this.pubkey, room, root, exactRoot: true, delivered: false });
-    this.#touchThread(root, room, Math.min(event.created_at, this.#sched.nowSeconds()));
-    this.#o.onReceipt?.({ type: "replied", event, room, parentEventId, ack: "ACCEPTED", repliedAt: this.#sched.nowSeconds() });
+    if (!this.#events.has(event.id)) {
+      const root = threadRootOf(event);
+      this.#events.set(event.id, { at: event.created_at, author: this.pubkey, room, root, exactRoot: true, delivered: false });
+      this.#touchThread(root, room, Math.min(event.created_at, this.#sched.nowSeconds()));
+    }
+    this.#reportReply({ type: "replied", event, room, parentEventId, ack: "ACCEPTED", repliedAt: this.#sched.nowSeconds() });
   }
 
   /** The queue's pending messages for this role, once per process. See `BuzzChannelOptions.backlog`. */

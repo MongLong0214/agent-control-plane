@@ -114,11 +114,14 @@ const harness = (options: {
   backlog?: () => readonly { eventId: string; event: ReturnType<typeof sign> }[];
   answeredSince?: () => number | null;
   historyBefore?: number;
+  /** The first N replied-receipt appends fail (the sink answers `false`), as a full disk would. */
+  failReceipts?: number;
 } = {}) => {
   const connections: FakeConnection[] = [];
   const notifications: ChannelNotification[] = [];
   const receipts: ChannelReceipt[] = [];
   const scheduler = fakeScheduler();
+  let failures = options.failReceipts ?? 0;
   scheduler.set(options.now ?? 2_000);
   const openSocket: BuzzRelaySocketFactory = (_url, handlers) => {
     const connection: FakeConnection = {
@@ -152,7 +155,14 @@ const harness = (options: {
       if (options.failOnce?.delete(n.content)) throw new Error("transport closed");
       notifications.push(n);
     },
-    onReceipt: (r) => receipts.push(r),
+    onReceipt: (r) => {
+      if (failures > 0 && r.type === "replied") {
+        failures -= 1;
+        return false;
+      }
+      receipts.push(r);
+      return true;
+    },
     openSocket,
     scheduler,
     ...(options.store ? { store: options.store } : {}),
@@ -275,6 +285,59 @@ describe("a mention of this CTO reaches its session once, as untrusted data", ()
     const followUp = sign(ceo, [["h", ROOM], ["e", asked.id, "", "root"], ["e", old.id, "", "reply"]], "go ahead after all", NOW - 10);
     await h.deliver(connection, followUp);
     expect(h.notifications.map((n) => n.content)).toEqual(["go ahead after all"]);
+  });
+
+  it("re-reports once a remembered reply whose replied receipt never reached the daemon, and still delivers a later CEO follow-up", async () => {
+    const NOW = 200_000;
+    const asked = mention(ceo, "hold the deploy", NOW - 100_000);
+    const old = sign(cto, [["h", ROOM], ["e", asked.id, "", "reply"], ["p", ceoPub]], "held", NOW - 99_000);
+    // An earlier process remembered the reply, but its receipt was trimmed from the file before the daemon applied it.
+    const store: ChannelStateStore = {
+      load: () => ({ cursor: NOW - 3_600, failed: [], events: [[asked.id, NOW - 3_600, ceoPub, ROOM, asked.id, true], [old.id, NOW - 3_600, ctoPub, ROOM, asked.id, false]] }),
+      save: () => undefined,
+    };
+    const h = harness({ store, now: NOW, answeredSince: () => NOW - 200_000 });
+    const connection = await h.connect();
+    await h.deliver(connection, old);
+    await h.deliver(connection, old);
+    expect(h.receipts.filter((r) => r.type === "replied")).toEqual([
+      { type: "replied", event: old, room: ROOM, parentEventId: asked.id, ack: "ACCEPTED", repliedAt: NOW },
+    ]);
+    // The replay did not reset the thread's activity time: the CEO's follow-up in it is still for this CTO.
+    const followUp = sign(ceo, [["h", ROOM], ["e", asked.id, "", "root"], ["e", old.id, "", "reply"]], "go ahead after all", NOW - 10);
+    await h.deliver(connection, followUp);
+    expect(h.notifications.map((n) => n.content)).toEqual(["go ahead after all"]);
+  });
+
+  it("re-reports a reply its own receipt append failed for, on the relay's replay, and not again once it is written", async () => {
+    const h = harness({ failReceipts: 1 });
+    const connection = await h.connect();
+    const asked = mention(ceo, "hold the deploy", 1_500);
+    await h.deliver(connection, asked);
+    const cli = sign(cto, [["h", ROOM], ["e", asked.id, "", "reply"], ["p", ceoPub]], "held", 1_600);
+    await h.deliver(connection, cli);
+    expect(h.receipts.filter((r) => r.type === "replied")).toEqual([]);
+    await h.deliver(connection, cli);
+    await h.deliver(connection, cli);
+    expect(h.receipts.filter((r) => r.type === "replied")).toEqual([
+      { type: "replied", event: cli, room: ROOM, parentEventId: asked.id, ack: "ACCEPTED", repliedAt: 2_000 },
+    ]);
+  });
+
+  it("appends one replied receipt for an expired reply the own-posts lookback replays within one subscription", async () => {
+    const NOW = 200_000;
+    const asked = mention(ceo, "hold the deploy", NOW - 150_000);
+    // Older than the answerable retention, so it is forgotten the moment it is handled; the subscription still returns it again.
+    const expired = sign(cto, [["h", ROOM], ["e", asked.id, "", "reply"], ["p", ceoPub]], "held", NOW - 140_000);
+    const h = harness({ now: NOW, answeredSince: () => NOW - 200_000 });
+    const connection = await h.connect();
+    await h.deliver(connection, expired);
+    // A newer event moves the cursor past it, so nothing but the retention horizon keeps it, and the horizon has passed.
+    await h.deliver(connection, mention(ceo, "newer", NOW - 50));
+    await h.deliver(connection, expired);
+    await h.deliver(connection, mention(ceo, "newer still", NOW - 40));
+    await h.deliver(connection, expired);
+    expect(h.receipts.filter((r) => r.type === "replied")).toHaveLength(1);
   });
 
   it("shows a fresh conversation's backlog from before its switch as history, never as a plain notification", async () => {
