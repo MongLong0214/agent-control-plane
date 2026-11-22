@@ -36,5 +36,5 @@ const deliberate = {
 };
 
 export const UNBOUNDED_SUBPROCESS_EXCLUSIONS = new Map([
-  ["src/deploy/rollback-pair.ts:2159", deliberate.restore],
+  ["src/deploy/rollback-pair.ts:2359", deliberate.restore],
 ]);

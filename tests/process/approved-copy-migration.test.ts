@@ -91,6 +91,35 @@ const imprintOf = (path: string) => ({
 /** The header's `user_version`, read without connecting — the act under test is the connection. */
 const headerVersion = (path: string): number => readFileSync(path).readUInt32BE(60);
 
+/**
+ * A copy at a version above 25 whose shape is real: the v25 lineage with each step to `version`
+ * applied by the migration itself and its receipt recorded, as `Db.applyMigration` does. A header
+ * rewritten to 26 over a v25 shape would be a copy no start could produce.
+ */
+const seedThrough = (path: string, version: number): string => {
+  seedAt(path, 25);
+  const raw = new Database(path);
+  try {
+    raw.function("acp_schema_migration_authorized", () => 1);
+    for (const migration of MIGRATIONS.filter((step) => step.fromVersion >= 25 && step.toVersion <= version)) {
+      raw.exec("BEGIN IMMEDIATE");
+      migration.apply(raw);
+      raw
+        .prepare(
+          `INSERT INTO schema_migrations (version, migration_id, checksum, applied_at)
+           VALUES (?, ?, ?, ?)`,
+        )
+        .run(migration.toVersion, migration.id, migration.checksum(), "2026-08-23T03:00:00.000Z");
+      raw.pragma(`user_version = ${migration.toVersion}`);
+      raw.exec("COMMIT");
+    }
+  } finally {
+    raw.close();
+    chmodSync(path, 0o600);
+  }
+  return path;
+};
+
 /** A private directory with a seeded copy and, unless told otherwise, an approval for it. */
 const copyIn = (label: string, options: { approve?: boolean; version?: number } = {}) => {
   const dir = tempDir(`acp-u6-unit3-${label}-`);
@@ -475,7 +504,49 @@ describe("U6-UNIT3 migrate-approved-copy runs in the file it verified", () => {
     expect(imprintOf(other)).toEqual(otherBefore);
   }, 300_000);
 
-  it("refuses a copy at another version, and one with no approval at all", () => {
+  it("#1492: migrates a copy from the version it is actually at, not from 25", () => {
+    const dir = tempDir("acp-1492-from26-");
+    chmodSync(dir, 0o700);
+    const path = seedThrough(join(dir, "copy.sqlite"), 26);
+    expect(headerVersion(path)).toBe(26);
+    // The same approval the operator takes, naming the chain `migration-plan` shows for this copy.
+    const approval = approveMigration(path, "1492-from26");
+    expect(approval.fromVersion).toBe(26);
+
+    const result = run(["migrate-approved-copy", "--database-copy", path, "--confirm-migration"], {
+      ACP_STATE_DIR: dir,
+      HOME: dir,
+    });
+    expect(result.status, result.stderr).toBe(0);
+    const report = JSON.parse(result.stdout) as {
+      fromVersion: number;
+      toVersion: number;
+      migrations: Array<{ id: string; checksum: boolean }>;
+      approvalRetired: boolean;
+    };
+    expect(report.fromVersion).toBe(26);
+    expect(report.toVersion).toBe(SCHEMA_VERSION);
+    expect(report.migrations.map((step) => step.id)).toEqual(
+      MIGRATIONS.filter((migration) => migration.fromVersion >= 26).map((migration) => migration.id),
+    );
+    expect(report.migrations.every((step) => step.checksum)).toBe(true);
+    expect(report.approvalRetired).toBe(true);
+    expect(headerVersion(path)).toBe(SCHEMA_VERSION);
+
+    // Its refusal for a copy with no matching approval is unchanged at this version.
+    const bare = tempDir("acp-1492-from26-bare-");
+    chmodSync(bare, 0o700);
+    const unapproved = seedThrough(join(bare, "copy.sqlite"), 26);
+    const none = run(["migrate-approved-copy", "--database-copy", unapproved, "--confirm-migration"], {
+      ACP_STATE_DIR: bare,
+      HOME: bare,
+    });
+    expect(none.status).not.toBe(0);
+    expect(none.stderr).toContain("no approval is on file");
+    expect(headerVersion(unapproved)).toBe(26);
+  }, 300_000);
+
+  it("refuses a copy whose chain cannot run, and one with no approval at all", () => {
     const wrongVersion = copyIn("v24", { version: 24 });
     const wrong = run(
       ["migrate-approved-copy", "--database-copy", wrongVersion.path, "--confirm-migration"],
