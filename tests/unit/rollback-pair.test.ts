@@ -1726,7 +1726,7 @@ describe("state-admin migrate-approved, then the rollback (migrate-before-start)
     expect(digestOfFile(fixture.databasePath)).toBe(digestOfFile(image));
   }, 180_000);
 
-  it("round 2 item 4: migrate-approved takes a zero-length -wal and its -shm as nothing uncheckpointed, and refuses a log that holds something", async () => {
+  it("round 2 item 4: migrate-approved takes a zero-length -wal and its -shm as nothing uncheckpointed", async () => {
     const { fixture } = await sealAtV25();
     const raw = new Database(fixture.databasePath);
     raw.pragma("journal_mode = WAL");
@@ -1739,23 +1739,46 @@ describe("state-admin migrate-approved, then the rollback (migrate-before-start)
     const { status } = await runMigrateApproved(fixture.databasePath);
     expect(status).toBe(0);
     expect(userVersionOf(fixture.databasePath)).toBe(SCHEMA_VERSION);
+  }, 180_000);
 
-    // A log with a frame in it is not nothing: the write is only there, and the command will not guess.
-    const held = await sealAtV25();
-    const wal = new Database(held.fixture.databasePath);
-    wal.pragma("journal_mode = WAL");
-    wal.pragma("wal_autocheckpoint = 0");
-    wal.exec("CREATE TABLE uncheckpointed (id INTEGER)");
-    try {
-      expect(statSync(`${held.fixture.databasePath}-wal`).size).toBeGreaterThan(0);
-      approveMigration(held.fixture.databasePath, "migrate-before-start-test");
-      await expect(
-        stateAdmin(["migrate-approved", "--database", held.fixture.databasePath, "--confirm-migration"]),
-      ).rejects.toThrow(/checkpointed database/);
-      expect(userVersionOf(held.fixture.databasePath)).toBe(25);
-    } finally {
-      wal.close();
-    }
+  it("final review C: a stopped database whose write-ahead log is non-empty but fully checkpointed still migrates, and a refusal on it moves nothing", async () => {
+    // A log's size says nothing about whether frames remain in it; a crashed daemon leaves exactly this.
+    const leaveLog = (databasePath: string): string => {
+      const raw = new Database(databasePath);
+      raw.pragma("journal_mode = WAL");
+      raw.pragma("wal_autocheckpoint = 0");
+      raw.exec("CREATE TABLE zz_probe (x INTEGER); DROP TABLE zz_probe;");
+      raw.pragma("wal_checkpoint(PASSIVE)");
+      const log = `${databasePath}-wal`;
+      expect(statSync(log).size).toBeGreaterThan(0);
+      const frames = readFileSync(log);
+      raw.close();
+      // The process that wrote them is gone; its log is still beside the file.
+      writeFileSync(log, frames, { mode: 0o600 });
+      rmSync(`${databasePath}-shm`, { force: true });
+      expect(statSync(log).size).toBeGreaterThan(0);
+      return log;
+    };
+
+    // Not approved: refused, and neither the file nor its log moved, and no shared-memory file appeared.
+    const unapproved = await sealAtV25();
+    const log = leaveLog(unapproved.fixture.databasePath);
+    const main = digestOfFile(unapproved.fixture.databasePath);
+    const logBefore = digestOfFile(log);
+    await expect(
+      stateAdmin(["migrate-approved", "--database", unapproved.fixture.databasePath, "--confirm-migration"]),
+    ).rejects.toMatchObject({ reasonCode: ReasonCode.SCHEMA_MIGRATION_NOT_APPROVED });
+    expect(digestOfFile(unapproved.fixture.databasePath)).toBe(main);
+    expect(digestOfFile(log)).toBe(logBefore);
+    expect(existsSync(`${unapproved.fixture.databasePath}-shm`)).toBe(false);
+
+    // Approved: the open takes the file as the daemon's first open would.
+    const approved = await sealAtV25();
+    approveMigration(approved.fixture.databasePath, "migrate-before-start-test");
+    leaveLog(approved.fixture.databasePath);
+    const { status } = await runMigrateApproved(approved.fixture.databasePath);
+    expect(status).toBe(0);
+    expect(userVersionOf(approved.fixture.databasePath)).toBe(SCHEMA_VERSION);
   }, 180_000);
 
   it("refuses a database already at this build's schema, one that does not exist, and an unconfirmed run", async () => {

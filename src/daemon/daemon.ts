@@ -662,6 +662,12 @@ export class Daemon {
   readonly attachments: RoleAttachmentCredentials;
   #timers: NodeJS.Timeout[] = [];
   #startedAt: string | null = null;
+  /**
+   * Whether `options.lock` arrived already held, and has not yet been used by a start. Only that one start
+   * may run under a lease it did not take; every later call on this instance acquires, finds the lock
+   * held by this very instance, and is refused, as a second start on one daemon always was.
+   */
+  #lockHandedOver = false;
   #mode: DaemonMode = "NORMAL";
   #bootstrapBlocking: BlockingFinding[] = [];
   /** #1189 D1 — what this start is stalled on, in `health.json` until a start succeeds. */
@@ -739,6 +745,7 @@ export class Daemon {
     mkdirSync(options.stateDir, { recursive: true });
     chmodSync(options.stateDir, 0o700);
     this.lock = options.lock ?? new SingleInstanceLock(join(options.stateDir, "agentcpd.lock"));
+    this.#lockHandedOver = options.lock?.held() === true;
     // #1336 R-1 — the same custody rule the MCP sockets apply (`drivenCredentialNotHeld` in agentcpd.ts):
     // an attachment is scoped to a PRIMARY_CTO, which is driven when its spawn record says DRIVEN.
     this.attachments = new RoleAttachmentCredentials(cp.sessions, cp.bindings, cp.clock, (sessionId) =>
@@ -1385,9 +1392,11 @@ export class Daemon {
    */
   async start(options: DaemonStartOptions = {}): Promise<Decision<ReconcileReport>> {
     const startedAt = this.cp.clock.nowIso();
-    // A lock the caller took before it opened anything is this daemon's already; only one not yet held
-    // is acquired here.
-    if (!this.lock.held()) {
+    // A lock the caller took before it opened anything is this daemon's already, for this one start. A
+    // repeat call does not inherit it: it acquires, and `acquire` refuses a lock this instance holds.
+    if (this.#lockHandedOver && this.lock.held()) {
+      this.#lockHandedOver = false;
+    } else {
       const acquired = this.lock.acquire(startedAt);
       if (!acquired.allowed) {
         this.recordLockContention(acquired.evidence);

@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { closeSync, existsSync, lstatSync, openSync, readFileSync, readSync, realpathSync, statSync } from "node:fs";
+import { closeSync, existsSync, lstatSync, openSync, readFileSync, readSync, realpathSync } from "node:fs";
 import { homedir, userInfo } from "node:os";
 import { dirname, isAbsolute, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -317,32 +317,19 @@ const daemonIsLive = (databasePath: string): { pid: number; startedAt: string } 
 };
 
 /** Read the main-file version without asking SQLite to materialize WAL or SHM on a refusal. */
-const offlineSchemaVersion = (
-  databasePath: string,
-  what = "offline suspension",
-  options: { acceptEmptyLog?: boolean } = {},
-): number => {
+const offlineSchemaVersion = (databasePath: string): number => {
   assertPrivateDatabaseFiles(databasePath);
   // A version committed only in a WAL is not in the main header. Refuse instead of guessing or
   // opening SQLite, which can create sidecars even in read-only mode.
-  //
-  // `acceptEmptyLog`: a zero-length `-wal` (and the `-shm` that indexes it) holds nothing uncheckpointed.
-  // An earlier read-only open of a WAL database leaves exactly that behind, so a command that must run
-  // after one does not refuse what carries no state. A log or journal with anything in it still refuses.
-  const holdsNothing = (path: string): boolean => existsSync(path) && statSync(path).size === 0;
-  const standing = databaseSidecarPaths(databasePath).filter((path) => existsSync(path));
-  const refused = options.acceptEmptyLog
-    ? standing.filter((path) => !(path.endsWith("-shm") || holdsNothing(path)))
-    : standing;
-  if (refused.length > 0) {
-    throw new Error(`${what} requires a checkpointed database without journal sidecars`);
+  if (databaseSidecarPaths(databasePath).some((path) => existsSync(path))) {
+    throw new Error("offline suspension requires a checkpointed database without journal sidecars");
   }
   const fd = openSync(databasePath, "r");
   try {
     const header = Buffer.alloc(100);
     if (readSync(fd, header, 0, header.length, 0) !== header.length ||
         !header.subarray(0, 16).equals(Buffer.from("SQLite format 3\0"))) {
-      throw new Error(`${what} requires a valid SQLite database header`);
+      throw new Error("offline suspension requires a valid SQLite database header");
     }
     return header.readUInt32BE(60);
   } finally {
@@ -374,8 +361,8 @@ const migrateApprovedInPlace = (databasePath: string): {
   approvedBy: string;
   approvalRetired: boolean;
 } => {
-  // Every refusal below happens before SQLite touches the file: no handle is opened for reading either,
-  // because a read-only connection to a WAL database creates `-shm` and `-wal` beside it.
+  // Every refusal below happens before SQLite opens the file itself: what is read, is read from a private
+  // copy, because even a read-only connection to a WAL database creates `-shm` and `-wal` beside it.
   if (!existsSync(databasePath)) throw new Error(`refusing to migrate: ${databasePath} does not exist`);
   ensurePrivateDirectory(dirname(databasePath));
   const lock = new SingleInstanceLock(join(dirname(databasePath), "agentcpd.lock"));
@@ -384,7 +371,12 @@ const migrateApprovedInPlace = (databasePath: string): {
     throw new Error(`refusing to migrate while another process holds the state lock: ${acquired.message}`);
   }
   try {
-    const version = offlineSchemaVersion(databasePath, "migrate-approved", { acceptEmptyLog: true });
+    // Judged from a private copy, whatever sits beside the file: a write-ahead log or hot journal is
+    // recovered in the copy, so the version is the true one, and nothing about the original (its bytes,
+    // its sidecars) moves on a refusal. Size says nothing about whether frames remain, so no sidecar is a
+    // reason to refuse; the open below takes the file as the daemon's first open would.
+    assertPrivateDatabaseFiles(databasePath);
+    const version = withDatabaseSnapshot(databasePath, (copy) => Number(copy.pragma("user_version", { simple: true })));
     if (version === 0) {
       throw new Error("refusing to migrate a database that carries no schema version; it has nothing to migrate from");
     }

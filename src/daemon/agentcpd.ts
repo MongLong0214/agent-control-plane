@@ -6521,10 +6521,27 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
   if ("refused" in taken) return refuseBeforeOpening(taken.refused);
   const startLock = taken.lock;
   process.once("exit", () => startLock.release());
+  // From the moment the lock is held, a stop signal gives it back and leaves. The daemon's own shutdown is
+  // installed far below, after the control plane and the listeners exist; without this a SIGTERM during the
+  // gate's probes ended the process by default, `exit` never fired, and `agentcpd.lock/holder.json` stayed
+  // behind for the installer to wait on forever. It writes nothing: no database is open yet, and when one
+  // is, a start that was never served has no stop to record.
+  const earlyStop = (): void => {
+    startLock.release();
+    process.exit(0);
+  };
+  process.on("SIGTERM", earlyStop);
+  process.on("SIGINT", earlyStop);
+  const dropEarlyStop = (): void => {
+    process.off("SIGTERM", earlyStop);
+    process.off("SIGINT", earlyStop);
+  };
   const refusedBeforeOpening = await refuseStartBeforeOpening(config);
   if (refusedBeforeOpening !== null) {
-    // Given back before the backoff is waited out: a daemon that refuses does not hold the lock while it sleeps.
+    // Given back before the backoff is waited out: a daemon that refuses does not hold the lock while it
+    // sleeps, and a signal during that sleep ends the process the way it always did.
     startLock.release();
+    dropEarlyStop();
     return refuseBeforeOpening(refusedBeforeOpening);
   }
 
@@ -6737,6 +6754,7 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
   // `install-launchd.sh upgrade` and `rollback` both wait for that file to disappear before
   // they will touch the database — so a parked daemon would fail every deploy on the host this
   // whole change exists for.
+  dropEarlyStop();
   process.on("SIGTERM", () => void shutdown("SIGTERM"));
   process.on("SIGINT", () => void shutdown("SIGINT"));
 

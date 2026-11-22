@@ -3,6 +3,7 @@ import { type ChildProcess, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
   chmodSync,
+  copyFileSync,
   existsSync,
   lstatSync,
   mkdirSync,
@@ -64,6 +65,7 @@ const imageOf = (path: string) => ({
   walBytes: existsSync(`${path}-wal`) ? sha(`${path}-wal`) : null,
   shm: existsSync(`${path}-shm`),
   journal: existsSync(`${path}-journal`),
+  journalBytes: existsSync(`${path}-journal`) ? sha(`${path}-journal`) : null,
   header: existsSync(path) ? readFileSync(path).subarray(18, 20).toString("hex") : null,
 });
 
@@ -401,6 +403,35 @@ describe("a start the doctor will refuse leaves the database as it found it (mig
     expectRefusedUntouched(result, database, before, "WORKTREE_PROBE_FAILED");
   }, 120_000);
 
+  it("final review A: a SIGTERM while a gate git probe is paused gives the lock back and writes nothing", async () => {
+    const { home, root, database } = newHome();
+    currentDatabase(database);
+    const repo = makeRepo({ "docs.md": "# gate\n" });
+    registerCheckout(database, repo);
+    // A `git` that says it started and then waits: the gate's first probe, held open.
+    const bin = mkdtempSync(join(tmpdir(), "acp-gate-slow-git-"));
+    homes.push(bin);
+    const marker = join(bin, "started");
+    writeFileSync(join(bin, "git"), `#!/bin/sh\necho started > "${marker}"\nexec sleep 8\n`, { mode: 0o755 });
+    const before = imageOf(database);
+
+    const run = startDaemon(home, { PATH: `${bin}:${process.env["PATH"] ?? ""}` });
+    const deadline = Date.now() + 60_000;
+    while (!existsSync(marker)) {
+      if (Date.now() > deadline) throw new Error(`the gate never reached its git probe; stderr: ${run.stderr().slice(-400)}`);
+      await new Promise<void>((resolveWait) => setTimeout(resolveWait, 50));
+    }
+    // The probe is paused with the lock held: this is the window the signal lands in.
+    expect(existsSync(join(root, "agentcpd.lock"))).toBe(true);
+    run.child.kill("SIGTERM");
+    const exit = await run.exited;
+
+    expect(exit.status === 0 || exit.signal === "SIGTERM").toBe(true);
+    // Nothing is left for the installer to wait on, and the database is the file it was.
+    expect(existsSync(join(root, "agentcpd.lock"))).toBe(false);
+    expect(imageOf(database)).toEqual(before);
+  }, 120_000);
+
   it("round 2 item 5: a start that finds agentcpd.lock held writes nothing and says so", async () => {
     const { home, root, database } = newHome();
     currentDatabase(database);
@@ -556,6 +587,37 @@ describe("the gate before the database is opened (judgeStartBeforeOpening)", () 
       if (previous === undefined) delete process.env["TMPDIR"];
       else process.env["TMPDIR"] = previous;
     }
+  });
+
+  it("final review B: a hot rollback journal is recovered in the copy, and the original is left exactly as it was", async () => {
+    const { root, database } = newHome();
+    currentDatabase(database, "DELETE");
+    registerCheckout(database, join(root, "no-such-checkout"));
+    // A transaction big enough to spill pages to the main file, caught mid-way: the file is changed, and
+    // the journal holds the pages that undo it. That pair, copied elsewhere, is what a killed daemon leaves.
+    const writer = new Database(database);
+    writer.pragma("cache_size = 10");
+    writer.exec("BEGIN");
+    writer.exec("CREATE TABLE gate_pad (b BLOB)");
+    writer.prepare("INSERT INTO gate_pad VALUES (zeroblob(?))").run(8 * 1024 * 1024);
+    const hot = join(root, "hot.sqlite");
+    copyFileSync(database, hot);
+    copyFileSync(`${database}-journal`, `${hot}-journal`);
+    chmodSync(hot, 0o600);
+    chmodSync(`${hot}-journal`, 0o600);
+    writer.exec("ROLLBACK");
+    writer.close();
+    expect(statSync(`${hot}-journal`).size).toBeGreaterThan(0);
+    const before = imageOf(hot);
+    expect(before.journal).toBe(true);
+
+    const { judgeStartBeforeOpening } = await import("../../src/daemon/start-gate.ts");
+    const judged = await judgeStartBeforeOpening(gateConfig(root, hot));
+
+    // Judged as an ordinary database, not refused for being unreadable.
+    expect(judged.findings.map((finding) => finding.code)).toContain("REPOSITORY_UNREADABLE");
+    expect(judged.findings.map((finding) => finding.code)).not.toContain("START_GATE_DATABASE_UNREADABLE");
+    expect(imageOf(hot)).toEqual(before);
   });
 
   it("lets a start with a readable credential and sound paths go on, writing nothing", async () => {

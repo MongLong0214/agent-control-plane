@@ -10,8 +10,8 @@ import { join } from "node:path";
  * creates `-shm` and a zero-length `-wal` beside it, and a later offline step that requires a database with
  * nothing uncheckpointed then refuses what a read left behind. So the read is made on a private copy: the
  * main file, and the write-ahead log or hot journal when one holds anything, copied into a directory only
- * this process can enter, and opened read-only there. The originals are read by the copy and nowhere else,
- * and never opened for writing.
+ * this process can enter, and opened there. The originals are read by the copy and nowhere else, and never
+ * opened.
  *
  * The copy is a point-in-time image of files nobody is writing: the callers hold `agentcpd.lock`, or run
  * with the daemon stopped. It is removed when `read` returns.
@@ -42,9 +42,15 @@ export const withDatabaseSnapshot = <T>(databasePath: string, read: (copy: Datab
         chmodSync(`${target}${suffix}`, 0o600);
       }
     }
-    copy = new Database(target, { readonly: true, fileMustExist: true });
-    // Forces recovery of a copied log now, so a copy that cannot be read fails here and not mid-query.
+    // Opened read-write, in a directory that is only the copy's: SQLite rolls a hot journal back and
+    // replays a write-ahead log only on a connection that may write, and a hot journal is what a daemon
+    // killed mid-transaction leaves. The recovery lands in the copy. The originals are not open at all, so
+    // the real open still finds them exactly as they were and recovers them as it always did. Reads from
+    // here on are held to reads.
+    copy = new Database(target, { fileMustExist: true });
+    // Forces recovery now, so a copy that cannot be read fails here and not mid-query.
     copy.pragma("schema_version", { simple: true });
+    copy.pragma("query_only = ON");
   } catch (error) {
     try {
       copy?.close();
