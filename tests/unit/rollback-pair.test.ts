@@ -19,13 +19,15 @@ import {
 import { basename, dirname, join } from "node:path";
 
 import Database from "better-sqlite3";
-import { afterAll, describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it, vi } from "vitest";
 
 import { isAcpError, type AcpError } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
+import { SingleInstanceLock } from "../../src/daemon/single-instance.ts";
 import { Db, SCHEMA_VERSION } from "../../src/db/database.ts";
 import { approveMigration, migrationApprovalPath } from "../../src/db/migration-approval.ts";
 import { MIGRATIONS } from "../../src/db/migrations.ts";
+import { main as stateAdmin } from "../../src/db/state-admin.ts";
 import {
   ROLLBACK_PAIR_INDEX_FILE,
   ROLLBACK_PAIR_MANIFEST_FILE,
@@ -1567,4 +1569,109 @@ describe("a rollback across the approved migration it was sealed for (#1492)", (
     expect(refused.reasonCode, refused.message).toBe(STALE);
     expect(refused.evidence["migrationReplay"]).toBeUndefined();
   }, 120_000);
+});
+
+/**
+ * `state-admin migrate-approved` is the offline step that makes an upgrade verifiable before the daemon
+ * writes anything: it applies the approved chain through the same open the daemon's first open makes,
+ * under the daemon's lock, and stops. What it leaves is exactly what the rollback guard's replay expects,
+ * so the pair sealed before the approval restores byte for byte.
+ */
+const runMigrateApproved = async (databasePath: string): Promise<{ status: number; report: Record<string, unknown> }> => {
+  const written: string[] = [];
+  const spy = vi.spyOn(process.stdout, "write").mockImplementation(((chunk: string | Uint8Array) => {
+    written.push(String(chunk));
+    return true;
+  }) as typeof process.stdout.write);
+  try {
+    const status = await stateAdmin(["migrate-approved", "--database", databasePath, "--confirm-migration"]);
+    return { status, report: JSON.parse(written.join("")) as Record<string, unknown> };
+  } finally {
+    spy.mockRestore();
+  }
+};
+
+describe("state-admin migrate-approved, then the rollback (migrate-before-start)", () => {
+  it("migrates offline, and the rollback accepts it and restores the sealed image byte for byte", async () => {
+    const { fixture, pair } = await sealAtV25({ installingNode: true });
+    const image = join(pair.root, pair.manifest.database.member);
+    approveMigration(fixture.databasePath, "migrate-before-start-test");
+
+    const { status, report } = await runMigrateApproved(fixture.databasePath);
+    expect(status).toBe(0);
+    expect(report).toMatchObject({ fromVersion: 25, toVersion: SCHEMA_VERSION, approvalRetired: true });
+    expect(userVersionOf(fixture.databasePath)).toBe(SCHEMA_VERSION);
+    expect(existsSync(migrationApprovalPath(fixture.databasePath))).toBe(false);
+    expect(retiredApprovals(fixture.databasePath)).toHaveLength(1);
+    // No daemon, no audit beyond the migration's own: the sealed high-water mark has not moved.
+    expect(maxAuditEventId(fixture.databasePath)).toBe(pair.manifest.database.highWater!.auditEventId);
+    for (const suffix of ["-wal", "-shm"]) expect(existsSync(`${fixture.databasePath}${suffix}`)).toBe(false);
+    // The lock the command held is gone.
+    const lock = new SingleInstanceLock(join(dirname(fixture.databasePath), "agentcpd.lock"));
+    expect(lock.acquire(new Date().toISOString()).allowed).toBe(true);
+    lock.release();
+
+    const validated = validateRollbackPair(pair.root, expectationFor(fixture, pair));
+    expect(validated.approvedMigration).toMatchObject({
+      fromVersion: 25,
+      toVersion: SCHEMA_VERSION,
+      approvedBy: "migrate-before-start-test",
+    });
+    const migratedDigest = digestOfFile(fixture.databasePath);
+    const applied = rollbackToSealedPair(pair.root, expectationFor(fixture, pair), join(fixture.home, "stage-migrate-approved"));
+    expect(applied.approvedMigration).toMatchObject({ fromVersion: 25, toVersion: SCHEMA_VERSION });
+    expect(digestOfFile(fixture.databasePath)).toBe(digestOfFile(image));
+    expect(digestOfFile(fixture.databasePath)).not.toBe(migratedDigest);
+    expect(userVersionOf(fixture.databasePath)).toBe(25);
+  }, 180_000);
+
+  it("refuses with no approval on file, and leaves the database as it was", async () => {
+    const { fixture } = await sealAtV25();
+    const before = digestOfFile(fixture.databasePath);
+    await expect(stateAdmin(["migrate-approved", "--database", fixture.databasePath, "--confirm-migration"])).rejects.toMatchObject({
+      reasonCode: ReasonCode.SCHEMA_MIGRATION_NOT_APPROVED,
+    });
+    expect(userVersionOf(fixture.databasePath)).toBe(25);
+    expect(digestOfFile(fixture.databasePath)).toBe(before);
+    expect(retiredApprovals(fixture.databasePath)).toHaveLength(0);
+  }, 120_000);
+
+  it("refuses while another process holds agentcpd.lock, keeps the approval, and runs once the lock is free", async () => {
+    const { fixture } = await sealAtV25();
+    approveMigration(fixture.databasePath, "migrate-before-start-test");
+    const before = digestOfFile(fixture.databasePath);
+    const holder = new SingleInstanceLock(join(dirname(fixture.databasePath), "agentcpd.lock"));
+    expect(holder.acquire(new Date().toISOString()).allowed).toBe(true);
+    try {
+      await expect(
+        stateAdmin(["migrate-approved", "--database", fixture.databasePath, "--confirm-migration"]),
+      ).rejects.toThrow(/state lock/);
+    } finally {
+      holder.release();
+    }
+    expect(userVersionOf(fixture.databasePath)).toBe(25);
+    expect(digestOfFile(fixture.databasePath)).toBe(before);
+    expect(existsSync(migrationApprovalPath(fixture.databasePath))).toBe(true);
+
+    const { status } = await runMigrateApproved(fixture.databasePath);
+    expect(status).toBe(0);
+    expect(userVersionOf(fixture.databasePath)).toBe(SCHEMA_VERSION);
+  }, 180_000);
+
+  it("refuses a database already at this build's schema, one that does not exist, and an unconfirmed run", async () => {
+    const { fixture } = await sealAtV25();
+    approveMigration(fixture.databasePath, "migrate-before-start-test");
+    await runMigrateApproved(fixture.databasePath);
+    const migrated = digestOfFile(fixture.databasePath);
+    await expect(
+      stateAdmin(["migrate-approved", "--database", fixture.databasePath, "--confirm-migration"]),
+    ).rejects.toThrow(/already at schema version/);
+    expect(digestOfFile(fixture.databasePath)).toBe(migrated);
+
+    const missing = join(dirname(fixture.databasePath), "absent.sqlite");
+    await expect(stateAdmin(["migrate-approved", "--database", missing, "--confirm-migration"])).rejects.toThrow(/does not exist/);
+    expect(existsSync(missing)).toBe(false);
+
+    await expect(stateAdmin(["migrate-approved", "--database", fixture.databasePath])).rejects.toThrow(/--confirm-migration/);
+  }, 180_000);
 });

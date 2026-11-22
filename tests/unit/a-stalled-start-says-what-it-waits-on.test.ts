@@ -145,7 +145,7 @@ describe("#1189 D1: a start refused on a permanent finding", () => {
       const stateDir = tempDir("acp-1189-refused-");
       const sent: Array<{ messageIds: readonly string[]; lockHeld: boolean }> = [];
       const start = async () => {
-        const daemon = new Daemon(h.cp, { stateDir });
+        const daemon = new Daemon(h.cp, { gateBeforeWrites: false, stateDir });
         return daemon.start({
           stallNotice: { deliver: async (messageIds) => { sent.push({ messageIds, lockHeld: daemon.lock.held() }); } },
         });
@@ -217,7 +217,7 @@ describe("#1189 D1: a start refused on a permanent finding", () => {
     const h = makeHarness();
     try {
       const stateDir = tempDir("acp-1189-no-ceo-");
-      const daemon = () => new Daemon(h.cp, { stateDir });
+      const daemon = () => new Daemon(h.cp, { gateBeforeWrites: false, stateDir });
       expect((await daemon().start()).allowed).toBe(false);
       expect(stallNotices(h)).toHaveLength(0);
       expect(health(stateDir)["startStall"]).toMatchObject({
@@ -243,19 +243,19 @@ describe("#1189 D1: a start refused on a permanent finding", () => {
       const capacityDir = join(h.root, "capacity");
 
       chmodSync(capacityDir, 0o755);
-      expect(await new Daemon(h.cp, { stateDir }).start()).toMatchObject({ allowed: false, reasonCode: ReasonCode.DOCTOR_ERROR });
+      expect(await new Daemon(h.cp, { gateBeforeWrites: false, stateDir }).start()).toMatchObject({ allowed: false, reasonCode: ReasonCode.DOCTOR_ERROR });
       expect(stallNotices(h).map((row) => (row.payload["findings"] as Array<{ code: string }>).map((f) => f.code)))
         .toEqual([["STATE_PATH_INSECURE"]]);
 
       chmodSync(capacityDir, 0o700);
       h.clock.advance(10 * 60_000);
-      const healthy = new Daemon(h.cp, { stateDir });
+      const healthy = new Daemon(h.cp, { gateBeforeWrites: false, stateDir });
       expect((await healthy.start()).allowed).toBe(true);
       expect(health(stateDir)["startStall"]).toBeNull();
       await healthy.stop();
 
       chmodSync(capacityDir, 0o755);
-      expect((await new Daemon(h.cp, { stateDir }).start()).allowed).toBe(false);
+      expect((await new Daemon(h.cp, { gateBeforeWrites: false, stateDir }).start()).allowed).toBe(false);
       const notices = stallNotices(h);
       expect(notices).toHaveLength(2);
       expect(notices[1]!.payload["stallId"]).not.toEqual(notices[0]!.payload["stallId"]);
@@ -333,7 +333,7 @@ describe("#1189 WIP 2: a start without the trusted gate credential is an explici
       // A launchd-style supervisor: started again after each backoff, past the crash-loop threshold.
       const STARTS = 4;
       for (let attempt = 1; attempt <= STARTS; attempt += 1) {
-        const daemon = new Daemon(h.cp, { stateDir });
+        const daemon = new Daemon(h.cp, { gateBeforeWrites: false, stateDir });
         const refused = await daemon.start({ stallNotice: { deliver: async (messageIds) => { sent.push(messageIds); } } });
         // An explicit failure of this start: refused with its reason, its lock let go, nothing left running or parked.
         expect(refused).toMatchObject({ allowed: false, reasonCode: ReasonCode.DOCTOR_BLOCKED });
@@ -405,7 +405,7 @@ describe("#1189 WIP 2: a start without the trusted gate credential is an explici
       const stateDir = tempDir("acp-1189-wip2-upgrade-");
       const sent: Array<readonly string[]> = [];
       const start = async () => {
-        const refused = await new Daemon(h.cp, { stateDir }).start({
+        const refused = await new Daemon(h.cp, { gateBeforeWrites: false, stateDir }).start({
           stallNotice: { deliver: async (messageIds) => { sent.push(messageIds); } },
         });
         expect(refused).toMatchObject({ allowed: false, reasonCode: ReasonCode.DOCTOR_BLOCKED });
@@ -448,7 +448,7 @@ describe("#1189 WIP 2: a start without the trusted gate credential is an explici
       claimBaseNotice(h, baseNotice);
       h.clock.advance(10 * 60_000);
       const stateDir = tempDir("acp-1189-wip2-dead-claim-");
-      expect(await new Daemon(h.cp, { stateDir }).start({ stallNotice: { deliver: async () => {} } }))
+      expect(await new Daemon(h.cp, { gateBeforeWrites: false, stateDir }).start({ stallNotice: { deliver: async () => {} } }))
         .toMatchObject({ allowed: false, reasonCode: ReasonCode.DOCTOR_BLOCKED });
       expect(h.cp.db.get<{ status: string }>(`SELECT status FROM outbox WHERE message_id = ?`, [baseNotice])!.status).toBe("REJECTED");
       expect(h.cp.audit.byKind("CEO_NOTIFICATION_WITHDRAWN").map((event) => event.evidence)).toEqual([
@@ -474,7 +474,7 @@ describe("#1189 WIP 2: a start without the trusted gate credential is an explici
       const baseNotice = queueBaseNotice(h);
       claimBaseNotice(h, baseNotice);
       const stateDir = tempDir("acp-1189-wip2-live-claim-");
-      expect(await new Daemon(h.cp, { stateDir }).start({ stallNotice: { deliver: async () => {} } }))
+      expect(await new Daemon(h.cp, { gateBeforeWrites: false, stateDir }).start({ stallNotice: { deliver: async () => {} } }))
         .toMatchObject({ allowed: false, reasonCode: ReasonCode.DOCTOR_BLOCKED });
       expect(h.cp.db.get<{ status: string; claim_token: string | null }>(
         `SELECT status, claim_token FROM outbox WHERE message_id = ?`, [baseNotice],
@@ -492,11 +492,11 @@ describe("#1189 WIP 2: a start without the trusted gate credential is an explici
       h.cp.credentials.install({ token: "test-token", creatorIdentity: "acme-bot" });
       const stateDir = tempDir("acp-1189-wip2-other-");
       chmodSync(join(h.root, "capacity"), 0o755);
-      expect(await new Daemon(h.cp, { stateDir }).start()).toMatchObject({ allowed: false, reasonCode: ReasonCode.DOCTOR_ERROR });
+      expect(await new Daemon(h.cp, { gateBeforeWrites: false, stateDir }).start()).toMatchObject({ allowed: false, reasonCode: ReasonCode.DOCTOR_ERROR });
       const [first] = stallNotices(h);
       expect(first!.payload).toMatchObject({ findings: [{ code: "STATE_PATH_INSECURE", repairOwner: "OWNER" }] });
       h.clock.advance(10 * 60_000);
-      expect(await new Daemon(h.cp, { stateDir }).start()).toMatchObject({ allowed: false, reasonCode: ReasonCode.DOCTOR_ERROR });
+      expect(await new Daemon(h.cp, { gateBeforeWrites: false, stateDir }).start()).toMatchObject({ allowed: false, reasonCode: ReasonCode.DOCTOR_ERROR });
       expect(stallNotices(h).map((row) => [row.message_id, row.status])).toEqual([[first!.message_id, "PENDING"]]);
       expect(health(stateDir)["startStall"]).toMatchObject({ routing: { status: "ALREADY_ROUTED", messageId: first!.message_id } });
       expect(h.cp.audit.byKind("CEO_NOTIFICATION_WITHDRAWN")).toHaveLength(0);
@@ -610,7 +610,7 @@ describe("#1189: the remaining non-security owner routes are explicit failures t
         const sent: Array<readonly string[]> = [];
         const STARTS = 3;
         for (let attempt = 1; attempt <= STARTS; attempt += 1) {
-          const daemon = new Daemon(h.cp, { stateDir });
+          const daemon = new Daemon(h.cp, { gateBeforeWrites: false, stateDir });
           const refused = await daemon.start({ stallNotice: { deliver: async (messageIds) => { sent.push(messageIds); } } });
           expect(refused).toMatchObject({ allowed: false, reasonCode: ReasonCode.DOCTOR_BLOCKED });
           expect(daemon.lock.held()).toBe(false);
@@ -655,7 +655,7 @@ describe("#1189: the remaining non-security owner routes are explicit failures t
       h.cp.credentials.install({ token: "test-token", creatorIdentity: "acme-bot" });
       const { identity } = await registerFixtureProject(h);
       rmSync(h.repoPath, { recursive: true, force: true });
-      const daemon = new Daemon(h.cp, { stateDir: tempDir("acp-1189-ceo-checkout-") });
+      const daemon = new Daemon(h.cp, { gateBeforeWrites: false, stateDir: tempDir("acp-1189-ceo-checkout-") });
       expect(await daemon.start({ stallNotice: { deliver: async () => {} } }))
         .toMatchObject({ allowed: false, reasonCode: ReasonCode.DOCTOR_BLOCKED });
       expect(daemon.lock.held()).toBe(false);
@@ -693,7 +693,7 @@ describe("#1189: the remaining non-security owner routes are explicit failures t
         const stateDir = tempDir("acp-1189-ceo-upgrade-");
         const sent: Array<readonly string[]> = [];
         const start = async () => {
-          const refused = await new Daemon(h.cp, { stateDir }).start({
+          const refused = await new Daemon(h.cp, { gateBeforeWrites: false, stateDir }).start({
             stallNotice: { deliver: async (messageIds) => { sent.push(messageIds); } },
           });
           expect(refused).toMatchObject({ allowed: false, reasonCode: ReasonCode.DOCTOR_BLOCKED });
@@ -735,7 +735,7 @@ describe("#1189: the remaining non-security owner routes are explicit failures t
       const baseNotice = queueBaseNotice(h, route);
       claimBaseNotice(h, baseNotice);
       h.clock.advance(10 * 60_000);
-      expect(await new Daemon(h.cp, { stateDir: tempDir("acp-1189-ceo-dead-claim-") }).start({ stallNotice: { deliver: async () => {} } }))
+      expect(await new Daemon(h.cp, { gateBeforeWrites: false, stateDir: tempDir("acp-1189-ceo-dead-claim-") }).start({ stallNotice: { deliver: async () => {} } }))
         .toMatchObject({ allowed: false, reasonCode: ReasonCode.DOCTOR_BLOCKED });
       expect(h.cp.db.get<{ status: string }>(`SELECT status FROM outbox WHERE message_id = ?`, [baseNotice])!.status).toBe("REJECTED");
       expect(h.cp.audit.byKind("CEO_NOTIFICATION_WITHDRAWN").map((event) => event.evidence)).toEqual([
@@ -760,7 +760,7 @@ describe("#1189: the remaining non-security owner routes are explicit failures t
     try {
       const baseNotice = queueBaseNotice(h, changed("SESSION_PROCESS_MISSING"));
       claimBaseNotice(h, baseNotice);
-      const daemon = new Daemon(h.cp, { stateDir: tempDir("acp-1189-ceo-live-claim-") });
+      const daemon = new Daemon(h.cp, { gateBeforeWrites: false, stateDir: tempDir("acp-1189-ceo-live-claim-") });
       expect(await daemon.start({ stallNotice: { deliver: async () => {} } }))
         .toMatchObject({ allowed: false, reasonCode: ReasonCode.DOCTOR_BLOCKED });
       expect(daemon.lock.held()).toBe(false);
@@ -780,7 +780,7 @@ describe("#1189: the remaining non-security owner routes are explicit failures t
       const baseNotice = queueBaseNotice(h, route);
       const ceo = h.cp.bindings.active(roleKeyFor(Role.CEO))!;
       expect(h.cp.outbox.acknowledge(baseNotice, ceo.sessionId, ceo.bindingGeneration).allowed).toBe(true);
-      expect(await new Daemon(h.cp, { stateDir: tempDir("acp-1189-ceo-acked-") }).start({ stallNotice: { deliver: async () => {} } }))
+      expect(await new Daemon(h.cp, { gateBeforeWrites: false, stateDir: tempDir("acp-1189-ceo-acked-") }).start({ stallNotice: { deliver: async () => {} } }))
         .toMatchObject({ allowed: false, reasonCode: ReasonCode.DOCTOR_BLOCKED });
       expect(h.cp.db.get<{ status: string }>(`SELECT status FROM outbox WHERE message_id = ?`, [baseNotice])!.status).toBe("ACKED");
       expect(h.cp.audit.byKind("CEO_NOTIFICATION_WITHDRAWN")).toHaveLength(0);
@@ -857,7 +857,7 @@ describe("#1189 D1: a start refused only on transient findings", () => {
     try {
       const stateDir = tempDir("acp-1189-transient-");
       const sent: Array<readonly string[]> = [];
-      const refused = await new Daemon(h.cp, { stateDir }).start({
+      const refused = await new Daemon(h.cp, { gateBeforeWrites: false, stateDir }).start({
         stallNotice: { deliver: async (messageIds) => { sent.push(messageIds); } },
       });
       expect(refused).toMatchObject({ allowed: false, reasonCode: ReasonCode.DOCTOR_BLOCKED });
@@ -881,7 +881,7 @@ describe("#1189 D1: a start refused only on transient findings", () => {
       const sent: Array<readonly string[]> = [];
       const refuse = async () => {
         h.clock.advance(10 * 60_000);
-        const refused = await new Daemon(h.cp, { stateDir, crashLoopThreshold: 3 }).start({
+        const refused = await new Daemon(h.cp, { gateBeforeWrites: false, stateDir, crashLoopThreshold: 3 }).start({
           stallNotice: { deliver: async (messageIds) => { sent.push(messageIds); } },
         });
         expect(refused).toMatchObject({ allowed: false, reasonCode: ReasonCode.DOCTOR_BLOCKED });
@@ -926,7 +926,7 @@ describe("#1189 D1 invariant: daemon absence or refusal never completes or fails
       h.cp.credentials.install({ token: "test-token", creatorIdentity: "acme-bot" });
       await runsHeldBack(h);
       h.clock.advance(30 * 24 * 60 * 60_000);
-      daemon = new Daemon(h.cp, { stateDir, watchdogIntervalMs: 25 });
+      daemon = new Daemon(h.cp, { gateBeforeWrites: false, stateDir, watchdogIntervalMs: 25 });
       const started = await daemon.start();
       if (!started.allowed) throw new Error(`${started.reasonCode}: ${JSON.stringify(started.evidence)}`);
       // The watchdog saw the month-old run as stalled, and reported it.
@@ -974,7 +974,7 @@ describe("#1189 A4: a start parked on a contradicted conversation", () => {
 
   it("tells the CEO before it parks, keeps the quarantine, and adjudicates nothing", async () => {
     const h = makeHarness();
-    const daemon = new Daemon(h.cp, { stateDir: tempDir("acp-1189-a4-"), bootstrapRecheckIntervalMs: 600_000 });
+    const daemon = new Daemon(h.cp, { gateBeforeWrites: false, stateDir: tempDir("acp-1189-a4-"), bootstrapRecheckIntervalMs: 600_000 });
     try {
       bindCeo(h);
       h.cp.credentials.install({ token: "test-token", creatorIdentity: "acme-bot" });
@@ -1160,7 +1160,7 @@ describe("#1189 D1: the stall notice's route while no daemon serves", () => {
     try {
       bindCeo(h);
       const order: string[] = [];
-      const refused = await new Daemon(h.cp, { stateDir: tempDir("acp-1189-route-order-") }).start({
+      const refused = await new Daemon(h.cp, { gateBeforeWrites: false, stateDir: tempDir("acp-1189-route-order-") }).start({
         stallNotice: {
           open: () => { order.push(`open with ${stallNotices(h).length} notice(s)`); return { started: true }; },
           deliver: async () => { order.push(`deliver with ${stallNotices(h).length} notice(s)`); },
@@ -1181,7 +1181,7 @@ describe("#1189 D1: the stall notice's route while no daemon serves", () => {
     const realKill = process.kill.bind(process);
     const kill = vi.spyOn(process, "kill").mockImplementation((pid, sig) => (pid === GATEWAY && sig === 0 ? true : realKill(pid, sig)));
     try {
-      const daemon = new Daemon(f.h.cp, { stateDir });
+      const daemon = new Daemon(f.h.cp, { gateBeforeWrites: false, stateDir });
       const result = await daemon.start({ stallNotice: startStallNoticeRoute(f.h.cp, { environment, hermesConfiguration: HERMES,
         ports: { ...pinned(() => daemon.lock.held()), noticeSenderFactory: accepting(sent) } }) });
       return { daemon, result };
@@ -1321,7 +1321,7 @@ describe("#1189 D1, CEO ruling 4: the refused start's notice", () => {
     const h = makeHarness();
     try {
       bindCeo(h);
-      expect(await new Daemon(h.cp, { stateDir: tempDir("acp-1189-says-") }).start())
+      expect(await new Daemon(h.cp, { gateBeforeWrites: false, stateDir: tempDir("acp-1189-says-") }).start())
         .toMatchObject({ allowed: false, reasonCode: ReasonCode.DOCTOR_BLOCKED });
       const [notice] = stallNotices(h);
       expect(notice!.payload).toMatchObject({ phase: "REFUSED", startRefused: true, acpActionPath: "NOT_RUNNING" });
@@ -1338,7 +1338,7 @@ describe("#1189 D1, CEO ruling 4: the refused start's notice", () => {
       const stateDir = tempDir("acp-1189-send-fails-");
       let sends = 0;
       const start = (stallNotice: NonNullable<Parameters<Daemon["start"]>[0]>["stallNotice"]) => {
-        const daemon = new Daemon(h.cp, { stateDir });
+        const daemon = new Daemon(h.cp, { gateBeforeWrites: false, stateDir });
         return daemon.start({ stallNotice }).then((result) => ({ result, lockHeld: daemon.lock.held() }));
       };
 
@@ -1375,7 +1375,7 @@ describe("#1189 D1, I2-2: the start stall is one CEO incident, re-delivered to a
       const stateDir = tempDir("acp-1189-redeliver-");
       const refuse = async () => {
         h.clock.advance(10 * 60_000);
-        expect(await new Daemon(h.cp, { stateDir }).start()).toMatchObject({ allowed: false, reasonCode: ReasonCode.DOCTOR_BLOCKED });
+        expect(await new Daemon(h.cp, { gateBeforeWrites: false, stateDir }).start()).toMatchObject({ allowed: false, reasonCode: ReasonCode.DOCTOR_BLOCKED });
         return health(stateDir)["startStall"] as Record<string, unknown>;
       };
       const targets = () => h.cp.db.all<{ message_id: string; target_session_id: string }>(
@@ -1415,13 +1415,13 @@ describe("#1189 D1, I2-2: the start stall is one CEO incident, re-delivered to a
     try {
       bindCeo(h);
       const stateDir = tempDir("acp-1189-recovered-");
-      expect(await new Daemon(h.cp, { stateDir }).start()).toMatchObject({ allowed: false, reasonCode: ReasonCode.DOCTOR_BLOCKED });
+      expect(await new Daemon(h.cp, { gateBeforeWrites: false, stateDir }).start()).toMatchObject({ allowed: false, reasonCode: ReasonCode.DOCTOR_BLOCKED });
       const [notice] = stallNotices(h);
       expect(notice!.status).toBe("PENDING");
 
       h.cp.credentials.install({ token: "test-token", creatorIdentity: "acme-bot" });
       h.clock.advance(10 * 60_000);
-      const healthy = new Daemon(h.cp, { stateDir });
+      const healthy = new Daemon(h.cp, { gateBeforeWrites: false, stateDir });
       expect((await healthy.start()).allowed).toBe(true);
       await healthy.stop();
 
@@ -1461,7 +1461,7 @@ describe("#1189 D1, CEO ruling 3: one crash-loop notice per failure episode", ()
       const stateDir = tempDir("acp-1189-crash-episode-");
       const refuse = async () => {
         h.clock.advance(10 * 60_000);
-        expect(await new Daemon(h.cp, { stateDir, crashLoopThreshold: 3 }).start())
+        expect(await new Daemon(h.cp, { gateBeforeWrites: false, stateDir, crashLoopThreshold: 3 }).start())
           .toMatchObject({ allowed: false, reasonCode: ReasonCode.DOCTOR_BLOCKED });
         return health(stateDir)["startStall"] as { cause: string; crashLoop: boolean; stallId: string; findings: Array<{ scope: string }>; routing: { status: string } };
       };
@@ -1484,7 +1484,7 @@ describe("#1189 D1, CEO ruling 3: one crash-loop notice per failure episode", ()
       setBare(h.repoPath, false);
       setBare(secondRepo, false);
       h.clock.advance(10 * 60_000);
-      const healthy = new Daemon(h.cp, { stateDir, crashLoopThreshold: 3 });
+      const healthy = new Daemon(h.cp, { gateBeforeWrites: false, stateDir, crashLoopThreshold: 3 });
       expect((await healthy.start()).allowed).toBe(true);
       await healthy.stop();
 

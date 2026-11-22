@@ -647,6 +647,45 @@ export class Doctor {
     return report;
   }
 
+  /**
+   * migrate-before-start — the part of the startup verdict that can be given before the start writes
+   * anything, so a start that is going to be refused is refused with the database exactly as it was.
+   *
+   * A start writes before it judges: it refreshes capacity (probe audits, snapshots, telemetry), runs
+   * reconcile (settling claims, messages, sessions, executions, observing every repository) and only then
+   * takes its system report. A refusal after that has already moved the database, which is what made the
+   * official rollback to the pair sealed before an approved migration refuse it as stale.
+   *
+   * A check belongs here only if no write the start makes can change its answer:
+   *
+   *   - `checkStatePaths` — file modes and ownership of the state root, the database and its sidecars.
+   *   - `checkGitHubGate` — whether the trusted gate's credential is installed and private (files).
+   *   - `checkRepositories` and `checkWorktrees` — read-only git probes of each registered checkout. They
+   *     are asked for their blocking findings only: whether a checkout is unreadable or its worktrees cannot
+   *     be listed does not depend on `last_observed_at`, and their other findings (drift, orphans) are
+   *     non-blocking and are left to the report taken after reconcile, which can still change them.
+   *
+   * Every other check reads rows the start's own writes settle, or takes its measurement by writing, and
+   * so cannot be judged first: bindings, runs, workers and sessions (reconcile settles dead sessions,
+   * abandons orphaned executions, retires worker bindings), claims and the outbox (`expireOverdue`),
+   * unresolved and canonical turns, and capacity coverage (`checkCapacity` refreshes what it then scores,
+   * which writes). They are judged where they always were, in the report after reconcile.
+   *
+   * Monotonic by construction: `aggregate` over more findings can only stay as bad or get worse, and a
+   * finding set containing one blocking ERROR or CRITICAL finding is BLOCKED or ERROR whatever else the
+   * full report adds. So a refusal here is never one the full report would have lifted. It writes nothing,
+   * records no `DOCTOR_REPORT`, and takes no capacity measurement.
+   */
+  async judgeBeforeWrites(): Promise<{ status: DoctorStatus; findings: Finding[] }> {
+    const findings: Finding[] = [
+      ...this.checkStatePaths(),
+      ...this.checkGitHubGate(),
+      ...(await this.checkRepositories()).filter((finding) => finding.blocking),
+      ...(await this.checkWorktrees()).filter((finding) => finding.blocking),
+    ];
+    return { status: aggregate(findings), findings };
+  }
+
   /** §9.5 step 3 — readiness gate before a fresh CTO is bound. */
   async sessionReadiness(sessionId: string): Promise<Decision<void>> {
     const session = this.sessions.get(sessionId);

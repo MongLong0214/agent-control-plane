@@ -18,6 +18,7 @@ import { backupDatabase, pruneAutomaticBackups, restoreDatabase } from "./backup
 import { Db, migrateApprovedCopy } from "./database.ts";
 import {
   approveMigration,
+  assertMigrationApproved,
   migrationApprovalPath,
   migrationPlanFrom,
   migrationRefusalPath,
@@ -54,6 +55,7 @@ const USAGE = `agentcpd-state — database backup, restore, migration approval a
   agentcpd-state migration-plan [--database /absolute/state.sqlite]
   agentcpd-state approve-migration --approved-by <who> --confirm-migration [--database /absolute/state.sqlite]
   agentcpd-state suspend-project --project-id <id> --approved-by <who> --confirm-suspend [--database /absolute/state.sqlite]
+  agentcpd-state migrate-approved --database /absolute/state.sqlite --confirm-migration
 
 Backup uses SQLite's online backup API and may run while agentcpd is running.
 Restore refuses a live agentcpd lock; stop the launchd job first. It preserves the
@@ -76,6 +78,13 @@ suspend-project is an offline owner action for a registered project whose checko
 It refuses a live daemon and a database at any other schema version, records the owner's name in
 the PROJECT_SUSPENDED audit row, and leaves resuming to the existing owner paths.
 
+migrate-approved applies the approved chain to the named database offline and exits, so an upgrade
+can be verified, and rolled back to the pair sealed before it, before the daemon writes anything. It
+opens the database exactly as the daemon's first open does (the approval check, the schema chain, the
+internal backup, the approval retired), holds agentcpd.lock for the whole command, and refuses a held
+lock, a missing approval, a database at no migratable version, and a missing database. It has no
+default --database. It starts nothing and writes nothing but the migration's own rows.
+
 migrate-approved-copy runs the approved chain against one disposable copy and exits. It takes
 --database-copy and has no default: the default is the one database it must never touch. It
 refuses a symbolic link, a non-regular file, a file with more than one link, a copy with a
@@ -94,6 +103,7 @@ const COMMANDS = [
   "approve-migration",
   "suspend-project",
   "migrate-approved-copy",
+  "migrate-approved",
 ] as const;
 type Command = (typeof COMMANDS)[number];
 
@@ -185,6 +195,27 @@ const parse = (argv: string[]): Parsed => {
     }
   } else if (projectId !== null || confirmedSuspend) {
     throw new Error(`--project-id and --confirm-suspend belong to suspend-project\n\n${USAGE}`);
+  }
+  if (command === "migrate-approved") {
+    // The same closed grammar as the copy form, with the database named rather than a copy: a command
+    // that rewrites the live database does not get a default for which one, and does not run unconfirmed.
+    const allowed = new Set(["--database", "--confirm-migration"]);
+    const seen = new Map<string, number>();
+    for (const token of tokens) {
+      if (!token.startsWith("--")) continue;
+      seen.set(token, (seen.get(token) ?? 0) + 1);
+      if (!allowed.has(token)) throw new Error(`migrate-approved does not take ${token}\n\n${USAGE}`);
+    }
+    const repeated = [...seen.entries()].filter(([, count]) => count > 1).map(([flag]) => flag);
+    if (repeated.length > 0) {
+      throw new Error(`migrate-approved takes each of ${repeated.sort().join(", ")} once\n\n${USAGE}`);
+    }
+    if (!seen.has("--database")) {
+      throw new Error(`migrate-approved requires --database <absolute path>\n\n${USAGE}`);
+    }
+    if (!confirmedMigration) {
+      throw new Error(`migrate-approved requires --confirm-migration\n\n${USAGE}`);
+    }
   }
   if (command === "migrate-approved-copy") {
     // A closed grammar for this one command: exactly `--database-copy <path>` once and
@@ -314,6 +345,75 @@ const readV51AnchorFallback = (databasePath: string): Array<{ roleKey: string; r
     return v51AnchorFallbackRoles(raw);
   } finally {
     raw.close();
+  }
+};
+
+/**
+ * The migration a daemon's first open would perform, performed alone (migrate-before-start).
+ *
+ * `new Db(path)` is that open: it checks the approval against this database and chain, applies the
+ * chain after taking its own internal backup, and retires the approval. Nothing else is called here,
+ * so nothing else is written: no audit row (the daemon's `SCHEMA_MIGRATION_APPROVAL_SPENT` is the
+ * daemon's, and is not what the approved-chain replay a rollback runs expects), no repository
+ * observation, no capacity or outbox row. The lock is the daemon's, taken before the database is
+ * opened and held until it is closed, so a daemon cannot start between the approval check and the
+ * last page. A database that would not migrate (absent, unversioned, already current) is refused
+ * before it is opened, because opening one of those would create or bootstrap it.
+ */
+const migrateApprovedInPlace = (databasePath: string): {
+  databasePath: string;
+  fromVersion: number;
+  toVersion: number;
+  migrations: string[];
+  approvedBy: string;
+  approvalRetired: boolean;
+} => {
+  ensurePrivateDirectory(dirname(databasePath));
+  const lock = new SingleInstanceLock(join(dirname(databasePath), "agentcpd.lock"));
+  const acquired = lock.acquire(systemClock.nowIso());
+  if (!acquired.allowed) {
+    throw new Error(`refusing to migrate while another process holds the state lock: ${acquired.message}`);
+  }
+  try {
+    if (!existsSync(databasePath)) throw new Error(`refusing to migrate: ${databasePath} does not exist`);
+    const version = onDiskSchemaVersion(databasePath);
+    if (version === 0) {
+      throw new Error("refusing to migrate a database that carries no schema version; it has nothing to migrate from");
+    }
+    if (version === SCHEMA_VERSION) {
+      throw new Error(`refusing to migrate: the database is already at schema version ${SCHEMA_VERSION}, this build's`);
+    }
+    // The daemon's own approval check, asked before the database is opened. `Db` asks it again under
+    // the lock and is the one that is relied on; this one makes a refusal read-only, because an open
+    // sets the journal mode and a refused migration should leave the file's bytes as they were.
+    assertMigrationApproved(
+      databasePath,
+      targetIdentityOf(databasePath),
+      migrationPlanFrom(version),
+      null,
+    );
+    const db = new Db(databasePath, { migrationLock: lock });
+    try {
+      const applied = db.appliedMigrationApproval;
+      if (applied === null) {
+        throw new Error("this open applied no migration, so there is no approved chain to report");
+      }
+      const toVersion = Number(
+        (db.get<{ user_version: number }>("SELECT user_version FROM pragma_user_version") ?? { user_version: 0 }).user_version,
+      );
+      return {
+        databasePath,
+        fromVersion: applied.fromVersion,
+        toVersion,
+        migrations: [...applied.migrations],
+        approvedBy: applied.approvedBy,
+        approvalRetired: db.migrationApprovalRetirement?.retired ?? false,
+      };
+    } finally {
+      db.close();
+    }
+  } finally {
+    lock.release();
   }
 };
 
@@ -459,6 +559,11 @@ export const main = async (argv: string[]): Promise<number> => {
       suspended: true,
       approvedBy: parsed.approvedBy!.trim(),
     })}\n`);
+    return 0;
+  }
+
+  if (parsed.command === "migrate-approved") {
+    process.stdout.write(`${JSON.stringify(migrateApprovedInPlace(parsed.databasePath), null, 2)}\n`);
     return 0;
   }
 
