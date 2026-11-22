@@ -24,20 +24,25 @@ const ensureDir = (stateDir: string): void => {
   mkdirSync(channelDir(stateDir), { recursive: true, mode: 0o700 });
 };
 
-/** What makes two receipts the same one: a reply or a delivery is its event, a registration is its launch's time. */
-const identityOf = (receipt: ChannelReceipt, stampedLaunchId: unknown): string =>
-  receipt.type === "registered"
-    ? `registered|${receipt.registeredAt}|${typeof stampedLaunchId === "string" ? stampedLaunchId : ""}`
+/**
+ * What makes two receipts the same one, by what reads them: the launcher matches `registered` and `emitted` receipts on the
+ * launch id they carry, so those are per launch (a registration also by its time); the daemon settles a reply by its event.
+ */
+const identityOf = (receipt: ChannelReceipt, stampedLaunchId: unknown): string => {
+  const launch = typeof stampedLaunchId === "string" ? stampedLaunchId : "";
+  return receipt.type === "registered"
+    ? `registered|${receipt.registeredAt}|${launch}`
     : receipt.type === "emitted"
-      ? `emitted|${receipt.room}|${receipt.eventId}`
+      ? `emitted|${receipt.room}|${receipt.eventId}|${launch}`
       : `replied|${receipt.room}|${receipt.event.id}`;
+};
 
 /**
  * One receipt as one line, stamped with the launch the server was started by; `O_APPEND` makes concurrent writers' lines whole.
  *
  * It returns only when this receipt reads back from the file through `readChannelReceipts`, the daemon's own reader, and
  * throws otherwise, so a caller that records "written" on a return records something the daemon will see:
- *   - a receipt already there for the same event is success and writes nothing, so a retry never doubles it;
+ *   - a receipt already there for the same event (and launch, for the kinds the launcher reads by launch) is success and writes nothing, so a retry never doubles it;
  *   - a last line with no newline is a writer that died mid-line: this receipt starts on a new line, so the fragment stays one
  *     skipped line. When that fragment is this very receipt, whole but for its newline (a short write), only the newline is
  *     written;

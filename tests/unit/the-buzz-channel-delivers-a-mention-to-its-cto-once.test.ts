@@ -1069,6 +1069,17 @@ describe("the receipts file after a partial append", () => {
     expect(read.receipts.map((r) => (r as { eventId: string }).eventId)).toEqual(["e1", "e2"]);
   });
 
+  it("writes a launch's own emitted receipt even when an older launch already left one for the same event, since the launcher matches on its launch id", () => {
+    const dir = mkdtempSync(join(tmpdir(), "buzz-channel-launch-"));
+    scratch.push(dir);
+    appendChannelReceipt(dir, "demo", receipt(1), "old-launch");
+    appendChannelReceipt(dir, "demo", receipt(1), "new-launch");
+    // The same launch repeating it adds nothing.
+    appendChannelReceipt(dir, "demo", receipt(1), "new-launch");
+    const read = readChannelReceipts(channelReceiptPath(dir, "demo"));
+    expect(read.receipts.map((r) => (r as { launchId?: string }).launchId)).toEqual(["old-launch", "new-launch"]);
+  });
+
   it("refuses to write what would not read back, so the channel never counts it as reported", () => {
     const dir = mkdtempSync(join(tmpdir(), "buzz-channel-shape-"));
     scratch.push(dir);
