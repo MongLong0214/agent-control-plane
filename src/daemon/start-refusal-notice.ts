@@ -56,6 +56,8 @@ const MAX_NOTICE_TEXT = 1_500;
 export interface RefusalNoticeDispatch {
   begin(): boolean;
   signal: AbortSignal;
+  /** What is left of the one overall budget now; the request's own timeout is never longer than this. */
+  remainingMs(): number;
 }
 
 /** The route as the start resolved it, or why it cannot be. The two ports are the test seam. */
@@ -80,12 +82,24 @@ export const DESTINATION_MISMATCH = "destination does not match the active CEO b
 /** The one reason a Gateway that does not confirm the signed daemon-notice route is told nothing. */
 export const NO_NOTICE_ROUTE = "receiver has no signed daemon-notice route";
 
+/**
+ * The one reason a Gateway that serves the CEO's conversation, but not as the process the binding names, is told
+ * nothing. The binding's pid and start are written only when the daemon adopts the Gateway (the incumbent
+ * adoption); a Gateway restarted since has not been adopted, and the notice never takes its word for it.
+ */
+export const TARGET_UNCONFIRMED = "the Gateway serves the CEO conversation, but its process is not the one the binding confirmed";
+
 /** The one reason a notice is not sent because the process the binding names changed after it was checked. */
 export const DESTINATION_CHANGED = "destination changed before dispatch";
 
 /** A refusal to send, with what was observed beside the reason (recorded as `detail`). */
 class NoticeNotSent extends Error {
   constructor(message: string, readonly detail?: string) { super(message); }
+}
+
+/** Not sent because the binding has not confirmed the process that now serves the conversation. */
+class TargetUnconfirmed extends Error {
+  constructor(readonly detail: string) { super(TARGET_UNCONFIRMED); }
 }
 
 /** The active CEO binding as a private copy of the database says it is, with the process it names. */
@@ -104,7 +118,7 @@ interface ActiveCeoBinding {
  * target head), but from a private copy of the database files. The live database is never opened. Null is
  * no binding, or one the pin would not accept.
  */
-const readActiveCeoBinding = async (databasePath: string, lineageRootDigest: string): Promise<ActiveCeoBinding | null> => {
+export const readActiveCeoBinding = async (databasePath: string, lineageRootDigest: string): Promise<ActiveCeoBinding | null> => {
   if (!existsSync(databasePath)) return null;
   return withDatabaseSnapshotAsync(databasePath, (copy): ActiveCeoBinding | null => {
     try {
@@ -154,6 +168,8 @@ const readActiveCeoBinding = async (databasePath: string, lineageRootDigest: str
 export interface RefusalNoticeProcessPorts {
   processStartToken?: typeof readProcessStartToken;
   processStartedAt?: typeof processStartedAt;
+  /** Tests only: the binding read (a private copy of the database), so a slow copy can be stated. */
+  readBinding?: typeof readActiveCeoBinding;
 }
 
 /**
@@ -221,12 +237,17 @@ export const refusalNoticeRouteFrom = (input: {
     laneSecret,
     destination: async (signal) => {
       // The binding first, from a private copy: with none, the Gateway is not asked at all.
-      const binding = await readActiveCeoBinding(input.databasePath, lineageRootDigest);
+      const binding = await (input.ports?.readBinding ?? readActiveCeoBinding)(input.databasePath, lineageRootDigest);
       if (!binding) throw new Error(DESTINATION_MISMATCH);
       checkedBinding = binding;
       const identity = await createHermesGatewayIdentityReader({ apiKey, port, signal })();
-      if (identity.lineage_root_digest !== lineageRootDigest || !matchesBinding(binding, identity, input.ports ?? {})) {
-        throw new Error(DESTINATION_MISMATCH);
+      if (identity.lineage_root_digest !== lineageRootDigest) throw new Error(DESTINATION_MISMATCH);
+      if (!matchesBinding(binding, identity, input.ports ?? {})) {
+        // The same conversation under a process the binding has not confirmed (a restarted Gateway that no
+        // daemon has adopted yet) is not told; any other difference is a destination that is not the binding's.
+        if (judgeLiveHead(binding.target, identity).verdict === "REFUSE") throw new Error(DESTINATION_MISMATCH);
+        throw new TargetUnconfirmed(
+          `gateway pid ${identity.process_pid}, binding pid ${binding.osPid}; the daemon records a new Gateway process when it adopts it`);
       }
       // Then, before anything is sent: the receiver says it has the route. Not confirmed is not sent, and this
       // notice goes nowhere else (not `/events`, not Buzz).
@@ -243,6 +264,8 @@ export const refusalNoticeRouteFrom = (input: {
       let changed = false;
       const result = await createHermesGatewayDaemonNoticeSender({
         apiKey, port, path: DAEMON_NOTICES_PATH, signal: dispatch.signal,
+        // The one budget bounds the request too; the sender's own default (5 s) is shorter than a CEO turn.
+        timeoutMs: Math.max(1, Math.floor(dispatch.remainingMs())),
         preDispatch: () => {
           const binding = checkedBinding;
           changed = binding === null || body.destination.process_pid !== binding.osPid ||
@@ -346,6 +369,7 @@ export const deliverRefusalNotice = async (
   };
   const dispatch: RefusalNoticeDispatch = {
     signal: controller.signal,
+    remainingMs: () => deadline - performance.now(),
     // Called after the transport's last synchronous check and immediately before the request is written.
     begin: () => {
       if (dispatched || pastBound()) return false;
@@ -364,6 +388,10 @@ export const deliverRefusalNotice = async (
     // Checked synchronously with the call: nothing between this line and the transport's `begin` yields.
     if (pastBound()) throw new Error("the bound expired before the request began");
     const result = await route.send(body, dispatch);
+    // An answer that was never read, after the request was written, is not a failure: the receiver may have it.
+    if (result.kind === "UNCERTAIN") {
+      return { outcome: "unknown", at: nowIso(), eventId, reason: `${result.kind}: ${result.reason}` };
+    }
     if (result.kind !== "RESPONDED") {
       return { outcome: "failed", at: nowIso(), eventId, reason: `${result.kind}: ${result.reason}` };
     }
@@ -378,10 +406,17 @@ export const deliverRefusalNotice = async (
   timer.unref?.();
   try {
     return await Promise.race([
-      attempt().catch((error: unknown): RefusalNoticeOutcome => ({
-        outcome: "failed", at: nowIso(), ...(eventId ? { eventId } : {}), reason: reasonOf(error),
-        ...(error instanceof NoticeNotSent && error.detail ? { detail: error.detail } : {}),
-      })),
+      attempt().catch((error: unknown): RefusalNoticeOutcome => {
+        // Once the request was released, an error is no proof it was not received.
+        if (dispatched && eventId) return { outcome: "unknown", at: nowIso(), eventId, reason: reasonOf(error) };
+        if (error instanceof TargetUnconfirmed) {
+          return { outcome: "target-unconfirmed", at: nowIso(), reason: error.message, detail: error.detail };
+        }
+        return {
+          outcome: "failed", at: nowIso(), ...(eventId ? { eventId } : {}), reason: reasonOf(error),
+          ...(error instanceof NoticeNotSent && error.detail ? { detail: error.detail } : {}),
+        };
+      }),
       bound,
     ]);
   } finally {

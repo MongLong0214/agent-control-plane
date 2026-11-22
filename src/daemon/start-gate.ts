@@ -21,7 +21,7 @@ import { TrustedCredentialStore } from "../github/credential-store.ts";
 import { DatabaseSnapshotUnavailable, withDatabaseSnapshotAsync } from "../db/database-snapshot.ts";
 import { ensurePrivateDirectory, inspectDatabaseStatePaths, inspectPrivatePath } from "../db/state-preflight.ts";
 import { readCheckoutRegistrations } from "../verify/worktree.ts";
-import { backoffSecondsFor, countStartupFailure, readCrashLoopFile, recordRefusalNotice, type RefusalNoticeOutcome } from "./crash-loop.ts";
+import { backoffSecondsFor, claimRefusalNoticeSend, countStartupFailure, readCrashLoopFile, recordRefusalNotice, type RefusalNoticeOutcome } from "./crash-loop.ts";
 import { type RefusalNoticeOptions, deliverRefusalNotice, refusalHost } from "./start-refusal-notice.ts";
 import { SingleInstanceLock } from "./single-instance.ts";
 
@@ -238,6 +238,11 @@ export const takeStartLock = (
   };
 };
 
+/** The claim on this refusalId's one notice; a record that cannot be written claims nothing. */
+const claimedForSend = (stateDir: string, refusalId: string, nowIso: string): boolean => {
+  try { return claimRefusalNoticeSend(stateDir, refusalId, nowIso); } catch { return false; }
+};
+
 /** A start refused before the database was opened: what to print, and the backoff the supervisor reads. */
 export interface StartRefusedBeforeOpening {
   decision: Decision<never>;
@@ -317,6 +322,9 @@ export const refuseStartBeforeOpening = async (
   let ceoNotice: RefusalNoticeOutcome | { outcome: "not-sent"; reason: string };
   if (recorded === null || lastRefusal === null) {
     ceoNotice = { outcome: "not-sent", reason: "crash-loop.json was not written" };
+  } else if (!claimedForSend(stateDir, refusalId, startedAt)) {
+    // This refusalId's notice was already handed to a sender (or the claim could not be kept): never twice.
+    ceoNotice = { outcome: "not-sent", reason: "this refusalId's notice was already sent or could not be claimed" };
   } else {
     ceoNotice = await deliverRefusalNotice(
       lastRefusal,

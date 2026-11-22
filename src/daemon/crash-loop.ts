@@ -32,6 +32,11 @@ export interface CrashLoopFile {
     databaseWritten: false;
     /** What became of the CEO notice for this refusal. Written after the refusal, by `recordRefusalNotice`. */
     notice?: RefusalNoticeOutcome;
+    /**
+     * Set once, before the notice is sent, by `claimRefusalNoticeSend`: this refusalId's notice has been
+     * handed to a sender, and no start sends it again, whatever became of it (`unknown` included).
+     */
+    noticeSendClaimedAt?: string;
   };
 }
 
@@ -44,7 +49,9 @@ export type RefusalNoticeOutcome =
   | { outcome: "failed"; at: string; reason: string; detail?: string; eventId?: string }
   /** The request was out when the bound expired: the receiver may or may not have it. Neither is claimed. */
   | { outcome: "unknown"; at: string; reason: string; eventId: string }
-  | { outcome: "route-unconfigured"; at: string; reason: string };
+  | { outcome: "route-unconfigured"; at: string; reason: string }
+  /** The Gateway serves the CEO's conversation, but the binding has not confirmed its process: nothing was sent. */
+  | { outcome: "target-unconfirmed"; at: string; reason: string; detail?: string };
 
 export const crashLoopPath = (stateDir: string): string => join(stateDir, "crash-loop.json");
 
@@ -174,6 +181,20 @@ export const recordRefusalNotice = (stateDir: string, refusalId: string, notice:
     const current = readJson<CrashLoopFile>(crashLoopPath(stateDir));
     if (!current?.lastRefusal || current.lastRefusal.refusalId !== refusalId) return false;
     replaceRecord(stateDir, JSON.stringify({ ...current, lastRefusal: { ...current.lastRefusal, notice } }));
+    return true;
+  });
+
+/**
+ * Takes the one right to send this refusalId's notice. True exactly once per `refusalId`: the claim is kept in
+ * the record before anything is sent, so a second start, a retry or a restart that reaches the same refusal
+ * never sends it again, and a notice whose outcome is `unknown` is not re-POSTed either.
+ */
+export const claimRefusalNoticeSend = (stateDir: string, refusalId: string, nowIso: string): boolean =>
+  withRecordLock(stateDir, () => {
+    const current = readJson<CrashLoopFile>(crashLoopPath(stateDir));
+    if (!current?.lastRefusal || current.lastRefusal.refusalId !== refusalId) return false;
+    if (current.lastRefusal.noticeSendClaimedAt !== undefined || current.lastRefusal.notice !== undefined) return false;
+    replaceRecord(stateDir, JSON.stringify({ ...current, lastRefusal: { ...current.lastRefusal, noticeSendClaimedAt: nowIso } }));
     return true;
   });
 
