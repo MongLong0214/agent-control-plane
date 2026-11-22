@@ -82,13 +82,7 @@ const CONTRACT_CHANGE_UNAPPLIED_CANCEL_FROM: readonly RunState[] = Object.freeze
   RunState.POST_MERGE_VERIFYING,
 ]);
 
-/**
- * Returns a copy: callers must not be able to reach the table itself.
- *
- * A bootstrap activation has no repository merge to perform. Its CEO-confirmed activation result is the
- * distinct, capability-gated completion proof, so READY_FOR_CEO_REVIEW → COMPLETED is the kind's alone; the
- * database refuses it for every other kind (`runs_review_completion_bootstrap_only`, schema v60).
- */
+/** Returns a copy: callers must not be able to reach the table itself. */
 export const legalTargets = (from: RunState, kind?: RunKind): readonly RunState[] => {
   const targets = [...TRANSITIONS[from]];
   if (kind === RunKind.PROJECT_BOOTSTRAP && from === RunState.READY_FOR_CEO_REVIEW) targets.push(RunState.COMPLETED);
@@ -100,9 +94,14 @@ export const canTransition = (from: RunState, to: RunState, kind?: RunKind): Dec
   if (from === to) {
     return deny(ReasonCode.RUN_TRANSITION_ILLEGAL, `run is already ${to}`, { from, to });
   }
+  if (isTerminal(from) && !(from === RunState.BLOCKED_POST_MERGE && to === RunState.POST_MERGE_VERIFYING)) {
+    return deny(ReasonCode.RUN_ALREADY_TERMINAL, `run is terminal in ${from}`, { from, to });
+  }
+  // A bootstrap activation has no repository merge to perform. Its CEO-confirmed activation
+  // result is the distinct, capability-gated completion proof; no ordinary run gets this
+  // shortcut through the finalization chain.
   const legal = legalTargets(from, kind);
   if (!legal.includes(to)) {
-    if (isTerminal(from)) return deny(ReasonCode.RUN_ALREADY_TERMINAL, `run is terminal in ${from}`, { from, to });
     return deny(ReasonCode.RUN_TRANSITION_ILLEGAL, `${from} -> ${to} is not a legal transition`, {
       from,
       to,

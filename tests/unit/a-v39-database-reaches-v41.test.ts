@@ -169,7 +169,7 @@ describe("integration of v40 (#1068) and v41 (#512 PR-B) from a v39 database", (
     const migrated = openDb(path);
     try {
       // #246 C1b adds v42, C3 v43, B2-b v44, #512 v45, #1094 v46 and SEC-OD1 v47 and v48 v49 (#512 S-PUSH) and v50 (post-merge recovery) on top; this row is about v40 and v41, which the chain still runs in order.
-      expect(SCHEMA_VERSION).toBe(60);
+      expect(SCHEMA_VERSION).toBe(59);
       expect(Number(migrated.raw.pragma("user_version", { simple: true }))).toBe(SCHEMA_VERSION);
       expect(migrated.all<{ version: number; migration_id: string }>(
         `SELECT version, migration_id FROM schema_migrations WHERE version >= 39 ORDER BY version`,
@@ -195,7 +195,6 @@ describe("integration of v40 (#1068) and v41 (#512 PR-B) from a v39 database", (
         { version: 57, migration_id: "v57-canonical-entitlement-transfer" },
         { version: 58, migration_id: "v58-canonical-cto-rotation" },
         { version: 59, migration_id: "v59-task-plan-key" },
-        { version: 60, migration_id: "v60-review-completion-bootstrap-only" },
       ]);
       const triggers = migrated.all<{ name: string }>(`SELECT name FROM sqlite_master WHERE type = 'trigger'`).map((row) => row.name);
       for (const name of [...V40_TRIGGERS, ...V41_TRIGGERS]) expect(triggers, name).toContain(name);
