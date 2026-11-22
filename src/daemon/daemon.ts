@@ -668,6 +668,12 @@ export class Daemon {
    * held by this very instance, and is refused, as a second start on one daemon always was.
    */
   #lockHandedOver = false;
+  /**
+   * Whether the lock is the caller's (`options.lock`). A start that refuses, fails or throws leaves it held:
+   * the caller closes the database first and gives it back after, so the lock is never released ahead of
+   * the close. A daemon that took its own lock gives it back itself, as before.
+   */
+  #lockIsTheCallers = false;
   #mode: DaemonMode = "NORMAL";
   #bootstrapBlocking: BlockingFinding[] = [];
   /** #1189 D1 — what this start is stalled on, in `health.json` until a start succeeds. */
@@ -746,6 +752,7 @@ export class Daemon {
     chmodSync(options.stateDir, 0o700);
     this.lock = options.lock ?? new SingleInstanceLock(join(options.stateDir, "agentcpd.lock"));
     this.#lockHandedOver = options.lock?.held() === true;
+    this.#lockIsTheCallers = options.lock !== undefined;
     // #1336 R-1 — the same custody rule the MCP sockets apply (`drivenCredentialNotHeld` in agentcpd.ts):
     // an attachment is scoped to a PRIMARY_CTO, which is driven when its spawn record says DRIVEN.
     this.attachments = new RoleAttachmentCredentials(cp.sessions, cp.bindings, cp.clock, (sessionId) =>
@@ -1407,7 +1414,7 @@ export class Daemon {
 
     const priorFailures = this.readCrashLoop();
     if (priorFailures.retryNotBefore && Date.parse(priorFailures.retryNotBefore) > Date.parse(startedAt)) {
-      this.lock.release();
+      this.#giveBackLockUnlessCallerHoldsIt();
       this.#startedAt = null;
       const backoffSeconds = Math.ceil(
         (Date.parse(priorFailures.retryNotBefore) - Date.parse(startedAt)) / 1000,
@@ -1473,7 +1480,7 @@ export class Daemon {
             this.recordStartupFailure(reasonCode, { reconcile: report, stall });
             this.uninstallContinuityCoordinator();
             this.cp.doctor.clearSupplementalFindings(this.#doctorSupplier);
-            this.lock.release();
+            this.#giveBackLockUnlessCallerHoldsIt();
             this.#startedAt = null;
             return deny(reasonCode, "startup doctor did not permit dispatch resume", { reconcile: report });
           }
@@ -1481,7 +1488,7 @@ export class Daemon {
           this.recordStartupFailure(reasonCode, { reconcile: report, stall });
           this.uninstallContinuityCoordinator();
           this.cp.doctor.clearSupplementalFindings(this.#doctorSupplier);
-          this.lock.release();
+          this.#giveBackLockUnlessCallerHoldsIt();
           this.#startedAt = null;
           return deny(reasonCode, "startup doctor did not permit dispatch resume", { reconcile: report });
         }
@@ -1548,7 +1555,7 @@ export class Daemon {
       this.recordStartupFailure(ReasonCode.DAEMON_STARTUP_FAILED, evidence);
       this.uninstallContinuityCoordinator();
       this.cp.doctor.clearSupplementalFindings(this.#doctorSupplier);
-      this.lock.release();
+      this.#giveBackLockUnlessCallerHoldsIt();
       this.#startedAt = null;
       return deny(ReasonCode.DAEMON_STARTUP_FAILED, "daemon startup failed", evidence);
     }
@@ -4095,6 +4102,21 @@ export class Daemon {
     } finally {
       if (timer) clearTimeout(timer);
     }
+  }
+
+  #giveBackLockUnlessCallerHoldsIt(): void {
+    if (!this.#lockIsTheCallers) this.lock.release();
+  }
+
+  /**
+   * The decision to stop, taken before anything else a stop does. A start parked for the bootstrap door
+   * would otherwise go on to promote while the stop drains workers (the abandon was only recorded once the
+   * drain ended): resuming runs, starting timers and writing DAEMON_STARTED after the stop had begun. Marking
+   * the park abandoned first, synchronously, means no promotion can follow; `stop()` records it again, which
+   * changes nothing.
+   */
+  beginStop(): void {
+    this.wakeBootstrap("ABANDONED");
   }
 
   /**

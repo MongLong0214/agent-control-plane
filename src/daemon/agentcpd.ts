@@ -6785,6 +6785,8 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
     cleaning ??= (async () => {
       process.stdout.write(`\nshutting down on ${signal}\n`);
       const stopped = await gracefulStop(startTracker, {
+        // The decision to stop closes off a bootstrap promotion first, before the drain below can run.
+        begin: () => daemon.beginStop(),
         closeListeners: async () => {
           if (hermesAutoAdoptionTimer) clearInterval(hermesAutoAdoptionTimer);
           await telegram?.close();
@@ -6802,7 +6804,12 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
           await sessionLaunch.close();
         },
         // The lock stays held until the handle is closed: `daemon.stop()` leaves it to this caller.
-        stopDaemon: () => daemon.stop({ leaveLockHeld: true }),
+        stopDaemon: async () => {
+          // A test hook, inert unless set: holds the daemon's stop, so a test can land signals inside it.
+          const delay = Number(process.env["ACP_TEST_DELAY_STOP_MS"] ?? 0);
+          if (delay > 0) await new Promise<void>((resolveWait) => setTimeout(resolveWait, delay));
+          return daemon.stop({ leaveLockHeld: true });
+        },
         closeDatabase: () => cp.close(),
         releaseLock: () => startLock.release(),
       });
@@ -6812,11 +6819,28 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
     })();
     return cleaning;
   };
+  // The cleanup for a caller that already has an error to throw: a cleanup that fails too is reported, and
+  // does not replace the error the caller is about to raise.
+  const cleanupReportingFailure = async (signal: string): Promise<void> => {
+    try {
+      await cleanup(signal);
+    } catch (error) {
+      process.stderr.write(`agentcpd: the stop did not complete cleanly: ${error instanceof Error ? error.message : String(error)}\n`);
+    }
+  };
   let shuttingDown: Promise<void> | null = null;
   const shutdown = async (signal: string): Promise<void> => {
     if (shuttingDown) return shuttingDown;
     shuttingDown = (async () => {
-      const stopped = await cleanup(signal);
+      let stopped: { complete: boolean };
+      try {
+        stopped = await cleanup(signal);
+      } catch (error) {
+        // A stop step failed (the stop's own audit write among them). The handle is closed and the lock
+        // given back by then; what is left is to say so and leave non-zero.
+        process.stderr.write(`agentcpd: the stop did not complete cleanly: ${error instanceof Error ? error.message : String(error)}\n`);
+        process.exit(1);
+      }
       // #1070 ACP-WORKER-03-FC — an incomplete stop is reported, never exited as clean. The lock and the
       // durable fence beside it stay, so exiting here does not let a successor take authority while a
       // worker git process group may still run; the exit status tells the supervisor why.
@@ -6876,7 +6900,7 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
   } catch (error) {
     // A start that threw is an exit after the open like any other: the one cleanup runs and finishes (the
     // handle closed, the lock given back) before the error is allowed to reach the process's exit.
-    await cleanup("a failed start");
+    await cleanupReportingFailure("a failed start");
     throw error;
   }
   // The start has settled; a shutdown that is already running owns what happens next, and never returns.
@@ -6887,9 +6911,14 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
       `backoff: ${JSON.stringify(daemon.crashLoopState())}\n`,
     );
     const backoffSeconds = daemon.crashLoopState().backoffSeconds;
+    // A refused start is an exit after the open like any other, so it goes through the one cleanup and
+    // waits for it: the handle is closed and only then is the lock given back (the refusal itself no
+    // longer releases it). It does not close or exit on its own, and a shutdown already running is its
+    // own cleanup, not something this branch may cut short.
+    await cleanupReportingFailure("a refused start");
+    if (shuttingDown) await shuttingDown;
     if (backoffSeconds > 0) await waitForBackoff(backoffSeconds);
-    await sessionLaunch.close();
-    cp.close();
+    if (shuttingDown) await shuttingDown;
     process.exit(1);
   }
 
@@ -7234,7 +7263,7 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
     // A startup that failed after some listener bound: the one cleanup closes every one of them (the Buzz
     // listeners and the relay subscriber included, which a failed startup used to walk past), stops the
     // daemon, closes the handle and gives the lock back, and finishes before the error leaves.
-    await cleanup("a failed startup");
+    await cleanupReportingFailure("a failed startup");
     throw err;
   }
 

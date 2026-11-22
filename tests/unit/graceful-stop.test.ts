@@ -10,6 +10,9 @@ import { StartTracker, gracefulStop, type GracefulStopSteps } from "../../src/da
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
 const steps = (events: string[], options: { complete?: boolean } = {}): GracefulStopSteps => ({
+  begin: () => {
+    events.push("begin");
+  },
   closeListeners: async () => {
     events.push("closeListeners");
   },
@@ -33,7 +36,7 @@ describe("a stop waits for the start that is writing, and closes before it lets 
 
     await gracefulStop(tracker, steps(events));
 
-    expect(events).toEqual(["DAEMON_STARTED", "closeListeners", "DAEMON_STOPPED", "closeDatabase", "releaseLock"]);
+    expect(events).toEqual(["begin", "DAEMON_STARTED", "closeListeners", "DAEMON_STOPPED", "closeDatabase", "releaseLock"]);
   });
 
   it("a park that was promoted is not a latch: the resumed start is waited for, however long it takes after the promotion", async () => {
@@ -59,7 +62,7 @@ describe("a stop waits for the start that is writing, and closes before it lets 
 
     await gracefulStop(tracker, steps(events));
 
-    expect(events).toEqual(["DAEMON_STARTED", "closeListeners", "DAEMON_STOPPED", "closeDatabase", "releaseLock"]);
+    expect(events).toEqual(["begin", "DAEMON_STARTED", "closeListeners", "DAEMON_STOPPED", "closeDatabase", "releaseLock"]);
   });
 
   it("a start that is parked now is stopped without waiting: the stop is what wakes it", async () => {
@@ -85,7 +88,7 @@ describe("a stop waits for the start that is writing, and closes before it lets 
 
     await stopped;
 
-    expect(events).toEqual(["closeListeners", "DAEMON_STOPPED", "closeDatabase", "releaseLock"]);
+    expect(events).toEqual(["begin", "closeListeners", "DAEMON_STOPPED", "closeDatabase", "releaseLock"]);
   });
 
   it("a start that never settles cannot hold the stop forever, and the database is still closed before the lock goes", async () => {
@@ -110,7 +113,7 @@ describe("a stop waits for the start that is writing, and closes before it lets 
     await gracefulStop(tracker, steps(events));
 
     expect(tracker.settled).toBe(true);
-    expect(events).toEqual(["closeListeners", "DAEMON_STOPPED", "closeDatabase", "releaseLock"]);
+    expect(events).toEqual(["begin", "closeListeners", "DAEMON_STOPPED", "closeDatabase", "releaseLock"]);
   });
 
   it("a stop that could not confirm its workers gone closes the database and keeps the lock", async () => {
@@ -121,6 +124,53 @@ describe("a stop waits for the start that is writing, and closes before it lets 
     const stopped = await gracefulStop(tracker, steps(events, { complete: false }));
 
     expect(stopped.complete).toBe(false);
-    expect(events).toEqual(["closeListeners", "DAEMON_STOPPED", "closeDatabase"]);
+    expect(events).toEqual(["begin", "closeListeners", "DAEMON_STOPPED", "closeDatabase"]);
+  });
+
+  it("the decision to stop is taken before anything is awaited", async () => {
+    const events: string[] = [];
+    const tracker = new StartTracker();
+    tracker.track(new Promise<void>(() => undefined));
+    tracker.park();
+
+    const stopping = gracefulStop(tracker, steps(events), { settleBoundMs: 10 });
+    // Synchronously, before the first await in the stop has had a chance to yield.
+    expect(events).toEqual(["begin"]);
+    await stopping;
+  });
+
+  it("a step that fails, the daemon's own stop and its audit write among them, still closes the database and only then releases the lock", async () => {
+    const events: string[] = [];
+    const tracker = new StartTracker();
+    tracker.track(Promise.resolve());
+
+    await expect(
+      gracefulStop(tracker, {
+        ...steps(events),
+        stopDaemon: async () => {
+          events.push("stopDaemon failed");
+          throw new Error("DAEMON_STOPPED could not be written");
+        },
+      }),
+    ).rejects.toThrow("DAEMON_STOPPED could not be written");
+
+    expect(events).toEqual(["begin", "closeListeners", "stopDaemon failed", "closeDatabase", "releaseLock"]);
+  });
+
+  it("a close that itself fails still lets the lock go", async () => {
+    const events: string[] = [];
+    const tracker = new StartTracker();
+    tracker.track(Promise.resolve());
+
+    await expect(
+      gracefulStop(tracker, {
+        ...steps(events),
+        closeDatabase: () => {
+          throw new Error("close failed");
+        },
+      }),
+    ).rejects.toThrow("close failed");
+
+    expect(events).toEqual(["begin", "closeListeners", "DAEMON_STOPPED", "releaseLock"]);
   });
 });

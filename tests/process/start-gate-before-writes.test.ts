@@ -568,6 +568,94 @@ describe("a start the doctor will refuse leaves the database as it found it (mig
     expect(left).toEqual(closedAndReleased);
   }, 180_000);
 
+  /**
+   * Samples, while the process runs, for the one thing the cleanup order forbids: the lock gone while the
+   * database is still open (a write-ahead log standing beside it). Polling cannot prove an absence, but the
+   * orders it is here to catch hold the wrong state for whole seconds.
+   */
+  const watchLockAgainstOpenHandle = (root: string, database: string) => {
+    let violated = false;
+    const timer = setInterval(() => {
+      if (!existsSync(join(root, "agentcpd.lock")) && existsSync(`${database}-wal`)) violated = true;
+    }, 5);
+    return { stop: (): boolean => { clearInterval(timer); return violated; } };
+  };
+
+  /** A start the daemon itself refuses once the database is open: its own backoff is still running (2 s). */
+  const refusedByBackoff = (root: string): void => {
+    writeFileSync(
+      join(root, "crash-loop.json"),
+      JSON.stringify({ failures: 1, firstAt: new Date().toISOString(), retryNotBefore: new Date(Date.now() + 600_000).toISOString() }),
+      { mode: 0o600 },
+    );
+  };
+
+  it("stop (ii): a refused start goes through the one cleanup: the handle is closed first, the lock released after, and the stop is on record", async () => {
+    const { home, root, database } = newHome("/tmp");
+    currentDatabase(database);
+    installGitHubAppCredential(root);
+    refusedByBackoff(root);
+    const watcher = watchLockAgainstOpenHandle(root, database);
+
+    const run = startDaemon(home);
+    const exit = await run.exited;
+    const violated = watcher.stop();
+    const left = leftovers(root, database);
+
+    expect(exit.status).toBe(1);
+    expect(violated).toBe(false);
+    expect(left).toEqual(closedAndReleased);
+    expect(auditCount(database, "DAEMON_START_REFUSED")).toBe(1);
+    expect(auditCount(database, "DAEMON_STARTED")).toBe(0);
+    expect(auditCount(database, "DAEMON_STOPPED")).toBe(1);
+  }, 180_000);
+
+  it("stop (ii): SIGTERM and SIGINT during a refusal's backoff, with the daemon's stop held, are not cut short by the refusal", async () => {
+    const { home, root, database } = newHome("/tmp");
+    currentDatabase(database);
+    installGitHubAppCredential(root);
+    refusedByBackoff(root);
+    const watcher = watchLockAgainstOpenHandle(root, database);
+
+    // The stop is held 2.5 s, longer than the 2 s backoff the refusal waits out.
+    const run = startDaemon(home, { ACP_TEST_DELAY_STOP_MS: "2500" });
+    await run.waitFor("backoff:");
+    run.child.kill("SIGTERM");
+    run.child.kill("SIGINT");
+    await run.exited;
+    const violated = watcher.stop();
+    const left = leftovers(root, database);
+
+    expect(violated).toBe(false);
+    expect(left).toEqual(closedAndReleased);
+    expect(run.stdout().match(/shutting down on/g)?.length).toBe(1);
+    expect(auditCount(database, "DAEMON_STOPPED")).toBe(1);
+  }, 180_000);
+
+  it("stop (ii): a stop whose DAEMON_STOPPED write fails still closes the handle, and only then releases the lock", async () => {
+    const { home, root, database } = newHome("/tmp");
+    currentDatabase(database);
+    installGitHubAppCredential(root);
+    const raw = new Database(database);
+    raw.exec(
+      `CREATE TRIGGER zz_refuse_stop BEFORE INSERT ON audit_events WHEN NEW.kind = 'DAEMON_STOPPED'
+       BEGIN SELECT RAISE(ABORT, 'the stop row is refused'); END`,
+    );
+    raw.close();
+    const watcher = watchLockAgainstOpenHandle(root, database);
+
+    const run = startDaemon(home, { ACP_TEST_RAISE_SIGTERM_AT: "after-check" });
+    await run.exited;
+    const violated = watcher.stop();
+    const left = leftovers(root, database);
+
+    expect(violated).toBe(false);
+    expect(left).toEqual(closedAndReleased);
+    expect(auditCount(database, "DAEMON_STARTED")).toBe(1);
+    expect(auditCount(database, "DAEMON_STOPPED")).toBe(0);
+    expect(run.stderr()).toContain("the stop did not complete cleanly");
+  }, 180_000);
+
   it("stop (ii): a start that fails is not recorded as a start, and the stop after it still closes the handle and releases the lock", async () => {
     const { home, root, database } = newHome("/tmp");
     currentDatabase(database);
