@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import {
   chmodSync,
+  copyFileSync,
   cpSync,
   existsSync,
   linkSync,
@@ -25,6 +26,7 @@ import { isAcpError, type AcpError } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { SingleInstanceLock } from "../../src/daemon/single-instance.ts";
 import { Db, SCHEMA_VERSION } from "../../src/db/database.ts";
+import { backupDatabase } from "../../src/db/backup.ts";
 import { approveMigration, migrationApprovalPath } from "../../src/db/migration-approval.ts";
 import { MIGRATIONS } from "../../src/db/migrations.ts";
 import { main as stateAdmin } from "../../src/db/state-admin.ts";
@@ -32,6 +34,7 @@ import {
   ROLLBACK_PAIR_INDEX_FILE,
   ROLLBACK_PAIR_MANIFEST_FILE,
   applyRollbackPair,
+  replacementSourcePath,
   rollbackToSealedPair,
   sealRollbackPair,
   stageRollbackPair,
@@ -1460,7 +1463,7 @@ const userVersionOf = (path: string): number => readFileSync(path).readUInt32BE(
 
 /** A pair sealed from the stopped v25 database, and the approved migration run after it. */
 const sealAtV25 = async (
-  options: { installingNode?: boolean } = {},
+  options: { installingNode?: boolean; nodeScript?: string } = {},
 ): Promise<{ fixture: Fixture; pair: SealedRollbackPair }> => {
   const fixture = makeFixture();
   seedV25Database(fixture.databasePath);
@@ -1468,9 +1471,11 @@ const sealAtV25 = async (
     // The sealed generation's own `state-admin restore <image> --database <live> --confirm-restore`,
     // reduced to the one thing a restore does here: put the image where the live database is. The
     // rollback's own check that the destination now holds the staged image byte for byte still runs.
-    writeFileSync(join(fixture.sources.runtimeRoot, fixture.sources.nodeExecutable), '#!/bin/bash\nset -e\ncp "$3" "$5"\n', {
-      mode: 0o755,
-    });
+    writeFileSync(
+      join(fixture.sources.runtimeRoot, fixture.sources.nodeExecutable),
+      options.nodeScript ?? '#!/bin/bash\nset -e\ncp "$3" "$5"\n',
+      { mode: 0o755 },
+    );
     chmodSync(join(fixture.sources.runtimeRoot, fixture.sources.nodeExecutable), 0o755);
   }
   const pair = await sealRollbackPair(fixture.pairsRoot, fixture.sources);
@@ -1797,4 +1802,316 @@ describe("state-admin migrate-approved, then the rollback (migrate-before-start)
 
     await expect(stateAdmin(["migrate-approved", "--database", fixture.databasePath])).rejects.toThrow(/--confirm-migration/);
   }, 180_000);
+});
+
+/**
+ * A replacement database (#1501): the live database was converted past the pair's generation, and the
+ * way back installs a converted copy instead of the pair's own image. The pair is sealed at v25, the
+ * live database takes one more write in v25 and is then migrated to this build's schema, and the image
+ * is "live minus the approved migration" — the v25 database with that write. The identity chain is the
+ * image, its source record (SHA-256 of the migrated main file and of the image), the unchanged replay,
+ * and the live main file still being that source.
+ */
+const REPLACEMENT_FORMAT = "agent-control-plane.rollback-replacement/v1";
+
+interface ReplacementScenario {
+  fixture: Fixture;
+  pair: SealedRollbackPair;
+  expectation: RollbackPairExpectation;
+  /** An image built from the pre-migration copy (or from `build`) with a source record naming the live file as it is now. */
+  makeImage: (name: string, build?: (workPath: string) => void) => Promise<string>;
+  image: string;
+}
+
+const replacementScenario = async (nodeScript?: string): Promise<ReplacementScenario> => {
+  const { fixture, pair } = await sealAtV25({ installingNode: true, ...(nodeScript === undefined ? {} : { nodeScript }) });
+  const expectation = expectationFor(fixture, pair);
+  writeAuditEvent(fixture.databasePath, "v25-era-write");
+  const v25Copy = join(fixture.home, "v25-copy.sqlite");
+  copyFileSync(fixture.databasePath, v25Copy);
+  chmodSync(v25Copy, 0o600);
+  migrateApproved(fixture.databasePath);
+
+  const makeImage = async (name: string, build?: (workPath: string) => void): Promise<string> => {
+    const work = join(fixture.home, `work-${name}`);
+    mkdirSync(work, { mode: 0o700 });
+    const workPath = join(work, "state.sqlite");
+    if (build === undefined) copyFileSync(v25Copy, workPath);
+    else build(workPath);
+    chmodSync(workPath, 0o600);
+    const out = join(fixture.home, `replacement-${name}`);
+    mkdirSync(out, { mode: 0o700 });
+    const image = join(out, "state.sqlite");
+    await backupDatabase(workPath, image);
+    writeFileSync(
+      replacementSourcePath(image),
+      JSON.stringify({
+        format: REPLACEMENT_FORMAT,
+        sourceMainSha256: `sha256:${digestOfFile(fixture.databasePath)}`,
+        imageSha256: `sha256:${digestOfFile(image)}`,
+      }),
+      { mode: 0o600 },
+    );
+    return image;
+  };
+  return { fixture, pair, expectation, makeImage, image: await makeImage("good") };
+};
+
+const rewriteSourceRecord = (image: string, patch: Record<string, string>): void => {
+  const record = JSON.parse(readFileSync(replacementSourcePath(image), "utf8")) as Record<string, string>;
+  writeFileSync(replacementSourcePath(image), JSON.stringify({ ...record, ...patch }), { mode: 0o600 });
+};
+
+/** Edits the append-only ledger the way only a forger would: the immutability trigger lifted, then put back as it was. */
+const editLedger = (path: string, sql: string, ...params: string[]): void => {
+  const raw = new Database(path);
+  try {
+    const trigger = raw
+      .prepare("SELECT sql FROM sqlite_schema WHERE type = 'trigger' AND name = 'schema_migrations_immutable'")
+      .pluck()
+      .get() as string;
+    raw.exec("DROP TRIGGER schema_migrations_immutable");
+    raw.prepare(sql).run(...params);
+    raw.exec(trigger);
+  } finally {
+    raw.close();
+  }
+};
+
+describe("a rollback that installs a replacement database (#1501)", () => {
+  it("accepts live-minus-the-approved-migration, and installs exactly the staged image", async () => {
+    const { fixture, pair, expectation, image } = await replacementScenario();
+    const imageDigest = digestOfFile(image);
+    const before = deploymentState(fixture, pair);
+
+    const validated = validateRollbackPair(pair.root, expectation, { replacementDatabase: image });
+    expect(validated.approvedMigration).toMatchObject({ fromVersion: 25, toVersion: SCHEMA_VERSION });
+    expect(validated.replacement?.imageSha256).toBe(`sha256:${imageDigest}`);
+    expect(deploymentState(fixture, pair)).toBe(before);
+
+    const applied = rollbackToSealedPair(pair.root, expectation, join(fixture.home, "stage-replacement"), {
+      replacementDatabase: image,
+    });
+    expect(applied.replacementImageSha256).toBe(`sha256:${imageDigest}`);
+    expect(digestOfFile(fixture.databasePath)).toBe(imageDigest);
+    expect(userVersionOf(fixture.databasePath)).toBe(25);
+    // The v25-era write the pair's own image does not hold is the whole point of the replacement.
+    expect(maxAuditEventId(fixture.databasePath)).toBeGreaterThan(pair.manifest.database.highWater!.auditEventId ?? 0);
+  }, 120_000);
+
+  it("refuses a write after the conversion, a missing approval, and no flag at all, as STALE with nothing changed", async () => {
+    const written = await replacementScenario();
+    writeAuditEvent(written.fixture.databasePath, "after-conversion");
+    const writtenBefore = deploymentState(written.fixture, written.pair);
+    for (const attempt of [
+      () => validateRollbackPair(written.pair.root, written.expectation, { replacementDatabase: written.image }),
+      () =>
+        rollbackToSealedPair(written.pair.root, written.expectation, join(written.fixture.home, "stage-w"), {
+          replacementDatabase: written.image,
+        }),
+    ]) {
+      const refused = refusal(attempt);
+      expect(refused.reasonCode, refused.message).toBe(STALE);
+    }
+    expect(deploymentState(written.fixture, written.pair)).toBe(writtenBefore);
+
+    const unapproved = await replacementScenario();
+    for (const name of retiredApprovals(unapproved.fixture.databasePath)) {
+      rmSync(join(dirname(unapproved.fixture.databasePath), name));
+    }
+    const unapprovedBefore = deploymentState(unapproved.fixture, unapproved.pair);
+    const noApproval = refusal(() =>
+      validateRollbackPair(unapproved.pair.root, unapproved.expectation, { replacementDatabase: unapproved.image }),
+    );
+    expect(noApproval.reasonCode, noApproval.message).toBe(STALE);
+    expect(deploymentState(unapproved.fixture, unapproved.pair)).toBe(unapprovedBefore);
+
+    const plain = await replacementScenario();
+    const plainBefore = deploymentState(plain.fixture, plain.pair);
+    for (const attempt of [
+      () => validateRollbackPair(plain.pair.root, plain.expectation),
+      () => rollbackToSealedPair(plain.pair.root, plain.expectation, join(plain.fixture.home, "stage-p")),
+    ]) {
+      const refused = refusal(attempt);
+      expect(refused.reasonCode, refused.message).toBe(STALE);
+    }
+    expect(deploymentState(plain.fixture, plain.pair)).toBe(plainBefore);
+  }, 180_000);
+
+  it("refuses an image that is not the pair's generation as INTERNAL_ERROR with nothing changed", async () => {
+    const scenario = await replacementScenario();
+    const { fixture, pair, expectation, makeImage } = scenario;
+    // Not converted at all: the live database's own image, at this build's schema version.
+    const unconverted = await makeImage("unconverted", (work) => {
+      copyFileSync(fixture.databasePath, work);
+    });
+    // A fresh database at the sealed version: same schema, a ledger written at another moment.
+    const fresh = await makeImage("fresh", (work) => {
+      seedV25Database(work);
+      editLedger(work, "UPDATE schema_migrations SET applied_at = ?", "2026-11-01T00:00:00.000Z");
+    });
+    const extraTrigger = await makeImage("trigger", (work) => {
+      copyFileSync(join(fixture.home, "v25-copy.sqlite"), work);
+      const raw = new Database(work);
+      try {
+        raw.exec("CREATE TRIGGER extra_trigger AFTER INSERT ON audit_events BEGIN SELECT 1; END");
+      } finally {
+        raw.close();
+      }
+    });
+    const alteredLedger = await makeImage("ledger", (work) => {
+      copyFileSync(join(fixture.home, "v25-copy.sqlite"), work);
+      editLedger(work, "UPDATE schema_migrations SET checksum = ? WHERE version = 25", `sha256:${"c".repeat(64)}`);
+    });
+    const before = deploymentState(fixture, pair);
+    for (const [name, image] of [
+      ["unconverted", unconverted],
+      ["fresh", fresh],
+      ["extra trigger", extraTrigger],
+      ["altered ledger checksum", alteredLedger],
+    ] as const) {
+      for (const attempt of [
+        () => validateRollbackPair(pair.root, expectation, { replacementDatabase: image }),
+        () =>
+          rollbackToSealedPair(pair.root, expectation, join(fixture.home, `stage-${name.replaceAll(" ", "-")}`), {
+            replacementDatabase: image,
+          }),
+      ]) {
+        const refused = refusal(attempt);
+        expect(refused.reasonCode, `${name}: ${refused.message}`).toBe(ReasonCode.INTERNAL_ERROR);
+      }
+    }
+    expect(deploymentState(fixture, pair)).toBe(before);
+  }, 180_000);
+
+  it("refuses when the source hash does not name the live main file, as STALE with nothing changed", async () => {
+    const { fixture, pair, expectation, image } = await replacementScenario();
+    rewriteSourceRecord(image, { sourceMainSha256: `sha256:${"d".repeat(64)}` });
+    const before = deploymentState(fixture, pair);
+    for (const attempt of [
+      () => validateRollbackPair(pair.root, expectation, { replacementDatabase: image }),
+      () =>
+        rollbackToSealedPair(pair.root, expectation, join(fixture.home, "stage-source"), { replacementDatabase: image }),
+    ]) {
+      const refused = refusal(attempt);
+      expect(refused.reasonCode, refused.message).toBe(STALE);
+      expect(refused.message).toContain("source file");
+    }
+    expect(deploymentState(fixture, pair)).toBe(before);
+  }, 120_000);
+
+  it("refuses a live database that is not quiescent: a held lock, a journal, a non-empty log", async () => {
+    for (const how of ["lock", "journal", "wal"] as const) {
+      const { fixture, pair, expectation, image } = await replacementScenario();
+      const lock = new SingleInstanceLock(join(dirname(fixture.databasePath), "agentcpd.lock"));
+      if (how === "lock") expect(lock.acquire(new Date().toISOString()).allowed).toBe(true);
+      if (how === "journal") writeFileSync(`${fixture.databasePath}-journal`, "", { mode: 0o600 });
+      if (how === "wal") writeFileSync(`${fixture.databasePath}-wal`, "not empty", { mode: 0o600 });
+      const before = deploymentState(fixture, pair);
+      try {
+        const refused = refusal(() => validateRollbackPair(pair.root, expectation, { replacementDatabase: image }));
+        expect(refused.reasonCode, `${how}: ${refused.message}`).toBe(STALE);
+        expect(refused.message, how).toContain("not quiescent");
+        expect(deploymentState(fixture, pair), how).toBe(before);
+      } finally {
+        lock.release();
+      }
+    }
+  }, 240_000);
+
+  it("refuses an image that is not the one its source record names, as INTERNAL_ERROR", async () => {
+    const { fixture, pair, expectation, image } = await replacementScenario();
+    rewriteSourceRecord(image, { imageSha256: `sha256:${"e".repeat(64)}` });
+    const before = deploymentState(fixture, pair);
+    const refused = refusal(() => validateRollbackPair(pair.root, expectation, { replacementDatabase: image }));
+    expect(refused.reasonCode, refused.message).toBe(ReasonCode.INTERNAL_ERROR);
+    rmSync(replacementSourcePath(image));
+    const missing = refusal(() => validateRollbackPair(pair.root, expectation, { replacementDatabase: image }));
+    expect(missing.reasonCode, missing.message).toBe(ReasonCode.INTERNAL_ERROR);
+    expect(deploymentState(fixture, pair)).toBe(before);
+  }, 120_000);
+
+  it("refuses a staged image that changed after validation, and an installed image that is not the staged one", async () => {
+    const changed = await replacementScenario();
+    const staged = stageRollbackPair(changed.pair.root, changed.expectation, join(changed.fixture.home, "stage-c"), {
+      replacementDatabase: changed.image,
+    });
+    const liveBefore = digestOfFile(changed.fixture.databasePath);
+    writeFileSync(staged.databasePath, "not the image that was validated", { mode: 0o600 });
+    const refusedStage = refusal(() => applyRollbackPair(staged));
+    expect(refusedStage.reasonCode, refusedStage.message).toBe(ReasonCode.INTERNAL_ERROR);
+    expect(digestOfFile(changed.fixture.databasePath)).toBe(liveBefore);
+
+    // A restore that exits zero having installed other bytes: the post-condition is file equality.
+    const installed = await replacementScenario('#!/bin/bash\nset -e\ncp "$3" "$5"\nprintf x >> "$5"\n');
+    const expectation = installed.expectation;
+    const refused = refusal(() =>
+      rollbackToSealedPair(installed.pair.root, expectation, join(installed.fixture.home, "stage-i"), {
+        replacementDatabase: installed.image,
+      }),
+    );
+    expect(refused.reasonCode, refused.message).toBe(ReasonCode.INTERNAL_ERROR);
+    expect(refused.message).toContain("without installing the sealed image");
+  }, 180_000);
+
+  it("refuses a write made during the runtime copy at the check before the database step, and compensates", async () => {
+    const { fixture, pair, expectation, image } = await replacementScenario();
+    let wrote = false;
+    const appRootBefore = walk(fixture.appRoot);
+    const refused = refusal(() =>
+      rollbackToSealedPair(pair.root, expectation, join(fixture.home, "stage-window"), {
+        replacementDatabase: image,
+        onStep: (step) => {
+          if (step === "plist" && !wrote) {
+            wrote = true;
+            writeAuditEvent(fixture.databasePath, "during-the-runtime-copy");
+          }
+        },
+      }),
+    );
+    expect(wrote).toBe(true);
+    expect(refused.reasonCode, refused.message).toBe(STALE);
+    // The database step never ran: the live database is still the migrated one, write included.
+    expect(userVersionOf(fixture.databasePath)).toBe(SCHEMA_VERSION);
+    expect(existsSync(fixture.plistDestination)).toBe(false);
+    expect(existsSync(fixture.launcherDestination)).toBe(false);
+    expect(walk(fixture.appRoot)).toEqual(appRootBefore);
+  }, 120_000);
+
+  for (const failAfter of ["runtime", "plist", "launcher", "restoreHelper", "database", "compensate"] as const) {
+    it(`leaves the previous generation whole when it fails after ${failAfter}`, async () => {
+      const { fixture, pair, expectation, image } = await replacementScenario();
+      const liveBefore = digestOfFile(fixture.databasePath);
+      const auditBefore = maxAuditEventId(fixture.databasePath);
+      const appRootBefore = walk(fixture.appRoot);
+      let thrown: AcpError | undefined;
+      try {
+        rollbackToSealedPair(pair.root, expectation, join(fixture.home, `stage-${failAfter}`), {
+          replacementDatabase: image,
+          failAfter,
+        });
+      } catch (error) {
+        if (!isAcpError(error)) throw error;
+        thrown = error;
+      }
+      expect(thrown?.message).toContain(`injected failure ${failAfter === "compensate" ? "after runtime" : `after ${failAfter}`}`);
+      if (failAfter === "compensate") {
+        expect(thrown?.evidence["compensationFailed"]).toBe(true);
+        expect(existsSync(String(thrown?.evidence["recoveryRoot"]))).toBe(true);
+        // Compensation never ran, so the database was never touched by it either.
+        expect(digestOfFile(fixture.databasePath)).toBe(liveBefore);
+        return;
+      }
+      expect(walk(fixture.appRoot)).toEqual(appRootBefore);
+      expect(existsSync(fixture.plistDestination)).toBe(false);
+      expect(existsSync(fixture.launcherDestination)).toBe(false);
+      if (failAfter === "database") {
+        // The image was installed and then put back from the recovery point: same content, re-imaged.
+        expect(userVersionOf(fixture.databasePath)).toBe(SCHEMA_VERSION);
+        expect(maxAuditEventId(fixture.databasePath)).toBe(auditBefore);
+      } else {
+        expect(digestOfFile(fixture.databasePath)).toBe(liveBefore);
+      }
+    }, 120_000);
+  }
 });
