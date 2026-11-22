@@ -961,8 +961,9 @@ row `bootstrap-v60`, not the one above, so the ledger guard refuses it; that is 
 immediately after the copy is taken. If any differs at any of those points, the copy is discarded and
 the procedure stops.
 
-1. The daemon is stopped and `~/.agent-control-plane/agentcpd.lock` is free (item 3's wait, with its
-   `exit 1`, not a warning).
+1. The daemon is stopped and `~/.agent-control-plane/agentcpd.lock` is free: the wait, with its
+   `exit 1` and not a warning, in step 3 ("Stop the job, then rebuild the candidate…") of the section
+   "4. Reconcile the deployed daemon with candidate main — blocks #512".
 2. `state.sqlite-journal` does not exist.
 3. `state.sqlite-wal` is absent or zero bytes.
 4. The source main file's SHA-256 is the one recorded at the start.
@@ -1014,28 +1015,42 @@ Verify the copy before using it: `PRAGMA integrity_check` returns `ok` on it, an
 digest (defined under the post-checks) equals the same digest taken from the source opened the
 same immutable way. A copy that cannot be proven equal to the source is not a starting point.
 
+**The reference for the schema comparisons.** The only valid reference for comparing full
+`(type, name, tbl_name, sql)` rows is the database image sealed in this database's own rollback pair,
+taken before the v59→v60 migration: the pair's `database/state.sqlite`, which carries v59's
+`sqlite_schema`. A migrated database keeps the whitespace each older release wrote for its own
+objects, and a database created fresh by the v59 build spells some of them differently, so a fresh
+image fails a valid source. If no such image exists, compare object `type`, `name` and `tbl_name`
+only, against a database created fresh by the pinned v59 build. That is weaker: a changed definition
+under an unchanged name is not caught. Say in the evidence which of the two was used.
+
+The two v60 triggers are compared against the text a v60 migration stores, not against
+`src/db/schema.sql` verbatim. SQLite drops `IF NOT EXISTS` from the stored text, so the literal
+statement never matches. The stored text is the statement in `src/db/schema.sql` from
+`CREATE TRIGGER IF NOT EXISTS <name>` through `END;`, with ` IF NOT EXISTS` removed and the final `;`
+dropped, and no comment above it. A v60 database produced by migrating the reference image holds
+exactly that.
+
 **Guards, checked on the copy, before anything is changed.** Any one of these failing stops the
 procedure. Nothing is repaired to make a guard pass.
 
 - `PRAGMA user_version` is not `60`, or the v60 ledger row is absent, appears more than once, or
   carries a different `migration_id` or `checksum`, or `max(version)` in `schema_migrations` is not 60.
-- The trigger set is not exactly the v59 set plus `runs_review_completion_bootstrap_only` and
-  `runs_kind_immutable`. Compare names and `tbl_name` against the v59 expected image — the database
-  image sealed in the pair, or one created by the pinned v59 build — and read the two v60 triggers
-  back as `type='trigger' AND tbl_name='runs'`. A missing, extra or renamed trigger is a stop.
-- `sqlite_schema` differs from v60's expected schema. The expected v60 schema is the v59 expected
-  schema plus those two triggers, byte for byte in `sql` — `src/db/schema.sql` on this build carries
-  their text. Compare every `(type, name, tbl_name, sql)` row, not a count.
+- The trigger set is not exactly the reference's set plus `runs_review_completion_bootstrap_only` and
+  `runs_kind_immutable`. Compare `type`, `name` and `tbl_name` against the reference, and read the two
+  v60 triggers back as `type='trigger' AND tbl_name='runs'`. A missing, extra or renamed trigger is a
+  stop.
+- `sqlite_schema` differs from v60's expected schema: the reference's rows plus the two triggers in the
+  stored text above. With the sealed image as the reference, compare every `(type, name, tbl_name,
+  sql)` row, not a count. With a fresh v59 image as the reference, compare `type`, `name` and
+  `tbl_name` only, and compare the two triggers' `sql` to the stored text above.
 - `PRAGMA integrity_check` is anything but `ok`.
 
-**The steps.** One transaction, on the copy, in a `sqlite3` shell that supports `.dbconfig`. It starts
-by running `quiet` and `check_copy` again in the same `bash`: the source's digest is re-checked
-before the conversion, not only at the end, and the SQL never runs against a path that is not the
-verified copy.
+**The steps.** One transaction, on the copy, in a `sqlite3` shell that supports `.dbconfig`. Write the
+SQL below to `$WORK/convert.sql` first — with an editor, or with `cat > "$WORK/convert.sql"`, pasting
+it and ending with Ctrl-D — and run it from that file. A shell heredoc needs a writable temporary
+directory, which a sandboxed shell or a read-only `TMPDIR` may not have.
 
-    set -euo pipefail
-    quiet && check_copy || { echo "stop: the source or the copy changed since the copy was taken" >&2; exit 1; }
-    sqlite3 "$COPY" <<'SQL'
     .bail on
     .dbconfig enable_trigger off
     BEGIN IMMEDIATE;
@@ -1059,7 +1074,14 @@ verified copy.
     COMMIT;
     PRAGMA wal_checkpoint(TRUNCATE);
     SELECT 'user_version', user_version FROM pragma_user_version;
-    SQL
+
+Then, in the same `bash` that took the copy, run it. This begins by running `quiet` and `check_copy`
+again: the source's digest is re-checked before the conversion, not only at the end, and the SQL never
+runs against a path that is not the verified copy.
+
+    set -euo pipefail
+    quiet && check_copy || { echo "stop: the source or the copy changed since the copy was taken" >&2; exit 1; }
+    sqlite3 "$COPY" < "$WORK/convert.sql"
 
 `.dbconfig enable_trigger off` is what makes the `DELETE` possible, and it is the only thing that
 does. `schema_migrations_no_delete` refuses to delete a receipt row on purpose
@@ -1080,7 +1102,9 @@ different row cannot match it, and the `changes()` guard stops anything but exac
    Take it from the copy before the transaction and after it. A count of rows is not a digest.
 2. `schema_migrations` differs from its pre-transaction state by the v60 row and nothing else: the
    same digest over the rows where `version <> 60` is equal, and the v60 row is gone.
-3. `sqlite_schema` equals the v59 expected schema, every `(type, name, tbl_name, sql)` row.
+3. `sqlite_schema` equals the reference, at the strength the reference allows: with the image sealed in
+   this database's own rollback pair, every `(type, name, tbl_name, sql)` row; with only a fresh v59
+   image, `type`, `name` and `tbl_name`, which is weaker and is reported as such.
 4. `PRAGMA integrity_check` is `ok`, and `PRAGMA user_version` is `59`.
 
 **Proving the converted copy in isolation.** Make a throwaway duplicate of the converted copy, record
@@ -1105,14 +1129,54 @@ duplicate's state directory. A refusal before the open is a defect in the duplic
 data difference: discard that duplicate and its `crash-loop.json`, fix the setup, make a new duplicate
 from the converted copy and retry. It says nothing about the converted copy and is not a stop.
 
+**Pointing the daemon at the duplicate.** The daemon finds its state directory through `HOME` and
+nothing else: `agentcpd` takes `defaultConfig()`, and that is `homedir()/.agent-control-plane`
+(`src/app/control-plane.ts`, `src/daemon/agentcpd.ts`). `ACP_STATE_DIR` has **no effect on the
+daemon**; only `agentctl` reads it (`src/cli/agentctl.ts`). So the duplicate is started with
+`HOME=<throwaway home>`, where `<throwaway home>/.agent-control-plane` **is** the duplicate directory
+holding `state.sqlite` and `credentials/`. A daemon started without that `HOME` override opens the
+live state directory — its lock, `crash-loop.json` and `health.json` — whatever else was set.
+
+The daemon also refuses to start without two credentials of its own: `ACP_OPERATOR_TOKEN`, and a
+separate `ACP_MCP_TOKEN` that must not equal it (`src/daemon/agentcpd.ts`). Give it throwaway values,
+generated for this run and never printed, never the deployment's. Start it from an empty environment
+(`env -i`), so no live token, socket path or other `ACP_*` variable reaches it.
+
+Before the start, print the state path the daemon would resolve and refuse if it is not the duplicate
+or if it is the live one. `V59_ROOT` is the v59 build:
+
+    set -euo pipefail
+    LIVE="$HOME/.agent-control-plane"
+    DUP_HOME=/absolute/path/to/throwaway-home      # the duplicate is "$DUP_HOME/.agent-control-plane", mode 700
+    V59_ROOT=/absolute/path/to/the/v59/build
+    RESOLVED="$(env -i HOME="$DUP_HOME" PATH="$PATH" node --input-type=module -e \
+      'const { defaultConfig } = await import(process.argv[1]); console.log(defaultConfig().databasePath)' \
+      "$V59_ROOT/dist/app/control-plane.js")"
+    echo "the daemon would open: $RESOLVED"
+    [ "$(realpath "$(dirname "$RESOLVED")")" = "$(realpath "$DUP_HOME/.agent-control-plane")" ] || { echo "stop: that is not the duplicate" >&2; exit 1; }
+    [ "$(realpath "$(dirname "$RESOLVED")")" != "$(realpath "$LIVE")" ] || { echo "stop: that is the live state directory" >&2; exit 1; }
+
+Then start the daemon, and ask it with `agentctl`:
+
+    OPERATOR_TOKEN="$(uuidgen)"; MCP_TOKEN="$(uuidgen)"
+    env -i HOME="$DUP_HOME" PATH="$PATH" ACP_OPERATOR_TOKEN="$OPERATOR_TOKEN" ACP_MCP_TOKEN="$MCP_TOKEN" \
+      node "$V59_ROOT/dist/daemon/agentcpd.js"
+    # in another shell, with the same OPERATOR_TOKEN:
+    env -i HOME="$DUP_HOME" PATH="$PATH" ACP_STATE_DIR="$DUP_HOME/.agent-control-plane" \
+      ACP_OPERATOR_TOKEN="$OPERATOR_TOKEN" node "$V59_ROOT/dist/cli/agentctl.js" daemon status
+
+For `agentctl`, `ACP_STATE_DIR` must name the duplicate and `ACP_OPERATOR_SOCKET` must be unset: when
+it is set it overrides `ACP_STATE_DIR` (`src/cli/agentctl.ts`) and the CLI would talk to whatever
+socket it names, which on a deployed host is the live one. `env -i` leaves it unset.
+
 Once the setup is right, the start must reach ready, and ready is the product's own answer, all
 three of these together:
 
 - the daemon's stdout carries the `{ "started": … }` report, which it prints only after the last
   startup step that can still refuse the start;
 - `health.json` in the duplicate's state directory says `"mode": "NORMAL"`, not `BOOTSTRAP`;
-- the operator socket answers `agentctl daemon status` (with `ACP_STATE_DIR` and the operator token
-  pointed at the duplicate, never the live ones), and the answer reports mode `NORMAL`.
+- the operator socket answers `agentctl daemon status`, run as above against the duplicate, and the
+  answer reports mode `NORMAL`.
 
 A `health.json` with a new `pid` and `startedAt` is not enough on its own: the daemon writes both
 before it decides whether to run, park in `BOOTSTRAP` or refuse. A start that
@@ -1137,7 +1201,7 @@ only if all four of these do:
    `repositories`.
 3. New rows appear only in `audit_events`, `capacity_snapshots` and `telemetry_metrics`, and the only
    `sqlite_sequence` changes are those tables' counters rising.
-4. `sqlite_schema` is still equal to the v59 expected schema, `user_version` is 59 and
+4. `sqlite_schema` is still equal, row for row, to the converted copy's, `user_version` is 59 and
    `integrity_check` is `ok`.
 
 Anything else — a missing or changed row, a new row in any other table, another `repositories`
