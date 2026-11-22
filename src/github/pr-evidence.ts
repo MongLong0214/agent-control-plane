@@ -192,6 +192,15 @@ const BRIEF_WHERE_CHARS = 60;
 const GAP_LIST_BUDGET_CHARS = 5_000;
 
 /**
+ * A continuation page re-reads the compare, so its gaps are told from the ones the pages before counted by a
+ * tag per gap, kept in the signed cursor (at most GAP_TAGS_KEPT, which keeps the cursor far under its 4,000
+ * characters). A gap past that is not remembered and counts as new on every page: counted and listed within
+ * the same budget, never taken for one already counted.
+ */
+const GAP_TAG_CHARS = 6;
+const GAP_TAGS_KEPT = 250;
+
+/**
  * The answer's state in under 2048 characters, done, complete and nextCursor first, so a reader that sees only
  * the start (a Hermes tool error, a spillover preview) still has it and can ask for the next page. It is the
  * answer's first text block as well as a field. Each value is a copy of what the fields below carry in full.
@@ -269,9 +278,8 @@ const cursorSchema = z.object({
   /** How many gaps the pages before this one named, and a digest chained over them page by page. */
   g: z.number().int().min(0),
   gd: z.string(),
-  /** Digests of the compare's PATCH_OMITTED gaps and of its other gaps as the pages before this one counted them. */
-  ko: z.string(),
-  kf: z.string(),
+  /** GAP_TAG_CHARS-character tags of the compare's gaps the pages before this one counted: see `gapTagOf`. */
+  kt: z.string().max(GAP_TAGS_KEPT * GAP_TAG_CHARS),
 }).strict();
 type Cursor = z.infer<typeof cursorSchema>;
 
@@ -385,11 +393,14 @@ const textCostOf = (code: number): number =>
   : code < 0x20 || (code >= 0xd800 && code <= 0xdfff) ? 13
   : 2;
 
-/** The compare's gaps, those of omitted patches apart from the rest. */
-const splitGaps = (gaps: PrEvidenceIncomplete[]) => ({
-  omitted: gaps.filter((entry) => entry.kind === "PATCH_OMITTED"),
-  failures: gaps.filter((entry) => entry.kind !== "PATCH_OMITTED"),
-});
+/** A keyed tag of one gap, whole (kind, where, detail), so the same gap on another page has the same tag. */
+const gapTagOf = (entry: PrEvidenceIncomplete): string => macOf(JSON.stringify(entry)).slice(0, GAP_TAG_CHARS);
+const tagsIn = (kept: string): string[] => kept.match(new RegExp(`.{${GAP_TAG_CHARS}}`, "g")) ?? [];
+
+/** Gaps naming no file first (a failed lookup, a missing merge-base), then per-file gaps, then omitted patches. */
+const gapRank = (entry: PrEvidenceIncomplete): number => entry.kind === "PATCH_OMITTED" ? 2 : entry.file === undefined ? 0 : 1;
+const failuresFirst = (gaps: PrEvidenceIncomplete[]): PrEvidenceIncomplete[] =>
+  [0, 1, 2].flatMap((rank) => gaps.filter((entry) => gapRank(entry) === rank));
 
 /** `gaps` is every gap this page counts, listed or not. */
 const briefOf = (
@@ -822,22 +833,21 @@ export const readPrEvidence = async (source: PrEvidenceSource, input: PrEvidence
 
   let summary: PrEvidenceSummary | null = null;
   // What the next cursor carries: every gap the read has named up to and including this page.
-  let carried = { g: 0, gd: "", ko: "", kf: "" };
-  const compareGaps = splitGaps(incomplete);
+  let carried = { g: 0, gd: "", kt: "" };
+  const compareTags = incomplete.map(gapTagOf);
   if (cursor) {
-    // A continuation page re-reads the compare, so what that read names again is not new: a group of gaps the
-    // pages before already counted (same digest) is neither counted nor listed again. What is new is counted into
+    // A continuation page re-reads the compare, so a gap it names again, one by one and not as a group, is not
+    // new: the pages before counted it, so it is neither counted nor listed again. What is new is counted into
     // the read's, and listed after one entry that counts the read's.
     incomplete.splice(0);
-    const fresh = [
-      ...(compareGaps.failures.length > 0 && digestOf(compareGaps.failures) !== cursor.kf ? compareGaps.failures : []),
-      ...(compareGaps.omitted.length > 0 && digestOf(compareGaps.omitted) !== cursor.ko ? compareGaps.omitted : []),
-    ];
+    const known = new Set(tagsIn(cursor.kt));
+    const own = read.gaps;
+    const fresh = failuresFirst(own.filter((_, i) => !known.has(compareTags[i]!)));
+    for (const tag of compareTags) if (known.size < GAP_TAGS_KEPT) known.add(tag);
     carried = {
       g: cursor.g + fresh.length,
       gd: fresh.length === 0 ? cursor.gd : digestOf({ before: cursor.gd, gaps: fresh }),
-      ko: compareGaps.omitted.length > 0 ? digestOf(compareGaps.omitted) : cursor.ko,
-      kf: compareGaps.failures.length > 0 ? digestOf(compareGaps.failures) : cursor.kf,
+      kt: [...known].join(""),
     };
     if (carried.g > 0) {
       incomplete.push({ kind: "SNAPSHOT_INCOMPLETE", lookup: pullLookup,
@@ -891,12 +901,11 @@ export const readPrEvidence = async (source: PrEvidenceSource, input: PrEvidence
     };
   }
 
-  // Failures first, the compare's omitted patches last, so a gap that says what went wrong is never behind forty
-  // that say a file is binary. Sliced after every read of the snapshot, so the next cursor carries the first page's
-  // whole gap list.
-  const ordered = [...incomplete.filter((entry) => entry.kind !== "PATCH_OMITTED"), ...incomplete.filter((entry) => entry.kind === "PATCH_OMITTED")];
-  if (!cursor) carried = { g: ordered.length, gd: digestOf(ordered), ko: digestOf(compareGaps.omitted), kf: digestOf(compareGaps.failures) };
-  const gaps = ordered;
+  // A gap that names no file comes before the per-file ones and the omitted patches, so what went wrong is never
+  // behind forty that say a file is binary. Sliced after every read of the snapshot, so the next cursor carries
+  // the first page's whole gap list.
+  const gaps = cursor ? incomplete : failuresFirst(incomplete);
+  if (!cursor) carried = { g: gaps.length, gd: digestOf(gaps), kt: [...new Set(compareTags)].slice(0, GAP_TAGS_KEPT).join("") };
   const pageIndex = cursor?.i ?? 1;
   const pageChars = input.pageChars ?? PR_EVIDENCE_DIFF_PAGE_MAX_CHARS;
   const cursorAt = (o: number): string => encodeCursor({

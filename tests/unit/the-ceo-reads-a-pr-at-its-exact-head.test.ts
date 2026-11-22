@@ -740,6 +740,33 @@ describe("pr_evidence_get", () => {
       expect(page.incomplete.length + page.incompleteNotListed).toBe(2);
     });
 
+    it("counts only the added failure as new when 40 per-file failures recur on the page, and lists its detail first", async () => {
+      // 40 files with no line counts: the same MALFORMED_RESPONSE per file on every page.
+      const unmeasured = binaryRows().map((row) => { const { additions: _a, ...rest } = row; return rest; });
+      gh.pulls.push(pullRow(45, HEAD_A, 190));
+      gh.filesByHead.set(HEAD_A, [...unmeasured, ...Array.from({ length: 150 }, (_, i) => fileRow(100 + i))]);
+      gh.checkRuns.push({ id: 9, name: "ci", head_sha: HEAD_A, status: "completed", conclusion: "success" });
+      const firstAnswer = await ceoCall({ projectId, prNumber: 45, expectedHead: HEAD_A });
+      if (firstAnswer.ok) throw new Error("unreachable");
+      const first = firstAnswer.evidence as unknown as Page;
+      expect(first.brief.gaps.count).toBe(40);
+      // Only page 2's compare lacks the merge-base commit; the 40 per-file failures are the same on both pages.
+      gh.reshape = { compare: (body) => { const { merge_base_commit: _gone, ...rest } = body; return rest; } };
+      const secondAnswer = await ceoCall({ projectId, prNumber: 45, expectedHead: HEAD_A, cursor: first.diff.nextCursor });
+      if (secondAnswer.ok) throw new Error("unreachable");
+      const second = secondAnswer.evidence as unknown as Page;
+      expect(second.incomplete[0]).toMatchObject({ kind: "SNAPSHOT_INCOMPLETE", detail: expect.stringContaining("41 gap(s), 40 before this page and 1 on it") });
+      expect(second.incomplete[1]).toMatchObject({ kind: "MALFORMED_RESPONSE", detail: expect.stringContaining("merge-base") });
+      expect(second.incomplete.length + second.incompleteNotListed).toBe(2);
+      expect(second.brief.gaps.first.some((quote) => quote.includes("merge-base"))).toBe(true);
+      // The next page repeats both failures, which the pages before already counted.
+      const thirdAnswer = await ceoCall({ projectId, prNumber: 45, expectedHead: HEAD_A, cursor: second.diff.nextCursor });
+      if (thirdAnswer.ok) throw new Error("unreachable");
+      const third = thirdAnswer.evidence as unknown as Page;
+      expect(third.incomplete).toHaveLength(1);
+      expect(third.incomplete[0]).toMatchObject({ detail: expect.stringContaining("41 gap(s), 41 before this page and 0 on it") });
+    });
+
     it("never gives the gap list more than a small share of an answer, first page included", async () => {
       seedBinaries(44);
       const first = await ceoCall({ projectId, prNumber: 44, expectedHead: HEAD_A });
