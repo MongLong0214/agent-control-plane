@@ -23,7 +23,9 @@ import { afterAll, describe, expect, it } from "vitest";
 
 import { isAcpError, type AcpError } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
-import { Db } from "../../src/db/database.ts";
+import { Db, SCHEMA_VERSION } from "../../src/db/database.ts";
+import { approveMigration, migrationApprovalPath } from "../../src/db/migration-approval.ts";
+import { MIGRATIONS } from "../../src/db/migrations.ts";
 import {
   ROLLBACK_PAIR_INDEX_FILE,
   ROLLBACK_PAIR_MANIFEST_FILE,
@@ -1414,4 +1416,155 @@ describe("a rollback preserves every write made since its pair was sealed (SSOT 
       validateRollbackPair(pair.root, expectationFor(fixture, pair, { indexDigest: forgedDigest })),
     ).toThrow(/manifest has an invalid shape/);
   });
+});
+
+/**
+ * A pair is sealed to be the way back from an approved schema migration, and the migration alone
+ * changes the content digest. The audit high-water mark cannot tell that apart from a write (a
+ * migration moves no audit row, and neither does a write to another table), so the guard replays
+ * the approved chain on the sealed image and compares content (#1492).
+ *
+ * The chain is real: a v25 database seeded from the committed lineage, migrated to this build's
+ * schema by `approveMigration` and `Db`, the way the live upgrade runs.
+ */
+const V25_LINEAGE = readFileSync(new URL("../fixtures/schema-v25-lineage.sql", import.meta.url), "utf8");
+
+const seedV25Database = (path: string): void => {
+  for (const suffix of ["", "-wal", "-shm"]) rmSync(`${path}${suffix}`, { force: true });
+  const raw = new Database(path);
+  try {
+    raw.function("acp_schema_migration_authorized", () => 1);
+    raw.exec(V25_LINEAGE);
+    for (const [version, id] of [
+      [20, "bootstrap-v20"],
+      [21, "v21-canonical-turns"],
+      [22, "v22-canonical-turn-ledger"],
+      [23, "v23-turn-claimed-at"],
+      [24, "v24-observation-ledger"],
+      [25, "v25-sources-name-admitted-messages"],
+    ] as const) {
+      raw
+        .prepare("INSERT INTO schema_migrations (version, migration_id, checksum, applied_at) VALUES (?, ?, ?, ?)")
+        .run(version, id, `sha256:${"b".repeat(64)}`, "2026-08-23T02:39:31.318Z");
+    }
+    raw.pragma("user_version = 25");
+  } finally {
+    raw.close();
+    chmodSync(path, 0o600);
+  }
+};
+
+const userVersionOf = (path: string): number => readFileSync(path).readUInt32BE(60);
+
+/** A pair sealed from the stopped v25 database, and the approved migration run after it. */
+const sealAtV25 = async (
+  options: { installingNode?: boolean } = {},
+): Promise<{ fixture: Fixture; pair: SealedRollbackPair }> => {
+  const fixture = makeFixture();
+  seedV25Database(fixture.databasePath);
+  if (options.installingNode === true) {
+    // The sealed generation's own `state-admin restore <image> --database <live> --confirm-restore`,
+    // reduced to the one thing a restore does here: put the image where the live database is. The
+    // rollback's own check that the destination now holds the staged image byte for byte still runs.
+    writeFileSync(join(fixture.sources.runtimeRoot, fixture.sources.nodeExecutable), '#!/bin/bash\nset -e\ncp "$3" "$5"\n', {
+      mode: 0o755,
+    });
+    chmodSync(join(fixture.sources.runtimeRoot, fixture.sources.nodeExecutable), 0o755);
+  }
+  const pair = await sealRollbackPair(fixture.pairsRoot, fixture.sources);
+  expect(pair.manifest.database.highWater!.userVersion).toBe(25);
+  return { fixture, pair };
+};
+
+const migrateApproved = (databasePath: string): void => {
+  approveMigration(databasePath, "rollback-pair-test");
+  new Db(databasePath).close();
+  expect(existsSync(migrationApprovalPath(databasePath))).toBe(false);
+};
+
+const retiredApprovals = (databasePath: string): string[] =>
+  readdirSync(dirname(databasePath)).filter((name) => /^migration-approval\.applied-v25-v\d+-\d+\.json$/.test(name));
+
+describe("a rollback across the approved migration it was sealed for (#1492)", () => {
+  it("accepts the sealed image when the migration is the only change, and says why", async () => {
+    const { fixture, pair } = await sealAtV25({ installingNode: true });
+    const image = join(pair.root, pair.manifest.database.member);
+    migrateApproved(fixture.databasePath);
+    expect(userVersionOf(fixture.databasePath)).toBe(SCHEMA_VERSION);
+    // Nothing the audit counters can see moved, which is why they cannot be the proof.
+    expect(maxAuditEventId(fixture.databasePath)).toBe(pair.manifest.database.highWater!.auditEventId);
+
+    const validated = validateRollbackPair(pair.root, expectationFor(fixture, pair));
+    expect(validated.approvedMigration).toMatchObject({
+      fromVersion: 25,
+      toVersion: SCHEMA_VERSION,
+      migrations: MIGRATIONS.filter((migration) => migration.fromVersion >= 25).map((migration) => migration.id),
+      approvedBy: "rollback-pair-test",
+    });
+    // Accepted at staging and at apply's own re-check, and the whole rollback runs.
+    expect(() =>
+      stageRollbackPair(pair.root, expectationFor(fixture, pair), join(fixture.home, "stage-a")),
+    ).not.toThrow();
+    const migratedDigest = digestOfFile(fixture.databasePath);
+    const applied = rollbackToSealedPair(pair.root, expectationFor(fixture, pair), join(fixture.home, "stage-b"));
+    expect(applied.approvedMigration).toMatchObject({ fromVersion: 25, toVersion: SCHEMA_VERSION });
+
+    // What is installed is the sealed image: its bytes and its version, not the migrated database's.
+    expect(digestOfFile(fixture.databasePath)).toBe(digestOfFile(image));
+    expect(digestOfFile(fixture.databasePath)).not.toBe(migratedDigest);
+    expect(userVersionOf(fixture.databasePath)).toBe(25);
+  }, 120_000);
+
+  it("refuses when an ordinary write follows the migration, naming the failed replay", async () => {
+    const { fixture, pair } = await sealAtV25();
+    migrateApproved(fixture.databasePath);
+    writeAuditEvent(fixture.databasePath, "after-the-migration");
+    const before = deploymentState(fixture, pair);
+
+    for (const attempt of [
+      () => validateRollbackPair(pair.root, expectationFor(fixture, pair)),
+      () => rollbackToSealedPair(pair.root, expectationFor(fixture, pair), join(fixture.home, "stage-b")),
+    ]) {
+      const refused = refusal(attempt);
+      expect(refused.reasonCode, refused.message).toBe(STALE);
+      expect(refused.message).toContain(REMEDY);
+      expect(refused.evidence["migrationReplay"]).toMatchObject({
+        outcome: "replay-did-not-match-the-live-database",
+        fromVersion: 25,
+        toVersion: SCHEMA_VERSION,
+      });
+    }
+    expect(deploymentState(fixture, pair)).toBe(before);
+  }, 120_000);
+
+  it("refuses a write to an ordinary table that no audit counter sees, after the migration", async () => {
+    const { fixture, pair } = await sealAtV25();
+    migrateApproved(fixture.databasePath);
+    const writer = new Database(fixture.databasePath);
+    writer.exec("CREATE TABLE after_the_migration (id INTEGER PRIMARY KEY)");
+    writer.close();
+    expect(maxAuditEventId(fixture.databasePath)).toBe(pair.manifest.database.highWater!.auditEventId);
+    const refused = refusal(() => validateRollbackPair(pair.root, expectationFor(fixture, pair)));
+    expect(refused.reasonCode).toBe(STALE);
+    expect(refused.evidence["migrationReplay"]).toMatchObject({ outcome: "replay-did-not-match-the-live-database" });
+  }, 120_000);
+
+  it("refuses an ordinary write with no migration, as before, with no replay attempted", async () => {
+    const { fixture, pair } = await sealAtV25();
+    writeAuditEvent(fixture.databasePath, "after-the-seal");
+    const refused = refusal(() => validateRollbackPair(pair.root, expectationFor(fixture, pair)));
+    expect(refused.reasonCode, refused.message).toBe(STALE);
+    expect(refused.evidence["migrationReplay"]).toBeUndefined();
+  }, 120_000);
+
+  it("refuses a migrated database that no applied approval accounts for", async () => {
+    const { fixture, pair } = await sealAtV25();
+    migrateApproved(fixture.databasePath);
+    const files = retiredApprovals(fixture.databasePath);
+    expect(files).toHaveLength(1);
+    rmSync(join(dirname(fixture.databasePath), files[0]!));
+    const refused = refusal(() => validateRollbackPair(pair.root, expectationFor(fixture, pair)));
+    expect(refused.reasonCode, refused.message).toBe(STALE);
+    expect(refused.evidence["migrationReplay"]).toBeUndefined();
+  }, 120_000);
 });

@@ -88,6 +88,14 @@ import Database from "better-sqlite3";
 import { acpError, isAcpError } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import { backupDatabase, captureRollbackPointSync, restoreDatabase, validateBackup } from "../db/backup.ts";
+import { Db } from "../db/database.ts";
+import {
+  approveMigration,
+  migrationPlanFrom,
+  readRetiredMigrationApprovals,
+  type MigrationApproval,
+} from "../db/migration-approval.ts";
+import { SCHEMA_VERSION } from "../db/migrations.ts";
 import { RollbackFilesystem, type RollbackEntry, type RollbackParent } from "../db/fd-vfs.ts";
 import { PRIVATE_FILE_MODE } from "../db/state-preflight.ts";
 
@@ -731,6 +739,27 @@ const hiddenRowidName = (raw: Database.Database, table: string): string => {
 };
 
 /**
+ * The only fields a migration replay cannot reproduce, named so nothing else is ever excluded.
+ *
+ * Each migration step appends one `schema_migrations` row stamped with the clock (`applied_at`),
+ * and the first step also records the pre-migration backup it took (`backup_file`, a path, and
+ * `backup_checksum`, the digest of that file). A replay in a temporary directory takes its own
+ * backup at its own time, so these three differ from the live database's on every run, whatever
+ * else is true. The ledger is immutable by trigger, so the replay cannot be made to carry the
+ * live values; the comparison reads them as NULL on both sides instead.
+ *
+ * Only for ledger rows above the sealed version, so every row the seal already held, and every
+ * row of every other table, is compared exactly. The row's own `version`, `migration_id` and
+ * `checksum` stay in the comparison, which is what says the live ledger names the approved chain.
+ */
+const MIGRATION_BOOKKEEPING_COLUMNS = ["applied_at", "backup_file", "backup_checksum"] as const;
+
+interface MigrationBookkeepingMask {
+  /** Ledger rows with `version` above this are the migration's own, and read their bookkeeping as NULL. */
+  aboveVersion: number;
+}
+
+/**
  * One digest over everything a write can change: `user_version`, `application_id`, the schema
  * without its root pages (layout, not content), and every row of every table in key order. Each
  * value is tagged with its storage class and length-prefixed, so `'1'`, `1` and `1.0` differ and no
@@ -743,7 +772,7 @@ const hiddenRowidName = (raw: Database.Database, table: string): string => {
  * Where an `INTEGER PRIMARY KEY` already aliases it, the value appears twice, which costs nothing.
  * A `WITHOUT ROWID` table has no hidden identity: its declared primary key is all of it.
  */
-const digestDatabaseContent = (raw: Database.Database): string => {
+const digestDatabaseContent = (raw: Database.Database, mask?: MigrationBookkeepingMask): string => {
   const hash = createHash("sha256");
   const length = Buffer.alloc(8);
   const field = (tag: string, bytes: Uint8Array): void => {
@@ -774,7 +803,24 @@ const digestDatabaseContent = (raw: Database.Database): string => {
     }
   };
 
+  // What `SELECT` reads for a table: every column, except that under a mask the migration
+  // bookkeeping of the ledger rows the mask names reads as NULL. Nothing else is ever masked.
+  const selection = (table: string): string => {
+    if (mask === undefined || table !== "schema_migrations") return "*";
+    return (raw.prepare("SELECT name FROM pragma_table_info(?)").pluck().all(table) as string[])
+      .map((column) =>
+        (MIGRATION_BOOKKEEPING_COLUMNS as readonly string[]).includes(column)
+          ? `CASE WHEN version > ${mask.aboveVersion} THEN NULL ELSE ${quoteIdentifier(column)} END`
+          : quoteIdentifier(column),
+      )
+      .join(", ");
+  };
+
   field("F", Buffer.from(DATABASE_CONTENT_FORMAT, "utf8"));
+  // A masked digest is a different measurement and must never equal an unmasked one.
+  if (mask !== undefined) {
+    field("M", Buffer.from(`schema_migrations(${MIGRATION_BOOKKEEPING_COLUMNS.join(",")}) above ${mask.aboveVersion}`, "utf8"));
+  }
   field("V", Buffer.from(String(raw.pragma("user_version", { simple: true })), "utf8"));
   field("A", Buffer.from(String(raw.pragma("application_id", { simple: true })), "utf8"));
   rows("SELECT type, name, tbl_name, sql FROM sqlite_schema ORDER BY type, name");
@@ -790,7 +836,7 @@ const digestDatabaseContent = (raw: Database.Database): string => {
     field("T", Buffer.from(table.name, "utf8"));
     if (table.wr === 0) {
       const rowid = hiddenRowidName(raw, table.name);
-      rows(`SELECT ${rowid}, * FROM ${quoteIdentifier(table.name)} ORDER BY ${rowid}`);
+      rows(`SELECT ${rowid}, ${selection(table.name)} FROM ${quoteIdentifier(table.name)} ORDER BY ${rowid}`);
       continue;
     }
     const key = (
@@ -798,7 +844,7 @@ const digestDatabaseContent = (raw: Database.Database): string => {
     )
       .map(quoteIdentifier)
       .join(", ");
-    rows(`SELECT * FROM ${quoteIdentifier(table.name)} ORDER BY ${key}`);
+    rows(`SELECT ${selection(table.name)} FROM ${quoteIdentifier(table.name)} ORDER BY ${key}`);
   }
   return `sha256:${hash.digest("hex")}`;
 };
@@ -813,7 +859,10 @@ const digestDatabaseContent = (raw: Database.Database): string => {
  * the main file alone is older than the last commit until something checkpoints it. A database
  * that changes while it is being copied has a writer, and is refused rather than measured.
  */
-const measureDatabaseAt = (databasePath: string): RollbackPairDatabaseHighWater | null => {
+const measureDatabaseAt = (
+  databasePath: string,
+  mask?: MigrationBookkeepingMask,
+): (RollbackPairDatabaseHighWater & { migrationMaskedSha256?: string }) | null => {
   if (lstatSync(databasePath, { throwIfNoEntry: false }) === undefined) return null;
   const files = ["", "-wal", "-journal"];
   for (const suffix of files) {
@@ -858,6 +907,7 @@ const measureDatabaseAt = (databasePath: string): RollbackPairDatabaseHighWater 
       return {
         contentFormat: DATABASE_CONTENT_FORMAT,
         contentSha256: digestDatabaseContent(raw),
+        ...(mask === undefined ? {} : { migrationMaskedSha256: digestDatabaseContent(raw, mask) }),
         userVersion: Number(raw.pragma("user_version", { simple: true })),
         auditEventId:
           audited === 0 ? null : (raw.prepare("SELECT max(event_id) FROM audit_events").pluck().get() as number | null),
@@ -926,6 +976,142 @@ const assertLiveDatabaseAtSeal = (manifest: RollbackPairManifest, root: string):
       { root, databasePath, sealedAt: manifest.createdAt, sealed, live },
     );
   }
+};
+
+/**
+ * `assertLiveDatabaseAtSeal`, except that a live database whose content differs from the seal by
+ * exactly the migration the owner approved is accepted, and the migration is returned (#1492).
+ *
+ * A pair is sealed from the stopped database right before an approved schema migration, to be the
+ * way back from it. The migration alone changes the content digest and moves no audit row, so the
+ * seal check would refuse the one rollback the pair exists for, with nothing written since. Only
+ * a content difference is eligible, and only the replay below can excuse it; every other refusal
+ * from the check above, and every content difference the replay does not reproduce, stands as it
+ * was, with the replay's outcome added to the evidence.
+ */
+const assertLiveDatabaseAtSealOrApprovedMigration = (
+  manifest: RollbackPairManifest,
+  root: string,
+  sealedImage: string,
+): ApprovedMigrationSinceSeal | null => {
+  try {
+    assertLiveDatabaseAtSeal(manifest, root);
+    return null;
+  } catch (error) {
+    if (
+      !isAcpError(error) ||
+      error.reasonCode !== ReasonCode.ROLLBACK_PAIR_STALE_DATABASE ||
+      error.evidence["live"] === undefined
+    ) {
+      throw error;
+    }
+    const replay = replayApprovedMigration(
+      manifest.database.highWater!,
+      manifest.identity.database.targetPath,
+      sealedImage,
+    );
+    if ("approved" in replay) return replay.approved;
+    if (replay.evidence === undefined) throw error;
+    throw acpError(error.reasonCode, error.message, { ...error.evidence, migrationReplay: replay.evidence });
+  }
+};
+
+/** What explained the live database's difference from the seal, for the operator and the audit trail. */
+export interface ApprovedMigrationSinceSeal {
+  fromVersion: number;
+  toVersion: number;
+  migrations: readonly string[];
+  approvedBy: string;
+  approvedAt: string;
+  /** The digest, with the migration's own ledger bookkeeping masked, both the replay and the live database produced. */
+  replayedContentSha256: string;
+}
+
+/**
+ * Whether the live database is exactly the sealed image plus the migration the owner approved.
+ *
+ * The audit high-water mark cannot say so: a migration moves no audit row, and neither does a write
+ * to any other table. The content can. So when an applied approval on file names a chain that
+ * starts at the sealed version, the sealed image is copied aside, that chain is applied to the copy
+ * through the product's own approval and open path, and the copy is compared with the live database
+ * under one digest. Equal means the live database holds the seal and the migration and nothing
+ * else, so putting the seal back discards nothing. Anything else — no approval, another chain, a
+ * replay that fails, a digest that differs by one row — is not explained, and is refused as before.
+ *
+ * `evidence` is present only when a replay was attempted and did not match.
+ */
+const replayApprovedMigration = (
+  sealed: RollbackPairDatabaseHighWater,
+  databasePath: string,
+  sealedImage: string,
+): { approved: ApprovedMigrationSinceSeal } | { evidence?: Record<string, unknown> } => {
+  if (sealed.userVersion >= SCHEMA_VERSION) return {};
+  let plan: ReturnType<typeof migrationPlanFrom>;
+  try {
+    plan = migrationPlanFrom(sealed.userVersion);
+  } catch {
+    return {};
+  }
+  const livePath = realpathSync(databasePath);
+  const approvals = readRetiredMigrationApprovals(databasePath, sealed.userVersion).filter(
+    (approval: MigrationApproval) =>
+      approval.toVersion === plan.toVersion &&
+      approval.migrations.length === plan.migrations.length &&
+      approval.migrations.every((id, index) => id === plan.migrations[index]) &&
+      approval.target.path === livePath,
+  );
+  const approval = approvals.at(-1);
+  if (approval === undefined) return {};
+
+  const evidence = (outcome: string, extra: Record<string, unknown> = {}): { evidence: Record<string, unknown> } => ({
+    evidence: {
+      outcome,
+      fromVersion: approval.fromVersion,
+      toVersion: approval.toVersion,
+      migrations: approval.migrations,
+      ...extra,
+    },
+  });
+  const live = measureDatabaseAt(databasePath, { aboveVersion: sealed.userVersion });
+  if (live === null || live.userVersion !== approval.toVersion) {
+    return evidence("live-database-not-at-the-approved-version", { liveVersion: live?.userVersion ?? null });
+  }
+
+  let replayed: string;
+  const scratch = mkdtempSync(join(tmpdir(), "acp-rollback-replay-"));
+  try {
+    const copy = join(scratch, "state.sqlite");
+    copyFileSync(sealedImage, copy);
+    chmodSync(copy, 0o600);
+    approveMigration(copy, "rollback-pair-replay");
+    new Db(copy).close();
+    const raw = new Database(copy, { fileMustExist: true });
+    try {
+      replayed = digestDatabaseContent(raw, { aboveVersion: sealed.userVersion });
+    } finally {
+      raw.close();
+    }
+  } catch (error) {
+    return evidence("replay-failed", { error: error instanceof Error ? error.message : String(error) });
+  } finally {
+    rmSync(scratch, { recursive: true, force: true });
+  }
+  if (replayed !== live.migrationMaskedSha256) {
+    return evidence("replay-did-not-match-the-live-database", {
+      replayedContentSha256: replayed,
+      liveContentSha256: live.migrationMaskedSha256,
+    });
+  }
+  return {
+    approved: {
+      fromVersion: approval.fromVersion,
+      toVersion: approval.toVersion,
+      migrations: approval.migrations,
+      approvedBy: approval.approvedBy,
+      approvedAt: approval.approvedAt,
+      replayedContentSha256: replayed,
+    },
+  };
 };
 
 /**
@@ -1237,6 +1423,8 @@ export interface ValidatedRollbackPair {
   runtimeRoot: string;
   entrypointPath: string;
   stateAdminPath: string;
+  /** Present when the live database differs from the seal only by the approved migration it was sealed for. */
+  approvedMigration?: ApprovedMigrationSinceSeal;
 }
 
 /**
@@ -1696,8 +1884,12 @@ export const validateRollbackPair = (
   expectation: RollbackPairExpectation,
 ): ValidatedRollbackPair => {
   const validated = validateSealedPair(pairRoot, expectation);
-  assertLiveDatabaseAtSeal(validated.manifest, validated.root);
-  return validated;
+  const approvedMigration = assertLiveDatabaseAtSealOrApprovedMigration(
+    validated.manifest,
+    validated.root,
+    validated.databasePath,
+  );
+  return approvedMigration === null ? validated : { ...validated, approvedMigration };
 };
 
 export interface StagedRollbackPair {
@@ -1709,6 +1901,7 @@ export interface StagedRollbackPair {
   launcherPath: string;
   runtimeRoot: string;
   stateAdminPath: string;
+  approvedMigration?: ApprovedMigrationSinceSeal;
 }
 
 export interface StageOptions {
@@ -1852,6 +2045,7 @@ export const stageRollbackPair = (
       launcherPath: join(pairMembers, identity.service.launcher),
       runtimeRoot: join(pairMembers, "runtime"),
       stateAdminPath: join(pairMembers, "runtime", identity.runtime.stateAdmin),
+      ...(validated.approvedMigration === undefined ? {} : { approvedMigration: validated.approvedMigration }),
     };
   } catch (error) {
     rmSync(stageRoot, { recursive: true, force: true });
@@ -1949,6 +2143,8 @@ export interface AppliedRollbackPair {
   plistPath: string;
   launcherPath: string;
   databasePath: string;
+  /** Present when the database put back differed from the live one only by the approved migration. */
+  approvedMigration?: ApprovedMigrationSinceSeal;
   /**
    * `null` on every successful return: the previous generation this copy held is deliberately
    * gone, and the sealed pair for it still exists under `pair_root` — that is what the sealed-pair
@@ -2035,7 +2231,11 @@ export const applyRollbackPair = (
     // Again, immediately before the first mutation. The validation staging ran is not enough on its
     // own: staging copies the whole closure, and a write that lands in that window is still a write
     // this rollback would discard. A refusal here has changed nothing.
-    assertLiveDatabaseAtSeal(staged.manifest, staged.stageRoot);
+    const approvedMigration = assertLiveDatabaseAtSealOrApprovedMigration(
+      staged.manifest,
+      staged.stageRoot,
+      staged.databasePath,
+    );
 
     // A sibling of the stage parent, deliberately not nested under `staged.stageRoot`: the stage is
     // exactly what `rollbackToSealedPair`'s own `finally` removes once this call returns *or*
@@ -2194,6 +2394,7 @@ export const applyRollbackPair = (
         plistPath: plistDestination,
         launcherPath: launcherDestination,
         databasePath: databaseDestination,
+        ...(approvedMigration === null ? {} : { approvedMigration }),
         recoveryRoot: null,
       };
     } catch (error) {
@@ -2436,6 +2637,9 @@ const main = async (argv: readonly string[]): Promise<number> => {
           `ACP_PAIR_SCHEMA_VERSION=${validated.manifest.identity.schemaVersion}`,
           `ACP_PAIR_SERVICE_LABEL=${validated.manifest.identity.service.label}`,
           `ACP_PAIR_SERVICE_GENERATION=${validated.manifest.identity.service.generation}`,
+          ...(validated.approvedMigration === undefined
+            ? []
+            : [`ACP_PAIR_APPROVED_MIGRATION=v${validated.approvedMigration.fromVersion}-v${validated.approvedMigration.toVersion}`]),
           "",
         ].join("\n"),
       );
@@ -2453,6 +2657,9 @@ const main = async (argv: readonly string[]): Promise<number> => {
         `ACP_APPLIED_GENERATION=${applied.generation}`,
         `ACP_APPLIED_RUNTIME_ROOT=${applied.runtimeRoot}`,
         `ACP_APPLIED_DATABASE=${applied.databasePath}`,
+        ...(applied.approvedMigration === undefined
+          ? []
+          : [`ACP_APPLIED_APPROVED_MIGRATION=v${applied.approvedMigration.fromVersion}-v${applied.approvedMigration.toVersion}`]),
         "",
       ].join("\n"),
     );
