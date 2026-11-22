@@ -6587,6 +6587,7 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
           lineageRootDigest: adoptionValues.ACP_HERMES_LINEAGE_ROOT_DIGEST! }
       : null,
     laneSecret: process.env["ACP_TELEGRAM_EXTERNAL_SECRET"],
+    databasePath: config.databasePath,
   });
   const refusedBeforeOpening = await refuseStartBeforeOpening(config, undefined, { route: refusalNoticeRoute });
   if (refusedBeforeOpening !== null) {

@@ -30,7 +30,9 @@ import { SingleInstanceLock } from "../../src/daemon/single-instance.ts";
 import { Db } from "../../src/db/database.ts";
 import { approveMigration, migrationApprovalPath } from "../../src/db/migration-approval.ts";
 import { cleanupTempDirs, gitSync, makeRepo, tempDir } from "../helpers/fixtures.ts";
+import { DIGEST, LIVE, adoptedFixture } from "../helpers/adopted-ceo.ts";
 import { installGitHubAppCredential } from "../helpers/github-app-credential.ts";
+import { readProcessStartToken } from "../../src/core/process-argv.ts";
 import { makeHarness } from "../helpers/harness.ts";
 
 /**
@@ -289,9 +291,11 @@ describe("a start the doctor will refuse leaves the database as it found it (mig
 
   it("#1496: a refused start tells the CEO through the Hermes Gateway, outside the database, and a backoff retry does not resend", async () => {
     const { home, root, database } = newHome();
-    currentDatabase(database);
-    const lineage = `sha256:${"c".repeat(64)}`;
-    const identity = { session_id: "gw-session", lineage_root_digest: lineage, process_pid: 777, process_started_at: "gw-start" };
+    // The CEO the daemon's database names is the Hermes Gateway running as this test's own process.
+    adoptedFixture({ root, livePid: process.pid }).h.cp.close();
+    const lineage = DIGEST;
+    const identity = { session_id: LIVE, lineage_root_digest: lineage, process_pid: process.pid,
+      process_started_at: readProcessStartToken(process.pid)! };
     const posts: Array<{ path: string; auth: string | undefined; body: Record<string, unknown> }> = [];
     const gateway = createServer((req: IncomingMessage, res: ServerResponse) => {
       res.setHeader("Content-Type", "application/json");

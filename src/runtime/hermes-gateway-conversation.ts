@@ -171,6 +171,8 @@ export interface HermesGatewayDaemonNoticeOptions {
   port?: number;
   /** Tests only: the answer deadline; production keeps the conversation sender's 5 s. */
   timeoutMs?: number;
+  /** A caller that has stopped waiting: ends the identity lookup, and the request if it is already out. */
+  signal?: AbortSignal;
 }
 
 /**
@@ -187,7 +189,8 @@ export interface HermesGatewayDaemonNoticeOptions {
 export const createHermesGatewayDaemonNoticeSender = (options: HermesGatewayDaemonNoticeOptions):
   ((body: DaemonNoticeBody) => Promise<DaemonNoticeSendOutcome>) => {
   const port = options.port ?? DEFAULT_HERMES_GATEWAY_PORT;
-  const readIdentity = createHermesGatewayIdentityReader({ apiKey: options.apiKey, port });
+  const readIdentity = createHermesGatewayIdentityReader({ apiKey: options.apiKey, port,
+    ...(options.signal ? { signal: options.signal } : {}) });
   return async (notice) => {
     const destination = notice?.destination;
     if (!Number.isSafeInteger(port) || port < 1 || port > 65535 || !/^[\x21-\x7e]+$/.test(options.apiKey) ||
@@ -254,9 +257,13 @@ export const createHermesGatewayDaemonNoticeSender = (options: HermesGatewayDaem
         });
         req.on("error", () => finish(lost("TRANSPORT_ERROR")));
         timer = setTimeout(() => { finish(lost("TIMEOUT")); req.destroy(); }, options.timeoutMs ?? TIMEOUT_MS);
-        let authorized = true;
-        try { authorized = options.preDispatch ? options.preDispatch() === true : true; }
-        catch { authorized = false; }
+        options.signal?.addEventListener("abort", () => { finish(lost("ABORTED")); req.destroy(); }, { once: true });
+        // An aborted caller has stopped waiting: the request is not begun, and `preDispatch` is not asked.
+        let authorized = options.signal?.aborted !== true;
+        if (authorized) {
+          try { authorized = options.preDispatch ? options.preDispatch() === true : true; }
+          catch { authorized = false; }
+        }
         if (!authorized) {
           finish({ kind: "NOT_SENT", reason: "STALE" });
           req.destroy();

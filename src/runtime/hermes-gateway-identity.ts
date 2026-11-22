@@ -33,10 +33,11 @@ const isIdentity = (value: unknown): value is HermesGatewayIdentity => {
 const readHermesGatewayIdentity = async (options: {
   apiKey: string;
   port?: number;
+  signal?: AbortSignal;
 }): Promise<HermesGatewayIdentity> => {
   const port = options.port ?? DEFAULT_HERMES_GATEWAY_PORT;
   if (typeof options.apiKey !== "string" || !/^[\x21-\x7e]+$/.test(options.apiKey) ||
-      !Number.isSafeInteger(port) || port < 1 || port > 65535) throw failure();
+      !Number.isSafeInteger(port) || port < 1 || port > 65535 || options.signal?.aborted) throw failure();
 
   return new Promise<HermesGatewayIdentity>((resolve, reject) => {
     const req = request({ hostname: HERMES_GATEWAY_HOST, family: 4, port, path: PATH, method: "GET",
@@ -72,6 +73,8 @@ const readHermesGatewayIdentity = async (options: {
     }, TIMEOUT_MS);
     req.on("error", () => reject(failure()));
     req.on("close", () => clearTimeout(timer));
+    // A caller that has stopped waiting (#1496) ends the lookup rather than leave it to its own timer.
+    options.signal?.addEventListener("abort", () => { reject(failure()); req.destroy(); }, { once: true });
     req.end();
   });
 };
@@ -81,8 +84,11 @@ export const createHermesGatewayIdentityReader = (options: {
   apiKey: string;
   /** The Gateway port (`configuredHermesGatewayPort`); omitted is the default, 8642. */
   port?: number;
+  /** Ends a lookup in flight, and refuses one not yet started, once aborted. */
+  signal?: AbortSignal;
 }): (() => Promise<HermesGatewayIdentity>) => {
   const apiKey = options.apiKey;
   const port = options.port;
-  return () => readHermesGatewayIdentity({ apiKey, port });
+  const signal = options.signal;
+  return () => readHermesGatewayIdentity({ apiKey, port, ...(signal ? { signal } : {}) });
 };

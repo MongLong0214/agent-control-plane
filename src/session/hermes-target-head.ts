@@ -92,7 +92,7 @@ type TargetRow = { target_binding_id: string; target_actor_id: string; target_lo
  * served. Anything else makes the whole history unusable (null) rather than skipping the row, since
  * a skipped newest row would hand back an older head.
  */
-const headHistory = (db: Db, row: TargetRow): readonly string[] | null => {
+const headHistory = (db: Pick<Db, "all">, row: TargetRow): readonly string[] | null => {
   if (!isHermesHead(row.target_locator)) return null;
   const advances = db.all<{ head: unknown; headDigest: unknown; previousHeadDigest: unknown }>(
     `SELECT json_extract(evidence_json, '$.head') AS head,
@@ -118,7 +118,7 @@ const headHistory = (db: Db, row: TargetRow): readonly string[] | null => {
 };
 
 /** The actor's one target binding and its current head, or null when it has none or its heads are unusable. */
-export const readHermesTargetHead = (db: Db, actorId: string): HermesTargetHead | null => {
+export const readHermesTargetHead = (db: Pick<Db, "all">, actorId: string): HermesTargetHead | null => {
   const rows = db.all<TargetRow & { executor_kind: string }>(
     `SELECT target_binding_id, target_actor_id, executor_kind, target_locator, target_locator_digest
        FROM actor_target_bindings WHERE target_actor_id = ?`,

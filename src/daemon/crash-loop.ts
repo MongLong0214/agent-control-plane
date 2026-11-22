@@ -42,6 +42,8 @@ export interface CrashLoopFile {
 export type RefusalNoticeOutcome =
   | { outcome: "delivered"; at: string; eventId: string; receiptId: string }
   | { outcome: "failed"; at: string; reason: string; eventId?: string }
+  /** The request was out when the bound expired: the receiver may or may not have it. Neither is claimed. */
+  | { outcome: "unknown"; at: string; reason: string; eventId: string }
   | { outcome: "route-unconfigured"; at: string; reason: string };
 
 export const crashLoopPath = (stateDir: string): string => join(stateDir, "crash-loop.json");
@@ -84,31 +86,82 @@ const replaceRecord = (stateDir: string, contents: string): void => {
   }
 };
 
+const LOCK_WAIT_MS = 3_000;
+const LOCK_STALE_MS = 10_000;
+const sleepSync = (ms: number): void => {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+};
+
+/**
+ * Runs one read-modify-write of the record while no other start is doing the same. Starts that refuse run
+ * at once and concurrently (a held lock, a gate refusal still waiting on its CEO notice, a retry in the
+ * backoff), and each of them rewrites this file from what it read: without this, the one that read first and
+ * wrote last erased what the others wrote, a `lastRefusal` and its notice outcome among it, and the next
+ * start inside the backoff told the CEO again.
+ *
+ * The lock is a file created exclusively beside the record and never through a link, held only for the
+ * read-modify-write (never for a notice's delivery), and given up on as stale after `LOCK_STALE_MS`. A start
+ * that cannot take it within `LOCK_WAIT_MS` throws, and its caller keeps the refusal without the record, as
+ * it always has when the record could not be written.
+ */
+const withRecordLock = <T>(stateDir: string, action: () => T): T => {
+  const lock = join(stateDir, ".crash-loop.lock");
+  const deadline = Date.now() + LOCK_WAIT_MS;
+  for (;;) {
+    try {
+      const fd = openSync(lock, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
+      closeSync(fd);
+      break;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      try {
+        if (Date.now() - lstatSync(lock).mtimeMs > LOCK_STALE_MS) unlinkSync(lock);
+        else if (Date.now() >= deadline) throw new Error("crash-loop.json is being written by another start");
+        else sleepSync(15);
+      } catch (inner) {
+        if ((inner as NodeJS.ErrnoException).code !== "ENOENT") throw inner;
+      }
+    }
+  }
+  try {
+    return action();
+  } finally {
+    try { unlinkSync(lock); } catch { /* already gone */ }
+  }
+};
+
 export const readCrashLoopFile = (stateDir: string, nowIso: string): CrashLoopFile =>
   readJson<CrashLoopFile>(crashLoopPath(stateDir)) ?? { failures: 0, firstAt: nowIso };
 
 export const backoffSecondsFor = (failures: number): number => (failures === 0 ? 0 : Math.min(300, 2 ** failures));
 
-/** Counts one failed start in the file and returns what it wrote. */
+/**
+ * Counts one failed start in the file and returns what it wrote. An existing `lastRefusal`, with its notice
+ * outcome, is kept: only a newer refusal (`refusal`) replaces it, so a start that is refused for another
+ * reason (the lock held, a failure after the open) cannot make the next start forget what it already told.
+ */
 export const countStartupFailure = (
   stateDir: string,
   nowIso: string,
   refusal?: NonNullable<CrashLoopFile["lastRefusal"]>,
 ): { next: CrashLoopFile; backoffSeconds: number } => {
-  const previous = readCrashLoopFile(stateDir, nowIso);
-  const failures = previous.failures + 1;
-  const backoffSeconds = backoffSecondsFor(failures);
-  const next: CrashLoopFile = {
-    failures,
-    firstAt: previous.failures === 0 ? nowIso : previous.firstAt,
-    retryNotBefore: new Date(Date.parse(nowIso) + backoffSeconds * 1000).toISOString(),
-    ...(refusal ? { lastRefusal: refusal } : {}),
-  };
   // A state directory that does not exist yet (a first start refused before anything created it) is made
   // here, owner-only, so the refusal has somewhere to be recorded.
   mkdirSync(stateDir, { recursive: true, mode: 0o700 });
-  replaceRecord(stateDir, JSON.stringify(next));
-  return { next, backoffSeconds };
+  return withRecordLock(stateDir, () => {
+    const previous = readCrashLoopFile(stateDir, nowIso);
+    const failures = previous.failures + 1;
+    const backoffSeconds = backoffSecondsFor(failures);
+    const kept = refusal ?? previous.lastRefusal;
+    const next: CrashLoopFile = {
+      failures,
+      firstAt: previous.failures === 0 ? nowIso : previous.firstAt,
+      retryNotBefore: new Date(Date.parse(nowIso) + backoffSeconds * 1000).toISOString(),
+      ...(kept ? { lastRefusal: kept } : {}),
+    };
+    replaceRecord(stateDir, JSON.stringify(next));
+    return { next, backoffSeconds };
+  });
 };
 
 /**
@@ -116,13 +169,15 @@ export const countStartupFailure = (
  * the backoff the supervisor reads are the ones the refusal wrote. A record that no longer names this
  * `refusalId` (another refusal replaced it) is left alone.
  */
-export const recordRefusalNotice = (stateDir: string, refusalId: string, notice: RefusalNoticeOutcome): boolean => {
-  const current = readJson<CrashLoopFile>(crashLoopPath(stateDir));
-  if (!current?.lastRefusal || current.lastRefusal.refusalId !== refusalId) return false;
-  replaceRecord(stateDir, JSON.stringify({ ...current, lastRefusal: { ...current.lastRefusal, notice } }));
-  return true;
-};
+export const recordRefusalNotice = (stateDir: string, refusalId: string, notice: RefusalNoticeOutcome): boolean =>
+  withRecordLock(stateDir, () => {
+    const current = readJson<CrashLoopFile>(crashLoopPath(stateDir));
+    if (!current?.lastRefusal || current.lastRefusal.refusalId !== refusalId) return false;
+    replaceRecord(stateDir, JSON.stringify({ ...current, lastRefusal: { ...current.lastRefusal, notice } }));
+    return true;
+  });
 
+/** A start that succeeded: the count and the refusal it answered are both over. */
 export const clearCrashLoopFile = (stateDir: string): void => {
-  replaceRecord(stateDir, JSON.stringify({ failures: 0 }));
+  withRecordLock(stateDir, () => replaceRecord(stateDir, JSON.stringify({ failures: 0 })));
 };

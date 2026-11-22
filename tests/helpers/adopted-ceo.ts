@@ -109,9 +109,16 @@ export const adoptedFixture = (
      * row exists and before it is bound, so the Gateway's binding is the newest generation.
      */
     history?: (h: Harness) => void;
+    /** The state directory the harness's database lives in; a fresh temp directory when omitted. */
+    root?: string;
+    /**
+     * A process that is really alive (the test's own): the Gateway runtime row records that pid with its real
+     * `ps` start and pins its real native start, as a daemon that started it would.
+     */
+    livePid?: number;
   } = {},
 ): AdoptedCeoFixture => {
-  const h = makeHarness();
+  const h = makeHarness(bound.root === undefined ? {} : { root: bound.root });
   bound.history?.(h);
   const parents = new Map<number, number>([
     [RELAY, SHELL],
@@ -124,15 +131,17 @@ export const adoptedFixture = (
     parentOf: (pid) => parents.get(pid) ?? null,
     startToken: (pid) => tokens.get(pid) ?? null,
   };
-  const gateway = h.cp.sessions.create({
-    provider: "hermes",
-    model: "hermes-runtime",
-    osPid: GATEWAY,
-    osStartedAt: bound.unpinned?.lstart ?? LSTART,
-  });
+  const gateway = bound.livePid === undefined
+    ? h.cp.sessions.create({
+        provider: "hermes",
+        model: "hermes-runtime",
+        osPid: GATEWAY,
+        osStartedAt: bound.unpinned?.lstart ?? LSTART,
+      })
+    : h.cp.sessions.createWithPinnedStart({ provider: "hermes", model: "hermes-runtime", osPid: bound.livePid });
   expect(h.cp.sessions.transition(gateway.sessionId, SessionLifecycle.READY).allowed).toBe(true);
   // What adoption does since #1037: the exact token beside the lstart the row keeps.
-  if (bound.unpinned === undefined) h.cp.sessions.pinNativeStart(gateway.sessionId, TOKEN);
+  if (bound.unpinned === undefined && bound.livePid === undefined) h.cp.sessions.pinNativeStart(gateway.sessionId, TOKEN);
   const claimed = {
     executorKind: "hermes",
     targetLocator: bound.locator ?? LIVE,
