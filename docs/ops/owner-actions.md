@@ -997,6 +997,7 @@ the variables are the same ones:
     # A new, unique path; mkdir without -p fails, and set -e stops, if anything already exists there.
     WORK="$STATE/downgrade-60-59-$(date -u +%Y%m%dT%H%M%SZ)-$(uuidgen)"
     mkdir -m 700 "$WORK"
+    echo "work directory: $WORK"
     COPY="$WORK/state.sqlite"
     printf '%s\n' "$SOURCE_SHA" > "$WORK/source.sha256.before"
     quiet || { rm -f "$COPY"; exit 1; }
@@ -1136,11 +1137,24 @@ nothing else from the live one:
   a working installation token cannot succeed here, by design; report it as a finding about the
   proof, not as a reason to use the real credential.
 
-Write the credential and the throwaway temp directory once, after the duplicate exists:
+Make the throwaway home, the duplicate, the credential and the throwaway temp directory, in the
+same shell as the copy block (it needs `$WORK` and `$COPY`). `mktemp` gives a fresh, short path: the
+operator socket is `$DUP_HOME/.agent-control-plane/agentcpd.operator.sock`, and macOS caps a unix
+socket path at 104 bytes, so a throwaway home inside `$WORK` is too long. The block saves the
+variables to `$WORK/env`, so that if a later block stops and the shell closes, a new shell can
+`. <work directory>/env` and carry on from the block that stopped:
 
     set -euo pipefail
     umask 077
+    DUP_HOME="$(realpath "$(mktemp -d /tmp/acp-v59.XXXXXX)")"
+    V59_ROOT=/absolute/path/to/the/v59/build
     DUP="$DUP_HOME/.agent-control-plane"
+    mkdir -m 700 "$DUP"
+    cp "$COPY" "$DUP/state.sqlite"; chmod 600 "$DUP/state.sqlite"
+    cmp "$COPY" "$DUP/state.sqlite"
+    shasum -a 256 < "$COPY" > "$WORK/converted.sha256"
+    printf 'WORK=%q\nCOPY=%q\nDUP_HOME=%q\nV59_ROOT=%q\nDUP=%q\n' \
+      "$WORK" "$COPY" "$DUP_HOME" "$V59_ROOT" "$DUP" > "$WORK/env"
     mkdir -p "$DUP/credentials" "$DUP_HOME/tmp"
     openssl genrsa -out "$DUP/credentials/github-app.pem" 2048
     printf '%s\n' 'GITHUB_APP_ID=1' 'GITHUB_APP_INSTALLATION_ID=1' \
@@ -1150,8 +1164,9 @@ Write the credential and the throwaway temp directory once, after the duplicate 
 A start without that credential is refused by the gate with `TRUSTED_GATE_CREDENTIAL_MISSING`. The
 refusal happens before the database is opened and leaves a `crash-loop.json` backoff record in the
 duplicate's state directory. A refusal before the open is a defect in the duplicate's setup, not a
-data difference: discard that duplicate and its `crash-loop.json`, fix the setup, make a new duplicate
-from the converted copy and retry. It says nothing about the converted copy and is not a stop.
+data difference: the start block stops and closes the shell; in a new shell `. <work directory>/env`,
+discard that duplicate and its `crash-loop.json`, fix the setup, rerun the block above to make a new
+duplicate from the converted copy, and retry. It says nothing about the converted copy.
 
 **Pointing the daemon at the duplicate.** The daemon finds its state directory through `HOME` and
 nothing else: `agentcpd` takes `defaultConfig()`, and that is `homedir()/.agent-control-plane`
@@ -1192,15 +1207,18 @@ default; `ACP_DAEMON_SUPERVISOR` only changes the exit code of a refused start; 
 ignored by the daemon, as above. Nothing in `src/` reads an `XDG_*` variable.
 
 Before the start, check what it would touch, and refuse on anything outside the throwaway home.
-`V59_ROOT` is the v59 build, `DUP_HOME` the throwaway home:
+`V59_ROOT` is the v59 build, `DUP_HOME` the throwaway home, both set by the block above:
 
     set -euo pipefail
     LIVE="$HOME/.agent-control-plane"
-    DUP_HOME=/absolute/path/to/throwaway-home      # the duplicate is "$DUP_HOME/.agent-control-plane", mode 700
-    V59_ROOT=/absolute/path/to/the/v59/build
-    DUP="$DUP_HOME/.agent-control-plane"
-    stop() { echo "stop: $1" >&2; exit 1; }
+    stop() { echo "stop: $1; variables are in $WORK/env" >&2; exit 1; }
     within() { case "$(realpath "$2")/" in "$(realpath "$1")"/*) return 0 ;; *) return 1 ;; esac; }
+    ! within "$DUP_HOME" "$LIVE" || stop "the throwaway home contains the live state directory"
+    ! within "$DUP_HOME" "$WORK" || stop "the throwaway home contains the work directory"
+    ! within "$LIVE" "$DUP_HOME" || stop "the throwaway home is inside the live state directory"
+    SOCK="$(realpath "$DUP")/agentcpd.operator.sock"
+    [ "${#SOCK}" -lt 104 ] || stop "the operator socket path is ${#SOCK} bytes; macOS allows at most 103"
+    cmp "$COPY" "$DUP/state.sqlite" || stop "the duplicate is not the converted copy"
     RESOLVED="$(env -i HOME="$DUP_HOME" PATH="$PATH" node --input-type=module -e \
       'const { defaultConfig } = await import(process.argv[1]); console.log(defaultConfig().databasePath)' \
       "$V59_ROOT/dist/app/control-plane.js")"
@@ -1245,7 +1263,8 @@ never printed:
       node "$V59_ROOT/dist/daemon/agentcpd.js" > "$WORK/daemon.out" 2> "$WORK/daemon.err" < /dev/null &
     DAEMON_PID=$!
     echo "$DAEMON_PID" > "$WORK/daemon.pid"
-    abort() { kill "$DAEMON_PID" 2>/dev/null || true; echo "stop: $1; see $WORK/daemon.err" >&2; exit 1; }
+    abort() { kill "$DAEMON_PID" 2>/dev/null || true; wait "$DAEMON_PID" 2>/dev/null || true
+      echo "stop: $1; see $WORK/daemon.err; variables are in $WORK/env" >&2; exit 1; }
     for i in $(seq 1 120); do
       kill -0 "$DAEMON_PID" 2>/dev/null || abort "the daemon exited"
       grep -q '"started"' "$WORK/daemon.out" && break
