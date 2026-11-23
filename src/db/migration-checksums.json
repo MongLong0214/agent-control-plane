@@ -1,5 +1,5 @@
 {
-  "schemaVersion": 59,
+  "schemaVersion": 60,
   "live": {
     "v12-migration-ledger-and-invariant-replay": "sha256:ec8955aed2d499e13d313e3fed473e0cb4e2ecb1c45af2e7fc95f2537ec91261",
     "v13-finalization-state-machine": "sha256:1d8ff28d8f21296e0380b76b76637813e825b7f9c91029dc03ac52d877af3936",
@@ -47,6 +47,7 @@
     "v55-approved-run-revision-reentry": "sha256:2df7f4739e8e4a17537e0da63aa6840afe8041c13c752fd54ac6a3685db1bd72",
     "v56-adopted-bootstrap-first-manifest": "sha256:2d0fd08804dbe7d9e2621f5e494675703eb4c7e64119d64e322e374e79638a47",
     "v57-canonical-entitlement-transfer": "sha256:9147ef1dd6ecf549a2c5bf575c69fc0cc2f0cdc2368d00d7f56a4841cc1b35b3",
-    "v58-canonical-cto-rotation": "sha256:453b606b6863166da6f9527c245885838203cad2311c1ff227e3acf6d46a5883"
+    "v58-canonical-cto-rotation": "sha256:453b606b6863166da6f9527c245885838203cad2311c1ff227e3acf6d46a5883",
+    "v59-task-plan-key": "sha256:3729cfa5817040d8967779ae0af8772cd7e79c2042ea4a6c3cb1f34d1245705e"
   }
 }
