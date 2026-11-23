@@ -426,19 +426,14 @@ const buildRealClosure = (root: string): string => {
   const closure = join(root, "real-closure");
   mkdirSync(join(closure, "bin"), { recursive: true, mode: 0o700 });
   boundedExecFileSync("/bin/cp", ["-Rc", `${REPO_DIST}/.`, closure]);
-  mkdirSync(join(closure, "node_modules"), { recursive: true, mode: 0o700 });
-  for (const pkg of ["better-sqlite3", "bindings", "file-uri-to-path"]) {
-    const found = boundedExecFileSync(
-      "/usr/bin/find",
-      ["node_modules/.pnpm", "-maxdepth", "4", "-type", "d", "-path", `*/node_modules/${pkg}`],
-      { encoding: "utf8", cwd: process.cwd() },
-    )
-      .split("\n")
-      .filter(Boolean)[0];
-    if (!found) throw new Error(`the fixture could not find ${pkg} to seal`);
-    // `-L` dereferences pnpm's symlinks: a sealed pair refuses links, and rightly.
-    boundedExecFileSync("/bin/cp", ["-RcL", join(process.cwd(), found), join(closure, "node_modules", pkg)]);
-  }
+  // Every production dependency, through the command the owner runbook uses
+  // (`deploy/closure-node-modules.sh`). This used to hand-pick the three packages the database layer
+  // needs, which is why a closure that could not resolve `nostr-tools`' own dependency went
+  // unnoticed: nothing here imported it.
+  boundedExecFileSync(join(process.cwd(), "deploy", "closure-node-modules.sh"), [
+    process.cwd(),
+    join(closure, "node_modules"),
+  ], { timeout: 240_000 });
   boundedExecFileSync("/bin/cp", ["-c", process.execPath, join(closure, "bin", "node")]);
   chmodSync(join(closure, "bin", "node"), 0o755);
   return closure;
@@ -577,6 +572,27 @@ describe("a rollback installs one whole generation", () => {
     // addon and reported its on-disk version. A module-resolution failure could not get here.
     expect(standalone.stdout).toContain("onDiskVersion");
     expect(JSON.parse(standalone.stdout).onDiskVersion).toBeGreaterThan(0);
+
+    // Every module the pair runs resolves its whole dependency graph from inside the closure. The
+    // `migration-plan` row above loads only what the database layer needs; `--help` and the
+    // daemon entrypoint's static imports reach `nostr-tools` and its own dependency `@noble/hashes`,
+    // which pnpm keeps beside the package and a dereferenced copy of `node_modules` loses.
+    const sealedEnv = { HOME: fixture.root, PATH: "/nonexistent" };
+    const help = boundedSpawnSync(installedNode, [join(fixture.installRoot, "db", "state-admin.js"), "--help"], {
+      encoding: "utf8",
+      env: sealedEnv,
+    });
+    // `--help` prints the usage and exits 1 by design; what it must not do is fail to load.
+    expect(`${help.stdout}${help.stderr}`).toContain("agentcpd-state");
+    expect(help.stderr).not.toContain("ERR_MODULE_NOT_FOUND");
+    for (const entry of ["daemon/agentcpd.js", "db/state-admin.js", "deploy/rollback-pair.js"]) {
+      const imported = boundedSpawnSync(
+        installedNode,
+        ["--input-type=module", "-e", `await import(${JSON.stringify(join(fixture.installRoot, entry))});`],
+        { encoding: "utf8", env: sealedEnv },
+      );
+      expect(imported.status, `${entry}: ${imported.stderr}`).toBe(0);
+    }
   }, 300_000);
 
   it("refuses a closure that still links a library outside itself", async () => {

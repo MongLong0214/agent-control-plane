@@ -535,7 +535,12 @@ item 6 restores it as one operation.
     CLOSURE="$HOME/.agent-control-plane/closure-$(date -u +%Y%m%dT%H%M%SZ)"
     mkdir -p "$CLOSURE" && chmod 700 "$CLOSURE"
     cp -Rc "$APP_ROOT/dist/." "$CLOSURE/"
-    cp -RcL "$APP_ROOT/node_modules" "$CLOSURE/node_modules"
+    # Not `cp -RcL "$APP_ROOT/node_modules"`: that copy dereferences pnpm's symlinks into real
+    # directories at the top level, where a package's own dependencies (`@noble/hashes`, which
+    # `nostr-tools` needs) are not, so the sealed `state-admin.js` cannot start and the rollback
+    # fails at its database step. This installs the same lockfile's production dependencies as a
+    # hoisted, symlink-free tree that resolves on its own; it needs `pnpm` on PATH.
+    "$APP_ROOT/deploy/closure-node-modules.sh" "$APP_ROOT" "$CLOSURE/node_modules"
     chmod 755 "$CLOSURE/bin/node"
     node "$APP_ROOT/dist/deploy/rollback-pair.js" seal \
       --pairs-root "$HOME/.agent-control-plane/rollback-pairs" \
@@ -858,7 +863,12 @@ checkout path for `$APP_ROOT`:
     CLOSURE="$HOME/.agent-control-plane/closure-$(date -u +%Y%m%dT%H%M%SZ)"
     mkdir -p "$CLOSURE" && chmod 700 "$CLOSURE"
     cp -Rc "$APP_ROOT/dist/." "$CLOSURE/"
-    cp -RcL "$APP_ROOT/node_modules" "$CLOSURE/node_modules"
+    # Not `cp -RcL "$APP_ROOT/node_modules"`: that copy dereferences pnpm's symlinks into real
+    # directories at the top level, where a package's own dependencies (`@noble/hashes`, which
+    # `nostr-tools` needs) are not, so the sealed `state-admin.js` cannot start and the rollback
+    # fails at its database step. This installs the same lockfile's production dependencies as a
+    # hoisted, symlink-free tree that resolves on its own; it needs `pnpm` on PATH.
+    "$APP_ROOT/deploy/closure-node-modules.sh" "$APP_ROOT" "$CLOSURE/node_modules"
     chmod 755 "$CLOSURE/bin/node"
     node "$APP_ROOT/dist/deploy/rollback-pair.js" seal \
       --pairs-root "$HOME/.agent-control-plane/rollback-pairs" \
