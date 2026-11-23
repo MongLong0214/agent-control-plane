@@ -34,6 +34,7 @@ import {
   ROLLBACK_PAIR_INDEX_FILE,
   ROLLBACK_PAIR_MANIFEST_FILE,
   applyRollbackPair,
+  recordReplacementSource,
   replacementSourcePath,
   rollbackToSealedPair,
   sealRollbackPair,
@@ -1809,8 +1810,10 @@ describe("state-admin migrate-approved, then the rollback (migrate-before-start)
  * way back installs a converted copy instead of the pair's own image. The pair is sealed at v25, the
  * live database takes one more write in v25 and is then migrated to this build's schema, and the image
  * is "live minus the approved migration" — the v25 database with that write. The identity chain is the
- * image, its source record (SHA-256 of the migrated main file and of the image), the unchanged replay,
- * and the live main file still being that source.
+ * image, its source record (SHA-256 of the migrated main file and of the image, written by
+ * `recordReplacementSource` only after the replay shows the image derives from that source), the
+ * unchanged replay, and the live main file still being that source. Images that are not sound are
+ * given a hand-forged record, because the writer refuses to write one for them.
  */
 const REPLACEMENT_FORMAT = "agent-control-plane.rollback-replacement/v1";
 
@@ -1818,7 +1821,11 @@ interface ReplacementScenario {
   fixture: Fixture;
   pair: SealedRollbackPair;
   expectation: RollbackPairExpectation;
-  /** An image built from the pre-migration copy (or from `build`) with a source record naming the live file as it is now. */
+  /**
+   * An image built from the pre-migration copy (or from `build`). Its source record is written by
+   * `recordReplacementSource` when the image derives from the live file as it is now, and forged to
+   * say the live file's hash when `build` is given — which is what a hostile or careless writer does.
+   */
   makeImage: (name: string, build?: (workPath: string) => void) => Promise<string>;
   image: string;
 }
@@ -1843,15 +1850,19 @@ const replacementScenario = async (nodeScript?: string): Promise<ReplacementScen
     mkdirSync(out, { mode: 0o700 });
     const image = join(out, "state.sqlite");
     await backupDatabase(workPath, image);
-    writeFileSync(
-      replacementSourcePath(image),
-      JSON.stringify({
-        format: REPLACEMENT_FORMAT,
-        sourceMainSha256: `sha256:${digestOfFile(fixture.databasePath)}`,
-        imageSha256: `sha256:${digestOfFile(image)}`,
-      }),
-      { mode: 0o600 },
-    );
+    if (build === undefined) {
+      recordReplacementSource(pair.root, expectation, fixture.databasePath, image);
+    } else {
+      writeFileSync(
+        replacementSourcePath(image),
+        JSON.stringify({
+          format: REPLACEMENT_FORMAT,
+          sourceMainSha256: `sha256:${digestOfFile(fixture.databasePath)}`,
+          imageSha256: `sha256:${digestOfFile(image)}`,
+        }),
+        { mode: 0o600 },
+      );
+    }
     return image;
   };
   return { fixture, pair, expectation, makeImage, image: await makeImage("good") };
@@ -2076,6 +2087,137 @@ describe("a rollback that installs a replacement database (#1501)", () => {
     expect(existsSync(fixture.plistDestination)).toBe(false);
     expect(existsSync(fixture.launcherDestination)).toBe(false);
     expect(walk(fixture.appRoot)).toEqual(appRootBefore);
+  }, 120_000);
+
+  it("never loosens STALE: a same-version write with no migration is refused although the image equals the live database", async () => {
+    const { fixture, pair } = await sealAtV25({ installingNode: true });
+    const expectation = expectationFor(fixture, pair);
+    writeAuditEvent(fixture.databasePath, "same-version-write");
+    // An image that is a backup of the live database, and a record naming the live file: nothing here is
+    // wrong except that no approved migration separates the pair from the live database.
+    const work = join(fixture.home, "work-same");
+    mkdirSync(work, { mode: 0o700 });
+    copyFileSync(fixture.databasePath, join(work, "state.sqlite"));
+    chmodSync(join(work, "state.sqlite"), 0o600);
+    const out = join(fixture.home, "replacement-same");
+    mkdirSync(out, { mode: 0o700 });
+    const image = join(out, "state.sqlite");
+    await backupDatabase(join(work, "state.sqlite"), image);
+    writeFileSync(
+      replacementSourcePath(image),
+      JSON.stringify({
+        format: REPLACEMENT_FORMAT,
+        sourceMainSha256: `sha256:${digestOfFile(fixture.databasePath)}`,
+        imageSha256: `sha256:${digestOfFile(image)}`,
+      }),
+      { mode: 0o600 },
+    );
+    const before = deploymentState(fixture, pair);
+    // Refused without the flag, and the flag refuses it for the same reason, with the same code.
+    for (const attempt of [
+      () => validateRollbackPair(pair.root, expectation),
+      () => validateRollbackPair(pair.root, expectation, { replacementDatabase: image }),
+      () =>
+        rollbackToSealedPair(pair.root, expectation, join(fixture.home, "stage-same"), { replacementDatabase: image }),
+    ]) {
+      const refused = refusal(attempt);
+      expect(refused.reasonCode, refused.message).toBe(STALE);
+    }
+    const flagged = refusal(() => validateRollbackPair(pair.root, expectation, { replacementDatabase: image }));
+    expect(flagged.message).toContain("approved migration");
+    // The writer will not vouch for it either.
+    rmSync(replacementSourcePath(image));
+    const unrecorded = refusal(() => recordReplacementSource(pair.root, expectation, fixture.databasePath, image));
+    expect(unrecorded.reasonCode, unrecorded.message).toBe(STALE);
+    expect(existsSync(replacementSourcePath(image))).toBe(false);
+    expect(deploymentState(fixture, pair)).toBe(before);
+  }, 120_000);
+
+  it("never loosens STALE: a pair that records no high-water mark is still refused with the flag", async () => {
+    const { fixture, pair, expectation, image } = await replacementScenario();
+    const manifest = readPairManifest(pair.root);
+    delete manifest.database.highWater;
+    writePairManifest(pair.root, manifest);
+    const legacyDigest = reindex(pair.root);
+    const legacy = { ...expectation, indexDigest: legacyDigest };
+    const before = deploymentState(fixture, pair);
+    for (const attempt of [
+      () => validateRollbackPair(pair.root, legacy, { replacementDatabase: image }),
+      () => rollbackToSealedPair(pair.root, legacy, join(fixture.home, "stage-legacy"), { replacementDatabase: image }),
+    ]) {
+      const refused = refusal(attempt);
+      expect(refused.reasonCode, refused.message).toBe(STALE);
+      expect(refused.message).toMatch(/records no database high-water mark/);
+    }
+    expect(deploymentState(fixture, pair)).toBe(before);
+  }, 120_000);
+
+  it("writes the source record only for an image that derives from the quiescent source, mode 0600, never over a record", async () => {
+    const scenario = await replacementScenario();
+    const { fixture, pair, expectation, image, makeImage } = scenario;
+    const record = JSON.parse(readFileSync(replacementSourcePath(image), "utf8")) as Record<string, string>;
+    expect(record).toEqual({
+      format: REPLACEMENT_FORMAT,
+      sourceMainSha256: `sha256:${digestOfFile(fixture.databasePath)}`,
+      imageSha256: `sha256:${digestOfFile(image)}`,
+    });
+    expect(statSync(replacementSourcePath(image)).mode & 0o777).toBe(0o600);
+    // The record the writer wrote is the one validate and rollback accept.
+    expect(() => validateRollbackPair(pair.root, expectation, { replacementDatabase: image })).not.toThrow();
+
+    // Never over an existing record.
+    const again = refusal(() => recordReplacementSource(pair.root, expectation, fixture.databasePath, image));
+    expect(again.reasonCode).toBe(ReasonCode.INVALID_ARGUMENT);
+    expect(JSON.parse(readFileSync(replacementSourcePath(image), "utf8"))).toEqual(record);
+
+    // Not the pair's database.
+    const elsewhere = join(fixture.home, "elsewhere.sqlite");
+    copyFileSync(fixture.databasePath, elsewhere);
+    const notLive = refusal(() => recordReplacementSource(pair.root, expectation, elsewhere, image));
+    expect(notLive.reasonCode, notLive.message).toBe(ReasonCode.INVALID_ARGUMENT);
+
+    // An image that does not derive from the source: refused, and no record is left behind.
+    const lie = await makeImage("lie", (work) => {
+      copyFileSync(join(fixture.home, "v25-copy.sqlite"), work);
+      const raw = new Database(work);
+      try {
+        raw.prepare("INSERT INTO audit_events (at, kind, evidence_json) VALUES (?, ?, ?)").run("2026-01-01T00:00:00Z", "x", "{}");
+      } finally {
+        raw.close();
+      }
+    });
+    rmSync(replacementSourcePath(lie));
+    const notDerived = refusal(() => recordReplacementSource(pair.root, expectation, fixture.databasePath, lie));
+    expect(notDerived.reasonCode, notDerived.message).toBe(STALE);
+    expect(existsSync(replacementSourcePath(lie))).toBe(false);
+
+    // A source that is not quiescent: refused, and no record is left behind.
+    const plain = await makeImage("plain");
+    rmSync(replacementSourcePath(plain));
+    writeFileSync(`${fixture.databasePath}-journal`, "", { mode: 0o600 });
+    const busy = refusal(() => recordReplacementSource(pair.root, expectation, fixture.databasePath, plain));
+    expect(busy.reasonCode, busy.message).toBe(STALE);
+    expect(busy.message).toContain("not quiescent");
+    expect(existsSync(replacementSourcePath(plain))).toBe(false);
+  }, 180_000);
+
+  it("refuses a non-empty -wal that appears after the first checks, at the check before the database step", async () => {
+    const { fixture, pair, expectation, image } = await replacementScenario();
+    let wrote = false;
+    const refused = refusal(() =>
+      rollbackToSealedPair(pair.root, expectation, join(fixture.home, "stage-wal"), {
+        replacementDatabase: image,
+        onStep: (step) => {
+          if (step === "plist" && !wrote) {
+            wrote = true;
+            writeFileSync(`${fixture.databasePath}-wal`, "a frame the main file hash cannot see", { mode: 0o600 });
+          }
+        },
+      }),
+    );
+    expect(wrote).toBe(true);
+    expect(refused.reasonCode, refused.message).toBe(STALE);
+    expect(refused.message).toContain("not quiescent");
   }, 120_000);
 
   for (const failAfter of ["runtime", "plist", "launcher", "restoreHelper", "database", "compensate"] as const) {

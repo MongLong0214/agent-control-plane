@@ -71,6 +71,7 @@ expect_schema_version=""
 expect_service_generation=""
 expect_node_version=""
 replacement_database=""
+replacement_database_given=0
 no_start=0
 
 while [[ $# -gt 0 ]]; do
@@ -92,7 +93,7 @@ while [[ $# -gt 0 ]]; do
     --expect-node-version)
       expect_node_version="${2:-}"; shift 2 ;;
     --replacement-database)
-      replacement_database="${2:-}"; shift 2 ;;
+      replacement_database_given=1; replacement_database="${2:-}"; shift 2 ;;
     --no-start)
       no_start=1; shift ;;
     --help|-h)
@@ -1002,7 +1003,11 @@ case "$command_name" in
     # Optional: a converted copy to install instead of the pair's own database image. Handed to the
     # coordinator as given; it checks the image, its manifest and its source record. A coordinator
     # that does not declare the flag would ignore it and run a plain rollback, so it is refused here.
-    if [[ -n "$replacement_database" ]]; then
+    # An empty value (an unset variable, say) is refused rather than dropped: dropping it would run a
+    # plain rollback when the operator asked for a replacement.
+    if [[ "$replacement_database_given" == "1" ]]; then
+      [[ -n "$replacement_database" ]] ||
+        fail "--replacement-database requires a path to the converted image"
       [[ "$replacement_database" == /* ]] ||
         fail "--replacement-database must be an absolute path: $replacement_database"
       [[ -n "$declared_replacement" ]] ||
