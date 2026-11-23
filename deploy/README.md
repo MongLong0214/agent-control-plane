@@ -333,5 +333,38 @@ line rather than reading any of it from the host, so the same command seals the 
 left and, later, the one being moved to; it prints the pair id and the index digest to retain.
 `docs/ops/owner-actions.md` carries the full procedure.
 
+When the live database has been converted past the pair's generation by an approved migration, the
+pair's own image is not the database to put back: it lacks every write made after it was sealed. Roll
+back with a **replacement database** instead, a converted copy of the stopped live database made with
+`state-admin backup --database <copy> --output IMAGE`. Record where it came from while the daemon is
+still stopped:
+
+```bash
+node dist/deploy/rollback-pair.js record-replacement <the same identity flags as validate> \
+  --source ~/.agent-control-plane/state.sqlite --image IMAGE
+deploy/install-launchd.sh rollback --pair-id <uuid> --expected-index-digest sha256:<hex> \
+  --expect-schema-version N --expect-service-generation NAME --expect-node-version vX.Y.Z \
+  --replacement-database IMAGE
+```
+
+`record-replacement` requires the source to be quiescent (no lock holder, no `-journal`, an empty or
+absent `-wal`), shows that IMAGE is the pair's generation and exactly the source minus the approved
+migration, hashes the source main file, and writes `IMAGE.source.json` (mode 0600, never over an
+existing one):
+
+```json
+{ "format": "agent-control-plane.rollback-replacement/v1",
+  "sourceMainSha256": "sha256:<hex of the stopped source main file>",
+  "imageSha256": "sha256:<hex of IMAGE>" }
+```
+
+`validate` and `rollback` then run every live-database check against IMAGE, refuse with
+`ROLLBACK_PAIR_STALE_DATABASE` unless the approved-migration replay explains the live database, and
+require the live main file to still be that source, quiescent, immediately before the database is
+replaced. A write after the conversion, a missing retired approval, or no flag at all still refuses.
+The pair's runtime closure, plist and launcher install as usual. The coordinator cannot hold
+`agentcpd.lock` across the restore (the sealed restore refuses while it is held), so keep the daemon
+stopped until the rollback returns.
+
 `uninstall` removes only the LaunchAgent plist and launcher. It intentionally leaves the
 database and backups intact.
