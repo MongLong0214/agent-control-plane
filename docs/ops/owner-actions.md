@@ -539,9 +539,13 @@ item 6 restores it as one operation.
     # directories at the top level, where a package's own dependencies (`@noble/hashes`, which
     # `nostr-tools` needs) are not, so the sealed `state-admin.js` cannot start and the rollback
     # fails at its database step. This installs the same lockfile's production dependencies as a
-    # hoisted, symlink-free tree that resolves on its own; it needs `pnpm` on PATH.
-    "$APP_ROOT/deploy/closure-node-modules.sh" "$APP_ROOT" "$CLOSURE/node_modules"
+    # hoisted, symlink-free tree that resolves on its own; it needs `pnpm` on PATH. It installs
+    # under the closure's own `bin/node` and loads better-sqlite3 and nostr-tools with it before
+    # it succeeds, so an addon built for a different Node is refused here, not at rollback. On a
+    # pnpm cache miss that addon is fetched by `prebuild-install` or built by `node-gyp`, and the
+    # lockfile's integrity hashes do not cover it.
     chmod 755 "$CLOSURE/bin/node"
+    "$APP_ROOT/deploy/closure-node-modules.sh" "$APP_ROOT" "$CLOSURE/node_modules" "$CLOSURE/bin/node"
     node "$APP_ROOT/dist/deploy/rollback-pair.js" seal \
       --pairs-root "$HOME/.agent-control-plane/rollback-pairs" \
       --database "$HOME/.agent-control-plane/state.sqlite" \
@@ -850,6 +854,7 @@ leaving *and*, later, the one you are moving to as its return leg. A producer th
 the generation it is running under would make a rollback a one-way door. Substitute your own
 checkout path for `$APP_ROOT`:
 
+    set -euo pipefail
     APP_ROOT=/absolute/path/to/agent-control-plane
     # The closure is what gets sealed, and it carries its own interpreter, native extension and
     # dependencies. A pair that named an external `node` (or an extension living outside `dist`)
@@ -867,9 +872,13 @@ checkout path for `$APP_ROOT`:
     # directories at the top level, where a package's own dependencies (`@noble/hashes`, which
     # `nostr-tools` needs) are not, so the sealed `state-admin.js` cannot start and the rollback
     # fails at its database step. This installs the same lockfile's production dependencies as a
-    # hoisted, symlink-free tree that resolves on its own; it needs `pnpm` on PATH.
-    "$APP_ROOT/deploy/closure-node-modules.sh" "$APP_ROOT" "$CLOSURE/node_modules"
+    # hoisted, symlink-free tree that resolves on its own; it needs `pnpm` on PATH. It installs
+    # under the closure's own `bin/node` and loads better-sqlite3 and nostr-tools with it before
+    # it succeeds, so an addon built for a different Node is refused here, not at rollback. On a
+    # pnpm cache miss that addon is fetched by `prebuild-install` or built by `node-gyp`, and the
+    # lockfile's integrity hashes do not cover it.
     chmod 755 "$CLOSURE/bin/node"
+    "$APP_ROOT/deploy/closure-node-modules.sh" "$APP_ROOT" "$CLOSURE/node_modules" "$CLOSURE/bin/node"
     node "$APP_ROOT/dist/deploy/rollback-pair.js" seal \
       --pairs-root "$HOME/.agent-control-plane/rollback-pairs" \
       --database "$HOME/.agent-control-plane/state.sqlite" \

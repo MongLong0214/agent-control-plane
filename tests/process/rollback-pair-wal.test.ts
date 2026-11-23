@@ -426,16 +426,17 @@ const buildRealClosure = (root: string): string => {
   const closure = join(root, "real-closure");
   mkdirSync(join(closure, "bin"), { recursive: true, mode: 0o700 });
   boundedExecFileSync("/bin/cp", ["-Rc", `${REPO_DIST}/.`, closure]);
+  boundedExecFileSync("/bin/cp", ["-c", process.execPath, join(closure, "bin", "node")]);
+  chmodSync(join(closure, "bin", "node"), 0o755);
   // Every production dependency, through the command the owner runbook uses
-  // (`deploy/closure-node-modules.sh`). This used to hand-pick the three packages the database layer
-  // needs, which is why a closure that could not resolve `nostr-tools`' own dependency went
-  // unnoticed: nothing here imported it.
+  // (`deploy/closure-node-modules.sh`), installed and loaded under the closure's own Node. This
+  // used to hand-pick the three packages the database layer needs, which is why a closure that
+  // could not resolve `nostr-tools`' own dependency went unnoticed: nothing here imported it.
   boundedExecFileSync(join(process.cwd(), "deploy", "closure-node-modules.sh"), [
     process.cwd(),
     join(closure, "node_modules"),
+    join(closure, "bin", "node"),
   ], { timeout: 240_000 });
-  boundedExecFileSync("/bin/cp", ["-c", process.execPath, join(closure, "bin", "node")]);
-  chmodSync(join(closure, "bin", "node"), 0o755);
   return closure;
 };
 
