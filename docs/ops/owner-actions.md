@@ -958,8 +958,8 @@ order, while the job is stopped, before the next `start`.
 ### Restore a stopped v60 database to v59 (single path, 60→59 only)
 
 This is the one way to turn a schema v60 (#1464) database into a v59 one that keeps the data written
-under v60. It produces and verifies a converted copy and stops there: replacing the operational
-database is blocked (see the end of this section). It is written for one source and one target and it refuses everything else; there is no flag to widen
+under v60. It produces and verifies a converted copy; installing that copy as the operational
+database uses the replacement-database path at the end of this section. It is written for one source and one target and it refuses everything else; there is no flag to widen
 it, and a second variant for another version pair is not a smaller version of this one — it is a
 different procedure that needs its own rehearsal. It exists because the sealed pair above restores
 the database image it sealed, and that image predates whatever the daemon wrote after it.
@@ -1345,24 +1345,25 @@ only if all four of these do:
 Anything else — a missing or changed row, a new row in any other table, another `repositories`
 column changing, a counter for any other table moving — is a stop.
 
-**Replacing the operational database is blocked.** This procedure supports conversion and isolated
-verification only. It ends with a verified converted copy and its evidence, and nothing here installs
-that copy over the live database.
+**Installing the converted copy.** After the conversion and the isolated start proof, the copy is
+installed with the supported replacement-database path; `deploy/README.md` ("replacement database")
+has the flags and the checks. In order:
 
-- No supported path exists that installs the v59 runtime generation — the closure, the plist and the
-  launcher — together with the converted database. A database-only `state-admin restore` would leave
-  a v59 database under a v60 runtime, so it must not be used to complete this recovery.
-- The sealed rollback pair does not fill this gap. Its database member is the image taken before the
-  migration, and it refuses a database written since its seal as `ROLLBACK_PAIR_STALE_DATABASE`. A
-  pair sealed from the work file targets the work path, not the live one, and is refused for that.
-  Neither the pair nor any other restore described in this document completes this recovery.
-- Record the source's `sha256` once more at the end; it must equal the value taken at the start,
-  which shows the source was never touched. Keep the verified converted copy, its
-  `source.sha256.before` and `copy.sha256.before-convert`, the digests and every output of the
-  checks. Do not replace anything, and do not delete the evidence.
+1. Keep the daemon stopped until the rollback returns. The coordinator cannot hold `agentcpd.lock`
+   across the restore, and a write to the live database after the conversion makes the rollback refuse.
+2. The P59 pair must have been sealed before the migration, and the retired approval for the
+   migration must still be kept; a missing approval refuses.
+3. `state-admin backup --database <converted copy> --output IMAGE`.
+4. `node dist/deploy/rollback-pair.js record-replacement <the validate identity flags, with
+   --pair-id <P59>> --source <live db> --image IMAGE`. It requires the source to be quiescent and writes
+   `IMAGE.source.json`.
+5. `deploy/install-launchd.sh rollback --pair-id <P59> … --replacement-database IMAGE`, from a checkout
+   built with the replacement check (`rollback-pair validate … --replacement-database IMAGE` first).
 
-Operational replacement waits for a separately reviewed, supported install path, and for owner
-approval on the day it is done.
+A database-only `state-admin restore` must not be used: it leaves a v59 database under a v60 runtime.
+Record the source's `sha256` once more at the end; it must equal the value taken at the start. Keep
+the verified converted copy, its `source.sha256.before` and `copy.sha256.before-convert`, the digests,
+`IMAGE.source.json` and every output of the checks, and do not delete the evidence.
 
 **Stopping rules.**
 
