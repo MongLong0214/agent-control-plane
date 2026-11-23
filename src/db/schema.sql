@@ -1684,6 +1684,8 @@ END;
 -- it reached (the first, the record's), in event order, the last reaching the pin's session. This is the
 -- chain's shape only; that each link is the adopted conversation's restart is the control plane's proof
 -- (carriedByTakeovers), asked before the first GitHub write. A takeover row alone moves nothing.
+-- v61: or by a repository rename recorded for exactly this move, while the renamed repository still holds the
+-- name it is leaving (the rename's own transaction, which renames it right after).
 CREATE TRIGGER IF NOT EXISTS projects_active_manifest_moves_by_grant
 BEFORE UPDATE OF active_manifest_digest ON projects
 WHEN NEW.active_manifest_digest IS NOT OLD.active_manifest_digest
@@ -1773,6 +1775,13 @@ WHEN NEW.active_manifest_digest IS NOT OLD.active_manifest_digest
            AND json_extract(e.evidence_json, '$.adoptCanonicalCto.buzzActorId') IS c.buzz_actor_id
          ELSE 0 END
 ))
+ AND NOT EXISTS (
+  SELECT 1 FROM repository_identity_renames n
+    JOIN repositories r ON r.repository_id = n.repository_id AND r.identity = n.from_identity
+   WHERE n.project_id = NEW.project_id
+     AND n.from_manifest_digest IS OLD.active_manifest_digest
+     AND n.to_manifest_digest IS NEW.active_manifest_digest
+)
 BEGIN
   SELECT RAISE(ABORT, 'MANIFEST_ACTIVATION_AUTHORITY_DENIED');
 END;
@@ -4581,4 +4590,57 @@ CREATE TRIGGER IF NOT EXISTS canonical_cto_rotations_no_delete
 BEFORE DELETE ON canonical_cto_rotations
 BEGIN
   SELECT RAISE(ABORT, 'CANONICAL_ENTITLEMENT_TRANSFER_IMMUTABLE');
+END;
+
+-- v61 — the same GitHub repository under a new name. GitHub keeps a repository's node id across a rename, and
+-- ACP keys a repository by its `github:owner/name` text, written once into rows that cannot change (receipts,
+-- verification results, bootstrap applications, the resident allocation). One row per rename: the repository, the
+-- name it had and the one it took, the node id GitHub answered for the new name (equal to the one the allocation
+-- recorded), and the active manifest the rename replaced and the one it activated (the same manifest with that one
+-- remote changed). Readers of a write-once identity resolve it through this table; nothing else moves the name.
+CREATE TABLE IF NOT EXISTS repository_identity_renames (
+  rename_id            TEXT PRIMARY KEY,
+  repository_id        TEXT NOT NULL REFERENCES repositories(repository_id),
+  project_id           TEXT NOT NULL REFERENCES projects(project_id),
+  from_identity        TEXT NOT NULL,
+  to_identity          TEXT NOT NULL,
+  repository_node_id   TEXT NOT NULL,
+  from_manifest_digest TEXT NOT NULL REFERENCES manifests(digest),
+  to_manifest_digest   TEXT NOT NULL REFERENCES manifests(digest),
+  renamed_at           TEXT NOT NULL,
+  CHECK (from_identity <> to_identity),
+  CHECK (from_manifest_digest <> to_manifest_digest)
+) WITHOUT ROWID;
+-- CP-HI-06 — v61: a rename is recorded once and never rewritten by its key.
+CREATE TRIGGER IF NOT EXISTS repository_identity_renames_no_replace
+BEFORE INSERT ON repository_identity_renames
+WHEN EXISTS (SELECT 1 FROM repository_identity_renames WHERE rename_id = NEW.rename_id)
+BEGIN
+  SELECT RAISE(ABORT, 'REPOSITORY_RENAME_IMMUTABLE');
+END;
+-- CP-HI-03 — v61: a rename names the repository as it stands, under the project's active manifest: the repository
+-- holds from_identity in that project, unretired, and the project's active manifest is from_manifest_digest. So a
+-- row cannot describe a move that is not the next one, and the manifest-pointer guard's rename branch cannot be
+-- reached by a row written for another state.
+CREATE TRIGGER IF NOT EXISTS repository_identity_renames_names_the_current_repository
+BEFORE INSERT ON repository_identity_renames
+WHEN NOT EXISTS (SELECT 1 FROM repositories r
+                  WHERE r.repository_id = NEW.repository_id AND r.identity = NEW.from_identity
+                    AND r.project_id IS NEW.project_id AND r.retired_at IS NULL)
+  OR NOT EXISTS (SELECT 1 FROM projects p
+                  WHERE p.project_id = NEW.project_id AND p.active_manifest_digest IS NEW.from_manifest_digest)
+BEGIN
+  SELECT RAISE(ABORT, 'REPOSITORY_RENAME_IMMUTABLE');
+END;
+-- CP-HI-02 — v61: a recorded rename never changes.
+CREATE TRIGGER IF NOT EXISTS repository_identity_renames_immutable
+BEFORE UPDATE ON repository_identity_renames
+BEGIN
+  SELECT RAISE(ABORT, 'REPOSITORY_RENAME_IMMUTABLE');
+END;
+-- CP-HI-02 — v61: a recorded rename is never erased; old receipts and results are read through it.
+CREATE TRIGGER IF NOT EXISTS repository_identity_renames_no_delete
+BEFORE DELETE ON repository_identity_renames
+BEGIN
+  SELECT RAISE(ABORT, 'REPOSITORY_RENAME_IMMUTABLE');
 END;

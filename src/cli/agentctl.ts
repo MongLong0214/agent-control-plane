@@ -44,6 +44,12 @@ const USAGE = `agentctl — Agent Control Plane operator CLI
   agentctl project register <name> <path> register a project and its primary repository
   agentctl project retire <id> <reason>    retire a project, preserving history
   agentctl project list                   list projects with derived activity and CI observations
+  agentctl project rename-repository <id> <owner/name> [--role <role>] [--apply]
+                                           after the owner renamed the repository on GitHub, adopt the
+                                           new name for the SAME repository (GitHub must answer it with
+                                           the recorded node id; the project must have nothing in flight)
+                                           and point the local clones' origin at it. Prints the plan and
+                                           changes nothing without --apply; run it again to continue
   agentctl cto list                       every CTO: generation, live session, channel, room, last Buzz
   agentctl cto add|relaunch|retire <project> ...
                                            one command per CTO lifecycle step, composed from the ones
@@ -594,6 +600,25 @@ export const dispatch = async (
   if (command === "project") {
     if (args[0] === "list") return call("project.list");
     if (args[0] === "retire") return call("project.retire",{projectId:required(args[1],"projectId"),reason:args.slice(2).join(" ") || "operator retirement"});
+    if (args[0] === "rename-repository") {
+      const [, projectId, to, ...rest] = args;
+      let role: string | undefined;
+      let apply = false;
+      for (let index = 0; index < rest.length; index += 1) {
+        if (rest[index] === "--apply") apply = true;
+        else if (rest[index] === "--role" && rest[index + 1] !== undefined) role = rest[++index];
+        else return fail(`unknown project rename-repository argument: ${rest[index] ?? ""}`);
+      }
+      const decision = await client.request("project.renameRepository", {
+        projectId: required(projectId, "projectId"),
+        to: required(to, "owner/name"),
+        ...(role === undefined ? {} : { role }),
+        apply,
+      });
+      print(decision.allowed ? decision.value : decision);
+      const clones = decision.allowed ? (decision.value as { clones?: Array<{ result?: string }> }).clones ?? [] : [];
+      return decision.allowed && !clones.some((clone) => clone.result === "FAILED") ? 0 : 1;
+    }
     if (args[0] === "register") {
       return call("project.register", {
         name: required(args[1], "name"),

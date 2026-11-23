@@ -19,6 +19,7 @@ import type { ArtifactStore } from "../db/artifacts.ts";
 import type { AuditLog } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
 import { ArtifactKind, RunKind, TaskState } from "../domain/types.ts";
+import { currentRepositoryIdentity } from "../registry/repository-rename.ts";
 import type { RunEngine } from "./run-engine.ts";
 import { CLOSED_TO_NEW_TASKS, type TaskGraph, type TaskRecord } from "./task-graph.ts";
 
@@ -889,7 +890,9 @@ export class WorkScopeTracking {
       [run.projectId],
     );
     if (!row || (row.repositoryIdentity == null && row.repositoryNodeId == null)) return allow(ReasonCode.OK, null);
-    const identity = typeof row.repositoryIdentity === "string" ? row.repositoryIdentity : "";
+    // v61: the allocation keeps the name it was made under; a recorded rename of the repository at its node id
+    // gives the name it has now, which is the one GitHub answers and the run's primary repository holds.
+    const identity = typeof row.repositoryIdentity === "string" ? currentRepositoryIdentity(this.ports.db, row.repositoryIdentity, row.repositoryNodeId) : "";
     const parsed = parseGitHubIdentity(identity);
     const primary = this.ports.runs.repositoriesOf(runId).find((repository) => repository.repositoryRole === "primary");
     if (parsed === null || parsed.ref !== null || !isGitHubNodeId(row.repositoryNodeId) || (primary !== undefined && primary.identity !== identity)) {

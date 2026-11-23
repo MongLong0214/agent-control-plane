@@ -30,10 +30,11 @@ describe("v59 → v60 review completion is PROJECT_BOOTSTRAP's alone", () => {
     expect(createHash("sha1").update(`blob ${bytes.length}\0`).update(bytes).digest("hex")).toBe("7c2c8a2a6381dcd862217020a3ed97c097531b55");
     expect(bytes.toString()).not.toContain(TRIGGER);
     expect(MIGRATIONS.find((step) => step.toVersion === 59)!.checksum()).toBe(V59_CHECKSUM);
-    expect(SCHEMA_VERSION).toBe(60);
-    expect(MIGRATIONS.slice(-2).map((step) => [step.id, step.fromVersion, step.toVersion])).toEqual([
+    expect(SCHEMA_VERSION).toBe(61);
+    expect(MIGRATIONS.slice(-3).map((step) => [step.id, step.fromVersion, step.toVersion])).toEqual([
       ["v59-task-plan-key", 58, 59],
       ["v60-review-completion-bootstrap-only", 59, 60],
+      ["v61-repository-identity-rename", 60, 61],
     ]);
   });
 

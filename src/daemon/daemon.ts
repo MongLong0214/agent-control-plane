@@ -369,6 +369,12 @@ export const OPERATOR_METHOD = {
   PROJECT_LIST: "project.list",
   PROJECT_RETIRE: "project.retire",
   PROJECT_REGISTER: "project.register",
+  /**
+   * Adopts GitHub's new name for the same repository (`RepositoryRenames`). Deliberately not in
+   * OPERATOR_MUTATION_METHODS: running the same command again must read the world again and continue
+   * where it stopped, so its answer is never replayed from the idempotency cache.
+   */
+  PROJECT_RENAME_REPOSITORY: "project.renameRepository",
   ACTOR_LIST: "actor.list",
   ACTOR_REGISTER: "actor.register",
   ACTOR_UNREGISTER: "actor.unregister",
@@ -1019,6 +1025,18 @@ export class Daemon {
 
         case OPERATOR_METHOD.PROJECT_REGISTER:
           return this.registerProject(request.params);
+
+        case OPERATOR_METHOD.PROJECT_RENAME_REPOSITORY: {
+          const projectId = requiredOperatorString(request.params, "projectId");
+          if (!projectId.allowed) return projectId;
+          const to = requiredOperatorString(request.params, "to");
+          if (!to.allowed) return to;
+          const role = request.params["role"];
+          if (role !== undefined && (typeof role !== "string" || role.length === 0)) return invalidOperatorParam("role", role);
+          const apply = request.params["apply"];
+          if (typeof apply !== "boolean") return invalidOperatorParam("apply", apply);
+          return this.cp.repositoryRenames.rename({ projectId: projectId.value, to: to.value, ...(role === undefined ? {} : { role }), apply });
+        }
 
         case OPERATOR_METHOD.ACTOR_LIST:
           return allow(ReasonCode.OK, this.cp.actors.activeSet());

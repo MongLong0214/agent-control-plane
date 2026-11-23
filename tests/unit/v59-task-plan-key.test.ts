@@ -8,7 +8,7 @@ import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 import { releasedChainImage } from "../helpers/released-chain-image.ts";
 import { privateStatePath, schemaRowsOf } from "../helpers/released-v44-schema.ts";
 import { contentDigests } from "../helpers/released-v45-schema.ts";
-import { V60_ADDED_TRIGGERS } from "../helpers/released-v50-schema.ts";
+import { V60_ADDED_TRIGGERS, V61_ADDED_TRIGGERS, V61_CHANGED_GUARDS } from "../helpers/released-v50-schema.ts";
 
 afterAll(cleanupTempDirs);
 
@@ -22,13 +22,14 @@ describe("v59 — tasks.plan_key, the PLAN's own key for a task (#1413)", () => 
     approveMigration(path, "v58 → v59 witness");
     new Db(path).close();
     const after = contentDigests(path, 58);
-    expect(after.userVersion).toBe(60);
+    expect(after.userVersion).toBe(61);
     const { schema_migrations: _receiptsBefore, ...rowsBefore } = before.tables;
     const { schema_migrations: _receiptsAfter, ...rowsAfter } = after.tables;
     expect(rowsAfter).toEqual(rowsBefore);
     const upgraded = schemaRowsOf(path);
-    // The chain runs on through v60, whose trigger is v60's test's to account for.
-    const changed = upgraded.filter((row) => !V60_ADDED_TRIGGERS.includes(row.name) && !v58Rows.some((old) => JSON.stringify(old) === JSON.stringify(row)));
+    // The chain runs on through v60 and v61, whose objects are their own tests' to account for.
+    const later = [...V60_ADDED_TRIGGERS, "repository_identity_renames", ...V61_ADDED_TRIGGERS, ...V61_CHANGED_GUARDS];
+    const changed = upgraded.filter((row) => !later.includes(row.name) && !v58Rows.some((old) => JSON.stringify(old) === JSON.stringify(row)));
     expect(changed.map((row) => `${row.type} ${row.name}`).sort()).toEqual(["index tasks_run_plan_key", "table tasks"]);
     const freshPath = join(tempDir("acp-v59-fresh-"), "state.sqlite");
     new Db(freshPath).close();
