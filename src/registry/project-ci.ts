@@ -4,7 +4,7 @@ import { ReasonCode } from "../core/reason-codes.ts";
 import type { Db } from "../db/database.ts";
 import { CI_FAILED_CONCLUSIONS, ciVerificationRecords, type CiVerificationRecord } from "../verify/ci-verification-records.ts";
 import type { ProjectRegistry } from "./project-registry.ts";
-import { repositoryIdentities } from "./repository-rename.ts";
+import { repositoryIdentities } from "./repository-identity-chain.ts";
 
 /**
  * #1257 — the CI section of a project read: what CI the active manifest declares and what ACP has

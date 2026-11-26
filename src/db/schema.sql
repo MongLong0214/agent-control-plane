@@ -1684,8 +1684,10 @@ END;
 -- it reached (the first, the record's), in event order, the last reaching the pin's session. This is the
 -- chain's shape only; that each link is the adopted conversation's restart is the control plane's proof
 -- (carriedByTakeovers), asked before the first GitHub write. A takeover row alone moves nothing.
--- v61: or by a repository rename recorded for exactly this move, while the renamed repository still holds the
--- name it is leaving (the rename's own transaction, which renames it right after).
+-- v61: or by the project's latest repository rename, recorded for exactly this move, while the renamed repository
+-- still holds the name it is leaving (the rename's own transaction, which renames it right after). An earlier rename
+-- of the project never moves it again: after A→B and B→A, the first row is not the latest. A row is bound to its place
+-- in the project's renames rather than marked consumed, so the rename table stays append-only.
 CREATE TRIGGER IF NOT EXISTS projects_active_manifest_moves_by_grant
 BEFORE UPDATE OF active_manifest_digest ON projects
 WHEN NEW.active_manifest_digest IS NOT OLD.active_manifest_digest
@@ -1781,6 +1783,7 @@ WHEN NEW.active_manifest_digest IS NOT OLD.active_manifest_digest
    WHERE n.project_id = NEW.project_id
      AND n.from_manifest_digest IS OLD.active_manifest_digest
      AND n.to_manifest_digest IS NEW.active_manifest_digest
+     AND n.sequence = (SELECT MAX(m.sequence) FROM repository_identity_renames m WHERE m.project_id = NEW.project_id)
 )
 BEGIN
   SELECT RAISE(ABORT, 'MANIFEST_ACTIVATION_AUTHORITY_DENIED');
@@ -4596,12 +4599,14 @@ END;
 -- ACP keys a repository by its `github:owner/name` text, written once into rows that cannot change (receipts,
 -- verification results, bootstrap applications, the resident allocation). One row per rename: the repository, the
 -- name it had and the one it took, the node id GitHub answered for the new name (equal to the one the allocation
--- recorded), and the active manifest the rename replaced and the one it activated (the same manifest with that one
--- remote changed). Readers of a write-once identity resolve it through this table; nothing else moves the name.
+-- recorded), the active manifest the rename replaced and the one it activated (the same manifest with that one
+-- remote changed), and its place in the project's renames (1, 2, ...). Readers of a write-once identity resolve it
+-- through this table; nothing else moves the name.
 CREATE TABLE IF NOT EXISTS repository_identity_renames (
   rename_id            TEXT PRIMARY KEY,
   repository_id        TEXT NOT NULL REFERENCES repositories(repository_id),
   project_id           TEXT NOT NULL REFERENCES projects(project_id),
+  sequence             INTEGER NOT NULL CHECK (sequence > 0),
   from_identity        TEXT NOT NULL,
   to_identity          TEXT NOT NULL,
   repository_node_id   TEXT NOT NULL,
@@ -4618,10 +4623,12 @@ WHEN EXISTS (SELECT 1 FROM repository_identity_renames WHERE rename_id = NEW.ren
 BEGIN
   SELECT RAISE(ABORT, 'REPOSITORY_RENAME_IMMUTABLE');
 END;
--- CP-HI-03 — v61: a rename names the repository as it stands, under the project's active manifest: the repository
--- holds from_identity in that project, unretired, and the project's active manifest is from_manifest_digest. So a
--- row cannot describe a move that is not the next one, and the manifest-pointer guard's rename branch cannot be
--- reached by a row written for another state.
+-- CP-HI-03 — v61: a rename names the repository as it stands, under the project's active manifest, and changes that
+-- manifest by exactly the one remote: the repository holds from_identity in that project, unretired; the project's
+-- active manifest is from_manifest_digest and names from_identity in exactly one repositories[] entry; the stored
+-- to_manifest_digest is that manifest with that entry's remote set to to_identity and nothing else changed; and the
+-- row is the project's next rename. So a row cannot describe a move that is not the next one, and the manifest-
+-- pointer guard's rename branch can only move the pointer to the same contract under the new name.
 CREATE TRIGGER IF NOT EXISTS repository_identity_renames_names_the_current_repository
 BEFORE INSERT ON repository_identity_renames
 WHEN NOT EXISTS (SELECT 1 FROM repositories r
@@ -4629,6 +4636,15 @@ WHEN NOT EXISTS (SELECT 1 FROM repositories r
                     AND r.project_id IS NEW.project_id AND r.retired_at IS NULL)
   OR NOT EXISTS (SELECT 1 FROM projects p
                   WHERE p.project_id = NEW.project_id AND p.active_manifest_digest IS NEW.from_manifest_digest)
+  OR NEW.sequence IS NOT (SELECT COALESCE(MAX(m.sequence), 0) + 1 FROM repository_identity_renames m WHERE m.project_id = NEW.project_id)
+  OR NOT EXISTS (
+    SELECT 1 FROM manifests f
+      JOIN manifests t ON t.digest = NEW.to_manifest_digest
+      JOIN json_each(f.content_json, '$.repositories') e ON json_extract(e.value, '$.remote') IS NEW.from_identity
+     WHERE f.digest = NEW.from_manifest_digest
+       AND (SELECT COUNT(*) FROM json_each(f.content_json, '$.repositories') o
+             WHERE json_extract(o.value, '$.remote') IS NEW.from_identity) = 1
+       AND json(t.content_json) = json(json_set(f.content_json, '$.repositories[' || e.key || '].remote', NEW.to_identity)))
 BEGIN
   SELECT RAISE(ABORT, 'REPOSITORY_RENAME_IMMUTABLE');
 END;

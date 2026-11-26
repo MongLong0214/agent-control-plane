@@ -11,6 +11,7 @@ import type { AuditLog } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
 import { TERMINAL_RUN_STATES } from "../domain/run-state.ts";
 import { git } from "../git/git.ts";
+import { repositoryIdentities } from "./repository-identity-chain.ts";
 import { parseGitHubIdentity, type ObservedRepository, type GitHubRepositoryTarget } from "../bootstrap/github-write-port.ts";
 
 /**
@@ -194,31 +195,7 @@ export const renamedRemoteUrl = (url: string, from: string, to: string): string 
 /** GitHub names are case-insensitive. */
 const sameIdentity = (left: string, right: string): boolean => left.toLowerCase() === right.toLowerCase();
 
-/**
- * Every identity the repository has held: its current one first, then each it was renamed from. A record
- * written once under an old name (a receipt, a verification result, a bootstrap result) is the repository's
- * when it names any of them.
- */
-export const repositoryIdentities = (db: Db, repositoryId: string, current: string): string[] => [
-  current,
-  ...db.all<{ from_identity: string }>(
-    `SELECT DISTINCT from_identity FROM repository_identity_renames WHERE repository_id = ? AND from_identity <> ? ORDER BY from_identity`,
-    [repositoryId, current],
-  ).map((row) => row.from_identity),
-];
-
-/**
- * The identity the repository GitHub knows by `nodeId` holds now, for an identity recorded under an earlier
- * name of it (the resident allocation's): the renamed repository's current identity, or `identity` itself
- * when no rename of it is recorded.
- */
-export const currentRepositoryIdentity = (db: Db, identity: string, nodeId: unknown): string =>
-  typeof nodeId !== "string" ? identity : db.get<{ identity: string }>(
-    `SELECT r.identity FROM repository_identity_renames n JOIN repositories r ON r.repository_id = n.repository_id
-      WHERE n.from_identity = ? AND n.repository_node_id = ? AND r.retired_at IS NULL
-      ORDER BY n.renamed_at DESC, n.rename_id DESC LIMIT 1`,
-    [identity, nodeId],
-  )?.identity ?? identity;
+export { currentRepositoryIdentity, repositoryIdentities } from "./repository-identity-chain.ts";
 
 export class RepositoryRenames {
   private readonly runGit: GitRunner;
@@ -251,7 +228,7 @@ export class RepositoryRenames {
       const done = db.get<RenameRow>(
         `SELECT rename_id, from_identity, to_identity, repository_node_id, from_manifest_digest, to_manifest_digest
            FROM repository_identity_renames WHERE repository_id = ? AND to_identity = ?
-          ORDER BY renamed_at DESC, rename_id DESC LIMIT 1`,
+          ORDER BY sequence DESC LIMIT 1`,
         [repository.repository_id, repository.identity],
       );
       if (!done) {
@@ -286,6 +263,7 @@ export class RepositoryRenames {
           role, identity: from, activeManifestDigest: project.active_manifest_digest,
         });
     }
+    const renamedIndex = base.manifest.repositories.findIndex((entry) => entry.role === role);
     const candidate = renamedManifest(base.manifest, role, to);
     const diff = renameManifestDiff(base.manifest, candidate, role, from, to);
     if (!diff.allowed) return diff as Decision<never>;
@@ -338,15 +316,25 @@ export class RepositoryRenames {
       }
       const stillBusy = this.busy(request.projectId, repository);
       if (stillBusy !== null) return stillBusy;
+      // The stored manifest is the active one's own text with that one remote set, as the rename guard compares
+      // it; its digest is the one planned, or the text moved since the plan.
+      const content = db.get<{ content: string }>(`SELECT json_set(content_json, ?, ?) AS content FROM manifests WHERE digest = ?`,
+        [`$.repositories[${renamedIndex}].remote`, to, base.digest])!.content;
+      const stored = assertPortableManifest(JSON.parse(content) as unknown);
+      if (!stored.allowed || manifestDigest(stored.value) !== toManifestDigest) {
+        return refuse(ReasonCode.CONFLICT, RepositoryRenameRefusal.STATE_MOVED, "the renamed manifest is not the one planned; run the command again", { from, to });
+      }
       if (!db.get(`SELECT 1 FROM manifests WHERE digest = ?`, [toManifestDigest])) {
         db.run(`INSERT INTO manifests (digest, schema_id, content_json, created_at) VALUES (?, ?, ?, ?)`,
-          [toManifestDigest, portable.value.schema, JSON.stringify(portable.value), this.ports.clock.nowIso()]);
+          [toManifestDigest, stored.value.schema, content, this.ports.clock.nowIso()]);
       }
+      const sequence = db.get<{ next: number }>(
+        `SELECT COALESCE(MAX(sequence), 0) + 1 AS next FROM repository_identity_renames WHERE project_id = ?`, [request.projectId])!.next;
       db.run(
-        `INSERT INTO repository_identity_renames (rename_id, repository_id, project_id, from_identity, to_identity, repository_node_id,
+        `INSERT INTO repository_identity_renames (rename_id, repository_id, project_id, sequence, from_identity, to_identity, repository_node_id,
                                                   from_manifest_digest, to_manifest_digest, renamed_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        [renameId, repository.repository_id, request.projectId, from, to, nodeId, base.digest, toManifestDigest, this.ports.clock.nowIso()],
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [renameId, repository.repository_id, request.projectId, sequence, from, to, nodeId, base.digest, toManifestDigest, this.ports.clock.nowIso()],
       );
       db.run(`UPDATE projects SET active_manifest_digest = ? WHERE project_id = ?`, [toManifestDigest, request.projectId]);
       // The checkout's content did not change, so its drift state stands; only the contract it was read under is the new one.
@@ -408,10 +396,15 @@ export class RepositoryRenames {
         ORDER BY r.run_id`,
       [...TERMINAL_RUN_STATES, projectId, repository.repository_id],
     );
+    // Under every name the repository has held, in any letter case: GitHub's names are case-insensitive, and a
+    // claim or receipt written under an earlier name is still this repository's work.
+    const names = JSON.stringify(repositoryIdentities(db, repository.repository_id, repository.identity).map((name) => name.toLowerCase()));
     const claims = db.all<{ claim_id: string }>(
-      `SELECT claim_id FROM resource_claims WHERE status = 'HELD' AND repository_identity = ? ORDER BY claim_id`, [repository.identity]);
+      `SELECT claim_id FROM resource_claims WHERE status = 'HELD' AND lower(repository_identity) IN (SELECT value FROM json_each(?))
+        ORDER BY claim_id`, [names]);
     const receipts = db.all<{ receipt_id: string }>(
-      `SELECT receipt_id FROM github_receipts WHERE status = 'PENDING' AND repository_identity = ? ORDER BY receipt_id`, [repository.identity]);
+      `SELECT receipt_id FROM github_receipts WHERE status = 'PENDING' AND lower(repository_identity) IN (SELECT value FROM json_each(?))
+        ORDER BY receipt_id`, [names]);
     if (runs.length === 0 && claims.length === 0 && receipts.length === 0) return null;
     return refuse(ReasonCode.CONFLICT, RepositoryRenameRefusal.PROJECT_BUSY,
       "the repository has work in flight; a rename waits until every run, claim and receipt of it has finished", {

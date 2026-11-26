@@ -19,7 +19,7 @@ import type { ArtifactStore } from "../db/artifacts.ts";
 import type { AuditLog } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
 import { ArtifactKind, RunKind, TaskState } from "../domain/types.ts";
-import { currentRepositoryIdentity } from "../registry/repository-rename.ts";
+import { currentRepositoryIdentity } from "../registry/repository-identity-chain.ts";
 import type { RunEngine } from "./run-engine.ts";
 import { CLOSED_TO_NEW_TASKS, type TaskGraph, type TaskRecord } from "./task-graph.ts";
 

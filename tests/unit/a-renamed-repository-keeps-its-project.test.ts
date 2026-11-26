@@ -11,6 +11,7 @@ import { ReasonCode } from "../../src/core/reason-codes.ts";
 import type { ProjectManifest } from "../../src/contracts/manifest.ts";
 import { Daemon } from "../../src/daemon/daemon.ts";
 import { startOperatorSocket } from "../../src/daemon/agentcpd.ts";
+import { ApprovedRunFinalizer } from "../../src/daemon/finalizer.ts";
 import { ExecutionMode, Role, RunKind, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
 import { RunEvidenceExporter } from "../../src/export/run-evidence.ts";
 import { type GitHubClient, proveActionsCheckProvenance } from "../../src/github/github-kernel.ts";
@@ -19,6 +20,7 @@ import { projectCi } from "../../src/registry/project-ci.ts";
 import {
   RepositoryRenameRefusal, RepositoryRenames, renameManifestDiff, renamedManifest, type RepositoryRenamePlan,
 } from "../../src/registry/repository-rename.ts";
+import { identityChain } from "../../src/registry/repository-identity-chain.ts";
 import { residentRepositories } from "../../src/registry/resident-repositories.ts";
 import { WorkScopeTracking } from "../../src/run/work-scope-tracking.ts";
 import { cleanupTempDirs, gitSync, makeRepo, tempDir } from "../helpers/fixtures.ts";
@@ -50,7 +52,8 @@ const NEW = `github:${FIXTURE.renamed.to}`;
 const NODE = FIXTURE.renamed.nodeId;
 const OLD_HTTPS = "https://github.com/MongLong0214/myeotnyeon.git";
 const OLD_SSH = "git@github.com:MongLong0214/myeotnyeon.git";
-const SHA = "c".repeat(40);
+const DEFAULT_SHA = "c".repeat(40);
+const SHA = DEFAULT_SHA;
 const WORKFLOW = {
   path: ".github/workflows/ci.yml", checkName: "project-ci", repositoryRole: "primary", approvedDigest: "sha256:approved-ci", unapprovedFirstActivation: false,
 };
@@ -62,9 +65,12 @@ const contract = {
 /** GitHub's REST answers replayed from the fixture; a redirect is refused, as ACP's transports refuse one. */
 class RecordedGitHub implements GitHubClient {
   readonly calls: string[] = [];
+  /** Runs on each request before it is answered: the world moving while ACP waits on GitHub. */
+  onRequest: ((path: string) => void) | null = null;
   constructor(private readonly responses: readonly Recorded[]) {}
   async request<T>(method: string, path: string): Promise<T> {
     this.calls.push(`${method} ${path}`);
+    this.onRequest?.(path);
     const hit = this.responses.find((response) => response.method === method && response.path === path);
     if (hit === undefined) throw acpError(ReasonCode.NOT_FOUND, `gh api ${method} ${path} failed: HTTP 404`, { status: 404, method, path });
     if (hit.status !== 200) {
@@ -96,9 +102,10 @@ interface World {
  * receipts and trusted-CI result were written under the old name, and the resident allocation recording
  * the repository's node id. GitHub already answers the new name.
  */
-const world = async (options: { responses?: Recorded[]; allocation?: "node" | "no-node" | "none" } = {}): Promise<World> => {
+const world = async (options: { responses?: Recorded[]; allocation?: "node" | "no-node" | "none"; evidenceWriters?: boolean } = {}): Promise<World> => {
   const github = new RecordedGitHub(options.responses ?? FIXTURE.responses);
   const h = makeHarness({
+    ...(options.evidenceWriters === true ? { allowTestEvidenceWriters: true } : {}),
     repoFactory: { workRoot: tempDir("rf-rename-"), githubPort: createBootstrapGitHubWritePort(github, async () => ({ exitCode: 0, stdout: "", stderr: "" })) },
   });
   gitSync(h.repoPath, ["remote", "add", "origin", OLD_HTTPS]);
@@ -140,7 +147,7 @@ const world = async (options: { responses?: Recorded[]; allocation?: "node" | "n
 };
 
 /** A merge, its post-merge verification and a trusted-CI result, each written under the old name as the kernel writes them. */
-const recordHistory = (h: Harness, runId: string): void => {
+const recordHistory = (h: Harness, runId: string, SHA = DEFAULT_SHA): void => {
   const at = h.clock.nowIso();
   const merge = `merge_execute:test:${runId}:${OLD}:${SHA}`;
   h.cp.db.run(
@@ -459,5 +466,132 @@ describe("v61 — a repository renamed on GitHub is adopted for the same reposit
       await listener.close();
       await daemon.stop();
     }
+  });
+
+  /** The fixture, and GitHub answering a third name of the same repository, for a second rename. */
+  const THIRD = "MongLong0214/youtube-factory-shorts";
+  const withThird = (): Recorded[] => [...FIXTURE.responses, {
+    method: "GET", path: `repos/${THIRD}`, status: 200,
+    body: { ...FIXTURE.responses.find((r) => r.status === 200)!.body, name: "youtube-factory-shorts", full_name: THIRD },
+  }];
+  const holdClaim = (w: World, identity: string, id = "clm_held"): void => {
+    const session = w.h.cp.bindings.active(w.ctoRoleKey)!.sessionId;
+    w.h.cp.db.run(`INSERT INTO resource_claims (claim_id, repository_identity, branch, declared_path, run_id, owner_session_id, owner_binding_generation,
+        acquired_at, expires_at, status) VALUES (?, ?, 'feature/shared', 'src/app.js', ?, ?, 1, ?, '2999-01-01T00:00:00.000Z', 'HELD')`,
+    [id, identity, w.oldRunId, session, w.h.clock.nowIso()]);
+  };
+
+  it("review P2-2: work in flight under another letter case, or under an earlier name, keeps the repository busy", async () => {
+    // GitHub's names are case-insensitive, so a claim may carry another spelling of the name the repository holds.
+    const cased = await world();
+    holdClaim(cased, "github:monglong0214/MYEOTNYEON");
+    expect(refusalOf(await rename(cased, true))).toBe(RepositoryRenameRefusal.PROJECT_BUSY);
+    expect(untouched(cased)).toMatchObject(UNTOUCHED);
+    // After A→B, a claim or receipt still keyed by A is B's work: B→C waits for it.
+    for (const seed of ["claim", "receipt"] as const) {
+      const w = await world({ responses: withThird() });
+      planOf(await rename(w, true));
+      if (seed === "claim") holdClaim(w, OLD);
+      else {
+        w.h.cp.db.run(`INSERT INTO github_receipts (receipt_id, idempotency_key, operation, run_id, repository_identity, resource_type, resource_identity,
+            preexisting, before_state_digest, after_state_digest, request_digest, response_json, created_at, reread_at, verified, status)
+          VALUES ('rcp_old_name', 'merge_execute:old-name', 'merge_execute', ?, ?, 'merge', 'x#9', 0, NULL, NULL, 'sha256:r', '{"pending":true}', ?, NULL, 0, 'PENDING')`,
+        [w.oldRunId, OLD, w.h.clock.nowIso()]);
+      }
+      const refused = await rename(w, true, THIRD);
+      expect(refusalOf(refused), seed).toBe(RepositoryRenameRefusal.PROJECT_BUSY);
+      expect(w.h.cp.repositories.byId(w.repositoryId)!.identity).toBe(NEW);
+      expect(renames(w.h)).toHaveLength(1);
+    }
+  });
+
+  it("review P2-1: a second rename is a new row, and the first one never moves the manifest again", async () => {
+    const w = await world({ responses: withThird() });
+    const first = planOf(await rename(w, true));
+    const second = planOf(await rename(w, true, THIRD));
+    expect(second).toMatchObject({ state: "RENAMED", from: NEW, to: `github:${THIRD}`, fromManifestDigest: first.toManifestDigest });
+    expect(renames(w.h).map((row) => [row["sequence"], row["from_identity"], row["to_identity"]]).sort())
+      .toEqual([[1, OLD, NEW], [2, NEW, `github:${THIRD}`]]);
+    expect(w.h.cp.projects.activeManifest(PROJECT)!.manifest.repositories[0]!.remote).toBe(`github:${THIRD}`);
+    // Old evidence is found under every earlier name.
+    expect(identityChain(w.h.cp.db, OLD)).toEqual([`github:${THIRD}`, OLD, NEW]);
+    expect(ciOf(w.h).lastObserved?.source).toMatchObject({ kind: "POST_MERGE_VERIFY_RECEIPT", runId: w.oldRunId });
+  });
+
+  it("review P3-3: replaying a pre-rename run's merge receipt finds its repository under the new name", async () => {
+    const w = await world({ evidenceWriters: true });
+    const runId = "run_completed_before_rename";
+    w.h.cp.db.run(
+      `INSERT INTO runs (run_id, project_id, kind, execution_mode, priority, state, goal, contract_digest, pinned_manifest_digest, created_at)
+       VALUES (?, ?, 'STANDARD_WORK', 'STANDARD', 'NORMAL', 'COMPLETED', 'merged before the rename', 'sha256:contract', ?, ?)`,
+      [runId, PROJECT, w.h.cp.projects.get(PROJECT)!.activeManifestDigest, w.h.clock.nowIso()],
+    );
+    w.h.cp.db.run(`INSERT INTO run_repositories (run_id, repository_id, repository_role, base_branch) VALUES (?, ?, 'primary', 'dev')`, [runId, w.repositoryId]);
+    recordHistory(w.h, runId, "d".repeat(40));
+    planOf(await rename(w, true));
+    const observe = vi.spyOn(w.h.cp.repositories, "observe");
+    const replayed = await new ApprovedRunFinalizer(w.h.cp, "rename-replay").finalizeApprovedRun(runId);
+    expect(replayed).toMatchObject({ allowed: true, reasonCode: ReasonCode.MERGE_IDEMPOTENT_REPLAY });
+    expect(observe).toHaveBeenCalledWith(w.repositoryId);
+  });
+
+  it("review P3-4: a claim recorded under the old name still conflicts with the same target under the new one", async () => {
+    const w = await world();
+    planOf(await rename(w, true));
+    holdClaim(w, OLD);
+    const claims = w.h.cp.claims as unknown as {
+      findConflict(request: { runId: string; repositoryIdentity: string }, target: { branch: string | null; worktreeId: string | null; declaredPath: string | null }):
+        { reasonCode: string } | null;
+    };
+    expect(claims.findConflict({ runId: "run_other", repositoryIdentity: NEW }, { branch: "feature/shared", worktreeId: null, declaredPath: null }))
+      .toMatchObject({ reasonCode: ReasonCode.CLAIM_BRANCH_CONFLICT });
+    expect(w.h.cp.claims.advisoryOverlaps(NEW, "run_other", ["src/feed.js"])).toEqual([
+      expect.objectContaining({ path: "src/feed.js", otherRun: w.oldRunId, otherPath: "src/app.js" }),
+    ]);
+  });
+
+  it("race (a): a run, claim or receipt that appears after the plan's quiet check and before the transaction makes the apply refuse", async () => {
+    for (const appears of ["run", "claim", "receipt"] as const) {
+      const w = await world();
+      let moved = false;
+      // The clones are read after the plan's quiet check and before the transaction: the world moves there.
+      const service = new RepositoryRenames({
+        db: w.h.cp.db, clock: w.h.clock, audit: w.h.cp.audit, github: createBootstrapGitHubWritePort(w.github),
+        git: async (cwd) => {
+          if (!moved) {
+            moved = true;
+            if (appears === "run") {
+              const run = w.h.cp.runs.create({ projectId: PROJECT, executionMode: ExecutionMode.STANDARD, contract, repositories: [{ repositoryId: w.repositoryId, repositoryRole: "primary", baseBranch: "dev" }] });
+              if (!run.allowed) throw new Error(run.message);
+            } else if (appears === "claim") holdClaim(w, OLD);
+            else {
+              w.h.cp.db.run(`INSERT INTO github_receipts (receipt_id, idempotency_key, operation, run_id, repository_identity, resource_type, resource_identity,
+                  preexisting, before_state_digest, after_state_digest, request_digest, response_json, created_at, reread_at, verified, status)
+                VALUES ('rcp_race', 'merge_execute:race', 'merge_execute', ?, ?, 'merge', 'x#10', 0, NULL, NULL, 'sha256:r', '{"pending":true}', ?, NULL, 0, 'PENDING')`,
+              [w.oldRunId, OLD, w.h.clock.nowIso()]);
+            }
+          }
+          return { exitCode: 0, stdout: `${originOf(cwd)}\n`, stderr: "" };
+        },
+      });
+      const refused = await service.rename({ projectId: PROJECT, to: FIXTURE.renamed.to, apply: true });
+      expect(moved, appears).toBe(true);
+      expect(refusalOf(refused), appears).toBe(RepositoryRenameRefusal.PROJECT_BUSY);
+      expect(untouched(w), appears).toMatchObject(UNTOUCHED);
+    }
+  });
+
+  it("race (b): a stop right after the GitHub rename, before any ACP write, leaves ACP as it was, and the rerun converges", async () => {
+    const w = await world();
+    // GitHub has the new name; the first attempt dies while asking it, before anything of ACP is written.
+    w.github.onRequest = () => { throw new Error("the connection was dropped mid-request"); };
+    expect(refusalOf(await rename(w, true))).toBe(RepositoryRenameRefusal.GITHUB_UNREADABLE);
+    expect(untouched(w)).toMatchObject(UNTOUCHED);
+    w.github.onRequest = null;
+    const converged = planOf(await rename(w, true));
+    expect(converged).toMatchObject({ state: "RENAMED", from: OLD, to: NEW });
+    expect([originOf(w.checkoutPath), originOf(w.clonePath)]).toEqual([
+      "https://github.com/MongLong0214/youtube-factory.git", "git@github.com:MongLong0214/youtube-factory.git",
+    ]);
   });
 });

@@ -32,6 +32,7 @@ import type {
 } from "../registry/manifest-activation-grants.ts";
 import { GitHubAppClient, transportOutcome } from "../github/github-kernel.ts";
 import { workflowDigestAtCommit } from "../github/workflow-digest-at-commit.ts";
+import { identityChain, identityChainJson } from "../registry/repository-identity-chain.ts";
 import { FOLLOW_UP_OWNER, type FollowUpAssessment, assessFollowUpRetry, followUpCauseOf } from "./post-merge-follow-up.ts";
 
 type ChangeTarget = Extract<ManifestActivationTarget, { kind: "CHANGE" }>;
@@ -550,7 +551,8 @@ export class ApprovedRunFinalizer {
       this.completeAnyRunningAttempt(runId);
       for (const receipt of this.durableMergeReceipts(runId)) {
         if (receipt.status !== "APPLIED" || receipt.verified !== 1) continue;
-        const repository = this.cp.repositories.byIdentity(receipt.repository_identity);
+        // v61: a receipt keeps the name it was written under; the repository may hold another one since.
+        const repository = this.cp.repositories.byIdentity(identityChain(this.cp.db, receipt.repository_identity)[0]!);
         if (repository) await this.cp.repositories.observe(repository.repositoryId);
       }
       return allow(
@@ -1939,10 +1941,13 @@ export class ApprovedRunFinalizer {
    * or a read-back that answered another merge, head or state) means the merge is no longer known as proven: null.
    */
   private notesPendingMerge(runId: string, repositoryIdentity: string, pullNumber: number): string | null {
+    // Under every name the repository has held (v61): the receipt and its key keep the one it was written under.
+    const names = identityChain(this.cp.db, repositoryIdentity);
     const receipt = this.cp.db.get<{ created_at: string }>(
       `SELECT created_at FROM github_receipts
-        WHERE run_id = ? AND repository_identity = ? AND operation = 'merge_execute' AND idempotency_key = ? AND status = 'PENDING'`,
-      [runId, repositoryIdentity, `merge_execute:${repositoryIdentity}:${pullNumber}`],
+        WHERE run_id = ? AND repository_identity IN (SELECT value FROM json_each(?)) AND operation = 'merge_execute'
+          AND idempotency_key IN (SELECT value FROM json_each(?)) AND status = 'PENDING'`,
+      [runId, JSON.stringify(names), JSON.stringify(names.map((name) => `merge_execute:${name}:${pullNumber}`))],
     );
     if (!receipt) return null;
     const latest = this.cp.audit.forRun(runId).filter((entry) =>
@@ -2026,9 +2031,9 @@ export class ApprovedRunFinalizer {
     return this.cp.db.get<DurableMergeReceipt>(
       `SELECT repository_identity, status, verified, response_json
          FROM github_receipts
-        WHERE run_id = ? AND repository_identity = ? AND operation = 'merge_execute'
+        WHERE run_id = ? AND repository_identity IN (SELECT value FROM json_each(?)) AND operation = 'merge_execute'
         ORDER BY created_at DESC, receipt_id DESC LIMIT 1`,
-      [runId, repositoryIdentity],
+      [runId, identityChainJson(this.cp.db, repositoryIdentity)],
     ) ?? null;
   }
 
@@ -2040,14 +2045,15 @@ export class ApprovedRunFinalizer {
     runId: string,
     repositoryIdentity: string,
   ): { status: string; verified: number; pullNumber: number } | null {
-    const row = this.cp.db.get<{ idempotency_key: string; status: string; verified: number }>(
-      `SELECT idempotency_key, status, verified
+    const row = this.cp.db.get<{ idempotency_key: string; status: string; verified: number; repository_identity: string }>(
+      `SELECT idempotency_key, status, verified, repository_identity
          FROM github_receipts
-        WHERE run_id = ? AND repository_identity = ? AND operation = 'merge_execute'
+        WHERE run_id = ? AND repository_identity IN (SELECT value FROM json_each(?)) AND operation = 'merge_execute'
         ORDER BY created_at DESC, receipt_id DESC LIMIT 1`,
-      [runId, repositoryIdentity],
+      [runId, identityChainJson(this.cp.db, repositoryIdentity)],
     );
-    const prefix = `merge_execute:${repositoryIdentity}:`;
+    // The key names the identity the receipt was written under (v61: perhaps an earlier name).
+    const prefix = `merge_execute:${row?.repository_identity ?? repositoryIdentity}:`;
     if (!row?.idempotency_key.startsWith(prefix)) return null;
     const pull = row.idempotency_key.slice(prefix.length);
     if (!/^[1-9]\d*$/.test(pull)) return null;

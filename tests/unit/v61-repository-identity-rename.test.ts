@@ -23,28 +23,40 @@ const IMMUTABLE = /REPOSITORY_RENAME_IMMUTABLE/;
 const DENIED = /MANIFEST_ACTIVATION_AUTHORITY_DENIED/;
 const AT = "2026-11-23T00:00:00.000Z";
 
-/** A fresh database holding one project at manifest m1 and its repository at `github:acme/old`. */
+const manifest = (remote: string, extra: Record<string, unknown> = {}): string =>
+  JSON.stringify({ schema: "x", projectId: "p1", repositories: [{ role: "primary", remote, manifestRoot: "." }], ciWorkflows: [], ...extra });
+
+/**
+ * A fresh database holding one project at manifest m1 and its repository at `github:acme/old`. m2 is m1 with that
+ * remote set to `github:acme/new` and nothing else changed; m3 names the new remote and also drops a workflow, the
+ * shape of a contract change, not a rename.
+ */
 const world = () => {
   const path = join(tempDir("acp-v61-world-"), "state.sqlite");
   new Db(path).close();
   const raw = new Database(path);
-  for (const digest of ["sha256:m1", "sha256:m2", "sha256:m3"]) {
-    raw.prepare(`INSERT INTO manifests (digest, schema_id, content_json, created_at) VALUES (?, 'x', '{}', ?)`).run(digest, AT);
+  for (const [digest, content] of [
+    ["sha256:m1", manifest("github:acme/old", { ciWorkflows: [{ path: "ci.yml", checkName: "ci" }] })],
+    ["sha256:m2", manifest("github:acme/new", { ciWorkflows: [{ path: "ci.yml", checkName: "ci" }] })],
+    ["sha256:m3", manifest("github:acme/new")],
+  ] as const) {
+    raw.prepare(`INSERT INTO manifests (digest, schema_id, content_json, created_at) VALUES (?, 'x', ?, ?)`).run(digest, content, AT);
   }
   raw.prepare(`INSERT INTO projects (project_id, name, active_manifest_digest, created_at) VALUES ('p1', 'p1', 'sha256:m1', ?)`).run(AT);
   raw.prepare(`INSERT INTO repositories (repository_id, identity, checkout_path, project_id, repository_role, created_at)
     VALUES ('repo_1', 'github:acme/old', '/tmp/acp-v61-repo', 'p1', 'primary', ?)`).run(AT);
-  const rename = (row: Partial<Record<string, string>> = {}) => raw.prepare(
-    `INSERT INTO repository_identity_renames (rename_id, repository_id, project_id, from_identity, to_identity, repository_node_id,
-       from_manifest_digest, to_manifest_digest, renamed_at) VALUES (@rename_id, @repository_id, @project_id, @from_identity, @to_identity,
-       @repository_node_id, @from_manifest_digest, @to_manifest_digest, @renamed_at)`,
+  const rename = (row: Partial<Record<string, string | number>> = {}) => raw.prepare(
+    `INSERT INTO repository_identity_renames (rename_id, repository_id, project_id, sequence, from_identity, to_identity, repository_node_id,
+       from_manifest_digest, to_manifest_digest, renamed_at) VALUES (@rename_id, @repository_id, @project_id, @sequence, @from_identity,
+       @to_identity, @repository_node_id, @from_manifest_digest, @to_manifest_digest, @renamed_at)`,
   ).run({
-    rename_id: "ren_1", repository_id: "repo_1", project_id: "p1", from_identity: "github:acme/old", to_identity: "github:acme/new",
+    rename_id: "ren_1", repository_id: "repo_1", project_id: "p1", sequence: 1, from_identity: "github:acme/old", to_identity: "github:acme/new",
     repository_node_id: "R_node", from_manifest_digest: "sha256:m1", to_manifest_digest: "sha256:m2", renamed_at: AT, ...row,
   });
   const move = (digest: string) => () => raw.prepare(`UPDATE projects SET active_manifest_digest = ? WHERE project_id = 'p1'`).run(digest);
+  const name = (identity: string) => raw.prepare(`UPDATE repositories SET identity = ? WHERE repository_id = 'repo_1'`).run(identity);
   const pointer = () => raw.prepare(`SELECT active_manifest_digest FROM projects WHERE project_id = 'p1'`).pluck().get();
-  return { raw, rename, move, pointer, close: () => raw.close() };
+  return { raw, rename, move, name, pointer, close: () => raw.close() };
 };
 
 describe("v61 — a repository rename table, and the one manifest move it admits", () => {
@@ -101,34 +113,59 @@ describe("v61 — a repository rename table, and the one manifest move it admits
       expect(() => w.rename({ from_manifest_digest: "sha256:m3" })).toThrow(IMMUTABLE);
       w.raw.prepare(`INSERT INTO projects (project_id, name, created_at) VALUES ('p2', 'p2', ?)`).run(AT);
       expect(() => w.rename({ project_id: "p2" })).toThrow(IMMUTABLE);
-      // The same name, or the same manifest, is no rename.
-      expect(() => w.rename({ to_identity: "github:acme/old" })).toThrow(/CHECK constraint/);
-      expect(() => w.rename({ to_manifest_digest: "sha256:m1" })).toThrow(/CHECK constraint/);
+      // Not the project's next rename.
+      expect(() => w.rename({ sequence: 2 })).toThrow(IMMUTABLE);
+      // The same name, or the same manifest, is no rename: the guard or the CHECK refuses it, whichever fires first.
+      expect(() => w.rename({ to_identity: "github:acme/old" })).toThrow(/CHECK constraint|REPOSITORY_RENAME_IMMUTABLE/);
+      expect(() => w.rename({ to_manifest_digest: "sha256:m1" })).toThrow(/CHECK constraint|REPOSITORY_RENAME_IMMUTABLE/);
       w.rename();
       expect(() => w.rename()).toThrow(IMMUTABLE);
-      expect(() => w.raw.prepare(`INSERT OR REPLACE INTO ${TABLE} (rename_id, repository_id, project_id, from_identity, to_identity,
+      expect(() => w.raw.prepare(`INSERT OR REPLACE INTO ${TABLE} (rename_id, repository_id, project_id, sequence, from_identity, to_identity,
         repository_node_id, from_manifest_digest, to_manifest_digest, renamed_at)
-        VALUES ('ren_1', 'repo_1', 'p1', 'github:acme/old', 'github:acme/forged', 'R_node', 'sha256:m1', 'sha256:m3', ?)`).run(AT)).toThrow(IMMUTABLE);
+        VALUES ('ren_1', 'repo_1', 'p1', 1, 'github:acme/old', 'github:acme/forged', 'R_node', 'sha256:m1', 'sha256:m3', ?)`).run(AT)).toThrow(IMMUTABLE);
       expect(() => w.raw.prepare(`UPDATE ${TABLE} SET to_identity = 'github:acme/forged'`).run()).toThrow(IMMUTABLE);
       expect(() => w.raw.prepare(`DELETE FROM ${TABLE}`).run()).toThrow(IMMUTABLE);
       expect(w.raw.prepare(`SELECT to_identity FROM ${TABLE}`).pluck().all()).toEqual(["github:acme/new"]);
     } finally { w.close(); }
   });
 
-  it("moves the manifest pointer only along a recorded rename, and only while the repository still holds its old name", () => {
+  it("refuses a rename row whose new manifest is anything but the active one with that one remote changed", () => {
+    const w = world();
+    try {
+      // m3 names the new remote and drops a workflow: a contract change under a rename's cover.
+      expect(() => w.rename({ to_manifest_digest: "sha256:m3" })).toThrow(IMMUTABLE);
+      // m2 is the right manifest for another new name.
+      expect(() => w.rename({ to_identity: "github:acme/elsewhere" })).toThrow(IMMUTABLE);
+      // The pointer cannot reach m3 by any rename, and m2 only through the row that names it.
+      expect(w.move("sha256:m3")).toThrow(DENIED);
+      w.rename();
+      expect(w.move("sha256:m3")).toThrow(DENIED);
+      expect(w.move("sha256:m2")).not.toThrow();
+    } finally { w.close(); }
+  });
+
+  it("moves the manifest pointer only along the project's latest rename, and only while the repository still holds its old name", () => {
     const w = world();
     try {
       // No rename row: the v60 guard decides, and a move without a grant is refused.
       expect(w.move("sha256:m2")).toThrow(DENIED);
       w.rename();
-      // Only the move the row names.
-      expect(w.move("sha256:m3")).toThrow(DENIED);
       // Once the repository holds the new name, the row admits no further move along it.
-      w.raw.prepare(`UPDATE repositories SET identity = 'github:acme/new' WHERE repository_id = 'repo_1'`).run();
+      w.name("github:acme/new");
       expect(w.move("sha256:m2")).toThrow(DENIED);
-      w.raw.prepare(`UPDATE repositories SET identity = 'github:acme/old' WHERE repository_id = 'repo_1'`).run();
+      w.name("github:acme/old");
       expect(w.move("sha256:m2")).not.toThrow();
       expect(w.pointer()).toBe("sha256:m2");
+      w.name("github:acme/new");
+      // Renamed back, A→B→A: the second rename moves the pointer back to m1 and the repository back to its first name.
+      w.rename({ rename_id: "ren_2", sequence: 2, from_identity: "github:acme/new", to_identity: "github:acme/old",
+        from_manifest_digest: "sha256:m2", to_manifest_digest: "sha256:m1" });
+      expect(w.move("sha256:m1")).not.toThrow();
+      w.name("github:acme/old");
+      // Now the repository holds the first rename's old name and the pointer its old manifest again: that row is not the
+      // latest, so it moves nothing; and the latest one names another move.
+      expect(w.move("sha256:m2")).toThrow(DENIED);
+      expect(w.pointer()).toBe("sha256:m1");
     } finally { w.close(); }
   });
 });
