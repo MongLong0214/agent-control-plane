@@ -67,14 +67,20 @@ example above has no token, so it takes that fallback: it reports the lock and a
 never `mode`. The launcher provisions the operator token for `agentcpd`, not for an operator
 shell, so pass it deliberately when you need to ask the daemon anything.
 
-An operator shell can name a credential file instead of exporting the token: set
-`ACP_OPERATOR_TOKEN_FILE=<path>`. `agentctl` reads it only when `ACP_OPERATOR_TOKEN` is unset (the
-variable still wins; `agentctl cto --apply` resolves it the same way), refuses it unless it is a
-non-empty regular file, not a symlink, that you own with no group or other permission bits (0600),
-and reads nothing when neither variable is set. CTO launch shells unset both variables. The
-daemon's own credential is the login Keychain item `com.agentcontrolplane.agentcpd` /
-`ACP_OPERATOR_TOKEN`, not a file, so write the file once without printing it:
-`(umask 077; mkdir -p -m 700 ~/.agent-control-plane && security find-generic-password -s com.agentcontrolplane.agentcpd -a ACP_OPERATOR_TOKEN -w > ~/.agent-control-plane/operator.token && chmod 600 ~/.agent-control-plane/operator.token)`.
+For the installed daemon, read its credential from the launcher's Keychain item
+(`com.agentcontrolplane.agentcpd` / `ACP_OPERATOR_TOKEN`, or the service you installed with) for
+each call. The token then lives only in that one process's environment and no copy is written:
+
+```bash
+ACP_OPERATOR_TOKEN="$(security find-generic-password -s com.agentcontrolplane.agentcpd -a ACP_OPERATOR_TOKEN -w)" \
+  node dist/cli/agentctl.js daemon status
+```
+
+Do not copy that credential into a file. `ACP_OPERATOR_TOKEN_FILE=<path>` exists only for a
+credential you manage yourself, such as the token of a foreground daemon you started (below):
+`agentctl` and `agentctl cto --apply` read it only when `ACP_OPERATOR_TOKEN` is unset, refuse
+anything but a non-empty regular 0600 file you own (no symlink), and read nothing when neither
+variable is set. CTO launch shells unset both variables.
 
 A lock read is weaker evidence than a socket answer in two ways: it does not check that its
 pid is alive, and a parked daemon holds its lock exactly like a dispatching one. A daemon
