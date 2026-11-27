@@ -892,8 +892,9 @@ const createHermesServerFromPort = (
         "Read the git blob id of one file at one exact commit of a project's registered GitHub repository, so two files can " +
         "be compared by blob id when a PR's file list has no patch for one of them. The repository is the registry's for " +
         "projectId (name repositoryRole when the project has several); a URL, path or remote identity there is refused. " +
-        "commit is a full 40-hex SHA of a commit that repository holds (any other, or an unknown one, is refused); path is a " +
-        "repository-relative file path, and one the commit does not have is NOT_FOUND. Answers {commit, path, blobSha, size} " +
+        "commit is a full 40-hex SHA of a commit that repository itself reaches: an ancestor of its default branch or in one of its " +
+        "pull requests (a commit that exists only in a fork or the parent, or an unknown one, is refused); path is a " +
+        "repository-relative file path, and one the commit does not have is NOT_FOUND; a symbolic link is refused. Answers {commit, path, blobSha, size} " +
         "with the tree entry's mode, from the commit's own tree and no branch name. It only reads: it does not mark any patch " +
         "reviewed or change any review, merge or completion state. Current CEO only; read-only.",
       inputSchema: {

@@ -26,6 +26,10 @@ const BASE = "d1e2b1284f2f97a3d119bd4bbc5f4d2100a4055e";
 const BLOB = "e5f124254db4c87105b78afb792ebc275b1c3cca";
 const OTHER_BLOB = "0a".repeat(20);
 const STRANGER = "99".repeat(20);
+/** A commit GitHub resolves for this repository's API because a fork or the parent holds it; this repository does not. */
+const FORK_ONLY = "f0".repeat(20);
+const FORK_ROOT = "c1".repeat(20);
+const LINK_TARGET = "1c".repeat(20);
 
 const tree = (n: string): string => n.repeat(20);
 const HEAD_ROOT = tree("a1"), HEAD_SRC = tree("a2"), HEAD_DB = tree("a3");
@@ -37,15 +41,24 @@ const treeEntry = (path: string, sha: string): Row => ({ path, mode: "040000", t
 
 /** Two commits of acme/fixture, their trees, and the PR whose head's file list carries no patch for the moved file. */
 class BlobGitHub extends FakeGitHub {
-  commits = new Map<string, { tree: string }>([[HEAD, { tree: HEAD_ROOT }], [BASE, { tree: BASE_ROOT }]]);
+  commits = new Map<string, { tree: string }>([[HEAD, { tree: HEAD_ROOT }], [BASE, { tree: BASE_ROOT }], [FORK_ONLY, { tree: FORK_ROOT }]]);
   trees = new Map<string, Row[]>([
     [HEAD_ROOT, [treeEntry("src", HEAD_SRC), blobEntry("README.md", OTHER_BLOB, 12)]],
     [HEAD_SRC, [treeEntry("db", HEAD_DB)]],
-    [HEAD_DB, [blobEntry("schema-v60.sql", BLOB), blobEntry("schema.sql", OTHER_BLOB, 4000)]],
+    [HEAD_DB, [blobEntry("schema-v60.sql", BLOB), blobEntry("schema.sql", OTHER_BLOB, 4000),
+      { path: "schema-link.sql", mode: "120000", type: "blob", sha: LINK_TARGET, size: 13 }]],
     [BASE_ROOT, [treeEntry("src", BASE_SRC)]],
     [BASE_SRC, [treeEntry("db", BASE_DB)]],
     [BASE_DB, [blobEntry("schema.sql", BLOB)]],
+    [FORK_ROOT, [blobEntry("README.md", OTHER_BLOB, 12)]],
   ]);
+  /** The default branch's head and the commits it reaches; the PR head is not one of them. */
+  mainHead = BASE;
+  onMain = new Set<string>([BASE]);
+  /** The pull requests of this repository that GitHub lists for a commit. */
+  pullsOfCommit = new Map<string, Row[]>();
+  /** Answers `commits/{sha}/pulls` or the compare with this status instead, as GitHub does when it cannot say. */
+  failingReachability: { pattern: RegExp; status: number } | null = null;
   truncated = new Set<string>();
   failing: Array<{ pattern: RegExp; status: number }> = [];
   /** Rewrites a commit answer, for a response that names another object than the one asked for. */
@@ -57,7 +70,11 @@ class BlobGitHub extends FakeGitHub {
     const gitTree = /\/repos\/acme\/fixture\/git\/trees\/([0-9a-f]+)$/.exec(path);
     const pull = /\/repos\/acme\/fixture\/pulls\/(\d+)$/.exec(path);
     const compare = /\/repos\/acme\/fixture\/compare\/([0-9a-f]{40})\.\.\.([0-9a-f]{40})\?per_page=1$/.exec(path);
-    if (method !== "GET" || !(gitCommit || gitTree || pull || compare)) {
+    const repository = /\/repos\/acme\/fixture$/.exec(path);
+    const mainRef = /\/repos\/acme\/fixture\/git\/ref\/heads\/main$/.exec(path);
+    const reaches = /\/repos\/acme\/fixture\/compare\/([0-9a-f]{40})\.\.\.([0-9a-f]{40})$/.exec(path);
+    const commitPulls = /\/repos\/acme\/fixture\/commits\/([0-9a-f]{40})\/pulls\?per_page=100$/.exec(path);
+    if (method !== "GET" || !(gitCommit || gitTree || pull || compare || repository || mainRef || reaches || commitPulls)) {
       // Anything else of the PR read (checks, statuses, rules) is a lookup that fails, which that tool names as a gap.
       if (method === "GET" && path.startsWith("/repos/acme/fixture/")) {
         this.calls.push({ method, path, body });
@@ -69,6 +86,17 @@ class BlobGitHub extends FakeGitHub {
     const failure = this.failing.find((entry) => entry.pattern.test(path));
     if (failure) throw acpError(ReasonCode.PROBE_FAILED, "GitHub App API request failed", { operation: method, status: failure.status });
     const missing = (): never => { throw acpError(ReasonCode.PROBE_FAILED, "GitHub App API request failed", { operation: method, status: 404 }); };
+    if (this.failingReachability?.pattern.test(path)) {
+      throw acpError(ReasonCode.PROBE_FAILED, "GitHub App API request failed", { operation: method, status: this.failingReachability.status });
+    }
+    if (repository) return { full_name: "acme/fixture", default_branch: "main" } as T;
+    if (mainRef) return { ref: "refs/heads/main", object: { type: "commit", sha: this.mainHead } } as T;
+    if (reaches) {
+      const [, commit, head] = reaches;
+      const status = commit === head ? "identical" : this.onMain.has(commit!) ? "ahead" : "diverged";
+      return { status, ahead_by: 0, behind_by: 0, files: [] } as T;
+    }
+    if (commitPulls) return (this.pullsOfCommit.get(commitPulls[1]!) ?? []) as T;
     if (gitCommit) {
       const found = this.commits.get(gitCommit[1]!);
       if (!found) return missing();
@@ -145,6 +173,10 @@ beforeEach(() => {
   gh.failing = [];
   gh.truncated.clear();
   gh.reshapeCommit = null;
+  gh.failingReachability = null;
+  gh.pullsOfCommit.clear();
+  // The PR #1504 head is on no default branch; it is in a pull request of the repository.
+  gh.pullsOfCommit.set(HEAD, [{ number: 1504, state: "open", base: { ref: "main", repo: { full_name: "acme/fixture" } }, head: { sha: HEAD } }]);
   gh.calls.length = 0;
 });
 
@@ -247,6 +279,33 @@ describe("repository_blob_get", () => {
     // GitHub's answer for another object than the one asked for is refused, not read.
     gh.reshapeCommit = (body) => ({ ...body, sha: STRANGER });
     expect(await blobAt({ projectId, commit: HEAD, path: "README.md" })).toMatchObject({ ok: false, reasonCode: ReasonCode.PROBE_FAILED });
+  });
+
+  it("(b) refuses a commit GitHub resolves but this repository does not reach, reading no tree for it", async () => {
+    // The fake answers git/commits for FORK_ONLY, as GitHub does for an object in the fork network.
+    const answer = await blobAt({ projectId, commit: FORK_ONLY, path: "README.md" });
+    expect(answer).toMatchObject({ ok: false, reasonCode: ReasonCode.NOT_FOUND, evidence: { commit: FORK_ONLY } });
+    expect(gh.calls.map((call) => call.path)).toEqual(expect.arrayContaining([`/repos/acme/fixture/git/commits/${FORK_ONLY}`]));
+    expect(gh.calls.filter((call) => /\/git\/trees\//.test(call.path))).toEqual([]);
+    // A PR of another repository that lists the commit does not make it this repository's.
+    gh.pullsOfCommit.set(FORK_ONLY, [{ number: 7, state: "open", base: { ref: "main", repo: { full_name: "someone/else" } } }]);
+    expect(await blobAt({ projectId, commit: FORK_ONLY, path: "README.md" })).toMatchObject({ ok: false, reasonCode: ReasonCode.NOT_FOUND });
+    // Reachability that could not be read is a gap, not a verdict that the commit is foreign.
+    gh.pullsOfCommit.clear();
+    gh.failingReachability = { pattern: /\/commits\/[0-9a-f]{40}\/pulls/, status: 500 };
+    expect(await blobAt({ projectId, commit: FORK_ONLY, path: "README.md" })).toMatchObject({ ok: false, reasonCode: ReasonCode.PROBE_FAILED });
+    // The base is an ancestor of the default branch's head, and the #1504 head is in a PR of this repository.
+    gh.failingReachability = null;
+    expect(await blobAt({ projectId, commit: BASE, path: "src/db/schema.sql" })).toMatchObject({ ok: true });
+    gh.pullsOfCommit.set(HEAD, [{ number: 1504, state: "closed", base: { ref: "main", repo: { full_name: "acme/fixture" } } }]);
+    expect(await blobAt({ projectId, commit: HEAD, path: "src/db/schema-v60.sql" })).toMatchObject({ ok: true, value: { blobSha: BLOB } });
+  });
+
+  it("(b) refuses a symbolic link, whose blob is the link target's text and not a file", async () => {
+    expect(await blobAt({ projectId, commit: HEAD, path: "src/db/schema-link.sql" }))
+      .toMatchObject({ ok: false, reasonCode: ReasonCode.INVALID_ARGUMENT, evidence: { mode: "120000" } });
+    // An ordinary file beside it is still read.
+    expect(await blobAt({ projectId, commit: HEAD, path: "src/db/schema.sql" })).toMatchObject({ ok: true, value: { mode: "100644" } });
   });
 
   it("(b) refuses a missing path, a directory used as a file, and a file used as a directory", async () => {

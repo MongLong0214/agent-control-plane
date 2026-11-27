@@ -4,6 +4,7 @@ import { ReasonCode } from "../core/reason-codes.ts";
 import {
   NOT_A_NAME, SHA, type PrEvidenceSource, isPermissionFailure, resolveRepository, statusOf,
 } from "./pr-evidence.ts";
+import { reachability } from "./workflow-digest-at-commit.ts";
 
 /**
  * `repository_blob_get` — the CEO's own read of one file's git blob id at one exact commit of a project's
@@ -15,6 +16,12 @@ import {
  * commit by `git/commits/{sha}`, which addresses commit objects only, then the tree one path segment at a
  * time by `git/trees/{sha}`, by object id instead of the contents API, whose `?ref=` resolves names. The blob id and size
  * are the tree entry's own; no bytes are fetched. It reads and reports; it marks nothing reviewed.
+ *
+ * `git/commits/{sha}` also answers for a commit that lives only in a fork or the parent of this repository,
+ * so a commit is read only once the repository itself reaches it: it is an ancestor of the default branch's
+ * head (the exact-commit reader's `reachability`, over GitHub's compare), or it belongs to a pull request of
+ * this repository (`commits/{sha}/pulls`). GitHub lists only open pull requests for a commit the default
+ * branch lacks, so the head of a closed, unmerged one is refused here.
  */
 
 export interface RepositoryBlobInput {
@@ -88,6 +95,59 @@ const failure = (error: unknown, what: string, evidence: Evidence): Decision<nev
   return deny(ReasonCode.PROBE_FAILED, `${what} could not be read from GitHub`, withStatus);
 };
 
+/** One GET-only accessor as the exact-commit reader's `reachability` takes a client. */
+const asClient = (github: PrEvidenceSource["github"]) => ({
+  request: <T>(_method: "GET" | "POST" | "PATCH" | "PUT" | "DELETE", path: string): Promise<T> => github.get<T>(path),
+});
+
+/**
+ * Whether this repository, not only its fork network, holds the commit. A lookup that failed is a gap and is
+ * never read as "not in the repository"; only an answer that says it is not reachable refuses as NOT_FOUND.
+ */
+const commitBelongsToRepository = async (
+  github: PrEvidenceSource["github"],
+  owner: string,
+  repo: string,
+  commit: string,
+  evidence: Evidence,
+): Promise<Decision<void>> => {
+  let defaultBranch: string | null = null;
+  try {
+    const answer = await github.get<unknown>(`/repos/${owner}/${repo}`);
+    const name = isRecord(answer) ? answer["default_branch"] : undefined;
+    defaultBranch = typeof name === "string" && name.length > 0 ? name : null;
+  } catch (error) {
+    return failure(error, "the repository", evidence);
+  }
+  if (defaultBranch === null) {
+    return deny(ReasonCode.PROBE_FAILED, "GitHub's answer does not name the repository's default branch", evidence);
+  }
+  const onDefault = await reachability(asClient(github), owner, repo, null, { commitSha: commit, defaultBranch });
+  if (onDefault.reachable === "REACHABLE") return allow(ReasonCode.OK, undefined);
+  let pulls: unknown;
+  try {
+    pulls = await github.get<unknown>(`/repos/${owner}/${repo}/commits/${commit}/pulls?per_page=100`);
+  } catch (error) {
+    return failure(error, "the pull requests of the commit", evidence);
+  }
+  if (!Array.isArray(pulls)) {
+    return deny(ReasonCode.PROBE_FAILED, "GitHub's answer is not a list of pull requests", evidence);
+  }
+  const ours = `${owner}/${repo}`.toLowerCase();
+  const held = (pulls as unknown[]).some((pull) => {
+    if (!isRecord(pull) || !Number.isInteger(pull["number"])) return false;
+    const baseRepo = isRecord(pull["base"]) && isRecord(pull["base"]["repo"]) ? pull["base"]["repo"]["full_name"] : undefined;
+    return typeof baseRepo === "string" && baseRepo.toLowerCase() === ours;
+  });
+  if (held) return allow(ReasonCode.OK, undefined);
+  // The default branch's answer could not be had: the commit is unproven, not proven foreign.
+  if (onDefault.reachable === "UNKNOWN") {
+    return deny(ReasonCode.PROBE_FAILED, "whether the repository's default branch reaches the commit could not be read", evidence);
+  }
+  return deny(ReasonCode.NOT_FOUND,
+    "the repository's default branch and pull requests do not reach that commit; it may live only in a fork or the parent", evidence);
+};
+
 export const readRepositoryBlob = async (
   source: Pick<PrEvidenceSource, "projects" | "repositories" | "github">,
   input: RepositoryBlobInput,
@@ -118,6 +178,9 @@ export const readRepositoryBlob = async (
     return deny(ReasonCode.PROBE_FAILED, "GitHub's answer is not the commit asked for", evidence);
   }
 
+  const reached = await commitBelongsToRepository(source.github, owner, repo, input.commit, evidence);
+  if (!reached.allowed) return reached as Decision<RepositoryBlob>;
+
   let current = rootTree;
   let entry: Json | null = null;
   for (const [index, segment] of segments.entries()) {
@@ -147,6 +210,12 @@ export const readRepositoryBlob = async (
     if (hit["type"] !== (last ? "blob" : "tree")) {
       return deny(ReasonCode.INVALID_ARGUMENT, "the path is not a file at the commit", {
         ...evidence, segment, foundType: typeof hit["type"] === "string" ? hit["type"] : null,
+      });
+    }
+    // A symbolic link's blob is its target's path as text, not the content of a file.
+    if (last && hit["mode"] === "120000") {
+      return deny(ReasonCode.INVALID_ARGUMENT, "the path is a symbolic link at the commit, not a file; its blob holds the link target's text", {
+        ...evidence, segment, mode: "120000",
       });
     }
     current = id;
