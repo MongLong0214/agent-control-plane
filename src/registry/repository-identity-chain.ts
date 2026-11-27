@@ -11,7 +11,10 @@ import type { Db } from "../db/database.ts";
 /**
  * One stretch of time in which a repository held a name: from `from` (inclusive) until `until` (exclusive), an open
  * end being null. A name is bound to the repository by the stretch it was valid in, not by the text alone: GitHub
- * frees a name when its repository is renamed, and another repository may take it.
+ * frees a name when its repository is renamed, and another repository may take it. The stretch is read against the
+ * stamps a rename row and a claim or receipt carry, which come from the wall clock: a clock stepped backward across
+ * a rename can put a row on the wrong side of it, and a row stamped within the same millisecond as a rename belongs
+ * to the name's next holder.
  */
 export interface RepositoryNameSpan {
   identity: string;
@@ -90,6 +93,21 @@ export const repositoryIdentities = (db: Db, repositoryId: string, current: stri
                          WHERE m.repository_id <> n.repository_id
                            AND (lower(m.from_identity) = lower(n.from_identity) OR lower(m.to_identity) = lower(n.from_identity)))
       ORDER BY n.from_identity`,
+    [repositoryId, current],
+  ).map((row) => row.from_identity),
+];
+
+/**
+ * Every identity the repository has held, a name another repository took since included: its current one first, then
+ * each it was renamed from. For a reader that decides which repository a row is by something other than the name (the
+ * CI read takes a row's run and asks that run's repository by id), where the name only finds the candidates. A reader
+ * that has nothing but the name must use `repositoryIdentities`, or `repositoryNameSpans` when it knows when the row
+ * was written.
+ */
+export const repositoryHeldIdentities = (db: Db, repositoryId: string, current: string): string[] => [
+  current,
+  ...db.all<{ from_identity: string }>(
+    `SELECT DISTINCT from_identity FROM repository_identity_renames WHERE repository_id = ? AND from_identity <> ? ORDER BY from_identity`,
     [repositoryId, current],
   ).map((row) => row.from_identity),
 ];

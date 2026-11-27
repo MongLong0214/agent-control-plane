@@ -4,7 +4,7 @@ import { afterAll, describe, expect, it } from "vitest";
 
 import { ManualClock } from "../../src/core/clock.ts";
 import { Db } from "../../src/db/database.ts";
-import { identityChain, repositoryIdentities, repositoryNameSpans } from "../../src/registry/repository-identity-chain.ts";
+import { identityChain, repositoryHeldIdentities, repositoryIdentities, repositoryNameSpans } from "../../src/registry/repository-identity-chain.ts";
 import { RepositoryRenames } from "../../src/registry/repository-rename.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 
@@ -21,31 +21,49 @@ const Y = "github:acme/y";
 const T0 = "2026-11-20T00:00:00.000Z";
 const T1 = "2026-11-21T00:00:00.000Z";
 const T2 = "2026-11-22T00:00:00.000Z";
+const T3 = "2026-11-24T00:00:00.000Z";
+const T4 = "2026-11-26T00:00:00.000Z";
+const T5 = "2026-11-27T00:00:00.000Z";
 const BEFORE_T1 = "2026-11-20T12:00:00.000Z";
 const AFTER_T2 = "2026-11-23T00:00:00.000Z";
+const AFTER_T4 = "2026-11-26T12:00:00.000Z";
+const AFTER_T5 = "2026-11-28T00:00:00.000Z";
+const Z = "github:acme/z";
 
-const manifest = (remote: string): string =>
-  JSON.stringify({ schema: "x", projectId: "pa", repositories: [{ role: "primary", remote, manifestRoot: "." }], ciWorkflows: [] });
+const manifest = (projectId: string, remote: string): string =>
+  JSON.stringify({ schema: "x", projectId, repositories: [{ role: "primary", remote, manifestRoot: "." }], ciWorkflows: [] });
 
-const world = () => {
+/**
+ * What happens after A (x to y at T1) and B (created as x at T2): `bLeaves` is B renamed x to z at T3; `aReturns` is
+ * then A renamed y back to x at T4 (A to y to x, with B in between); `cTakes` is a third repository C created as x at
+ * T5 once B left. Without an option the world stops at B holding x.
+ */
+const world = (after: { bLeaves?: boolean; aReturns?: boolean; cTakes?: boolean } = {}) => {
   const path = join(tempDir("acp-reused-name-"), "state.sqlite");
   new Db(path).close();
   const raw = new Database(path);
   raw.pragma("foreign_keys = OFF");
   const run = (sql: string, ...values: unknown[]) => raw.prepare(sql).run(...values);
-  for (const [digest, remote] of [["sha256:ma1", X], ["sha256:ma2", Y]] as const) {
-    run(`INSERT INTO manifests (digest, schema_id, content_json, created_at) VALUES (?, 'x', ?, ?)`, digest, manifest(remote), T0);
+  for (const [digest, project, remote] of [["sha256:ma1", "pa", X], ["sha256:ma2", "pa", Y], ["sha256:mb1", "pb", X], ["sha256:mb2", "pb", Z]] as const) {
+    run(`INSERT INTO manifests (digest, schema_id, content_json, created_at) VALUES (?, 'x', ?, ?)`, digest, manifest(project, remote), T0);
   }
   run(`INSERT INTO projects (project_id, name, active_manifest_digest, created_at) VALUES ('pa', 'pa', 'sha256:ma1', ?)`, T0);
-  run(`INSERT INTO projects (project_id, name, created_at) VALUES ('pb', 'pb', ?)`, T0);
+  run(`INSERT INTO projects (project_id, name, active_manifest_digest, created_at) VALUES ('pb', 'pb', 'sha256:mb1', ?)`, T0);
+  run(`INSERT INTO projects (project_id, name, created_at) VALUES ('pc', 'pc', ?)`, T0);
   run(`INSERT INTO repositories (repository_id, identity, checkout_path, project_id, repository_role, created_at) VALUES ('repo_a', ?, '/tmp/acp-reuse-a', 'pa', 'primary', ?)`, X, T0);
-  // A is renamed at T1: the rename row, the manifest pointer, the repository's name.
-  run(`INSERT INTO repository_identity_renames (rename_id, repository_id, project_id, sequence, from_identity, to_identity, repository_node_id,
-         from_manifest_digest, to_manifest_digest, renamed_at) VALUES ('ren_a', 'repo_a', 'pa', 1, ?, ?, 'R_node_a', 'sha256:ma1', 'sha256:ma2', ?)`, X, Y, T1);
-  run(`UPDATE projects SET active_manifest_digest = 'sha256:ma2' WHERE project_id = 'pa'`);
-  run(`UPDATE repositories SET identity = ? WHERE repository_id = 'repo_a'`, Y);
-  // B takes the freed name at T2.
+  const renamed = (id: string, repository: string, project: string, sequence: number, from: string, to: string, fromDigest: string, toDigest: string, at: string) => {
+    run(`INSERT INTO repository_identity_renames (rename_id, repository_id, project_id, sequence, from_identity, to_identity, repository_node_id,
+           from_manifest_digest, to_manifest_digest, renamed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, id, repository, project, sequence, from, to, `R_node_${repository}`, fromDigest, toDigest, at);
+    run(`UPDATE projects SET active_manifest_digest = ? WHERE project_id = ?`, toDigest, project);
+    run(`UPDATE repositories SET identity = ? WHERE repository_id = ?`, to, repository);
+  };
+  // A is renamed at T1; B takes the freed name at T2.
+  renamed("ren_a", "repo_a", "pa", 1, X, Y, "sha256:ma1", "sha256:ma2", T1);
   run(`INSERT INTO repositories (repository_id, identity, checkout_path, project_id, repository_role, created_at) VALUES ('repo_b', ?, '/tmp/acp-reuse-b', 'pb', 'primary', ?)`, X, T2);
+  if (after.bLeaves === true || after.aReturns === true || after.cTakes === true) renamed("ren_b", "repo_b", "pb", 1, X, Z, "sha256:mb1", "sha256:mb2", T3);
+  // A renamed back to the name B left: the rename restores the manifest A had, byte for byte.
+  if (after.aReturns === true) renamed("ren_a2", "repo_a", "pa", 2, Y, X, "sha256:ma2", "sha256:ma1", T4);
+  if (after.cTakes === true) run(`INSERT INTO repositories (repository_id, identity, checkout_path, project_id, repository_role, created_at) VALUES ('repo_c', ?, '/tmp/acp-reuse-c', 'pc', 'primary', ?)`, X, T5);
   const claim = (id: string, at: string, identity = X) => {
     // Foreign keys are off: the claim's run and session rows are not what is read.
     run(`INSERT INTO resource_claims (claim_id, repository_identity, worktree_id, run_id, owner_session_id, owner_binding_generation, acquired_at, expires_at, status)
@@ -74,8 +92,11 @@ describe("v61 — a name another repository took after a rename is not the renam
     const w = world();
     expect(repositoryNameSpans(w.db, "repo_a", Y)).toEqual([{ identity: X, from: null, until: T1 }, { identity: Y, from: null, until: null }]);
     expect(repositoryNameSpans(w.db, "repo_b", X)).toEqual([{ identity: X, from: T1, until: null }]);
+    // By its text alone a repository owns only the names no one else held; its held names are all of them.
     expect(repositoryIdentities(w.db, "repo_a", Y)).toEqual([Y]);
     expect(repositoryIdentities(w.db, "repo_b", X)).toEqual([X]);
+    expect(repositoryHeldIdentities(w.db, "repo_a", Y)).toEqual([Y, X]);
+    expect(repositoryHeldIdentities(w.db, "repo_b", X)).toEqual([X]);
   });
 
   it("busy(): A's claims and receipts under the reused name are A's, B's are B's, and neither counts the other's", () => {
@@ -113,5 +134,44 @@ describe("v61 — a name another repository took after a rename is not the renam
     expect(identityChain(w.db, X, AFTER_T2)).toEqual([X]);
     expect(identityChain(w.db, X)).toEqual([X]);
     expect(identityChain(w.db, Y)).toEqual([Y]);
+  });
+
+  it("A renamed x to y, B took x and renamed it to z, A renamed y back to x: each claim and receipt is the repository that held x when it was written", () => {
+    const w = world({ aReturns: true });
+    expect(repositoryNameSpans(w.db, "repo_a", X)).toEqual([
+      { identity: X, from: null, until: T1 }, { identity: Y, from: null, until: null }, { identity: X, from: T4, until: null },
+    ]);
+    expect(repositoryNameSpans(w.db, "repo_b", Z)).toEqual([{ identity: X, from: T1, until: T3 }, { identity: Z, from: null, until: null }]);
+    w.claim("clm_a_first", BEFORE_T1);
+    w.claim("clm_b", AFTER_T2);
+    w.claim("clm_a_again", AFTER_T4);
+    w.receipt("rcp_a_first", BEFORE_T1);
+    w.receipt("rcp_b", AFTER_T2);
+    w.receipt("rcp_a_again", AFTER_T4);
+    expect(w.busyOf("repo_a", X, "pa")).toEqual({ claims: ["clm_a_again", "clm_a_first"], receipts: ["rcp_a_again", "rcp_a_first"] });
+    expect(w.busyOf("repo_b", Z, "pb")).toEqual({ claims: ["clm_b"], receipts: ["rcp_b"] });
+    expect(identityChain(w.db, X, BEFORE_T1)).toEqual([X, Y]);
+    expect(identityChain(w.db, X, AFTER_T2)).toEqual([Z, X]);
+    expect(identityChain(w.db, X, AFTER_T4)).toEqual([X, Y]);
+    expect(identityChain(w.db, X)).toEqual([X, Y]);
+  });
+
+  it("a name reused twice (A, then B, then C): each repository owns what was written while it held the name, and no other's", () => {
+    const w = world({ cTakes: true });
+    expect(repositoryNameSpans(w.db, "repo_b", Z)).toEqual([{ identity: X, from: T1, until: T3 }, { identity: Z, from: null, until: null }]);
+    expect(repositoryNameSpans(w.db, "repo_c", X)).toEqual([{ identity: X, from: T3, until: null }]);
+    w.claim("clm_a", BEFORE_T1);
+    w.claim("clm_b", AFTER_T2);
+    w.claim("clm_c", AFTER_T5);
+    w.receipt("rcp_a", BEFORE_T1);
+    w.receipt("rcp_b", AFTER_T2);
+    w.receipt("rcp_c", AFTER_T5);
+    expect(w.busyOf("repo_a", Y, "pa")).toEqual({ claims: ["clm_a"], receipts: ["rcp_a"] });
+    expect(w.busyOf("repo_b", Z, "pb")).toEqual({ claims: ["clm_b"], receipts: ["rcp_b"] });
+    expect(w.busyOf("repo_c", X, "pc")).toEqual({ claims: ["clm_c"], receipts: ["rcp_c"] });
+    expect(identityChain(w.db, X, BEFORE_T1)).toEqual([Y, X]);
+    expect(identityChain(w.db, X, AFTER_T2)).toEqual([Z, X]);
+    expect(identityChain(w.db, X, AFTER_T5)).toEqual([X]);
+    expect(identityChain(w.db, X)).toEqual([X]);
   });
 });

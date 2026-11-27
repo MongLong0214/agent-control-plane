@@ -561,6 +561,59 @@ describe("v61 — a repository renamed on GitHub is adopted for the same reposit
     expect(observe).not.toHaveBeenCalledWith("repo_reuser");
   });
 
+  /** Another repository takes the name the renamed one left, and finishes a run whose merge and CI results carry it. */
+  const reuserFinishesARun = (w: World, runId: string, sha: string): void => {
+    w.h.clock.advance(1000);
+    w.h.cp.db.run(
+      `INSERT INTO repositories (repository_id, identity, checkout_path, project_id, repository_role, created_at) VALUES ('repo_reuser', ?, ?, NULL, NULL, ?)`,
+      [OLD, tempDir("reuser-"), w.h.clock.nowIso()],
+    );
+    w.h.clock.advance(1000);
+    w.h.cp.db.run(
+      `INSERT INTO runs (run_id, project_id, kind, execution_mode, priority, state, goal, contract_digest, pinned_manifest_digest, created_at)
+       VALUES (?, ?, 'STANDARD_WORK', 'STANDARD', 'NORMAL', 'COMPLETED', 'merged by the repository that took the name', 'sha256:contract', ?, ?)`,
+      [runId, PROJECT, w.h.cp.projects.get(PROJECT)!.activeManifestDigest, w.h.clock.nowIso()],
+    );
+    w.h.cp.db.run(`INSERT INTO run_repositories (run_id, repository_id, repository_role, base_branch) VALUES (?, 'repo_reuser', 'primary', 'dev')`, [runId]);
+    recordHistory(w.h, runId, sha);
+  };
+
+  it("a name the renamed repository left is taken by another repository: the CI read keeps the renamed one's results under it and shows none of the other's", async () => {
+    const w = await world();
+    const before = ciOf(w.h);
+    expect(before.lastObserved).toMatchObject({ commitSha: DEFAULT_SHA, source: { runId: w.oldRunId } });
+    planOf(await rename(w, true));
+    // The other repository's later run writes newer results for the same check under the same text.
+    reuserFinishesARun(w, "run_reuser", "e".repeat(40));
+    const after = ciOf(w.h);
+    expect(after.repositoryIdentity).toBe(NEW);
+    expect(after.lastObserved).toEqual(before.lastObserved);
+    expect(after.latestNonResult).toBeNull();
+    expect(JSON.stringify(after)).not.toContain("run_reuser");
+  });
+
+  it("a name taken by another repository: the finalizer resolves that repository's own receipt to it, and the renamed one's to the renamed one", async () => {
+    const w = await world({ evidenceWriters: true });
+    const before = "run_completed_before_rename";
+    w.h.cp.db.run(
+      `INSERT INTO runs (run_id, project_id, kind, execution_mode, priority, state, goal, contract_digest, pinned_manifest_digest, created_at)
+       VALUES (?, ?, 'STANDARD_WORK', 'STANDARD', 'NORMAL', 'COMPLETED', 'merged before the rename', 'sha256:contract', ?, ?)`,
+      [before, PROJECT, w.h.cp.projects.get(PROJECT)!.activeManifestDigest, w.h.clock.nowIso()],
+    );
+    w.h.cp.db.run(`INSERT INTO run_repositories (run_id, repository_id, repository_role, base_branch) VALUES (?, ?, 'primary', 'dev')`, [before, w.repositoryId]);
+    recordHistory(w.h, before, "d".repeat(40));
+    w.h.clock.advance(1000);
+    planOf(await rename(w, true));
+    reuserFinishesARun(w, "run_reuser", "e".repeat(40));
+    const observe = vi.spyOn(w.h.cp.repositories, "observe").mockResolvedValue(undefined as never);
+    const finalizer = new ApprovedRunFinalizer(w.h.cp, "rename-reuse-both");
+    expect(await finalizer.finalizeApprovedRun("run_reuser")).toMatchObject({ allowed: true, reasonCode: ReasonCode.MERGE_IDEMPOTENT_REPLAY });
+    expect(observe.mock.calls).toEqual([["repo_reuser"]]);
+    observe.mockClear();
+    expect(await finalizer.finalizeApprovedRun(before)).toMatchObject({ allowed: true, reasonCode: ReasonCode.MERGE_IDEMPOTENT_REPLAY });
+    expect(observe.mock.calls).toEqual([[w.repositoryId]]);
+  });
+
   it("review P3-4: a claim recorded under the old name still conflicts with the same target under the new one", async () => {
     const w = await world();
     planOf(await rename(w, true));

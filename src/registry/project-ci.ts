@@ -4,7 +4,7 @@ import { ReasonCode } from "../core/reason-codes.ts";
 import type { Db } from "../db/database.ts";
 import { CI_FAILED_CONCLUSIONS, ciVerificationRecords, type CiVerificationRecord } from "../verify/ci-verification-records.ts";
 import type { ProjectRegistry } from "./project-registry.ts";
-import { repositoryIdentities } from "./repository-identity-chain.ts";
+import { repositoryHeldIdentities } from "./repository-identity-chain.ts";
 
 /**
  * #1257 — the CI section of a project read: what CI the active manifest declares and what ACP has
@@ -229,8 +229,10 @@ const observedWorkflow = (
       observedAtHead: null, latestNonResult: null, unobserved: true, unobservedReason: "NO_REPOSITORY_FOR_ROLE" };
   }
   const identity = repository.identity;
-  // v61: a record keeps the name it was written under, so one written before a rename names an earlier one.
-  const identities = repositoryIdentities(db, repository.repository_id, identity);
+  // v61: a record keeps the name it was written under, so one written before a rename names an earlier one, even a
+  // name another repository took since. The name only finds the candidates: each record is then attributed through its
+  // run's repository by id (`attributedWorkflow`), which leaves out the rows of the repository that took the name.
+  const identities = repositoryHeldIdentities(db, repository.repository_id, identity);
   const repositoryHead = repository.last_observed_head === null
     ? null
     : { commitSha: repository.last_observed_head, observedAt: repository.last_observed_at };
