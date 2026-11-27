@@ -18,11 +18,11 @@
  *
  * It refuses to merge on anything but an observed-green head, because "the CI was green" is a claim
  * about a specific commit and the head can move between reading and merging; the same sha goes to
- * `--match-head-commit`, so GitHub merges that head or nothing. It refuses, too, a head that does
- * not already contain the base tip: CI checked the head's tree, and only then is the merge's tree
- * that same tree. GitHub's merge API takes no expected base, so the base branch's tip is read from
- * origin right before the merge call and the merge is read back against it: a base that moved
- * during the call fails loudly after the merge as MAIN_MOVED_DURING_MERGE, and is not retried.
+ * `--match-head-commit`, so GitHub merges that head or nothing. The base branch's tip is read from
+ * origin right before the merge call, and it refuses a head that does not already contain that tip:
+ * CI checked the head's tree, and only then is the merge's tree that same tree. GitHub's merge API
+ * takes no expected base, so the merge is read back against that tip: a base that moved during the
+ * call fails loudly after the merge as MAIN_MOVED_DURING_MERGE, and is not retried.
  *
  * After the merge it is read back -- and any mismatch fails loudly, because the merge cannot be
  * undone: GitHub reports the pull request merged at that commit; its parents are exactly the base
@@ -171,31 +171,12 @@ for (const status of (pr.statusCheckRollup ?? []).filter((c) => c.context === RE
   if (status.state !== "SUCCESS") fail(`the \`${REQUIRED_CHECK}\` commit status on ${short} is ${status.state}.`);
 }
 
-// The head must already contain the base tip. CI checked the head's tree; merged onto a base it does
-// not contain, the merge commit's tree is one no CI run saw, however green the head. GitHub's compare
-// answers it for these exact two shas, so nothing local has to be fetched first.
-const compared = ghJson(
-  ["api", `repos/{owner}/{repo}/compare/${base}...${head}`, "--jq", "{status: .status}"],
-  `how ${short} compares with the base ${base.slice(0, 7)}`,
-)?.status;
-if (compared !== "ahead" && compared !== "identical") {
-  fail(`#${number}'s head ${short} does not contain the base ${base.slice(0, 7)} (GitHub compares it as ${String(compared)}), so CI never checked the tree this merge would make. Update the branch, re-run CI.`);
-}
-
-process.stdout.write(
-  `\n  #${number} ${pr.title}\n  head ${short} — \`${REQUIRED_CHECK}\` green in ${named}, contains base ${base.slice(0, 7)}\n`,
-);
-
-if (dryRun) {
-  process.stdout.write("\nRESULT: PASS — checks only, nothing merged (--dry-run).\n");
-  process.exit(0);
-}
-
-// 4. The base branch's tip, read from origin right before the merge call: with the checked head it
-//    pins what the merge must be -- parents [tip, head], tree `git merge-tree tip head`. GitHub's
-//    baseRefOid is not that tip: it can still name an older base after the branch has moved on, and
-//    GitHub merges onto the branch as it is. #1504 merged correctly onto e1004978 while baseRefOid
-//    said d1e2b128, and a read-back pinned to d1e2b128 failed it.
+// 4. The base branch's tip, read from origin right before the merge call: the head must contain it,
+//    and with the checked head it pins what the merge must be -- parents [tip, head], tree
+//    `git merge-tree tip head`. GitHub's baseRefOid is not that tip: it can still name an older base
+//    after the branch has moved on, and GitHub merges onto the branch as it is. #1504's baseRefOid
+//    said d1e2b128 while main was e1004978: the containment check passed a head without main's tip,
+//    and a read-back pinned to d1e2b128 failed a merge that was correct.
 const baseBranch = `refs/heads/${pr.baseRefName}`;
 let baseBefore;
 try {
@@ -207,6 +188,33 @@ try {
 }
 if (typeof baseBefore !== "string" || !FULL_SHA.test(baseBefore)) {
   fail(`could not read ${pr.baseRefName}'s tip on origin right before the merge, so the merge could not be read back against it. Nothing was merged.`);
+}
+
+// The head must already contain that tip. CI checked the head's tree; merged onto a base it does not
+// contain, the merge commit's tree is one no CI run saw, however green the head. GitHub's compare
+// answers it for these exact two shas, so nothing local has to be fetched first. An answer that is
+// neither "contains" nor "does not contain" refuses: ancestry nobody could read is not a pass.
+let compared;
+try {
+  compared = JSON.parse(run("gh", ["api", `repos/{owner}/{repo}/compare/${baseBefore}...${head}`, "--jq", "{status: .status}"]))?.status;
+} catch (error) {
+  process.stdout.write(String(error.stdout ?? error.stderr ?? error.message ?? ""));
+}
+const tip = `${pr.baseRefName}'s tip ${baseBefore.slice(0, 7)}`;
+if (compared === "behind" || compared === "diverged") {
+  fail(`BASE_NOT_IN_HEAD: #${number}'s head ${short} does not contain the base, ${tip} on origin (GitHub compares it as ${compared}), so CI never checked the tree this merge would make. Update the branch, re-run CI. Nothing was merged.`);
+}
+if (compared !== "ahead" && compared !== "identical") {
+  fail(`BASE_ANCESTRY_UNKNOWN: could not tell whether #${number}'s head ${short} contains ${tip} on origin (GitHub answered ${String(compared)}). A check that cannot look reports that, not a verdict. Nothing was merged.`);
+}
+
+process.stdout.write(
+  `\n  #${number} ${pr.title}\n  head ${short} — \`${REQUIRED_CHECK}\` green in ${named}, contains ${tip}\n`,
+);
+
+if (dryRun) {
+  process.stdout.write("\nRESULT: PASS — checks only, nothing merged (--dry-run).\n");
+  process.exit(0);
 }
 
 // Merge the head that was checked, as a merge commit and nothing else, with the body that was checked.
