@@ -65,7 +65,15 @@ needs `ACP_OPERATOR_TOKEN`, and falls back to the local lock file and configured
 path when the daemon does not answer — including when no token was provided to ask with. The
 example above has no token, so it takes that fallback: it reports the lock and a `reasonCode`,
 never `mode`. The launcher provisions the operator token for `agentcpd`, not for an operator
-shell, so export it deliberately when you need to ask the daemon anything.
+shell, so pass it deliberately when you need to ask the daemon anything.
+
+An operator shell can name a credential file instead of exporting the token: set
+`ACP_OPERATOR_TOKEN_FILE=<path>`. `agentctl` reads it only when `ACP_OPERATOR_TOKEN` is unset (the
+variable still wins), refuses it unless it is a regular file you own with no group or other
+permission bits (0600), and reads nothing when neither variable is set. The daemon's own credential
+is the login Keychain item `com.agentcontrolplane.agentcpd` / `ACP_OPERATOR_TOKEN`, not a file, so
+write the file once without printing it:
+`(umask 077; security find-generic-password -s com.agentcontrolplane.agentcpd -a ACP_OPERATOR_TOKEN -w > ~/.agent-control-plane/operator.token)`.
 
 A lock read is weaker evidence than a socket answer in two ways: it does not check that its
 pid is alive, and a parked daemon holds its lock exactly like a dispatching one. A daemon

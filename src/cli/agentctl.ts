@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { randomUUID } from "node:crypto";
-import { existsSync, readFileSync, realpathSync } from "node:fs";
+import { closeSync, constants as fsConstants, existsSync, fstatSync, openSync, readFileSync, realpathSync } from "node:fs";
 import { createConnection, type Socket } from "node:net";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -9,7 +9,7 @@ import { defaultConfig } from "../app/control-plane.ts";
 import { AUTO_GENERATION, runAdoptedCeoAttachRelay, runAttachRelayCommand, type AttachRelayClaim } from "./attach-relay.ts";
 import { createCtoPorts, runCtoCommand } from "./cto-command.ts";
 import { digestOf } from "../core/digest.ts";
-import { type Decision, deny, isAcpError } from "../core/errors.ts";
+import { type Decision, allow, deny, isAcpError } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import type { RunState } from "../domain/types.ts";
 import { SingleInstanceLock } from "../daemon/single-instance.ts";
@@ -152,6 +152,36 @@ const OPERATOR_MUTATION_METHOD_NAMES = new Set([
   "telegram.reply.acknowledge",
 ]);
 
+/**
+ * The operator credential: `ACP_OPERATOR_TOKEN` when set, else the file the operator names in `ACP_OPERATOR_TOKEN_FILE`.
+ * Nothing is read implicitly — with neither set the token is absent and every request is refused as before — so a
+ * same-user call that was refused does not start succeeding because a credential file happens to exist. A named file
+ * is refused unless it is a regular file this uid owns that no group or other can read or write.
+ */
+export const readOperatorToken = (env: NodeJS.ProcessEnv): Decision<string | undefined> => {
+  const direct = env["ACP_OPERATOR_TOKEN"]?.trim();
+  if (direct) return allow(ReasonCode.OK, direct);
+  const path = env["ACP_OPERATOR_TOKEN_FILE"];
+  if (!path) return allow(ReasonCode.OK, undefined);
+  const refuse = (why: string): Decision<string | undefined> =>
+    deny(ReasonCode.OPERATOR_UNAUTHENTICATED, `ACP_OPERATOR_TOKEN_FILE is refused: ${why}; nothing was sent`, { path });
+  let fd: number;
+  try {
+    fd = openSync(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK);
+  } catch (error) {
+    return refuse(`it could not be opened without following a symlink (${(error as NodeJS.ErrnoException).code ?? "error"})`);
+  }
+  try {
+    const stat = fstatSync(fd);
+    if (!stat.isFile()) return refuse("it is not a regular file");
+    if (typeof process.getuid === "function" && stat.uid !== process.getuid()) return refuse("it is owned by another user");
+    if ((stat.mode & 0o077) !== 0) return refuse("it is readable or writable beyond its owner (want 0600)");
+    return allow(ReasonCode.OK, readFileSync(fd, "utf8").trim());
+  } finally {
+    closeSync(fd);
+  }
+};
+
 /** Creates a daemon-only operator client. It never opens SQLite or constructs a service. */
 export const createOperatorClient = (options: OperatorClientOptions): OperatorClient => ({
   hold: async (method, params = {}) => {
@@ -214,10 +244,15 @@ export const main = async (argv: string[]): Promise<number> => {
   const owner = rest.includes("--owner");
   const args = command === "adopt" ? rest : rest.filter((arg) => arg !== "--owner");
 
+  const operatorToken = readOperatorToken(process.env);
+  if (!operatorToken.allowed) {
+    print(operatorToken);
+    return 1;
+  }
   const client = createOperatorClient({
     socketPath:
       process.env["ACP_OPERATOR_SOCKET"] ?? join(config.databasePath, "..", "agentcpd.operator.sock"),
-    token: process.env["ACP_OPERATOR_TOKEN"],
+    token: operatorToken.value,
   });
 
   // The CTO lifecycle group composes the operator methods below with host steps; it reads the token from this
@@ -856,7 +891,7 @@ const exchangeOperatorRequest = (
     return Promise.resolve(
       deny(
         ReasonCode.OPERATOR_UNAUTHENTICATED,
-        "agentctl needs the separately provisioned ACP_OPERATOR_TOKEN to reach agentcpd",
+        "agentctl needs the separately provisioned ACP_OPERATOR_TOKEN (or ACP_OPERATOR_TOKEN_FILE) to reach agentcpd",
         { socketPath: options.socketPath },
       ),
     );
