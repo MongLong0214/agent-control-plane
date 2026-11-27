@@ -49,8 +49,9 @@ import type { Readable, Writable } from "node:stream";
  * to `attach: <stage> <reasonCode>` with the code copied from the daemon's own public envelope, followed for a claim
  * refusal by the branch name the daemon sent beside it (`attach: claim refused CONFLICT GENERATION_MISMATCH`).
  *
- * The adopted CEO's relay (`runAdoptedCeoAttachRelay`, #1037) is the same byte pipe with no claim
- * and no handshake in front of it, because its socket authenticates the connection itself.
+ * The adopted CEO's relay (`runAdoptedCeoAttachRelay`, #1037) is the same relay with no claim and
+ * no handshake in front of it, because its socket authenticates the connection itself; it comes
+ * back after a daemon restart through that same socket.
  */
 
 /**
@@ -140,6 +141,12 @@ export interface AttachRelayOptions {
  * admission and every restore of that wait (review PR1051-R2); `attemptTimeoutMs` bounds each step
  * inside it and never extends it. `flushTimeoutMs` bounds how long an exiting relay waits for a
  * client that stopped reading (PR1051-R4).
+ *
+ * `holdMs` and `endOnSilence` are the adopted CEO relay's (`ADOPTED_CEO_REATTACH`); the canonical
+ * CTO relay keeps both off. `holdMs` is how long a client request that arrives while the relay is
+ * reattaching waits for the restored link instead of being answered at once; 0 answers it at once.
+ * `endOnSilence` ends the relay when a door connects and then names nothing for a whole attempt —
+ * a daemon older than its acknowledgement, after a rollback — rather than asking it again forever.
  */
 export interface ReattachPolicy {
   maxWaitMs: number;
@@ -147,6 +154,8 @@ export interface ReattachPolicy {
   maxDelayMs: number;
   attemptTimeoutMs: number;
   flushTimeoutMs: number;
+  holdMs: number;
+  endOnSilence: boolean;
 }
 
 export const DEFAULT_REATTACH_POLICY: ReattachPolicy = {
@@ -155,7 +164,22 @@ export const DEFAULT_REATTACH_POLICY: ReattachPolicy = {
   maxDelayMs: 5_000,
   attemptTimeoutMs: 35_000,
   flushTimeoutMs: 5_000,
+  holdMs: 0,
+  endOnSilence: false,
 };
+
+/**
+ * The adopted CEO relay's bounds over `DEFAULT_REATTACH_POLICY`. A held request waits at most two
+ * minutes, inside Hermes's own 300 s tool-call timeout, so the relay's answer reaches the CEO first.
+ * At most `MAX_HELD_REQUESTS` requests and `MAX_LINE_BYTES` bytes are held; past either, a request
+ * is answered at once as before.
+ */
+export const ADOPTED_CEO_REATTACH: Partial<ReattachPolicy> = {
+  holdMs: 120_000,
+  endOnSilence: true,
+};
+
+const MAX_HELD_REQUESTS = 64;
 
 /**
  * How long a relay that has not been admitted yet keeps asking. Before the first receipt there is no credential to
@@ -385,11 +409,12 @@ const parseRestoreSuccession = (params: unknown): RestoreSuccession | null => {
  */
 const successionRefusal = (
   succession: RestoreSuccession,
-  admitted: Admission,
+  admitted: Admission | null,
   answeredChallenge: string | null,
   waiting: boolean,
 ): string | null => {
   if (waiting) return "a succession is already held";
+  if (admitted === null) return "this connection was admitted under no role";
   if (admitted.roleKey === null) return "this connection was admitted under no role";
   if (succession.from.roleKey !== admitted.roleKey) return "it restores another role";
   if (succession.to.roleKey !== admitted.roleKey) return "it changes the role";
@@ -511,6 +536,8 @@ type ReattachOutcome =
   | { kind: "admitted"; socket: Socket; tuple: Admission | null }
   | { kind: "unbound" }
   | { kind: "unavailable" }
+  /** Connected, and nothing came back for the whole attempt. */
+  | { kind: "silent" }
   | { kind: "refused"; reasonCode: string }
   | { kind: "malformed" };
 
@@ -528,14 +555,20 @@ const CTO_REATTACH_UNBOUND = "CTO_REATTACH_UNBOUND";
  * acknowledgement named (null when it named none). `CTO_REATTACH_UNBOUND`, a socket that is not
  * there (an older daemon) or one that never answers sends the caller to the claim. Any other
  * refusal is the daemon's answer about this process and ends the attach. An aborted attempt
- * destroys its socket and answers `unavailable`, so nothing it opened outlives it.
+ * destroys its socket and answers `unavailable`, so nothing it opened outlives it. One that
+ * connected and then heard nothing answers `silent`, which every caller but an `endOnSilence`
+ * reattach treats as `unavailable`.
  */
 const attemptReattach = (socketPath: string, timeoutMs: number, signal?: AbortSignal): Promise<ReattachOutcome> =>
   new Promise<ReattachOutcome>((resolveReattach) => {
     const socket = createConnection(socketPath);
     let received = Buffer.alloc(0);
     let settled = false;
-    const timer: NodeJS.Timeout = setTimeout(() => finish({ kind: "unavailable" }), timeoutMs);
+    let connected = false;
+    socket.once("connect", () => {
+      connected = true;
+    });
+    const timer: NodeJS.Timeout = setTimeout(() => finish(connected ? { kind: "silent" } : { kind: "unavailable" }), timeoutMs);
     timer.unref();
     const abandon = (): void => finish({ kind: "unavailable" });
     const finish = (outcome: ReattachOutcome): void => {
@@ -914,20 +947,33 @@ export const runAttachRelay = async (
  * client's own. A refusal is the daemon's one `{ok:false,reasonCode}` line, read here exactly as a
  * handshake refusal is above.
  *
- * It still never reconnects, but for a different reason than the CTO relay: there is no
- * credential to reuse. A respawn is simply a new connection, admitted or refused on the same facts
- * as the first one, and Hermes is what respawns it. Only the **first** connect waits
- * (`connectWhenReady`), because Hermes respawns the relay on the CEO's next tool call and retries
- * that call once: a call that lands while the daemon restarts would otherwise fail outright.
+ * It comes back after a daemon restart through the same socket (`relayWithReattach`). There is no
+ * credential to reuse, so a reconnect proves exactly what the first connection did: the new
+ * daemon admits it on the same kernel peer and Gateway ancestry, or refuses it. Exiting instead
+ * left Hermes holding a dead stdio server until the CEO's next tool call failed on it — every
+ * deploy, while the canonical CTO relays, which reattach, survived the same restart.
+ *
+ * The door's acknowledgement (`{ok:true,admitted}`, the first line of an admitted connection) names
+ * the binding and runtime this connection was admitted under, and is taken out of the stream. A
+ * reconnect whose acknowledgement names any other binding ends the relay with nothing forwarded
+ * (PR1051-R1, as for the CTO). A daemon older than that acknowledgement sends the client's traffic
+ * as its first line; the relay then has nothing to compare a reconnect against and exits when that
+ * connection closes, exactly as it did before.
+ *
+ * Only the **first** connect waits for a socket that is not there yet (`connectWhenReady`). A
+ * request the client sends while the relay is reattaching waits up to `ADOPTED_CEO_REATTACH.holdMs`
+ * for the restored link, because Hermes reports a failed call to the CEO as a failure; a request
+ * that was already on the lost connection is never sent again and is answered "outcome unknown".
  */
 export const runAdoptedCeoAttachRelay = async (
-  options: { toolSocketPath: string; initialConnect?: Partial<InitialConnectPolicy> },
+  options: { toolSocketPath: string; initialConnect?: Partial<InitialConnectPolicy>; reattach?: Partial<ReattachPolicy> },
   io: AttachRelayIo,
 ): Promise<number> => {
   const policy: InitialConnectPolicy = { ...ADOPTED_CEO_INITIAL_CONNECT, ...options.initialConnect };
   const ready = await connectWhenReady(options.toolSocketPath, policy, io);
   if ("exit" in ready) return ready.exit;
-  return pipeStdioToSocket(ready.socket, io, NO_HANDSHAKE);
+  return relayWithReattach(ready.socket, NO_HANDSHAKE, false, null, options.toolSocketPath,
+    { ...ADOPTED_CEO_REATTACH, ...options.reattach }, io);
 };
 
 /**
@@ -1202,6 +1248,16 @@ interface InFlightRequest {
   client: unknown;
 }
 
+/** A client request that arrived while the relay was reattaching, held for the restored link (`ReattachPolicy.holdMs`). */
+interface HeldRequest {
+  id: unknown;
+  key: string;
+  line: string;
+  message: RelayedMessage | null;
+  bytes: number;
+  timer: NodeJS.Timeout;
+}
+
 /** A request of the client's as it arrived: the line, byte for byte, and what it parsed to. */
 interface ClientRequest {
   message: RelayedMessage;
@@ -1215,9 +1271,10 @@ interface Link {
    * Review S2B-R2-01 — what this connection's own admission named: the tuple, and the role the
    * reattach door's acknowledgement authenticated this connection as (null on a claim's connection,
    * or when the acknowledgement named none). Fixed when the link opens; the one predecessor a
-   * succession announced on this link may name.
+   * succession announced on this link may name. Null on the adopted CEO's first connection until its
+   * acknowledgement names it, and for good on one whose daemon sends none.
    */
-  admitted: Admission;
+  admitted: Admission | null;
   /** Known at once for a reattach; for a claim's handshake, after the first line that is not a refusal. */
   accepted: boolean;
   closed: boolean;
@@ -1235,6 +1292,25 @@ interface Link {
   challenge: string | null;
   answeredChallenge: string | null;
 }
+
+/**
+ * What the adopted CEO door's first line names: `{ok:true,admitted}` with a complete tuple. `"traffic"` for a line that
+ * is no acknowledgement at all — the client's JSON-RPC, from a daemon older than the acknowledgement — and null for an
+ * acknowledgement that names no complete tuple, which cannot be compared and is refused (as a reconnect's is).
+ */
+const acknowledgedAdmission = (line: string): Admission | "traffic" | null => {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(line) as unknown;
+  } catch {
+    return "traffic";
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return "traffic";
+  if ("jsonrpc" in parsed) return "traffic";
+  const reply = parsed as { ok?: unknown; admitted?: unknown };
+  if (reply.ok !== true) return "traffic";
+  return parseAdmission(reply.admitted);
+};
 
 const succeeded = (message: RelayedMessage): boolean => {
   if (message.error !== undefined) return false;
@@ -1300,19 +1376,34 @@ const succeeded = (message: RelayedMessage): boolean => {
  * The capacity restore's challenge and succession (review S2B-R1-01) are the only reasons this
  * relay reads JSON-RPC beyond the client's `initialize`: a restore's challenge and its answer pass
  * unchanged and are only noted, and its succession is taken out of the stream.
+ *
+ * The adopted CEO relay differs in two ways. Its `initial` is null: the first connection's first
+ * line is the door's acknowledgement, which names the admission and is taken out of the stream, and
+ * a first line that is traffic instead (a daemon older than the acknowledgement) leaves the relay
+ * with nothing to compare a reconnect against, so it ends when that connection closes, writing
+ * nothing. And its `holdMs` is not 0: a request that arrives while reattaching waits, at most that
+ * long and within `MAX_HELD_REQUESTS` and `MAX_LINE_BYTES`, and is sent once the restore ends —
+ * or answered "not sent" when the wait runs out or the relay ends. Only a request that was never
+ * written to any daemon is held; one written to the lost link is answered and never sent again.
  */
 const relayWithReattach = (
   first: Socket,
   connection: { handshake(socket: Socket): void },
   firstAdmitted: boolean,
-  initial: Admission,
+  initial: Admission | null,
   reattachSocketPath: string,
   policyOverrides: Partial<ReattachPolicy> | undefined,
   io: AttachRelayIo,
 ): Promise<number> =>
   new Promise<number>((resolveRelay) => {
-    /** The binding a reconnect must name: the first admission's, or the one a restore's succession named. */
+    /**
+     * The binding a reconnect must name: the first admission's, or the one a restore's succession named.
+     * Null only until the adopted CEO door's acknowledgement names it, and for good when it never does.
+     */
     let admittedUnder = initial;
+    /** Client requests that arrived while reattaching, in arrival order, waiting for the restored link. */
+    const held: HeldRequest[] = [];
+    let heldBytes = 0;
     /**
      * Review S2B-R1-01 — the binding a committed capacity restore announced on the current link, held
      * for the next admission alone. One at a time; any admission takes it away.
@@ -1383,9 +1474,56 @@ const relayWithReattach = (
       toClient(JSON.stringify({ jsonrpc: "2.0", id, error: { code: RELAY_REATTACHING_ERROR, message } }));
     };
 
+    /** Takes `entry` out of the hold, if it is still there, and stops its clock. */
+    const unhold = (entry: HeldRequest): void => {
+      const index = held.indexOf(entry);
+      if (index === -1) return;
+      held.splice(index, 1);
+      heldBytes -= entry.bytes;
+      clearTimeout(entry.timer);
+    };
+    /** Holds a request that arrived while reattaching; false when the policy or a bound says it is answered now. */
+    const hold = (id: unknown, line: string, message: RelayedMessage | null): boolean => {
+      if (policy.holdMs <= 0) return false;
+      if (held.length >= MAX_HELD_REQUESTS) return false;
+      const bytes = Buffer.byteLength(line, "utf8");
+      if (heldBytes + bytes > MAX_LINE_BYTES) return false;
+      const entry: HeldRequest = {
+        id,
+        key: idKey(id),
+        line,
+        message,
+        bytes,
+        timer: setTimeout(() => {
+          unhold(entry);
+          undelivered(id, "agent-control-plane did not come back in time; this request was not sent");
+        }, policy.holdMs),
+      };
+      held.push(entry);
+      heldBytes += bytes;
+      return true;
+    };
+    /** A cancellation of a held request withdraws it unsent; the client expects no answer to it. */
+    const cancelHeld = (message: RelayedMessage | null): void => {
+      if (message?.method !== "notifications/cancelled") return;
+      const params = message.params;
+      if (typeof params !== "object" || params === null) return;
+      const key = idKey((params as { requestId?: unknown }).requestId);
+      const entry = held.find((candidate) => candidate.key === key);
+      if (entry !== undefined) unhold(entry);
+    };
+    /** Answers every held request as not sent; none of them reached a daemon. */
+    const refuseHeld = (message: string): void => {
+      for (const entry of [...held]) {
+        unhold(entry);
+        undelivered(entry.id, message);
+      }
+    };
+
     const end = (code: number): void => {
       if (phase === "done") return;
       phase = "done";
+      refuseHeld("the agent-control-plane relay ended; this request was not sent");
       if (waiting !== null) {
         clearTimeout(waiting.deadline);
         waiting.abort.abort();
@@ -1498,10 +1636,17 @@ const relayWithReattach = (
       const id = message === null ? undefined : requestIdOf(message);
       const link = current;
       if (phase !== "live" || link === null) {
+        if (id === undefined) return cancelHeld(message);
+        // Held, when the policy holds: it has reached no daemon, so the restored link is its first.
+        if (phase === "reattaching" && hold(id, line, message)) return;
         // Answered at once and remembered nowhere: a request reported as not sent is never sent later.
-        if (id !== undefined) undelivered(id, "agent-control-plane is reattaching; this request was not sent");
+        undelivered(id, "agent-control-plane is reattaching; this request was not sent");
         return;
       }
+      forward(link, line, message, id);
+    }, () => protocolFailure("client line"));
+    /** One client line onto the live `link`, noted where the restore and the in-flight table need it. */
+    const forward = (link: Link, line: string, message: RelayedMessage | null, id: unknown): void => {
       noteChallengeAnswer(link, message);
       // Every line leaves exactly as it arrived, under the client's own id.
       if (id !== undefined) {
@@ -1512,7 +1657,14 @@ const relayWithReattach = (
         clientInitialized = line;
       }
       send(link, line);
-    }, () => protocolFailure("client line"));
+    };
+    /** The held requests onto the restored `link`, in the order they arrived, before any later line. */
+    const sendHeld = (link: Link): void => {
+      for (const entry of [...held]) {
+        unhold(entry);
+        forward(link, entry.line, entry.message, entry.id);
+      }
+    };
     // Paused between chunks rather than inside one: a chunk is bounded by stdin's own high-water
     // mark, so what one chunk can add to stdout is bounded as well.
     const onClientData = (chunk: Buffer): void => {
@@ -1532,6 +1684,17 @@ const relayWithReattach = (
           return end(ATTACH_EXIT.HANDSHAKE_REFUSED);
         }
         link.accepted = true;
+        if (admittedUnder === null) {
+          // The adopted CEO door's acknowledgement: taken out of the stream, and from here on the
+          // admission every reconnect is compared with. Traffic instead leaves it null for good.
+          const acknowledged = acknowledgedAdmission(line);
+          if (acknowledged === null) return protocolFailure("handshake reply");
+          if (acknowledged !== "traffic") {
+            admittedUnder = acknowledged;
+            link.admitted = acknowledged;
+            return;
+          }
+        }
       }
       const message = parseRelayed(line);
       if (message !== null) {
@@ -1555,6 +1718,9 @@ const relayWithReattach = (
       current = null;
       daemonBlocked = false;
       if (phase === "done") return;
+      // No acknowledgement named this relay's admission, so no reconnect could be compared with it:
+      // the relay ends as the byte pipe does, writing nothing.
+      if (admittedUnder === null) return end(stdinEnded ? ATTACH_EXIT.OK : ATTACH_EXIT.STREAM_CLOSED);
       const unanswered = [...link.inFlight.values()];
       link.inFlight.clear();
       for (const { client } of unanswered) {
@@ -1569,7 +1735,7 @@ const relayWithReattach = (
       void reattach();
     };
 
-    const open = (socket: Socket, accepted: boolean, admitted: Admission): Link => {
+    const open = (socket: Socket, accepted: boolean, admitted: Admission | null): Link => {
       const link: Link = {
         socket,
         admitted,
@@ -1687,6 +1853,12 @@ const relayWithReattach = (
           io.stderr.write(`attach: reattach refused ${CTO_REATTACH_UNBOUND}\n`);
           return end(ATTACH_EXIT.HANDSHAKE_REFUSED);
         }
+        // A door that let the connection in and named nothing is older than its acknowledgement:
+        // asking it again would never end, so the relay ends and its client starts a new one.
+        if (outcome.kind === "silent" && policy.endOnSilence) {
+          io.stderr.write("attach: reattach unacknowledged\n");
+          return end(ATTACH_EXIT.UNAVAILABLE);
+        }
         if (outcome.kind === "admitted") {
           // An acknowledgement that names nothing cannot be compared, so it is refused rather than
           // admitted unchecked.
@@ -1698,7 +1870,8 @@ const relayWithReattach = (
           // whatever the admission names, so it is never adopted by a later one.
           const proven = succession;
           succession = null;
-          const next = readmitted(outcome.tuple, admittedUnder, proven);
+          const holding = admittedUnder;
+          const next = holding === null ? null : readmitted(outcome.tuple, holding, proven);
           if (next === null) {
             outcome.socket.destroy();
             // The relay found the mismatch itself, so it writes its own stage message rather than a
@@ -1713,6 +1886,7 @@ const relayWithReattach = (
             clearTimeout(wait.deadline);
             waiting = null;
             phase = "live";
+            sendHeld(link);
             flow();
             return;
           }
