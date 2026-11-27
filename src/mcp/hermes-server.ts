@@ -32,6 +32,7 @@ import { OWNER_ONLY_REASONS } from "../ceo/owner-decision-reason.ts";
 import type { Db } from "../db/database.ts";
 import type { Doctor } from "../doctor/doctor.ts";
 import type { GitHubKernel } from "../github/github-kernel.ts";
+import { readRepositoryBlob, type RepositoryBlobInput } from "../github/repository-blob.ts";
 import { PR_EVIDENCE_DIFF_PAGE_MAX_CHARS, type PrEvidence, type PrEvidenceInput, prEvidenceHeader, readPrEvidence } from "../github/pr-evidence.ts";
 import type { ExecutionMode, RunPriority } from "../domain/types.ts";
 import { Role, roleKeyFor, RunKind, RunState } from "../domain/types.ts";
@@ -294,6 +295,12 @@ export const createHermesMcpPort = (
     },
     /** One pull request of the project's registered repository at an exact head, read with GET only. */
     prEvidence: (input: PrEvidenceInput) => readPrEvidence({
+      projects: source.projects,
+      repositories: source.repositories,
+      github: source.github.readOnlyGitHub(),
+    }, input),
+    /** One file's blob id at one exact commit of the project's registered repository, read with GET only. */
+    repositoryBlob: (input: RepositoryBlobInput) => readRepositoryBlob({
       projects: source.projects,
       repositories: source.repositories,
       github: source.github.readOnlyGitHub(),
@@ -875,6 +882,36 @@ const createHermesServerFromPort = (
       if (paged?.schema !== "acp.pr-evidence.v1" || !paged.brief) return result;
       const { isError: _refusal, ...page } = result;
       return { ...page, content: [{ type: "text" as const, text: prEvidenceHeader(paged.brief) }, ...page.content] };
+    }),
+  );
+
+  server.registerTool(
+    "repository_blob_get",
+    {
+      description:
+        "Read the git blob id of one file at one exact commit of a project's registered GitHub repository, so two files can " +
+        "be compared by blob id when a PR's file list has no patch for one of them. The repository is the registry's for " +
+        "projectId (name repositoryRole when the project has several); a URL, path or remote identity there is refused. " +
+        "commit is a full 40-hex SHA of a commit that repository holds (any other, or an unknown one, is refused); path is a " +
+        "repository-relative file path, and one the commit does not have is NOT_FOUND. Answers {commit, path, blobSha, size} " +
+        "with the tree entry's mode, from the commit's own tree and no branch name. It only reads: it does not mark any patch " +
+        "reviewed or change any review, merge or completion state. Current CEO only; read-only.",
+      inputSchema: {
+        projectId: z.string().min(1).max(200),
+        repositoryRole: z.string().min(1).max(200).optional(),
+        commit: z.string().max(64),
+        path: z.string().min(1).max(1024),
+      },
+    },
+    async (args, extra) => read(async () => {
+      const peer = authenticateMcpPeer(authenticate);
+      if (!peer.allowed) return respond(peer);
+      const ceo = port.reviewEvidenceAttachAuthority(peer.value, admittedTurnOf(extra));
+      if (!ceo.allowed) {
+        return respond(deny(ceo.reasonCode,
+          "repository_blob_get answers only the current CEO's authenticated Hermes owner or peer turn", ceo.evidence));
+      }
+      return respond(await port.repositoryBlob(args));
     }),
   );
 
