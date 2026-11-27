@@ -691,6 +691,31 @@ describe("an operator-registered repository: its node id is GitHub's answer at r
     body: { ...renamedAnswer.body, name: "myeotnyeon", full_name: FIXTURE.renamed.from, ...body },
   });
   const recordedNodeIds = (h: Harness) => h.cp.audit.byKind(REPOSITORY_NODE_ID_RECORDED).map((entry) => entry.evidence);
+  /** Everything written to stdout, stderr or the console until `restore`. */
+  const captureOutput = () => {
+    const output: string[] = [];
+    const capture = (...chunks: unknown[]) => { output.push(chunks.map((chunk) => (typeof chunk === "string" ? chunk : JSON.stringify(chunk) ?? String(chunk))).join(" ")); return true; };
+    const spies = [
+      vi.spyOn(process.stdout, "write").mockImplementation(capture), vi.spyOn(process.stderr, "write").mockImplementation(capture),
+      ...(["log", "info", "warn", "error", "debug"] as const).map((method) => vi.spyOn(console, method).mockImplementation(capture)),
+    ];
+    return { text: () => output.join("\n"), restore: () => { for (const spy of spies) spy.mockRestore(); } };
+  };
+  /** A GitHub failure whose text carries a fake bearer header and a private body fragment, with and without an HTTP status. */
+  const leakingFailures = (path: string): ReadonlyArray<readonly [Error, number | undefined]> => {
+    const message = `gh api GET ${path} failed: HTTP 502 Authorization: Bearer xyz {"message":"private-body-fragment"}`;
+    return [
+      [acpError(ReasonCode.INTERNAL_ERROR, message, { status: 502, header: "Authorization: Bearer xyz", body: '{"message":"private-body-fragment"}' }), 502],
+      [new Error(message), undefined],
+    ];
+  };
+  /** The reply, every audit row and the output carry nothing of the failure's header or body. */
+  const expectNoLeak = (h: Harness, reply: unknown, output: string): void => {
+    const audit = JSON.stringify(h.cp.db.all(`SELECT kind, reason_code, actor, evidence_json FROM audit_events`));
+    for (const [where, text] of [["reply", JSON.stringify(reply)], ["audit", audit], ["output", output]] as const) {
+      for (const secret of ["Bearer xyz", "Authorization: Bearer", "private-body-fragment"]) expect(text, `${where} carries ${secret}`).not.toContain(secret);
+    }
+  };
 
   /**
    * The project registered over the operator method with GitHub answering `atRegistration`, then given its
@@ -713,12 +738,7 @@ describe("an operator-registered repository: its node id is GitHub's answer at r
     const started = await daemon.start();
     if (!started.allowed) throw new Error(`${started.reasonCode}: ${started.message}`);
     let registered: Awaited<ReturnType<Daemon["handleOperatorRequest"]>>;
-    const output: string[] = [];
-    const capture = (...chunks: unknown[]) => { output.push(chunks.map((chunk) => (typeof chunk === "string" ? chunk : JSON.stringify(chunk) ?? String(chunk))).join(" ")); return true; };
-    const spies = [
-      vi.spyOn(process.stdout, "write").mockImplementation(capture), vi.spyOn(process.stderr, "write").mockImplementation(capture),
-      ...(["log", "info", "warn", "error", "debug"] as const).map((method) => vi.spyOn(console, method).mockImplementation(capture)),
-    ];
+    const output = captureOutput();
     if (failWith !== undefined) github.onRequest = () => { throw failWith; };
     try {
       registered = await daemon.handleOperatorRequest({
@@ -727,7 +747,7 @@ describe("an operator-registered repository: its node id is GitHub's answer at r
     } finally {
       await daemon.stop();
       github.onRequest = null;
-      for (const spy of spies) spy.mockRestore();
+      output.restore();
     }
     if (!registered.allowed) throw new Error(`${registered.reasonCode}: ${registered.message}`);
     const registration = registered.value as {
@@ -748,7 +768,7 @@ describe("an operator-registered repository: its node id is GitHub's answer at r
 
     responses.splice(0, responses.length, ...afterRename);
     github.calls.length = 0;
-    return { h, github, registered, registration, registrationCalls, unactivated, output: output.join("\n"), repositoryId: registration.repository.repositoryId };
+    return { h, github, registered, registration, registrationCalls, unactivated, output: output.text(), repositoryId: registration.repository.repositoryId };
   };
   const renameOf = (h: Harness, apply: boolean) => h.cp.repositoryRenames.rename({ projectId: PROJECT, to: FIXTURE.renamed.to, apply });
 
@@ -801,22 +821,44 @@ describe("an operator-registered repository: its node id is GitHub's answer at r
   });
 
   it("a failed lookup reports a fixed code and at most GitHub's status: no error text, header or body reaches the reply, the audit log or the output", async () => {
-    const message = 'gh api GET repos/MongLong0214/myeotnyeon failed: HTTP 502 Authorization: Bearer xyz {"message":"private-body-fragment"}';
-    for (const [failure, expected] of [
-      [acpError(ReasonCode.INTERNAL_ERROR, message, { status: 502, header: "Authorization: Bearer xyz", body: '{"message":"private-body-fragment"}' }),
-        { code: RepositoryNodeIdUnrecorded.LOOKUP_FAILED, status: 502 }],
-      [new Error(message), { code: RepositoryNodeIdUnrecorded.LOOKUP_FAILED }],
-    ] as const) {
+    for (const [failure, status] of leakingFailures(`repos/${FIXTURE.renamed.from}`)) {
       const w = await operatorWorld([beforeRename()], FIXTURE.responses, failure);
       expect(w.registrationCalls).toEqual([`GET repos/${FIXTURE.renamed.from}`]);
       expect(w.registration).toMatchObject({ repository: { identity: OLD }, repositoryNodeId: null });
-      expect(w.registration.repositoryNodeIdUnrecorded).toEqual(expected);
-      const audit = JSON.stringify(w.h.cp.db.all(`SELECT kind, reason_code, actor, evidence_json FROM audit_events`));
-      for (const [where, text] of [["reply", JSON.stringify(w.registered)], ["audit", audit], ["output", w.output]] as const) {
-        for (const secret of ["Bearer xyz", "Authorization: Bearer", "private-body-fragment"]) expect(text, `${where} carries ${secret}`).not.toContain(secret);
-      }
+      expect(w.registration.repositoryNodeIdUnrecorded).toEqual({ code: RepositoryNodeIdUnrecorded.LOOKUP_FAILED, ...(status === undefined ? {} : { status }) });
+      expectNoLeak(w.h, w.registered, w.output);
       expect(recordedNodeIds(w.h)).toEqual([]);
       expect(refusalOf(await renameOf(w.h, true))).toBe(RepositoryRenameRefusal.NODE_ID_UNRECORDED);
+    }
+  });
+
+  it("a GitHub failure at rename time is refused with the fixed code and at most GitHub's status: no error text, header or body reaches the reply, the audit log or the output", async () => {
+    for (const [failure, status] of leakingFailures(`repos/${FIXTURE.renamed.to}`)) {
+      const w = await world();
+      w.h.cp.credentials.install({ token: "test-token", creatorIdentity: "acme-bot" });
+      bindCeo(w.h);
+      const daemon = new Daemon(w.h.cp, { stateDir: tempDir("acp-rename-leak-daemon-") });
+      const started = await daemon.start();
+      if (!started.allowed) throw new Error(`${started.reasonCode}: ${started.message}`);
+      const output = captureOutput();
+      w.github.onRequest = () => { throw failure; };
+      let reply: Awaited<ReturnType<Daemon["handleOperatorRequest"]>>;
+      try {
+        reply = await daemon.handleOperatorRequest({
+          requestId: "req-rename", method: OPERATOR_METHOD.PROJECT_RENAME_REPOSITORY, params: { projectId: PROJECT, to: FIXTURE.renamed.to, apply: true },
+        }, PEER);
+      } finally {
+        await daemon.stop();
+        w.github.onRequest = null;
+        output.restore();
+      }
+      expect(w.github.calls).toEqual([`GET repos/${FIXTURE.renamed.to}`]);
+      expect(reply).toMatchObject({ allowed: false, reasonCode: ReasonCode.INTERNAL_ERROR });
+      expect(reply.allowed ? null : reply.evidence).toEqual({
+        refusal: RepositoryRenameRefusal.GITHUB_UNREADABLE, to: NEW, ...(status === undefined ? {} : { status }),
+      });
+      expectNoLeak(w.h, reply, output.text());
+      expect(untouched(w)).toMatchObject(UNTOUCHED);
     }
   });
 

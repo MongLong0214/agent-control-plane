@@ -347,8 +347,11 @@ export class RepositoryRenames {
     try {
       observed = await this.ports.github.observeRepository({ owner: target.owner, name: target.name });
     } catch (error) {
+      // The fixed refusal and at most GitHub's HTTP status, rather than the error's text, which can carry a
+      // request header or a private body.
+      const status = httpStatusOf(error);
       return refuse(ReasonCode.INTERNAL_ERROR, RepositoryRenameRefusal.GITHUB_UNREADABLE, "GitHub's answer for the new name could not be read; nothing was changed", {
-        to, error: (error instanceof Error ? error.message : String(error)).slice(0, 300),
+        to, ...(status === undefined ? {} : { status }),
       });
     }
     if (observed === null) {
