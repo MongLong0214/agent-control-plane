@@ -69,18 +69,19 @@ shell, so pass it deliberately when you need to ask the daemon anything.
 
 For the installed daemon, read its credential from the launcher's Keychain item
 (`com.agentcontrolplane.agentcpd` / `ACP_OPERATOR_TOKEN`, or the service you installed with) for
-each call. The token then lives only in that one process's environment and no copy is written:
+each call. The subshell keeps the token in that one call, never runs `agentctl` when the lookup
+fails or returns nothing, and writes no copy:
 
 ```bash
-ACP_OPERATOR_TOKEN="$(security find-generic-password -s com.agentcontrolplane.agentcpd -a ACP_OPERATOR_TOKEN -w)" \
-  node dist/cli/agentctl.js daemon status
+(token="$(security find-generic-password -s com.agentcontrolplane.agentcpd -a ACP_OPERATOR_TOKEN -w)" &&
+  [ -n "$token" ] && ACP_OPERATOR_TOKEN="$token" exec node dist/cli/agentctl.js daemon status)
 ```
 
 Do not copy that credential into a file. `ACP_OPERATOR_TOKEN_FILE=<path>` exists only for a
 credential you manage yourself, such as the token of a foreground daemon you started (below):
-`agentctl` and `agentctl cto --apply` read it only when `ACP_OPERATOR_TOKEN` is unset, refuse
-anything but a non-empty regular 0600 file you own (no symlink), and read nothing when neither
-variable is set. CTO launch shells unset both variables.
+`agentctl` and `agentctl cto --apply` read it only when `ACP_OPERATOR_TOKEN` is absent (set but
+empty still wins and is refused), refuse anything but a non-empty regular 0600 file you own (no
+symlink), and read nothing when neither variable is set. CTO launch shells unset both variables.
 
 A lock read is weaker evidence than a socket answer in two ways: it does not check that its
 pid is alive, and a parked daemon holds its lock exactly like a dispatching one. A daemon

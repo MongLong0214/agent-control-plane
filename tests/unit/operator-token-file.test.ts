@@ -108,6 +108,21 @@ describe("agentctl ACP_OPERATOR_TOKEN_FILE", () => {
     expect(String(answer["message"])).toMatch(/it is empty/);
   });
 
+  // A failed Keychain lookup in `ACP_OPERATOR_TOKEN="$(...)"` leaves the variable present and empty. The file below holds
+  // the daemon's real credential, so a call that read it would be answered; refused means it was not read.
+  it.each([["empty", ""], ["whitespace-only", " \t\n"]])("refuses a present but %s ACP_OPERATOR_TOKEN without reading a valid file", async (_label, value) => {
+    const { answer } = await status({ ACP_OPERATOR_TOKEN: value, ACP_OPERATOR_TOKEN_FILE: tokenFile(TEST_OPERATOR_TOKEN, 0o600) });
+    expect(answer).not.toHaveProperty("mode");
+    expect(answer["daemonStatus"]).toMatchObject({ reasonCode: ReasonCode.OPERATOR_UNAUTHENTICATED });
+  });
+
+  it("falls back to a valid file only when ACP_OPERATOR_TOKEN is absent from the environment", async () => {
+    const { code, answer } = await status({ ACP_OPERATOR_TOKEN_FILE: tokenFile(TEST_OPERATOR_TOKEN, 0o600) });
+    expect("ACP_OPERATOR_TOKEN" in process.env).toBe(false);
+    expect(code).toBe(0);
+    expect(answer).toHaveProperty("mode");
+  });
+
   it("lets ACP_OPERATOR_TOKEN win over a named file, which is then never opened", async () => {
     const wrong = await status({
       ACP_OPERATOR_TOKEN: "not-the-daemons-operator-token",
@@ -149,6 +164,8 @@ describe("agentctl cto --apply resolves the credential the same way", () => {
     const none = await apply({});
     expect(none).toMatchObject({ code: 2, asked: 0 });
     expect(none.refused).toMatch(/needs ACP_OPERATOR_TOKEN or ACP_OPERATOR_TOKEN_FILE/);
+    const blank = await apply({ ACP_OPERATOR_TOKEN: "", ACP_OPERATOR_TOKEN_FILE: tokenFile(TEST_OPERATOR_TOKEN, 0o600) });
+    expect(blank).toMatchObject({ code: 2, asked: 0 });
     const loose = await apply({ ACP_OPERATOR_TOKEN_FILE: tokenFile(TEST_OPERATOR_TOKEN, 0o644) });
     expect(loose).toMatchObject({ code: 2, asked: 0 });
     expect(loose.refused).toMatch(/ACP_OPERATOR_TOKEN_FILE is refused: .*beyond its owner/);
