@@ -5,6 +5,7 @@ import type { Clock } from "../core/clock.ts";
 import { digestOf, sha256 } from "../core/digest.ts";
 import { type Decision, allow, deny, fromErrorPayload, isAcpError } from "../core/errors.ts";
 import { parseGitHubIdentity } from "../core/ids.ts";
+import { identityChain, identityChainJson } from "../registry/repository-identity-chain.ts";
 import { RunState } from "../domain/types.ts";
 import { isStalenessReasonCode, ReasonCode } from "../core/reason-codes.ts";
 import { projectManifestSchema, type BranchProfile, type ProjectManifest } from "../contracts/manifest.ts";
@@ -3722,9 +3723,10 @@ export class GitHubKernel {
     // this repository. Otherwise an unrelated green commit could stand in for a red merge.
     const mergedHere = this.db.get<{ n: number }>(
       `SELECT COUNT(*) AS n FROM github_receipts
-        WHERE operation = 'merge_execute' AND run_id = ? AND repository_identity = ?
+        WHERE operation = 'merge_execute' AND run_id = ? AND repository_identity IN (SELECT value FROM json_each(?))
           AND after_state_digest = ? AND status = 'APPLIED' AND verified = 1`,
-      [runId, repositoryIdentity, sha256(mergeCommitSha)],
+      // v61: a merge receipt keeps the name it was written under; the repository may hold another one since.
+      [runId, identityChainJson(this.db, repositoryIdentity), sha256(mergeCommitSha)],
     );
     if ((mergedHere?.n ?? 0) === 0) {
       return deny(
@@ -4103,8 +4105,8 @@ export class GitHubKernel {
 
     const acceptedMerge = this.db.get<{ response_json: string; verified: number }>(
       `SELECT response_json, verified FROM github_receipts
-        WHERE operation = 'merge_execute' AND run_id = ? AND repository_identity = ? AND after_state_digest = ?`,
-      [runId, repositoryIdentity, sha256(commitSha)],
+        WHERE operation = 'merge_execute' AND run_id = ? AND repository_identity IN (SELECT value FROM json_each(?)) AND after_state_digest = ?`,
+      [runId, identityChainJson(this.db, repositoryIdentity), sha256(commitSha)],
     );
     const merge = acceptedMerge
       ? (JSON.parse(acceptedMerge.response_json) as { sourceBranch?: string; targetBranch?: string })
@@ -4124,9 +4126,12 @@ export class GitHubKernel {
 
     const postMerge = this.db.get<{ response_json: string; verified: number }>(
       `SELECT response_json, verified FROM github_receipts
-        WHERE operation = 'post_merge_verify' AND run_id = ? AND repository_identity = ?
-          AND resource_identity = ?`,
-      [runId, repositoryIdentity, `${owner}/${repo}@${commitSha}`],
+        WHERE operation = 'post_merge_verify' AND run_id = ? AND repository_identity IN (SELECT value FROM json_each(?))
+          AND resource_identity IN (SELECT value FROM json_each(?))`,
+      // v61: under every name the repository has held, each with the owner/name its resource identity carries.
+      [runId, identityChainJson(this.db, repositoryIdentity), JSON.stringify(identityChain(this.db, repositoryIdentity)
+        .flatMap((name) => { const parsed = parseGitHubIdentity(name); return parsed ? [`${parsed.owner}/${parsed.repo}@${commitSha}`] : []; })
+        .concat(`${owner}/${repo}@${commitSha}`))],
     );
     const postChecks = postMerge
       ? (JSON.parse(postMerge.response_json) as { checks?: Array<{ conclusion?: string }> }).checks

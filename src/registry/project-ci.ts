@@ -4,6 +4,7 @@ import { ReasonCode } from "../core/reason-codes.ts";
 import type { Db } from "../db/database.ts";
 import { CI_FAILED_CONCLUSIONS, ciVerificationRecords, type CiVerificationRecord } from "../verify/ci-verification-records.ts";
 import type { ProjectRegistry } from "./project-registry.ts";
+import { repositoryHeldIdentities } from "./repository-identity-chain.ts";
 
 /**
  * #1257 — the CI section of a project read: what CI the active manifest declares and what ACP has
@@ -217,8 +218,8 @@ const observedWorkflow = (
   declared: DeclaredWorkflow,
   attribution: Map<string, AttributedWorkflow | null>,
 ): ProjectCiWorkflow => {
-  const repository = db.get<{ identity: string; last_observed_head: string | null; last_observed_at: string | null }>(
-    `SELECT identity, last_observed_head, last_observed_at FROM repositories
+  const repository = db.get<{ repository_id: string; identity: string; last_observed_head: string | null; last_observed_at: string | null }>(
+    `SELECT repository_id, identity, last_observed_head, last_observed_at FROM repositories
       WHERE project_id = ? AND repository_role = ? AND retired_at IS NULL AND registration = 'REGISTERED'
       ORDER BY created_at, repository_id LIMIT 1`,
     [projectId, workflow.repositoryRole],
@@ -228,6 +229,10 @@ const observedWorkflow = (
       observedAtHead: null, latestNonResult: null, unobserved: true, unobservedReason: "NO_REPOSITORY_FOR_ROLE" };
   }
   const identity = repository.identity;
+  // v61: a record keeps the name it was written under, so one written before a rename names an earlier one, even a
+  // name another repository took since. The name only finds the candidates: each record is then attributed through its
+  // run's repository by id (`attributedWorkflow`), which leaves out the rows of the repository that took the name.
+  const identities = repositoryHeldIdentities(db, repository.repository_id, identity);
   const repositoryHead = repository.last_observed_head === null
     ? null
     : { commitSha: repository.last_observed_head, observedAt: repository.last_observed_at };
@@ -243,9 +248,9 @@ const observedWorkflow = (
     return attribution.get(key)!;
   };
   const records = [
-    ...postMergeRecords(db, identity, workflow.checkName),
-    ...verificationRecords(db, identity, workflow.checkName),
-    ...bootstrapRecords(db, projects, projectId, identity, workflow.checkName),
+    ...postMergeRecords(db, identities, workflow.checkName),
+    ...verificationRecords(db, identities, workflow.checkName),
+    ...bootstrapRecords(db, projects, projectId, identities, workflow.checkName),
   ].sort(newestFirst);
 
   // Newest first. The first result is `lastObserved`, and the newest non-result before it is kept. The
@@ -330,7 +335,7 @@ const newestFirst = (a: CandidateRecord, b: CandidateRecord): number =>
  * Every verified post-merge receipt naming this check that names its run; a receipt without a run
  * has no pinned manifest to attribute it by. CASE keeps a malformed entry from failing the read.
  */
-const postMergeRecords = (db: Db, identity: string, checkName: string): CandidateRecord[] =>
+const postMergeRecords = (db: Db, identities: readonly string[], checkName: string): CandidateRecord[] =>
   db.all<{ receipt_id: string; run_id: string; resource_identity: string; created_at: string;
     conclusion: unknown; row_order: number }>(
     `SELECT g.receipt_id, g.run_id, g.resource_identity, g.created_at, g.rowid AS row_order,
@@ -338,10 +343,10 @@ const postMergeRecords = (db: Db, identity: string, checkName: string): Candidat
        FROM github_receipts g,
             json_each(CASE WHEN json_valid(g.response_json) THEN g.response_json ELSE '{}' END, '$.checks') c
       WHERE g.operation = 'post_merge_verify' AND g.status = 'APPLIED' AND g.verified = 1
-        AND g.repository_identity = ? AND g.run_id IS NOT NULL
+        AND g.repository_identity IN (SELECT value FROM json_each(?)) AND g.run_id IS NOT NULL
         AND (CASE WHEN c.type = 'object' THEN json_extract(c.value, '$.name') END) = ?
       ORDER BY g.created_at DESC, g.rowid DESC`,
-    [identity, checkName],
+    [JSON.stringify(identities), checkName],
   ).map((row) => {
     const at = row.resource_identity.lastIndexOf("@");
     const conclusion = typeof row.conclusion === "string" ? row.conclusion : null;
@@ -356,8 +361,8 @@ const postMergeRecords = (db: Db, identity: string, checkName: string): Candidat
   });
 
 /** Trusted-CI verification results for this check, read through the one helper that reads them. */
-const verificationRecords = (db: Db, identity: string, checkName: string): CandidateRecord[] =>
-  ciVerificationRecords(db, identity, checkName).map((row) => ({
+const verificationRecords = (db: Db, identities: readonly string[], checkName: string): CandidateRecord[] =>
+  ciVerificationRecords(db, identities, checkName).map((row) => ({
     conclusion: null,
     commitSha: row.exactHead,
     observedAt: row.endedAt,
@@ -385,7 +390,7 @@ const bootstrapRecords = (
   db: Db,
   projects: Pick<ProjectRegistry, "manifest">,
   projectId: string,
-  identity: string,
+  identities: readonly string[],
   checkName: string,
 ): CandidateRecord[] =>
   db.all<{ artifact_id: string; run_id: string; content_json: string; created_at: string; row_order: number }>(
@@ -410,7 +415,8 @@ const bootstrapRecords = (
     const parsed = parseRepoFactoryResult(content);
     if (!parsed.allowed) return [];
     const result = parsed.value;
-    const repository = result.repositories.find((candidate) => candidate.identity === identity);
+    const repository = result.repositories.find((candidate) => identities.includes(candidate.identity));
+    const identity = repository?.identity;
     const heads = [...new Set(result.bootstrapVerification
       .filter((verification) => verification.repositoryIdentity === identity)
       .map((verification) => verification.exactHead))];

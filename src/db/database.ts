@@ -1560,6 +1560,7 @@ const TRIGGER_CODES: Record<string, ReasonCode> = {
   // v57 — a canonical entitlement transfer is never replaced or erased, keeps its identity, and is claimed or
   // revoked once; an entitlement is never granted to a conversation or a held Buzz actor a transfer names.
   CANONICAL_ENTITLEMENT_TRANSFER_IMMUTABLE: ReasonCode.CONFLICT,
+  REPOSITORY_RENAME_IMMUTABLE: ReasonCode.CONFLICT,
   // #246 B2-b — a manifest activation grant is one per run, fixed once written, consumed once; the
   // project's pointer moves only with a consumed grant, and a CONTRACT_CHANGE completes only with its own.
   MANIFEST_GRANT_NO_REPLACE: ReasonCode.CONFLICT,

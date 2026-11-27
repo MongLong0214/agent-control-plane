@@ -39,7 +39,13 @@ export const residentRepositories = (db: Db, repositoryId?: string): ResidentRep
               json_extract(p.allocation_json, '$.clonePath') AS clone_path
          FROM resident_project_provisioning p
          JOIN repositories r ON r.project_id = p.project_id AND r.retired_at IS NULL
-                            AND r.identity = json_extract(p.allocation_json, '$.repositoryIdentity')
+                            AND (r.identity = json_extract(p.allocation_json, '$.repositoryIdentity')
+                                 -- v61: the allocation keeps the name it was made under; a recorded rename of the
+                                 -- same repository (its node id) carries it to the repository's current one.
+                                 OR EXISTS (SELECT 1 FROM repository_identity_renames n
+                                             WHERE n.repository_id = r.repository_id
+                                               AND n.from_identity = json_extract(p.allocation_json, '$.repositoryIdentity')
+                                               AND n.repository_node_id IS json_extract(p.allocation_json, '$.repositoryNodeId')))
         WHERE p.status IN ('PENDING', 'COMPLETE')
           AND json_type(p.allocation_json, '$.clonePath') = 'text'
           AND (? IS NULL OR r.repository_id = ?)

@@ -30,19 +30,20 @@ export interface CiVerificationRecord {
  * conclusion and VERIFICATION_CI_CHECK_PENDING for an unfinished check. Rows written before those
  * codes existed carry VERIFICATION_COMMAND_FAILED for both.
  */
-export const ciVerificationRecords = (db: Db, repositoryIdentity: string, checkName: string): CiVerificationRecord[] =>
+export const ciVerificationRecords = (db: Db, repositoryIdentities: readonly string[], checkName: string): CiVerificationRecord[] =>
   db.all<{ result_id: string; run_id: string; exact_head: string; ended_at: string;
     status: CiVerificationRecord["status"]; reason_code: string | null; row_order: number }>(
+    // Every name the repository has held (v61): a result keeps the identity it was written under.
     `SELECT v.result_id, v.run_id, v.exact_head, v.ended_at, v.status, v.reason_code, v.rowid AS row_order
        FROM verification_results v
-      WHERE v.source = 'ci' AND v.repository_identity = ? AND v.command_id = ?
+      WHERE v.source = 'ci' AND v.repository_identity IN (SELECT value FROM json_each(?)) AND v.command_id = ?
         AND v.attempt = (SELECT MAX(o.attempt) FROM verification_results o
                           WHERE o.candidate_snapshot_digest = v.candidate_snapshot_digest
                             AND o.command_id = v.command_id
                             AND o.repository_identity = v.repository_identity
                             AND o.source = v.source)
       ORDER BY v.ended_at DESC, v.rowid DESC`,
-    [repositoryIdentity, checkName],
+    [JSON.stringify(repositoryIdentities), checkName],
   ).map((row) => ({
     resultId: row.result_id,
     runId: row.run_id,

@@ -8,14 +8,14 @@ import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 import { releasedChainImage } from "../helpers/released-chain-image.ts";
 import { privateStatePath, schemaRowsOf } from "../helpers/released-v44-schema.ts";
 import { contentDigests } from "../helpers/released-v45-schema.ts";
-import { V58_ADDED_TRIGGERS, V58_CHANGED_GUARDS, V60_ADDED_TRIGGERS } from "../helpers/released-v50-schema.ts";
+import { V58_ADDED_TRIGGERS, V58_CHANGED_GUARDS, V60_ADDED_TRIGGERS, V61_ADDED_TRIGGERS, V61_CHANGED_GUARDS } from "../helpers/released-v50-schema.ts";
 
 afterAll(cleanupTempDirs);
 
 // The chain runs on through v59, whose column and index are v59's test to account for.
 const V59_OBJECTS = ["tasks", "tasks_run_plan_key"];
-/** The chain runs on through v60, whose trigger is v60's test's to account for. */
-const LATER_OBJECTS = [...V59_OBJECTS, ...V60_ADDED_TRIGGERS];
+/** The chain runs on through v60 and v61, whose objects (and v61's replaced pointer guard) are their own tests' to account for. */
+const LATER_OBJECTS = [...V59_OBJECTS, ...V60_ADDED_TRIGGERS, "repository_identity_renames", ...V61_ADDED_TRIGGERS, ...V61_CHANGED_GUARDS];
 const V58_OBJECTS = ["canonical_cto_rotations", ...V58_ADDED_TRIGGERS];
 
 describe("v58 — the canonical CTO switchover table, and the one rewrite of an actor's target it admits", () => {
@@ -28,7 +28,7 @@ describe("v58 — the canonical CTO switchover table, and the one rewrite of an 
     approveMigration(path, "v57 → v58 witness");
     new Db(path).close();
     const after = contentDigests(path, 57);
-    expect(after.userVersion).toBe(60);
+    expect(after.userVersion).toBe(61);
     const { schema_migrations: _receiptsBefore, ...rowsBefore } = before.tables;
     const { schema_migrations: _receiptsAfter, ...rowsAfter } = after.tables;
     expect(rowsAfter).toEqual(rowsBefore);

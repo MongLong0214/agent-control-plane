@@ -183,6 +183,13 @@ const LATER_OBJECTS: ReadonlyArray<{ version: number; objects?: readonly string[
   // #1189 — the run-state exits add one guard; the two state guards they replace keep their names.
   { version: 54, objects: ["runs_cancel_after_approval_requires_no_grant"] },
   { version: 60, objects: ["runs_review_completion_bootstrap_only", "runs_kind_immutable"] },
+  {
+    version: 61,
+    objects: [
+      "repository_identity_renames", "repository_identity_renames_no_replace", "repository_identity_renames_names_the_current_repository",
+      "repository_identity_renames_immutable", "repository_identity_renames_no_delete",
+    ],
+  },
   { version: 47, objects: ["run_artifacts_owner_decision_authority_guard"] },
   {
     version: 48,

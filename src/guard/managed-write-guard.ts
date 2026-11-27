@@ -11,6 +11,7 @@ import type { Db } from "../db/database.ts";
 import { Role, RunState, roleKeyFor } from "../domain/types.ts";
 import { type WorkspaceProbe, isWithin } from "./workspace-probe.ts";
 import { standingClaimSql } from "../claims/claim-registry.ts";
+import { identityChainJson } from "../registry/repository-identity-chain.ts";
 
 /**
  * Operations that mutate project-natured state. PRD §4 CP-HI-01 enumerates these
@@ -2440,8 +2441,9 @@ export class ManagedWriteGuard {
     }>(
       `SELECT c.claim_id, c.run_id, c.branch, c.worktree_id, c.declared_path
          FROM resource_claims c
-        WHERE ${standingClaimSql("c")} AND c.repository_identity = ? AND c.run_id <> ?`,
-      [participant.identity, runId],
+        WHERE ${standingClaimSql("c")} AND c.repository_identity IN (SELECT value FROM json_each(?)) AND c.run_id <> ?`,
+      // v61: a standing claim written under an earlier name of the repository still holds the same target.
+      [identityChainJson(this.db, participant.identity), runId],
     );
     if (held.length === 0) return null;
 
@@ -2529,8 +2531,8 @@ export class ManagedWriteGuard {
   private hasHeldWorktreeClaim(repositoryIdentity: string): boolean {
     return !!this.db.get<{ claim_id: string }>(
       `SELECT claim_id FROM resource_claims
-        WHERE repository_identity = ? AND status = 'HELD' AND worktree_id IS NOT NULL`,
-      [repositoryIdentity],
+        WHERE repository_identity IN (SELECT value FROM json_each(?)) AND status = 'HELD' AND worktree_id IS NOT NULL`,
+      [identityChainJson(this.db, repositoryIdentity)],
     );
   }
 

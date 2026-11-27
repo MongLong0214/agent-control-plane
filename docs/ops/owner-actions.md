@@ -1376,6 +1376,146 @@ the verified converted copy, its `source.sha256.before` and `copy.sha256.before-
 - If any step fails midway, discard nothing: the source is untouched by construction, so the whole
   procedure can be run again from a new copy, and the failed copy is the evidence.
 
+### Restore a stopped v61 database to v60 (single path, 61→60 only)
+
+This is the one way to turn a schema v61 (repository rename) database into a v60 one that keeps the data
+written under v61. It is the 60→59 procedure above applied to one other version pair, and it is its own
+procedure, rehearsed on its own (`tests/unit/rollback-pair.test.ts`, "a v61 database returns to v60"). It
+produces and verifies a converted copy; the copy is installed with the same replacement-database path, under
+a P60 pair. Nothing in `src/` runs it.
+
+**A recorded rename stops it.** v61 adds `repository_identity_renames`, and a row there is the only record
+that links the receipts, verification results and allocation written under a repository's old name to the
+name it holds now. Dropping the table would discard that record, so the conversion refuses, before it writes
+anything, when the table holds any row. Once a rename has been applied, recovery is forward-only on v61:
+
+1. Run the same `agentctl project rename-repository <project> <owner/name> --apply` again. It converges: the
+   ACP record is already written (`ALREADY_RENAMED`), and it sets any local clone's `origin` that still names
+   the old URL.
+2. If the v61 state itself has to go back, restore a v61 image taken before the rename, under the v61
+   build: a P61 pair sealed before the rename (`install-launchd.sh rollback --pair-id <P61> …`), or a
+   `state-admin backup` taken at v61 before the rename, restored with the daemon stopped. Either discards
+   everything written after it, and neither touches GitHub: the repository keeps its new name there, so the
+   restored ACP holds the old name again and its GitHub calls fail until the rename is applied again. There
+   is no combined GitHub-and-ACP rollback.
+
+Before applying a rename, seal a P61 pair, so that the second way exists.
+
+**What it applies to.** The source is a database at `user_version` 61 whose `schema_migrations` holds the v61
+row exactly — `version = 61`, `migration_id = 'v61-repository-identity-rename'`,
+`checksum = 'sha256:84bcf4d0932936943e591e35f7648a540112046afa5661ac3d07f9db545bde4c'` — with no rename
+recorded. The target is the v60 build pinned in the P60 pair sealed before the 60→61 migration. A database
+created at v61 rather than migrated to it carries `bootstrap-v61` and is refused; so is every other version
+pair.
+
+**Preconditions, and the copy.** Exactly as in the 60→59 section: the daemon stopped and the lock free, no
+`state.sqlite-journal`, an empty or absent `state.sqlite-wal`, the source digest recorded at the start and
+checked again around the copy, and an immutable `.backup` into a new work directory. Run that block as it
+stands, with `downgrade-61-60` in place of `downgrade-60-59` in the work directory's name, and keep the same
+`bash` for the steps below.
+
+**The reference.** The P60 pair's sealed image, `<pairs root>/<P60>/database/state.sqlite`, taken before the
+60→61 migration. It is also where the v60 manifest-pointer guard comes from: v61 replaced
+`projects_active_manifest_moves_by_grant`, and the v60 text a database holds depends on how it reached v60,
+so the conversion puts back the text the pair's own image holds and no other. Read it out, in the same `bash`:
+
+<!-- owner-actions:v61-to-v60-guard-text:start -->
+    set -euo pipefail
+    PAIR_IMAGE="${PAIR_IMAGE:?name the P60 pair image: <pairs root>/<P60>/database/state.sqlite}"
+    [ -f "$PAIR_IMAGE" ] && [ ! -L "$PAIR_IMAGE" ] || { echo "the pair image is not a regular, non-symlink file" >&2; exit 1; }
+    [ "$(sqlite3 "file:$PAIR_IMAGE?immutable=1" 'PRAGMA user_version')" = 60 ] || { echo "the pair image is not at v60" >&2; exit 1; }
+    sqlite3 "file:$PAIR_IMAGE?immutable=1" \
+      "SELECT sql || ';' FROM sqlite_schema WHERE type = 'trigger' AND name = 'projects_active_manifest_moves_by_grant'" \
+      > "$WORK/v60-pointer-guard.sql"
+    [ "$(head -n 1 "$WORK/v60-pointer-guard.sql")" = "CREATE TRIGGER projects_active_manifest_moves_by_grant" ] \
+      || { echo "the pair image holds no v60 manifest-pointer guard" >&2; exit 1; }
+    ! grep -q 'repository_identity_renames' "$WORK/v60-pointer-guard.sql" \
+      || { echo "the pair image's manifest-pointer guard is not v60's" >&2; exit 1; }
+<!-- owner-actions:v61-to-v60-guard-text:end -->
+
+**Guards, checked on the copy, before anything is changed.** Any one failing stops the procedure; nothing is
+repaired to make one pass. The SQL below checks each of them first, inside its transaction, and `.bail on`
+ends it there with the copy unchanged:
+
+- `PRAGMA user_version` is not `61`; the v61 ledger row is absent, repeated, or carries another id or checksum;
+  `max(version)` is not 61.
+- `repository_identity_renames` holds any row — the refusal above.
+- The v61 objects are not exactly the table and its four guards, or the manifest-pointer guard is not v61's.
+- `PRAGMA integrity_check` is anything but `ok` (run it first, as in the 60→59 section).
+
+**The steps.** One transaction, on the copy, from the work directory (the SQL reads `v60-pointer-guard.sql`
+from there). Write it to `$WORK/convert.sql` as in the 60→59 section, then run
+`quiet && check_copy && cd "$WORK" && sqlite3 "$COPY" < convert.sql`:
+
+<!-- owner-actions:v61-to-v60-convert:start -->
+    .bail on
+    .dbconfig enable_trigger off
+    BEGIN IMMEDIATE;
+    -- Each guard raises "integer overflow" when its condition holds; .bail on then stops the shell and the
+    -- open transaction is rolled back when the connection closes. Nothing is written before the last guard.
+    SELECT CASE WHEN (SELECT user_version FROM pragma_user_version) <> 61 THEN abs(-9223372036854775807-1) END;
+    SELECT CASE WHEN (SELECT count(*) FROM schema_migrations WHERE version = 61
+      AND migration_id = 'v61-repository-identity-rename'
+      AND checksum = 'sha256:84bcf4d0932936943e591e35f7648a540112046afa5661ac3d07f9db545bde4c') <> 1 THEN abs(-9223372036854775807-1) END;
+    SELECT CASE WHEN (SELECT max(version) FROM schema_migrations) <> 61 THEN abs(-9223372036854775807-1) END;
+    SELECT CASE WHEN (SELECT count(*) FROM sqlite_schema WHERE type = 'table' AND name = 'repository_identity_renames') <> 1
+      THEN abs(-9223372036854775807-1) END;
+    -- A recorded rename: dropping the table would discard it. Recovery is forward-only on v61.
+    SELECT CASE WHEN (SELECT count(*) FROM repository_identity_renames) <> 0 THEN abs(-9223372036854775807-1) END;
+    SELECT CASE WHEN (SELECT count(*) FROM sqlite_schema WHERE type = 'trigger' AND tbl_name = 'repository_identity_renames'
+      AND name IN ('repository_identity_renames_no_replace', 'repository_identity_renames_names_the_current_repository',
+                   'repository_identity_renames_immutable', 'repository_identity_renames_no_delete')) <> 4
+      OR (SELECT count(*) FROM sqlite_schema WHERE tbl_name = 'repository_identity_renames' AND name NOT LIKE 'sqlite_autoindex%') <> 5
+      THEN abs(-9223372036854775807-1) END;
+    SELECT CASE WHEN (SELECT count(*) FROM sqlite_schema WHERE type = 'trigger' AND name = 'projects_active_manifest_moves_by_grant'
+      AND tbl_name = 'projects' AND sql LIKE '%repository_identity_renames%') <> 1 THEN abs(-9223372036854775807-1) END;
+    DROP TRIGGER projects_active_manifest_moves_by_grant;
+    .read v60-pointer-guard.sql
+    SELECT CASE WHEN (SELECT count(*) FROM sqlite_schema WHERE type = 'trigger' AND name = 'projects_active_manifest_moves_by_grant'
+      AND tbl_name = 'projects' AND sql NOT LIKE '%repository_identity_renames%') <> 1 THEN abs(-9223372036854775807-1) END;
+    DROP TRIGGER repository_identity_renames_no_replace;
+    DROP TRIGGER repository_identity_renames_names_the_current_repository;
+    DROP TRIGGER repository_identity_renames_immutable;
+    DROP TRIGGER repository_identity_renames_no_delete;
+    DROP TABLE repository_identity_renames;
+    DELETE FROM schema_migrations WHERE version = 61 AND migration_id = 'v61-repository-identity-rename';
+    SELECT CASE WHEN changes() <> 1 THEN abs(-9223372036854775807-1) END;
+    PRAGMA user_version = 60;
+    SELECT CASE WHEN (SELECT max(version) FROM schema_migrations) <> 60 THEN abs(-9223372036854775807-1) END;
+    SELECT CASE WHEN (SELECT count(*) FROM sqlite_schema
+      WHERE tbl_name = 'repository_identity_renames' OR sql LIKE '%repository_identity_renames%') <> 0 THEN abs(-9223372036854775807-1) END;
+    COMMIT;
+    PRAGMA wal_checkpoint(TRUNCATE);
+    SELECT 'user_version', user_version FROM pragma_user_version;
+<!-- owner-actions:v61-to-v60-convert:end -->
+
+`.dbconfig enable_trigger off` is there for the one `DELETE` from `schema_migrations`, exactly as in the 60→59
+section, and is a property of this connection only. The rename table's guards go with the table.
+
+**Post-checks on the copy.** All must hold:
+
+1. Every table except `schema_migrations` and the dropped `repository_identity_renames` has the content digest
+   (defined in the 60→59 section) it had before the transaction.
+2. `schema_migrations` differs from its pre-transaction state by the v61 row and nothing else.
+3. `sqlite_schema` equals the P60 pair image's, every `(type, name, tbl_name, sql)` row. `record-replacement`
+   below checks this again and refuses a copy that differs.
+4. `PRAGMA integrity_check` is `ok`, and `PRAGMA user_version` is `60`.
+
+**Proving the converted copy in isolation, and installing it.** As in the 60→59 section, with the v60 build
+(`V60_ROOT`, the build pinned in the P60 pair) in place of the v59 build and a v60 duplicate in place of the v59
+one; the ready rule and the post-start check are the same. Then install it with the replacement-database path,
+the daemon kept stopped throughout:
+
+1. `state-admin backup --database <converted copy> --output IMAGE`.
+2. `node dist/deploy/rollback-pair.js record-replacement <the validate identity flags, with --pair-id <P60>>
+   --source <live db> --image IMAGE`, from the v61 build. It replays the retired 60→61 approval on IMAGE and
+   requires the result to equal the live v61 database: IMAGE must be exactly the live database minus v61.
+3. `deploy/install-launchd.sh rollback --pair-id <P60> … --replacement-database IMAGE`, after
+   `rollback-pair validate … --replacement-database IMAGE`.
+
+The P60 pair must have been sealed before the 60→61 migration and the retired approval kept. The stopping
+rules of the 60→59 section apply unchanged.
+
 ### What it creates
 
 A database backup and manifest under `~/.agent-control-plane/backups/` (item 2); a `dist/`
