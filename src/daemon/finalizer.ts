@@ -406,6 +406,8 @@ interface DurableMergeReceipt {
   status: "PENDING" | "APPLIED";
   verified: number;
   response_json: string;
+  /** When the receipt was written: the name it carries was the repository's then. */
+  created_at: string;
 }
 
 export interface ReclaimedFinalizationAttempt {
@@ -551,8 +553,9 @@ export class ApprovedRunFinalizer {
       this.completeAnyRunningAttempt(runId);
       for (const receipt of this.durableMergeReceipts(runId)) {
         if (receipt.status !== "APPLIED" || receipt.verified !== 1) continue;
-        // v61: a receipt keeps the name it was written under; the repository may hold another one since.
-        const repository = this.cp.repositories.byIdentity(identityChain(this.cp.db, receipt.repository_identity)[0]!);
+        // v61: a receipt keeps the name it was written under; the repository may hold another one since, and another
+        // repository may hold that name now. The name at the time the receipt was written is the repository's.
+        const repository = this.cp.repositories.byIdentity(identityChain(this.cp.db, receipt.repository_identity, receipt.created_at)[0]!);
         if (repository) await this.cp.repositories.observe(repository.repositoryId);
       }
       return allow(
@@ -2019,7 +2022,7 @@ export class ApprovedRunFinalizer {
 
   private durableMergeReceipts(runId: string): DurableMergeReceipt[] {
     return this.cp.db.all<DurableMergeReceipt>(
-      `SELECT repository_identity, status, verified, response_json
+      `SELECT repository_identity, status, verified, response_json, created_at
          FROM github_receipts
         WHERE run_id = ? AND operation = 'merge_execute' AND status IN ('PENDING','APPLIED')
         ORDER BY created_at, receipt_id`,
@@ -2029,7 +2032,7 @@ export class ApprovedRunFinalizer {
 
   private mergeReceipt(runId: string, repositoryIdentity: string): DurableMergeReceipt | null {
     return this.cp.db.get<DurableMergeReceipt>(
-      `SELECT repository_identity, status, verified, response_json
+      `SELECT repository_identity, status, verified, response_json, created_at
          FROM github_receipts
         WHERE run_id = ? AND repository_identity IN (SELECT value FROM json_each(?)) AND operation = 'merge_execute'
         ORDER BY created_at DESC, receipt_id DESC LIMIT 1`,

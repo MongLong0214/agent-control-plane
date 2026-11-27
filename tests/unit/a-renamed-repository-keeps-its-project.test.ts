@@ -535,6 +535,32 @@ describe("v61 — a repository renamed on GitHub is adopted for the same reposit
     expect(observe).toHaveBeenCalledWith(w.repositoryId);
   });
 
+  it("a name the renamed repository left is taken by another repository: the finalizer still resolves the old run's receipt to the renamed one", async () => {
+    const w = await world({ evidenceWriters: true });
+    const runId = "run_completed_before_rename";
+    w.h.cp.db.run(
+      `INSERT INTO runs (run_id, project_id, kind, execution_mode, priority, state, goal, contract_digest, pinned_manifest_digest, created_at)
+       VALUES (?, ?, 'STANDARD_WORK', 'STANDARD', 'NORMAL', 'COMPLETED', 'merged before the rename', 'sha256:contract', ?, ?)`,
+      [runId, PROJECT, w.h.cp.projects.get(PROJECT)!.activeManifestDigest, w.h.clock.nowIso()],
+    );
+    w.h.cp.db.run(`INSERT INTO run_repositories (run_id, repository_id, repository_role, base_branch) VALUES (?, ?, 'primary', 'dev')`, [runId, w.repositoryId]);
+    recordHistory(w.h, runId, "d".repeat(40));
+    w.h.clock.advance(1000);
+    planOf(await rename(w, true));
+    // A different repository takes the freed name after the rename.
+    w.h.clock.advance(1000);
+    w.h.cp.db.run(
+      `INSERT INTO repositories (repository_id, identity, checkout_path, project_id, repository_role, created_at) VALUES ('repo_reuser', ?, ?, NULL, NULL, ?)`,
+      [OLD, tempDir("reuser-"), w.h.clock.nowIso()],
+    );
+    expect(w.h.cp.repositories.byIdentity(OLD)?.repositoryId).toBe("repo_reuser");
+    const observe = vi.spyOn(w.h.cp.repositories, "observe").mockResolvedValue(undefined as never);
+    const replayed = await new ApprovedRunFinalizer(w.h.cp, "rename-reuse-replay").finalizeApprovedRun(runId);
+    expect(replayed).toMatchObject({ allowed: true, reasonCode: ReasonCode.MERGE_IDEMPOTENT_REPLAY });
+    expect(observe).toHaveBeenCalledWith(w.repositoryId);
+    expect(observe).not.toHaveBeenCalledWith("repo_reuser");
+  });
+
   it("review P3-4: a claim recorded under the old name still conflicts with the same target under the new one", async () => {
     const w = await world();
     planOf(await rename(w, true));

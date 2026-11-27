@@ -11,7 +11,7 @@ import type { AuditLog } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
 import { TERMINAL_RUN_STATES } from "../domain/run-state.ts";
 import { git } from "../git/git.ts";
-import { repositoryIdentities } from "./repository-identity-chain.ts";
+import { nameSpanMatchSql, repositoryIdentities, repositoryNameSpansJson } from "./repository-identity-chain.ts";
 import { parseGitHubIdentity, type ObservedRepository, type GitHubRepositoryTarget } from "../bootstrap/github-write-port.ts";
 
 /**
@@ -377,7 +377,13 @@ export class RepositoryRenames {
       [projectId],
     );
     if (!row || typeof row.identity !== "string") return null;
-    return repositoryIdentities(this.ports.db, repository.repository_id, repository.identity).includes(row.identity) ? row : null;
+    if (sameIdentity(row.identity, repository.identity)) return row;
+    // An earlier name of this repository: the allocation's node id is the repository's own, so a name another
+    // repository has taken since still resolves here and nowhere else.
+    return this.ports.db.get(
+      `SELECT 1 FROM repository_identity_renames WHERE repository_id = ? AND lower(from_identity) = lower(?) AND repository_node_id IS ?`,
+      [repository.repository_id, row.identity, row.nodeId],
+    ) ? row : null;
   }
 
   private recordedNodeId(projectId: string, repository: RepositoryRow): string | null {
@@ -396,15 +402,15 @@ export class RepositoryRenames {
         ORDER BY r.run_id`,
       [...TERMINAL_RUN_STATES, projectId, repository.repository_id],
     );
-    // Under every name the repository has held, in any letter case: GitHub's names are case-insensitive, and a
-    // claim or receipt written under an earlier name is still this repository's work.
-    const names = JSON.stringify(repositoryIdentities(db, repository.repository_id, repository.identity).map((name) => name.toLowerCase()));
+    // Under every name the repository has held, in any letter case, and only while it held it: a name freed by a
+    // rename may be taken by another repository, whose claims and receipts under it are not this one's work.
+    const spans = repositoryNameSpansJson(db, repository.repository_id, repository.identity);
     const claims = db.all<{ claim_id: string }>(
-      `SELECT claim_id FROM resource_claims WHERE status = 'HELD' AND lower(repository_identity) IN (SELECT value FROM json_each(?))
-        ORDER BY claim_id`, [names]);
+      `SELECT c.claim_id FROM resource_claims c WHERE c.status = 'HELD' AND ${nameSpanMatchSql("c.repository_identity", "c.acquired_at")}
+        ORDER BY c.claim_id`, [spans]);
     const receipts = db.all<{ receipt_id: string }>(
-      `SELECT receipt_id FROM github_receipts WHERE status = 'PENDING' AND lower(repository_identity) IN (SELECT value FROM json_each(?))
-        ORDER BY receipt_id`, [names]);
+      `SELECT g.receipt_id FROM github_receipts g WHERE g.status = 'PENDING' AND ${nameSpanMatchSql("g.repository_identity", "g.created_at")}
+        ORDER BY g.receipt_id`, [spans]);
     if (runs.length === 0 && claims.length === 0 && receipts.length === 0) return null;
     return refuse(ReasonCode.CONFLICT, RepositoryRenameRefusal.PROJECT_BUSY,
       "the repository has work in flight; a rename waits until every run, claim and receipt of it has finished", {
