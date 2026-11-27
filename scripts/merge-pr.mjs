@@ -20,13 +20,14 @@
  * about a specific commit and the head can move between reading and merging; the same sha goes to
  * `--match-head-commit`, so GitHub merges that head or nothing. It refuses, too, a head that does
  * not already contain the base tip: CI checked the head's tree, and only then is the merge's tree
- * that same tree. GitHub's merge API takes no expected base, so the base is read back instead: a
- * base that moved in between fails loudly after the merge.
+ * that same tree. GitHub's merge API takes no expected base, so the base branch's tip is read from
+ * origin right before the merge call and the merge is read back against it: a base that moved
+ * during the call fails loudly after the merge as MAIN_MOVED_DURING_MERGE, and is not retried.
  *
  * After the merge it is read back -- and any mismatch fails loudly, because the merge cannot be
  * undone: GitHub reports the pull request merged at that commit; its parents are exactly the base
- * read before the merge and the checked head, so the head is an ancestor; its tree is that head
- * merged onto that base (`git merge-tree`); and every CommitLore note the branch's commits carry
+ * tip read right before the merge call and the checked head, so the head is an ancestor; its tree is
+ * that head merged onto that tip (`git merge-tree`); and every CommitLore note the branch's commits carry
  * here is on origin after `commitlore sync`, because the commits' own bytes travel with the merge
  * but their notes do not.
  *
@@ -190,7 +191,25 @@ if (dryRun) {
   process.exit(0);
 }
 
-// 4. Merge the head that was checked, as a merge commit and nothing else, with the body that was checked.
+// 4. The base branch's tip, read from origin right before the merge call: with the checked head it
+//    pins what the merge must be -- parents [tip, head], tree `git merge-tree tip head`. GitHub's
+//    baseRefOid is not that tip: it can still name an older base after the branch has moved on, and
+//    GitHub merges onto the branch as it is. #1504 merged correctly onto e1004978 while baseRefOid
+//    said d1e2b128, and a read-back pinned to d1e2b128 failed it.
+const baseBranch = `refs/heads/${pr.baseRefName}`;
+let baseBefore;
+try {
+  const exact = run("git", ["ls-remote", "--exit-code", "origin", baseBranch]).split("\n")
+    .map((line) => line.split("\t")).filter(([, ref]) => ref === baseBranch);
+  if (exact.length === 1) baseBefore = exact[0][0];
+} catch (error) {
+  process.stdout.write(String(error.stdout ?? error.stderr ?? ""));
+}
+if (typeof baseBefore !== "string" || !FULL_SHA.test(baseBefore)) {
+  fail(`could not read ${pr.baseRefName}'s tip on origin right before the merge, so the merge could not be read back against it. Nothing was merged.`);
+}
+
+// Merge the head that was checked, as a merge commit and nothing else, with the body that was checked.
 run("gh", ["pr", "merge", number, "--merge", "--match-head-commit", head, "--subject", subject, "--body-file", bodyOut]);
 
 // Everything after this point reads back a merge that cannot be undone, so a refusal says so.
@@ -227,8 +246,16 @@ let recordLines = 0;
 let notesCarried = 0;
 try {
   const parents = run("git", ["rev-list", "--parents", "-n", "1", merged]).trim().split(" ").slice(1);
-  if (parents.length !== 2 || parents[0] !== base || parents[1] !== head) {
-    mismatches.push(`${merged.slice(0, 8)}'s parents are [${parents.map((p) => p.slice(0, 8)).join(", ")}], not the base and head checked, [${base.slice(0, 8)}, ${head.slice(0, 8)}]`);
+  const found = `${merged.slice(0, 8)}'s parents are [${parents.map((p) => p.slice(0, 8)).join(", ")}]`;
+  const pinned = `not the base and head checked, [${baseBefore.slice(0, 8)}, ${head.slice(0, 8)}]`;
+  // The base moved between the read and the merge: still a merge of the checked head, but not the one
+  // pinned, so it is reported and never passed. The tree against the parent it did land on is printed
+  // as a diagnostic only.
+  const movedTo = parents.length === 2 && parents[1] === head && parents[0] !== baseBefore ? parents[0] : undefined;
+  if (movedTo !== undefined) {
+    mismatches.push(`MAIN_MOVED_DURING_MERGE: ${pr.baseRefName} was ${baseBefore.slice(0, 8)} right before the merge call and GitHub merged onto ${movedTo.slice(0, 8)}; ${found}, ${pinned}. The merge is not retried`);
+  } else if (parents.length !== 2 || parents[0] !== baseBefore || parents[1] !== head) {
+    mismatches.push(`${found}, ${pinned}`);
   }
   try {
     run("git", ["merge-base", "--is-ancestor", head, merged]);
@@ -236,14 +263,20 @@ try {
     mismatches.push(`the head checked, ${head.slice(0, 8)}, is not an ancestor of ${merged.slice(0, 8)}`);
   }
   const tree = run("git", ["rev-parse", "--verify", `${merged}^{tree}`]).trim();
-  let rebuilt = "";
-  try {
-    rebuilt = run("git", ["merge-tree", "--write-tree", base, head]).split("\n")[0]?.trim() ?? "";
-  } catch {
-    rebuilt = "";
-  }
+  const mergedOnto = (onto) => {
+    try {
+      return run("git", ["merge-tree", "--write-tree", onto, head]).split("\n")[0]?.trim() ?? "";
+    } catch {
+      return "";
+    }
+  };
+  const rebuilt = mergedOnto(baseBefore);
   if (rebuilt !== tree) {
-    mismatches.push(`its tree ${tree.slice(0, 8)} is not ${head.slice(0, 8)} merged onto ${base.slice(0, 8)} (${rebuilt ? rebuilt.slice(0, 8) : "that merge does not resolve"})`);
+    mismatches.push(`its tree ${tree.slice(0, 8)} is not ${head.slice(0, 8)} merged onto ${baseBefore.slice(0, 8)} (${rebuilt ? rebuilt.slice(0, 8) : "that merge does not resolve"})`);
+  }
+  if (movedTo !== undefined) {
+    const actual = mergedOnto(movedTo);
+    mismatches.push(`diagnostic only, not a pass: its tree ${tree.slice(0, 8)} ${actual === tree ? "is" : "is not"} ${head.slice(0, 8)} merged onto ${movedTo.slice(0, 8)}, the parent GitHub merged onto (${actual ? actual.slice(0, 8) : "that merge does not resolve"})`);
   }
   const branch = run("git", ["rev-list", `${base}..${head}`]).split("\n").filter(Boolean);
   for (const sha of branch) {
@@ -274,7 +307,7 @@ try {
     }
   }
   if (mismatches.length === 0) {
-    process.stdout.write(`  read back ${merged.slice(0, 7)}: parents ${base.slice(0, 7)} and ${head.slice(0, 7)}, tree ${tree.slice(0, 7)}, ` +
+    process.stdout.write(`  read back ${merged.slice(0, 7)}: parents ${baseBefore.slice(0, 7)} and ${head.slice(0, 7)}, tree ${tree.slice(0, 7)}, ` +
       `${recordLines} record line(s) kept on ${branch.length} branch commit(s), ${notesCarried} note(s) on origin\n`);
   }
 } catch (error) {

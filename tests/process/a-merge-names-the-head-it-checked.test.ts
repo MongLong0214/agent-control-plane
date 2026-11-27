@@ -64,9 +64,12 @@ if (args[0] === "pr" && args[1] === "view") {
   }
   if (flag("--match-head-commit") !== world.head) { process.stderr.write("Head branch was modified\n"); process.exit(1); }
   fs.writeFileSync(world.composed, flag("--subject") + "\n\n" + fs.readFileSync(flag("--body-file"), "utf8"));
-  const firstParent = world.tamper === "base" ? world.first : "refs/heads/main";
+  // Another merge lands on main inside this call, after the script read main and before GitHub composes.
+  if (world.moveMainDuring) origin("update-ref", "refs/heads/main", world.moveMainDuring);
+  const firstParent = world.tamper === "base" ? world.first : origin("rev-parse", "refs/heads/main");
   const tree = origin("merge-tree", "--write-tree", firstParent, world.tamper === "tree" ? world.first : world.head).split("\n")[0];
-  const parents = world.tamper === "squash" ? ["-p", firstParent] : ["-p", firstParent, "-p", world.head];
+  const secondParent = world.tamper === "head" ? world.first : world.head;
+  const parents = world.tamper === "squash" ? ["-p", firstParent] : ["-p", firstParent, "-p", secondParent];
   const merged = origin("commit-tree", tree, ...parents, "-F", world.composed);
   origin("update-ref", "refs/heads/main", merged);
   fs.writeFileSync(world.state, JSON.stringify({ merged }));
@@ -95,13 +98,19 @@ if (args[0] === "sync") {
 `;
 
 interface Options {
-  readonly tamper?: "squash" | "base" | "tree";
+  /** `head`: the second parent is a branch commit, not the checked head. */
+  readonly tamper?: "squash" | "base" | "tree" | "head";
   readonly noSync?: boolean;
   readonly apiMerged?: boolean;
   readonly headRefOid?: string;
   readonly baseRefOid?: string;
   /** The base gains a commit after the head's green run, so the head no longer contains the base tip. */
   readonly advanceBase?: boolean;
+  /**
+   * main gains another merge, `before` the script runs while GitHub's baseRefOid still names the old
+   * base (#1504), or `during` the merge call, after the script read main.
+   */
+  readonly advanceMain?: "before" | "during";
 }
 
 const mergeWorld = (options: Options = {}) => {
@@ -138,6 +147,16 @@ const mergeWorld = (options: Options = {}) => {
     git(other, "push", "--quiet", "--no-verify", "origin", "main");
     baseRefOid = git(other, "rev-parse", "HEAD");
   }
+  let advanced: string | undefined;
+  if (options.advanceMain !== undefined) {
+    const other = join(dir, "other");
+    git(dir, "clone", "--quiet", "-b", "main", origin, other);
+    writeFileSync(join(other, "c.txt"), "another merge lands on main\n");
+    git(other, "add", "--all");
+    git(other, "commit", "--quiet", "--no-verify", "-m", "another merge lands on main");
+    advanced = git(other, "rev-parse", "HEAD");
+    git(other, "push", "--quiet", "--no-verify", "origin", options.advanceMain === "before" ? "HEAD:refs/heads/main" : "HEAD:refs/fixture/moved");
+  }
   git(work, "remote", "set-url", "origin", "git@github.com:test/repo.git");
   const bin = join(dir, "bin");
   mkdirSync(bin);
@@ -155,8 +174,9 @@ const mergeWorld = (options: Options = {}) => {
     origin, base, first, head, number: 8, ...files,
     tamper: options.tamper, noSync: options.noSync ?? false, apiMerged: options.apiMerged,
     headRefOid: options.headRefOid, baseRefOid,
+    moveMainDuring: options.advanceMain === "during" ? advanced : undefined,
   }));
-  return { dir, origin, work, base, first, head, files };
+  return { dir, origin, work, base, first, head, files, advanced: advanced ?? "" };
 };
 
 type MergeWorld = ReturnType<typeof mergeWorld>;
@@ -238,6 +258,51 @@ describe("a pull request merges as a merge commit, and is read back as one", () 
 
   it("fails loudly when GitHub does not report the pull request merged", () => {
     expectLoud(merge(mergeWorld({ apiMerged: false })), "GitHub does not report #8 as merged");
+  });
+});
+
+describe("the read-back is pinned to main as read right before the merge call, and the checked head", () => {
+  const atOrigin = (w: MergeWorld, ...args: readonly string[]): string => git(w.work, "--git-dir", w.origin, ...args);
+  const parentsOf = (w: MergeWorld, sha: string): string[] => atOrigin(w, "rev-list", "--parents", "-n", "1", sha).split(" ").slice(1);
+
+  it("passes when main moved on before the merge while GitHub's baseRefOid still named the older base (#1504)", () => {
+    const w = mergeWorld({ advanceMain: "before" });
+    const result = merge(w);
+    expect(result.status, result.stdout).toBe(0);
+    expect(result.merges).toHaveLength(1);
+    const merged = result.merged ?? "";
+    expect(parentsOf(w, merged)).toEqual([w.advanced, w.head]);
+    expect(atOrigin(w, "rev-parse", `${merged}^{tree}`)).toBe(atOrigin(w, "merge-tree", "--write-tree", w.advanced, w.head));
+    expect(result.stdout).toContain(`read back ${merged.slice(0, 7)}: parents ${w.advanced.slice(0, 7)} and ${w.head.slice(0, 7)}`);
+    expect(result.stdout).not.toContain("MAIN_MOVED_DURING_MERGE");
+    expect(result.stdout).toContain(`RESULT: PASS — #8 merged at ${w.head.slice(0, 7)}.`);
+  });
+
+  it("reports MAIN_MOVED_DURING_MERGE and does not pass or retry when main moved during the merge call", () => {
+    const w = mergeWorld({ advanceMain: "during" });
+    const result = merge(w);
+    const merged = result.merged ?? "";
+    const tree = atOrigin(w, "rev-parse", `${merged}^{tree}`).slice(0, 8);
+    expect(parentsOf(w, merged)).toEqual([w.advanced, w.head]);
+    expectLoud(result, `MAIN_MOVED_DURING_MERGE: main was ${w.base.slice(0, 8)} right before the merge call and GitHub merged onto ${w.advanced.slice(0, 8)}`);
+    expect(result.stdout).toContain("The merge is not retried");
+    expect(result.stdout).toContain(`its tree ${tree} is not ${w.head.slice(0, 8)} merged onto ${w.base.slice(0, 8)}`);
+    expect(result.stdout).toContain(`diagnostic only, not a pass: its tree ${tree} is ${w.head.slice(0, 8)} merged onto ${w.advanced.slice(0, 8)}`);
+  });
+
+  it("fails when the tree is not the checked head merged onto main as read before the call", () => {
+    const w = mergeWorld({ advanceMain: "before", tamper: "tree" });
+    const result = merge(w);
+    expectLoud(result, `is not ${w.head.slice(0, 8)} merged onto ${w.advanced.slice(0, 8)}`);
+    expect(result.stdout).not.toContain("MAIN_MOVED_DURING_MERGE");
+  });
+
+  it("fails when the second parent is not the checked head", () => {
+    const w = mergeWorld({ advanceMain: "before", tamper: "head" });
+    const result = merge(w);
+    expectLoud(result, `parents are [${w.advanced.slice(0, 8)}, ${w.first.slice(0, 8)}], not the base and head checked, [${w.advanced.slice(0, 8)}, ${w.head.slice(0, 8)}]`);
+    expect(result.stdout).toContain(`the head checked, ${w.head.slice(0, 8)}, is not an ancestor`);
+    expect(result.stdout).not.toContain("MAIN_MOVED_DURING_MERGE");
   });
 });
 
