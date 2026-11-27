@@ -1,8 +1,10 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
-import { chmodSync, writeFileSync } from "node:fs";
+import { chmodSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { main as cliMain } from "../../src/cli/agentctl.ts";
+import { runCtoCommand, type CtoPorts } from "../../src/cli/cto-command.ts";
+import { deny } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 import { makeStartedOperator, TEST_OPERATOR_TOKEN, type StartedOperator } from "../helpers/harness.ts";
@@ -89,6 +91,23 @@ describe("agentctl ACP_OPERATOR_TOKEN_FILE", () => {
     });
   });
 
+  it("refuses a symlink to a valid 0600 file", async () => {
+    const target = tokenFile(TEST_OPERATOR_TOKEN, 0o600);
+    const link = join(tempDir("acp-operator-token-link-"), "operator.token");
+    symlinkSync(target, link);
+    const { code, answer } = await status({ ACP_OPERATOR_TOKEN_FILE: link });
+    expect(code).toBe(1);
+    expect(answer).toMatchObject({ allowed: false, reasonCode: ReasonCode.OPERATOR_UNAUTHENTICATED });
+    expect(String(answer["message"])).toMatch(/symbolic link/);
+  });
+
+  it("refuses an empty 0600 file", async () => {
+    const { code, answer } = await status({ ACP_OPERATOR_TOKEN_FILE: tokenFile(" \n", 0o600) });
+    expect(code).toBe(1);
+    expect(answer).toMatchObject({ allowed: false, reasonCode: ReasonCode.OPERATOR_UNAUTHENTICATED });
+    expect(String(answer["message"])).toMatch(/it is empty/);
+  });
+
   it("lets ACP_OPERATOR_TOKEN win over a named file, which is then never opened", async () => {
     const wrong = await status({
       ACP_OPERATOR_TOKEN: "not-the-daemons-operator-token",
@@ -102,5 +121,36 @@ describe("agentctl ACP_OPERATOR_TOKEN_FILE", () => {
     });
     expect(right.code).toBe(0);
     expect(right.answer).toHaveProperty("mode");
+  });
+});
+
+// `cto --apply` checks for a credential before it asks the daemon to authenticate one. A daemon that refuses with its own
+// reason shows the check passed; a refusal naming the variables shows it did not, and then the daemon is never asked.
+describe("agentctl cto --apply resolves the credential the same way", () => {
+  const apply = async (env: Record<string, string>): Promise<{ code: number; refused: string; asked: number }> => {
+    const out: Array<{ refused?: string }> = [];
+    let asked = 0;
+    const ports = {
+      env,
+      write: (value: { refused?: string }) => { out.push(value); },
+      operator: { request: async () => { asked++; return deny(ReasonCode.CONFLICT, "daemon stub"); } },
+    } as unknown as CtoPorts;
+    const code = await runCtoCommand(["relaunch", "p1", "--apply"], ports);
+    return { code, refused: String(out.at(-1)?.refused), asked };
+  };
+
+  it("accepts an explicitly named 0600 file and goes on to ask the daemon", async () => {
+    const result = await apply({ ACP_OPERATOR_TOKEN_FILE: tokenFile(TEST_OPERATOR_TOKEN, 0o600) });
+    expect(result.asked).toBe(1);
+    expect(result.refused).toMatch(/daemon did not authenticate this credential \(CONFLICT\)/);
+  });
+
+  it("refuses with neither variable set, and with a file that is not 0600, before asking the daemon", async () => {
+    const none = await apply({});
+    expect(none).toMatchObject({ code: 2, asked: 0 });
+    expect(none.refused).toMatch(/needs ACP_OPERATOR_TOKEN or ACP_OPERATOR_TOKEN_FILE/);
+    const loose = await apply({ ACP_OPERATOR_TOKEN_FILE: tokenFile(TEST_OPERATOR_TOKEN, 0o644) });
+    expect(loose).toMatchObject({ code: 2, asked: 0 });
+    expect(loose.refused).toMatch(/ACP_OPERATOR_TOKEN_FILE is refused: .*beyond its owner/);
   });
 });

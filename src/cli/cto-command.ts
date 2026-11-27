@@ -13,6 +13,7 @@ import {
 import { fallbackHandoff, firstPromptOf, handoffPackageOf, markHandoff, readHandoff, writeHandoff } from "../cto/cto-conversation.ts";
 import { residentWorkerCheckoutPath } from "../core/resident-allocation-paths.ts";
 import { daemonBuzzSigner } from "../outbox/ceo-buzz-signer.ts";
+import { readOperatorToken } from "./operator-token.ts";
 import { BUZZ_CHANNEL_SERVER, CHANNEL_DEV_FLAG, channelEmittedBy, channelLaunchArgs, confirmChannelStartup, launchFolderTrust, tmuxChannelDriver } from "../runtime/cto-channel-launch.ts";
 import { readHostProvisionerReason, recordedResidentExitStatus } from "../runtime/host-provisioner-reason.ts";
 
@@ -33,7 +34,7 @@ import { readHostProvisionerReason, recordedResidentExitStatus } from "../runtim
  * stops the run. Each step's "already done" is read from the world, so running the same command again continues where
  * it stopped. The one thing kept between runs is a canonical relaunch's target conversation, until it is verified.
  *
- * Operator only. `--apply` needs ACP_OPERATOR_TOKEN, which every CTO launch shell unsets and which the daemon must
+ * Operator only. `--apply` needs ACP_OPERATOR_TOKEN (or ACP_OPERATOR_TOKEN_FILE), which every CTO launch shell unsets and which the daemon must
  * authenticate before any step runs, and none of this is a tool on a CTO's acp-cto surface: a CTO cannot retire or
  * relaunch another.
  */
@@ -507,7 +508,7 @@ const writeCanonicalLauncher = (ports: CtoPorts, projectId: string, plan: Canoni
     }),
     ...plan.resume];
   ports.files.replace(canonicalLauncherOf(ports, projectId), `#!/bin/sh\n# cto-launch: ${JSON.stringify(plan)}\n` +
-    "unset ACP_OPERATOR_TOKEN ACP_MCP_TOKEN ACP_BUZZ_INGRESS_SECRET GH_TOKEN GITHUB_TOKEN\n" +
+    "unset ACP_OPERATOR_TOKEN ACP_OPERATOR_TOKEN_FILE ACP_MCP_TOKEN ACP_BUZZ_INGRESS_SECRET GH_TOKEN GITHUB_TOKEN\n" +
     `cd ${quoteShell(plan.cwd)} || exit 1\nexec ${argv.map(quoteShell).join(" ")}\n`, 0o700);
   return argv;
 };
@@ -1379,10 +1380,15 @@ export const runCtoCommand = async (args: readonly string[], ports: CtoPorts): P
   if (positional.length !== 1 || !PROJECT_ID.test(positional[0]!)) return refuse(ports, `cto ${sub} takes exactly one project id`);
   const projectId = positional[0]!;
   const apply = flags.has("--apply");
-  // Operator only: a CTO's launch shell unsets ACP_OPERATOR_TOKEN, so a CTO cannot apply any of these. A token that is
+  // Operator only: a CTO's launch shell unsets ACP_OPERATOR_TOKEN and ACP_OPERATOR_TOKEN_FILE, so a CTO cannot apply any of these. A token that is
   // merely set proves nothing, and several steps change the host without the daemon, so before any of them the daemon
   // must authenticate it: one read-only request over the operator socket. Every --apply asks, cleanup-only reruns included.
-  if (apply && !ports.env["ACP_OPERATOR_TOKEN"]) return refuse(ports, "--apply is operator only and needs ACP_OPERATOR_TOKEN; nothing was changed");
+  // The credential is resolved as agentctl resolves it (ACP_OPERATOR_TOKEN, else an explicitly named ACP_OPERATOR_TOKEN_FILE).
+  if (apply) {
+    const credential = readOperatorToken(ports.env);
+    if (!credential.allowed) return refuse(ports, `--apply is operator only: ${credential.message}`);
+    if (!credential.value) return refuse(ports, "--apply is operator only and needs ACP_OPERATOR_TOKEN or ACP_OPERATOR_TOKEN_FILE; nothing was changed");
+  }
   if (apply) {
     const authenticated = await ports.operator.request("daemon.status", {});
     if (!authenticated.allowed) return refuse(ports, `--apply is operator only: the daemon did not authenticate this credential (${authenticated.reasonCode}); nothing was changed`);

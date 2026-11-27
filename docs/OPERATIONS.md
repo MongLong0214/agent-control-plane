@@ -69,11 +69,12 @@ shell, so pass it deliberately when you need to ask the daemon anything.
 
 An operator shell can name a credential file instead of exporting the token: set
 `ACP_OPERATOR_TOKEN_FILE=<path>`. `agentctl` reads it only when `ACP_OPERATOR_TOKEN` is unset (the
-variable still wins), refuses it unless it is a regular file you own with no group or other
-permission bits (0600), and reads nothing when neither variable is set. The daemon's own credential
-is the login Keychain item `com.agentcontrolplane.agentcpd` / `ACP_OPERATOR_TOKEN`, not a file, so
-write the file once without printing it:
-`(umask 077; security find-generic-password -s com.agentcontrolplane.agentcpd -a ACP_OPERATOR_TOKEN -w > ~/.agent-control-plane/operator.token)`.
+variable still wins; `agentctl cto --apply` resolves it the same way), refuses it unless it is a
+non-empty regular file, not a symlink, that you own with no group or other permission bits (0600),
+and reads nothing when neither variable is set. CTO launch shells unset both variables. The
+daemon's own credential is the login Keychain item `com.agentcontrolplane.agentcpd` /
+`ACP_OPERATOR_TOKEN`, not a file, so write the file once without printing it:
+`(umask 077; mkdir -p -m 700 ~/.agent-control-plane && security find-generic-password -s com.agentcontrolplane.agentcpd -a ACP_OPERATOR_TOKEN -w > ~/.agent-control-plane/operator.token && chmod 600 ~/.agent-control-plane/operator.token)`.
 
 A lock read is weaker evidence than a socket answer in two ways: it does not check that its
 pid is alive, and a parked daemon holds its lock exactly like a dispatching one. A daemon
