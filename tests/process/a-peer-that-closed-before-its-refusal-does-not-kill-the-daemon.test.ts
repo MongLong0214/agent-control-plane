@@ -67,7 +67,7 @@ describe("a peer that closed before the daemon refused it", () => {
 
   it("does not kill the daemon on the adopted CEO tool socket", async () => {
     const dir = root();
-    const listener = await startAdoptedCeoToolListener({ lock: { held: () => true } }, dir, async () => allow(ReasonCode.OK, {}), () => undefined);
+    const listener = await startAdoptedCeoToolListener({ lock: { held: () => true } }, dir, async () => allow(ReasonCode.OK, {} as never), () => undefined);
     listeners.push(listener);
     await peerGoneWhenIdentified(listener.socketPath);
     expect(uncaught).toEqual([]);

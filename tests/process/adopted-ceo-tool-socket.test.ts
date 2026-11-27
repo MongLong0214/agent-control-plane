@@ -28,6 +28,7 @@ import {
   ADOPTED_CEO_TOOL_SOCKET_FILENAME,
   MAX_SUN_PATH_BYTES,
   startAdoptedCeoToolListener,
+  type CanonicalCtoAdmittedTuple,
   type CanonicalSelfClaimListener,
 } from "../../src/daemon/canonical-self-claim-listener.ts";
 import { allow, type Decision } from "../../src/core/errors.ts";
@@ -248,18 +249,21 @@ const initialized = async (path: string): Promise<Relay> => {
 };
 
 describe("closing a kernel-peer listener does not wait on its connections (PR1046-R3)", () => {
-  it("closes with an admitted relay still attached, and the relay sees its stream end", async () => {
+  it("closes with an admitted relay still attached, and the relay outlives its connection", async () => {
     const { tools } = await started(true);
     const r = await initialized(tools.socketPath);
     // The Gateway is alive and the relay's stdin stays open: nothing on the client side ends this.
     expect(await settles(tools.close().then(() => 0))).toBe(0);
-    expect(await settles(r.exit)).toBe(ATTACH_EXIT.STREAM_CLOSED);
+    // A closed door is a daemon going away, which the relay waits out to reattach; its client ends it.
+    expect(await settles(r.exit, 500)).toBe("did-not-settle");
+    r.stdin.end();
+    expect(await settles(r.exit)).toBe(ATTACH_EXIT.OK);
   });
 
   it("closes while an admission is still deciding, and serves nothing once it decides", async () => {
     const dir = stateDir();
-    let decide: (decision: Decision<string>) => void = () => undefined;
-    const pending = new Promise<Decision<string>>((resolve) => {
+    let decide: (decision: Decision<CanonicalCtoAdmittedTuple>) => void = () => undefined;
+    const pending = new Promise<Decision<CanonicalCtoAdmittedTuple>>((resolve) => {
       decide = resolve;
     });
     let served = 0;
@@ -277,7 +281,7 @@ describe("closing a kernel-peer listener does not wait on its connections (PR104
     for (let wait = 0; admissions === 0 && wait < 100; wait += 1) await new Promise((resolve) => setTimeout(resolve, 10));
     expect(admissions).toBe(1);
     expect(await settles(listener.close().then(() => 0))).toBe(0);
-    decide(allow(ReasonCode.OK, "admitted after the close"));
+    decide(allow(ReasonCode.OK, { roleKey: CEO, assignmentId: "a", bindingGeneration: 1, sessionId: "s", sessionIncarnation: "i" }));
     await ended;
     await new Promise((resolve) => setTimeout(resolve, 20));
     expect(served).toBe(0);
