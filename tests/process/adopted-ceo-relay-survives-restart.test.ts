@@ -352,6 +352,56 @@ describe("what a reconnect may carry", () => {
     expect(daemon.lines[1]).toEqual([]);
   });
 
+  it.each([
+    { differs: "CEO session", admitted: { ...TUPLE, sessionId: "another-ceo-session" } },
+    { differs: "role key", admitted: { ...TUPLE, roleKey: "PRIMARY_CTO:another-project" } },
+  ])("forwards nothing to a restarted daemon that names the same generation and another $differs", async ({ admitted }) => {
+    expect(admitted.bindingGeneration).toBe(TUPLE.bindingGeneration);
+    const daemon = await standInDaemon(TUPLE);
+    const r = inProcessRelay(daemon.socketPath);
+    await r.initialize();
+    expect((await r.request("tools/list", {})).error).toBeUndefined();
+
+    await daemon.stop();
+    await sleep(LOSS_SEEN_MS);
+    const write = r.request("tools/call", runCreate("held-for-another-binding"));
+    await daemon.start(admitted);
+
+    expect(await settles(r.exit)).toBe(ATTACH_EXIT.HANDSHAKE_REFUSED);
+    expect(r.err()).toBe("attach: reattach admitted another binding\n");
+    expect((await write).error).toMatchObject({ code: RELAY_REATTACHING_ERROR, message: expect.stringContaining("not sent") });
+    // Admitted, and sent not one byte: no replayed initialize, no ping, no held write.
+    expect(daemon.lines).toHaveLength(2);
+    expect(daemon.lines[1]).toEqual([]);
+  });
+
+  it("delivers a write that arrived while the link was down exactly once, after reconnecting under the same binding", async () => {
+    const daemon = await standInDaemon(TUPLE);
+    const r = inProcessRelay(daemon.socketPath);
+    await r.initialize();
+    await vi.waitFor(() => expect(methodsOf(daemon.lines[0])).toContain("notifications/initialized"));
+
+    await daemon.stop();
+    await sleep(LOSS_SEEN_MS);
+    // Written into the gap: no daemon has seen it, so it is held rather than answered.
+    const write = r.request("tools/call", runCreate("held-in-the-gap"));
+    await sleep(LOSS_SEEN_MS);
+    await daemon.start();
+
+    const answered = await write;
+    expect(answered.error).toBeUndefined();
+    expect(answered.result).toEqual({ answeredBy: "stand-in" });
+    // Long enough for a second delivery to show if there were one.
+    await sleep(500);
+    expect(methodsOf(daemon.lines[0])).toEqual(["initialize", "notifications/initialized"]);
+    expect(methodsOf(daemon.lines[1])).toEqual(["initialize", "notifications/initialized", "ping", "tools/call"]);
+    expect(daemon.lines.flat().filter((line) => line.includes("held-in-the-gap"))).toHaveLength(1);
+    expect(r.received.filter((message) => message.id === 2)).toHaveLength(1);
+    expect(r.err()).toBe("");
+    r.stdin.end();
+    expect(await settles(r.exit)).toBe(ATTACH_EXIT.OK);
+  });
+
   it("answers a write that was on the lost connection, never sends it again, and serves the next call", async () => {
     const daemon = await standInDaemon(TUPLE, (method) => method === "tools/call");
     const r = inProcessRelay(daemon.socketPath);
