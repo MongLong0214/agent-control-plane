@@ -8,6 +8,7 @@ import { fileURLToPath } from "node:url";
 import { defaultConfig } from "../app/control-plane.ts";
 import { AUTO_GENERATION, runAdoptedCeoAttachRelay, runAttachRelayCommand, type AttachRelayClaim } from "./attach-relay.ts";
 import { createCtoPorts, runCtoCommand } from "./cto-command.ts";
+import { readOperatorToken } from "./operator-token.ts";
 import { digestOf } from "../core/digest.ts";
 import { type Decision, deny, isAcpError } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
@@ -214,10 +215,15 @@ export const main = async (argv: string[]): Promise<number> => {
   const owner = rest.includes("--owner");
   const args = command === "adopt" ? rest : rest.filter((arg) => arg !== "--owner");
 
+  const operatorToken = readOperatorToken(process.env);
+  if (!operatorToken.allowed) {
+    print(operatorToken);
+    return 1;
+  }
   const client = createOperatorClient({
     socketPath:
       process.env["ACP_OPERATOR_SOCKET"] ?? join(config.databasePath, "..", "agentcpd.operator.sock"),
-    token: process.env["ACP_OPERATOR_TOKEN"],
+    token: operatorToken.value,
   });
 
   // The CTO lifecycle group composes the operator methods below with host steps; it reads the token from this
@@ -856,7 +862,7 @@ const exchangeOperatorRequest = (
     return Promise.resolve(
       deny(
         ReasonCode.OPERATOR_UNAUTHENTICATED,
-        "agentctl needs the separately provisioned ACP_OPERATOR_TOKEN to reach agentcpd",
+        "agentctl needs the separately provisioned ACP_OPERATOR_TOKEN (or ACP_OPERATOR_TOKEN_FILE) to reach agentcpd",
         { socketPath: options.socketPath },
       ),
     );
