@@ -244,7 +244,7 @@ describe("repository_blob_get", () => {
 
   it("(b) refuses a wrong or unregistered repository, a URL or remote in place of the registry key, before asking GitHub", async () => {
     expect(await blobAt({ projectId: "not-a-project", commit: HEAD, path: "README.md" })).toMatchObject({ ok: false, reasonCode: ReasonCode.NOT_FOUND });
-    for (const projectLike of ["https://github.com/acme/fixture", "github:acme/fixture", "acme/fixture", "../blob-read", "/Users/isaac/projects/x"]) {
+    for (const projectLike of ["https://github.com/acme/fixture", "github:acme/fixture", "acme/fixture", "../blob-read", "/home/fixture/projects/x"]) {
       expect(await blobAt({ projectId: projectLike, commit: HEAD, path: "README.md" }), projectLike)
         .toMatchObject({ ok: false, reasonCode: ReasonCode.INVALID_ARGUMENT });
     }
