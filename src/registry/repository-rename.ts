@@ -3,7 +3,7 @@ import { existsSync } from "node:fs";
 
 import type { Clock } from "../core/clock.ts";
 import { canonicalJson } from "../core/digest.ts";
-import { allow, deny, type Decision } from "../core/errors.ts";
+import { allow, deny, isAcpError, type Decision } from "../core/errors.ts";
 import { normalizeRemoteIdentity } from "../core/ids.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import { assertPortableManifest, manifestDigest, type ProjectManifest } from "../contracts/manifest.ts";
@@ -20,7 +20,8 @@ import { parseGitHubIdentity, type ObservedRepository, type GitHubRepositoryTarg
  * GitHub keeps a repository's node id across a rename and answers the old path with a redirect, which ACP's
  * transport refuses, so every call ACP builds from the old `github:owner/name` fails once the owner renames
  * it. This adopts the new name for the same repository, and only for it: GitHub must answer the new name
- * with the node id the project's resident allocation recorded, and the new name as its full name. The
+ * with the node id the project's resident allocation recorded (for a repository no allocation names, the one
+ * GitHub answered at its operator registration, `recordRegisteredNodeId`), and the new name as its full name. The
  * project must be quiet — no unfinished run, HELD claim or PENDING receipt of the repository — so nothing
  * in flight needs to accept either name, and no CI check is widened: new evidence must name the new full
  * name exactly, as the kernel already requires.
@@ -40,6 +41,40 @@ import { parseGitHubIdentity, type ObservedRepository, type GitHubRepositoryTarg
  * `repositoryIdentities` (or `currentRepositoryIdentity` for the allocation), or a row written before a rename
  * stops being the repository's.
  */
+
+/**
+ * The audit kind holding the node id GitHub answered for a repository at its operator registration. An
+ * append-only event rather than a `repositories` column, which would take a schema version for one value.
+ * The rename trusts it, so nothing but `recordRegisteredNodeId` writes this kind.
+ */
+export const REPOSITORY_NODE_ID_RECORDED = "REPOSITORY_NODE_ID_RECORDED";
+
+/**
+ * Why `recordRegisteredNodeId` recorded nothing: a fixed code and at most GitHub's HTTP status, rather than
+ * the error's text or anything of GitHub's answer, which can carry a request header or a private body.
+ */
+export const RepositoryNodeIdUnrecorded = {
+  NOT_GITHUB_REPOSITORY: "NODE_ID_NOT_GITHUB_REPOSITORY",
+  LOOKUP_FAILED: "NODE_ID_LOOKUP_FAILED",
+  NOT_ON_GITHUB: "NODE_ID_NOT_ON_GITHUB",
+  /** GitHub answers the registered name with another full name. */
+  OTHER_FULL_NAME: "NODE_ID_OTHER_FULL_NAME",
+  /** The repository row changed while GitHub was asked. */
+  STATE_MOVED: "NODE_ID_STATE_MOVED",
+  ALREADY_RECORDED: "NODE_ID_ALREADY_RECORDED",
+  AUDIT_REFUSED: "NODE_ID_AUDIT_REFUSED",
+} as const;
+
+export interface NodeIdUnrecorded {
+  code: (typeof RepositoryNodeIdUnrecorded)[keyof typeof RepositoryNodeIdUnrecorded];
+  status?: number;
+}
+
+/** GitHub's HTTP status on a failed read, when the transport named one; nothing else of the error. */
+const httpStatusOf = (error: unknown): number | undefined => {
+  const status = isAcpError(error) ? error.evidence["status"] : undefined;
+  return typeof status === "number" && Number.isInteger(status) && status >= 100 && status <= 599 ? status : undefined;
+};
 
 /** Why a rename was refused: one stable code per refusal, in `evidence.refusal`. */
 export const RepositoryRenameRefusal = {
@@ -204,6 +239,41 @@ export class RepositoryRenames {
     this.runGit = ports.git ?? ((cwd, args) => git(cwd, args, { allowFailure: true }));
   }
 
+  /**
+   * Records the node id GitHub answers for a repository the operator has just registered, so a later rename
+   * can show a new name is the same repository. It is read at the exact registered `owner/name` and kept only
+   * when GitHub answers that name as the repository's own full name. Anything else (not a GitHub repository,
+   * no repository there, a redirect, an unreadable answer, another full name) records nothing: the
+   * registration stands as it did before, and a rename of the repository stays refused.
+   */
+  async recordRegisteredNodeId(repositoryId: string): Promise<{ repositoryNodeId: string | null; unrecorded?: NodeIdUnrecorded }> {
+    const unrecorded = (code: NodeIdUnrecorded["code"], status?: number) =>
+      ({ repositoryNodeId: null, unrecorded: { code, ...(status === undefined ? {} : { status }) } });
+    const registered = () => this.ports.db.get<{ identity: string; project_id: string | null }>(
+      `SELECT identity, project_id FROM repositories WHERE repository_id = ? AND registration = 'REGISTERED' AND retired_at IS NULL`,
+      [repositoryId]);
+    const repository = registered();
+    const target = repository === undefined ? null : parseGitHubIdentity(repository.identity);
+    if (repository === undefined || target === null || target.ref !== null) return unrecorded(RepositoryNodeIdUnrecorded.NOT_GITHUB_REPOSITORY);
+    let observed: ObservedRepository | null;
+    try {
+      observed = await this.ports.github.observeRepository({ owner: target.owner, name: target.name });
+    } catch (error) {
+      return unrecorded(RepositoryNodeIdUnrecorded.LOOKUP_FAILED, httpStatusOf(error));
+    }
+    if (observed === null) return unrecorded(RepositoryNodeIdUnrecorded.NOT_ON_GITHUB, 404);
+    if (!sameIdentity(`github:${observed.fullName}`, repository.identity)) return unrecorded(RepositoryNodeIdUnrecorded.OTHER_FULL_NAME);
+    // Read again after the await: still this repository under this name, and nothing recorded for it meanwhile.
+    if (registered()?.identity !== repository.identity) return unrecorded(RepositoryNodeIdUnrecorded.STATE_MOVED);
+    if (this.registeredNodeIds(repositoryId, repository.identity).length > 0) return unrecorded(RepositoryNodeIdUnrecorded.ALREADY_RECORDED);
+    const recorded = this.ports.audit.record({
+      kind: REPOSITORY_NODE_ID_RECORDED,
+      projectId: repository.project_id,
+      evidence: { repositoryId, identity: repository.identity, repositoryNodeId: observed.nodeId },
+    });
+    return recorded.allowed ? { repositoryNodeId: observed.nodeId } : unrecorded(RepositoryNodeIdUnrecorded.AUDIT_REFUSED);
+  }
+
   async rename(request: RepositoryRenameRequest): Promise<Decision<RepositoryRenamePlan>> {
     const { db } = this.ports;
     const role = request.role ?? "primary";
@@ -277,8 +347,11 @@ export class RepositoryRenames {
     try {
       observed = await this.ports.github.observeRepository({ owner: target.owner, name: target.name });
     } catch (error) {
+      // The fixed refusal and at most GitHub's HTTP status, rather than the error's text, which can carry a
+      // request header or a private body.
+      const status = httpStatusOf(error);
       return refuse(ReasonCode.INTERNAL_ERROR, RepositoryRenameRefusal.GITHUB_UNREADABLE, "GitHub's answer for the new name could not be read; nothing was changed", {
-        to, error: (error instanceof Error ? error.message : String(error)).slice(0, 300),
+        to, ...(status === undefined ? {} : { status }),
       });
     }
     if (observed === null) {
@@ -386,8 +459,29 @@ export class RepositoryRenames {
     ) ? row : null;
   }
 
+  /**
+   * The node ids `recordRegisteredNodeId` recorded for this repository row under the exact name it was
+   * registered with: its first rename's `from`, or its name when it has none. Distinct.
+   */
+  private registeredNodeIds(repositoryId: string, identity: string): unknown[] {
+    return this.ports.db.all<{ nodeId: unknown }>(
+      `SELECT DISTINCT json_extract(e.evidence_json, '$.repositoryNodeId') AS nodeId FROM audit_events e
+        WHERE e.kind = ? AND json_extract(e.evidence_json, '$.repositoryId') = ?
+          AND json_extract(e.evidence_json, '$.identity') = COALESCE(
+            (SELECT r.from_identity FROM repository_identity_renames r WHERE r.repository_id = ? ORDER BY r.sequence LIMIT 1), ?)`,
+      [REPOSITORY_NODE_ID_RECORDED, repositoryId, repositoryId, identity],
+    ).map((row) => row.nodeId);
+  }
+
+  /**
+   * The resident allocation's node id when an allocation names this repository, whatever it holds; otherwise
+   * the one node id recorded at its operator registration. Neither fills in for the other, and registration
+   * records that disagree are none.
+   */
   private recordedNodeId(projectId: string, repository: RepositoryRow): string | null {
-    const nodeId = this.allocation(projectId, repository)?.nodeId;
+    const allocation = this.allocation(projectId, repository);
+    const registered = allocation === null ? this.registeredNodeIds(repository.repository_id, repository.identity) : [];
+    const nodeId = allocation !== null ? allocation.nodeId : registered.length === 1 ? registered[0] : null;
     return typeof nodeId === "string" && /^[\x21-\x7e]{1,256}$/.test(nodeId) ? nodeId : null;
   }
 

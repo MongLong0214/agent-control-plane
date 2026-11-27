@@ -9,7 +9,7 @@ import { digestOf, sha256 } from "../../src/core/digest.ts";
 import { acpError, allow } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import type { ProjectManifest } from "../../src/contracts/manifest.ts";
-import { Daemon } from "../../src/daemon/daemon.ts";
+import { Daemon, OPERATOR_METHOD, type AuthenticatedOperatorPeer } from "../../src/daemon/daemon.ts";
 import { startOperatorSocket } from "../../src/daemon/agentcpd.ts";
 import { ApprovedRunFinalizer } from "../../src/daemon/finalizer.ts";
 import { ExecutionMode, Role, RunKind, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
@@ -18,11 +18,12 @@ import { type GitHubClient, proveActionsCheckProvenance } from "../../src/github
 import { canonical } from "../../src/guard/workspace-probe.ts";
 import { projectCi } from "../../src/registry/project-ci.ts";
 import {
-  RepositoryRenameRefusal, RepositoryRenames, renameManifestDiff, renamedManifest, type RepositoryRenamePlan,
+  REPOSITORY_NODE_ID_RECORDED, RepositoryNodeIdUnrecorded, RepositoryRenameRefusal, RepositoryRenames, renameManifestDiff, renamedManifest, type RepositoryRenamePlan,
 } from "../../src/registry/repository-rename.ts";
 import { identityChain } from "../../src/registry/repository-identity-chain.ts";
 import { residentRepositories } from "../../src/registry/resident-repositories.ts";
 import { WorkScopeTracking } from "../../src/run/work-scope-tracking.ts";
+import { createRun, firstManifest, rawFirstActivation, unitTestsWorkflow } from "../helpers/first-activation.ts";
 import { cleanupTempDirs, gitSync, makeRepo, tempDir } from "../helpers/fixtures.ts";
 import {
   TEST_MCP_TOKEN, TEST_OPERATOR_TOKEN, TEST_OWNER, bindCeo, fixtureManifest, makeHarness, registerFixtureProject, type Harness,
@@ -672,5 +673,241 @@ describe("v61 — a repository renamed on GitHub is adopted for the same reposit
     expect([originOf(w.checkoutPath), originOf(w.clonePath)]).toEqual([
       "https://github.com/MongLong0214/youtube-factory.git", "git@github.com:MongLong0214/youtube-factory.git",
     ]);
+  });
+});
+
+/**
+ * A repository the operator registered (`agentctl project register`) has no resident allocation, so its node
+ * id is the one GitHub answers at registration, read at the exact registered name: the rename then checks a
+ * new name against it as it checks an allocation's. GitHub's answer at the old name, before the owner renamed
+ * it there, is the fixture's answer with the old name.
+ */
+describe("an operator-registered repository: its node id is GitHub's answer at registration", () => {
+  const PEER: AuthenticatedOperatorPeer = { channel: "cli", peerId: "cli:fixture-operator", actor: "fixture-operator", incarnation: "incarnation-1" };
+  const renamedAnswer = FIXTURE.responses.find((response) => response.status === 200)!;
+  /** GitHub before the owner renamed the repository there: the old name answers 200 as itself. */
+  const beforeRename = (body: Record<string, unknown> = {}): Recorded => ({
+    method: "GET", path: `repos/${FIXTURE.renamed.from}`, status: 200,
+    body: { ...renamedAnswer.body, name: "myeotnyeon", full_name: FIXTURE.renamed.from, ...body },
+  });
+  const recordedNodeIds = (h: Harness) => h.cp.audit.byKind(REPOSITORY_NODE_ID_RECORDED).map((entry) => entry.evidence);
+  /** Everything written to stdout, stderr or the console until `restore`. */
+  const captureOutput = () => {
+    const output: string[] = [];
+    const capture = (...chunks: unknown[]) => { output.push(chunks.map((chunk) => (typeof chunk === "string" ? chunk : JSON.stringify(chunk) ?? String(chunk))).join(" ")); return true; };
+    const spies = [
+      vi.spyOn(process.stdout, "write").mockImplementation(capture), vi.spyOn(process.stderr, "write").mockImplementation(capture),
+      ...(["log", "info", "warn", "error", "debug"] as const).map((method) => vi.spyOn(console, method).mockImplementation(capture)),
+    ];
+    return { text: () => output.join("\n"), restore: () => { for (const spy of spies) spy.mockRestore(); } };
+  };
+  /** A GitHub failure whose text carries a fake bearer header and a private body fragment, with and without an HTTP status. */
+  const leakingFailures = (path: string): ReadonlyArray<readonly [Error, number | undefined]> => {
+    const message = `gh api GET ${path} failed: HTTP 502 Authorization: Bearer xyz {"message":"private-body-fragment"}`;
+    return [
+      [acpError(ReasonCode.INTERNAL_ERROR, message, { status: 502, header: "Authorization: Bearer xyz", body: '{"message":"private-body-fragment"}' }), 502],
+      [new Error(message), undefined],
+    ];
+  };
+  /** The reply, every audit row and the output carry nothing of the failure's header or body. */
+  const expectNoLeak = (h: Harness, reply: unknown, output: string): void => {
+    const audit = JSON.stringify(h.cp.db.all(`SELECT kind, reason_code, actor, evidence_json FROM audit_events`));
+    for (const [where, text] of [["reply", JSON.stringify(reply)], ["audit", audit], ["output", output]] as const) {
+      for (const secret of ["Bearer xyz", "Authorization: Bearer", "private-body-fragment"]) expect(text, `${where} carries ${secret}`).not.toContain(secret);
+    }
+  };
+
+  /**
+   * The project registered over the operator method with GitHub answering `atRegistration`, then given its
+   * first manifest (naming the old name) the way a first activation leaves it, its activation run finished,
+   * and GitHub then answering as the fixture does after the owner's rename (or `afterRename`). `failWith` is
+   * thrown by the transport at registration; everything written to stdout, stderr or the console meanwhile
+   * is `output`.
+   */
+  const operatorWorld = async (atRegistration: Recorded[], afterRename: Recorded[] = FIXTURE.responses, failWith?: Error) => {
+    const responses = [...atRegistration];
+    const github = new RecordedGitHub(responses);
+    const h = makeHarness({
+      repoFactory: { workRoot: tempDir("rf-rename-op-"), githubPort: createBootstrapGitHubWritePort(github, async () => ({ exitCode: 0, stdout: "", stderr: "" })) },
+    });
+    gitSync(h.repoPath, ["remote", "add", "origin", OLD_HTTPS]);
+    h.cp.credentials.install({ token: "test-token", creatorIdentity: "acme-bot" });
+    bindCeo(h);
+    const stateDir = tempDir("acp-rename-op-daemon-");
+    const daemon = new Daemon(h.cp, { stateDir });
+    const started = await daemon.start();
+    if (!started.allowed) throw new Error(`${started.reasonCode}: ${started.message}`);
+    let registered: Awaited<ReturnType<Daemon["handleOperatorRequest"]>>;
+    const output = captureOutput();
+    if (failWith !== undefined) github.onRequest = () => { throw failWith; };
+    try {
+      registered = await daemon.handleOperatorRequest({
+        requestId: "req-register", method: OPERATOR_METHOD.PROJECT_REGISTER, params: { name: PROJECT, checkoutPath: h.repoPath, projectId: PROJECT },
+      }, PEER);
+    } finally {
+      await daemon.stop();
+      github.onRequest = null;
+      output.restore();
+    }
+    if (!registered.allowed) throw new Error(`${registered.reasonCode}: ${registered.message}`);
+    const registration = registered.value as {
+      repository: { repositoryId: string; identity: string }; repositoryNodeId: string | null; repositoryNodeIdUnrecorded?: { code: string; status?: number };
+    };
+    const registrationCalls = [...github.calls];
+    // Registered and never activated, the project has no manifest naming the repository: the rename refuses before it asks GitHub.
+    const unactivated = await h.cp.repositoryRenames.rename({ projectId: PROJECT, to: FIXTURE.renamed.to, apply: false });
+
+    const activation = await createRun(h, PROJECT, RunKind.CONTRACT_CHANGE);
+    const registrationEventId = h.cp.db.get<{ event_id: number }>(`SELECT event_id FROM audit_events WHERE kind = 'PROJECT_REGISTERED' AND project_id = ?`, [PROJECT])!.event_id;
+    rawFirstActivation(h, {
+      projectId: PROJECT, runId: activation.runId, registrationEventId,
+      manifest: firstManifest(PROJECT, [unitTestsWorkflow], { repositories: [{ role: "primary", remote: OLD, manifestRoot: "." }] }),
+    });
+    const cancelled = h.cp.runs.cancel(activation.runId, "the first activation finished");
+    if (!cancelled.allowed) throw new Error(cancelled.message);
+
+    responses.splice(0, responses.length, ...afterRename);
+    github.calls.length = 0;
+    return { h, github, registered, registration, registrationCalls, unactivated, output: output.text(), repositoryId: registration.repository.repositoryId };
+  };
+  const renameOf = (h: Harness, apply: boolean) => h.cp.repositoryRenames.rename({ projectId: PROJECT, to: FIXTURE.renamed.to, apply });
+
+  it("project.register records the node id GitHub answers at the registered name, and a rename to a name GitHub answers with that id is allowed", async () => {
+    const third = "MongLong0214/youtube-factory-shorts";
+    const w = await operatorWorld([beforeRename()], [...FIXTURE.responses, {
+      method: "GET", path: `repos/${third}`, status: 200, body: { ...renamedAnswer.body, name: "youtube-factory-shorts", full_name: third },
+    }]);
+    expect(w.registration).toMatchObject({ repository: { identity: OLD }, repositoryNodeId: NODE });
+    expect(w.registration.repositoryNodeIdUnrecorded).toBeUndefined();
+    expect(w.registrationCalls).toEqual([`GET repos/${FIXTURE.renamed.from}`]);
+    expect(recordedNodeIds(w.h)).toEqual([{ repositoryId: w.repositoryId, identity: OLD, repositoryNodeId: NODE }]);
+    expect(w.h.cp.db.get(`SELECT COUNT(*) AS n FROM resident_project_provisioning`)).toEqual({ n: 0 });
+    expect(refusalOf(w.unactivated)).toBe(RepositoryRenameRefusal.MANIFEST_REMOTE_MISMATCH);
+
+    const planned = planOf(await renameOf(w.h, false));
+    expect(planned).toMatchObject({ mode: "dry-run", state: "PLANNED", repositoryId: w.repositoryId, from: OLD, to: NEW, repositoryNodeId: NODE });
+    expect(w.github.calls).toEqual([`GET repos/${FIXTURE.renamed.to}`]);
+    expect(planOf(await renameOf(w.h, true))).toMatchObject({ state: "RENAMED", from: OLD, to: NEW, repositoryNodeId: NODE });
+    expect(w.h.cp.repositories.byId(w.repositoryId)!.identity).toBe(NEW);
+    expect(renames(w.h)).toEqual([expect.objectContaining({ repository_id: w.repositoryId, from_identity: OLD, to_identity: NEW, repository_node_id: NODE })]);
+    // Renamed once, the repository is still the row registered under the old name: a second rename reads the same record.
+    expect(planOf(await w.h.cp.repositoryRenames.rename({ projectId: PROJECT, to: third, apply: false })))
+      .toMatchObject({ state: "PLANNED", from: NEW, to: `github:${third}`, repositoryNodeId: NODE });
+  });
+
+  it("a lookup that fails at registration leaves the registration as it was, records nothing, and the rename is refused", async () => {
+    for (const [atRegistration, expected] of [
+      [[], { code: RepositoryNodeIdUnrecorded.NOT_ON_GITHUB, status: 404 }],
+      [[{ ...beforeRename(), status: 500 }], { code: RepositoryNodeIdUnrecorded.LOOKUP_FAILED, status: 500 }],
+      [[{ ...beforeRename(), status: 301, body: { message: "Moved Permanently" } }], { code: RepositoryNodeIdUnrecorded.LOOKUP_FAILED, status: 301 }],
+      [[beforeRename({ full_name: "MongLong0214/something-else" })], { code: RepositoryNodeIdUnrecorded.OTHER_FULL_NAME }],
+      [[beforeRename({ node_id: "" })], { code: RepositoryNodeIdUnrecorded.LOOKUP_FAILED }],
+    ] as const) {
+      const unrecorded = JSON.stringify(expected);
+      const w = await operatorWorld([...atRegistration]);
+      expect(w.registration, unrecorded).toMatchObject({ repository: { identity: OLD }, repositoryNodeId: null });
+      expect(w.registration.repositoryNodeIdUnrecorded, unrecorded).toEqual(expected);
+      expect(w.h.cp.projects.get(PROJECT), unrecorded).not.toBeNull();
+      expect(w.h.cp.repositories.byId(w.repositoryId), unrecorded).toMatchObject({ identity: OLD, projectId: PROJECT, registration: "REGISTERED" });
+      expect(recordedNodeIds(w.h), unrecorded).toEqual([]);
+
+      const refused = await renameOf(w.h, true);
+      expect(refused, unrecorded).toMatchObject({ allowed: false, reasonCode: ReasonCode.EVIDENCE_MISSING });
+      expect(refusalOf(refused), unrecorded).toBe(RepositoryRenameRefusal.NODE_ID_UNRECORDED);
+      expect(w.github.calls, unrecorded).toEqual([]);
+      expect(w.h.cp.repositories.byId(w.repositoryId)!.identity, unrecorded).toBe(OLD);
+      expect(renames(w.h), unrecorded).toEqual([]);
+    }
+  });
+
+  it("a failed lookup reports a fixed code and at most GitHub's status: no error text, header or body reaches the reply, the audit log or the output", async () => {
+    for (const [failure, status] of leakingFailures(`repos/${FIXTURE.renamed.from}`)) {
+      const w = await operatorWorld([beforeRename()], FIXTURE.responses, failure);
+      expect(w.registrationCalls).toEqual([`GET repos/${FIXTURE.renamed.from}`]);
+      expect(w.registration).toMatchObject({ repository: { identity: OLD }, repositoryNodeId: null });
+      expect(w.registration.repositoryNodeIdUnrecorded).toEqual({ code: RepositoryNodeIdUnrecorded.LOOKUP_FAILED, ...(status === undefined ? {} : { status }) });
+      expectNoLeak(w.h, w.registered, w.output);
+      expect(recordedNodeIds(w.h)).toEqual([]);
+      expect(refusalOf(await renameOf(w.h, true))).toBe(RepositoryRenameRefusal.NODE_ID_UNRECORDED);
+    }
+  });
+
+  it("a GitHub failure at rename time is refused with the fixed code and at most GitHub's status: no error text, header or body reaches the reply, the audit log or the output", async () => {
+    for (const [failure, status] of leakingFailures(`repos/${FIXTURE.renamed.to}`)) {
+      const w = await world();
+      w.h.cp.credentials.install({ token: "test-token", creatorIdentity: "acme-bot" });
+      bindCeo(w.h);
+      const daemon = new Daemon(w.h.cp, { stateDir: tempDir("acp-rename-leak-daemon-") });
+      const started = await daemon.start();
+      if (!started.allowed) throw new Error(`${started.reasonCode}: ${started.message}`);
+      const output = captureOutput();
+      w.github.onRequest = () => { throw failure; };
+      let reply: Awaited<ReturnType<Daemon["handleOperatorRequest"]>>;
+      try {
+        reply = await daemon.handleOperatorRequest({
+          requestId: "req-rename", method: OPERATOR_METHOD.PROJECT_RENAME_REPOSITORY, params: { projectId: PROJECT, to: FIXTURE.renamed.to, apply: true },
+        }, PEER);
+      } finally {
+        await daemon.stop();
+        w.github.onRequest = null;
+        output.restore();
+      }
+      expect(w.github.calls).toEqual([`GET repos/${FIXTURE.renamed.to}`]);
+      expect(reply).toMatchObject({ allowed: false, reasonCode: ReasonCode.INTERNAL_ERROR });
+      expect(reply.allowed ? null : reply.evidence).toEqual({
+        refusal: RepositoryRenameRefusal.GITHUB_UNREADABLE, to: NEW, ...(status === undefined ? {} : { status }),
+      });
+      expectNoLeak(w.h, reply, output.text());
+      expect(untouched(w)).toMatchObject(UNTOUCHED);
+    }
+  });
+
+  it("a new name GitHub answers with another node id than the one recorded at registration is refused, and nothing is written", async () => {
+    const w = await operatorWorld([beforeRename({ node_id: "R_kgDOAnotherOne" })]);
+    expect(w.registration.repositoryNodeId).toBe("R_kgDOAnotherOne");
+    const pointer = w.h.cp.projects.get(PROJECT)!.activeManifestDigest;
+    const refused = await renameOf(w.h, true);
+    expect(refused).toMatchObject({ allowed: false, reasonCode: ReasonCode.REPOSITORY_IDENTITY_MISMATCH });
+    expect(refusalOf(refused)).toBe(RepositoryRenameRefusal.DIFFERENT_REPOSITORY);
+    expect(refused.allowed ? null : refused.evidence).toMatchObject({ recordedNodeId: "R_kgDOAnotherOne", observedNodeId: NODE });
+    expect(w.h.cp.repositories.byId(w.repositoryId)!.identity).toBe(OLD);
+    expect(w.h.cp.projects.get(PROJECT)!.activeManifestDigest).toBe(pointer);
+    expect(renames(w.h)).toEqual([]);
+  });
+
+  it("the bootstrap path is unchanged: an allocation of the repository decides alone, and no registration record fills in for it or settles a conflict", async () => {
+    // GitHub still answering the old name, so a registration record can be taken for the bootstrap world's repository.
+    const withOldName = (node: string): Recorded[] => [...FIXTURE.responses.filter((response) => response.status === 200), beforeRename({ node_id: node })];
+
+    // An allocation without a node id stays refused, though a registration record names one.
+    const noNode = await world({ allocation: "no-node", responses: withOldName(NODE) });
+    expect(await noNode.h.cp.repositoryRenames.recordRegisteredNodeId(noNode.repositoryId)).toEqual({ repositoryNodeId: NODE });
+    expect(refusalOf(await rename(noNode, true))).toBe(RepositoryRenameRefusal.NODE_ID_UNRECORDED);
+    expect(untouched(noNode)).toMatchObject(UNTOUCHED);
+
+    // An allocation's node id is the one checked, whatever a registration record says.
+    const allocated = await world({ responses: withOldName("R_kgDOAnotherOne") });
+    expect(await allocated.h.cp.repositoryRenames.recordRegisteredNodeId(allocated.repositoryId)).toEqual({ repositoryNodeId: "R_kgDOAnotherOne" });
+    expect(planOf(await rename(allocated, false))).toMatchObject({ state: "PLANNED", repositoryNodeId: NODE });
+
+    // Without an allocation, registration records that disagree are no node id.
+    const conflicting = await world({ allocation: "none", responses: withOldName(NODE) });
+    expect(await conflicting.h.cp.repositoryRenames.recordRegisteredNodeId(conflicting.repositoryId)).toEqual({ repositoryNodeId: NODE });
+    expect(await conflicting.h.cp.repositoryRenames.recordRegisteredNodeId(conflicting.repositoryId)).toMatchObject({ repositoryNodeId: null });
+    conflicting.h.cp.audit.record({ kind: REPOSITORY_NODE_ID_RECORDED, evidence: { repositoryId: conflicting.repositoryId, identity: OLD, repositoryNodeId: "R_kgDOAnotherOne" } });
+    expect(refusalOf(await rename(conflicting, true))).toBe(RepositoryRenameRefusal.NODE_ID_UNRECORDED);
+    expect(untouched(conflicting)).toMatchObject(UNTOUCHED);
+
+    // A record counts only for the repository row it names, under the exact name that row was registered with.
+    for (const evidence of [
+      { repositoryId: "repo_another_repository", identity: OLD },
+      { identity: "github:MongLong0214/someone-else" },
+      { identity: "github:monglong0214/myeotnyeon" },
+    ]) {
+      const foreign = await world({ allocation: "none" });
+      foreign.h.cp.audit.record({ kind: REPOSITORY_NODE_ID_RECORDED, evidence: { repositoryId: foreign.repositoryId, repositoryNodeId: NODE, ...evidence } });
+      expect(refusalOf(await rename(foreign, true)), JSON.stringify(evidence)).toBe(RepositoryRenameRefusal.NODE_ID_UNRECORDED);
+      expect(untouched(foreign)).toMatchObject(UNTOUCHED);
+    }
   });
 });
