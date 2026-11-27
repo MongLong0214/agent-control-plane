@@ -1408,7 +1408,16 @@ export class Daemon {
       repositoryRole: "primary",
     });
     if (!repository.allowed) return repository;
-    return allow(ReasonCode.OK, { project: project.value, repository: repository.value });
+    // GitHub's node id for the repository at its registered name, which a later rename checks a new name
+    // against. The registration stands without it. Asked here rather than in `repositories.register`, which
+    // every registration (a bootstrap activation's included) goes through.
+    const nodeId = await this.cp.repositoryRenames.recordRegisteredNodeId(repository.value.repositoryId);
+    return allow(ReasonCode.OK, {
+      project: project.value,
+      repository: repository.value,
+      repositoryNodeId: nodeId.repositoryNodeId,
+      ...(nodeId.unrecorded === undefined ? {} : { repositoryNodeIdUnrecorded: nodeId.unrecorded }),
+    });
   }
 
   /**
