@@ -18,6 +18,7 @@ import {
   type NoticeState,
   NotificationKind,
   deliverIncident,
+  enqueueCeoNotice,
   runEpisode,
   runProgressedPast,
   runStateEntry,
@@ -330,18 +331,14 @@ export class AgentOwnedWaits {
         if (!run || wait?.kind !== AgentWaitKind.CEO_REVIEW || !wait.review) return allow(ReasonCode.OK, null);
         if (this.#decided(wait)) return allow(ReasonCode.OK, null);
         if (this.#holderHasReview(run.runId, wait.review.candidateSnapshotDigest, ceo)) return allow(ReasonCode.OK, null);
-        const enqueued = this.ports.outbox.enqueue({
+        const enqueued = enqueueCeoNotice(this.ports.outbox, ceo, {
           idempotencyKey: `ceo-review-redelivery:${run.runId}:${digestOf({
             candidateSnapshotDigest: wait.review.candidateSnapshotDigest,
             packetDigest: wait.review.packetDigest,
             generation: ceo.bindingGeneration,
             sessionId: ceo.sessionId,
           })}`,
-          roleKey: ceo.roleKey,
-          bindingGeneration: ceo.bindingGeneration,
-          targetSessionId: ceo.sessionId,
           runId: run.runId,
-          kind: MessageKind.CEO_NOTIFICATION,
           payload: { ...this.#reviewNotice(run, wait.review), redelivered: true },
         });
         if (!enqueued.allowed) return enqueued as Decision<string | null>;
@@ -762,13 +759,9 @@ export class AgentOwnedWaits {
       } else if (!recovery) {
         const ceo = this.#ceo();
         if (!ceo) return deny(ReasonCode.GATE_AUTHORITY_DENIED, "no CEO binding can receive the wait's notice", { runId: wait.runId });
-        const enqueued = this.ports.outbox.enqueue({
+        const enqueued = enqueueCeoNotice(this.ports.outbox, ceo, {
           idempotencyKey: `agent-wait:${wait.runId}:${wait.episode}:${step}`,
-          roleKey: ceo.roleKey,
-          bindingGeneration: ceo.bindingGeneration,
-          targetSessionId: ceo.sessionId,
           runId: wait.runId,
-          kind: MessageKind.CEO_NOTIFICATION,
           payload: this.#noticeOf(run, wait, step, deadlineMs),
         });
         if (!enqueued.allowed) return enqueued as unknown as Decision<string | null>;
