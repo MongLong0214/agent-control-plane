@@ -828,9 +828,8 @@ export class RepairService {
    * rows of `roleKey`, PENDING or EXPIRED, so an expired one is listed and not hidden (with both, that message
    * only if it is that role's).
    * Null without a target, which keeps the unscoped reset.
-   * Only a row a retry can deliver is reset, and every other target row is listed with why not: a
-   * holder-claimed kind is delivered by its holder's claim, never by the delivery pass; an expired row is
-   * never resent. The evidence names the target's rows and nothing else.
+   * Only a row a retry can deliver is reset, and every other target row is listed with why not
+   * (`retryOutboxRefusal`). The evidence names the target's rows and nothing else.
    */
   private retryOutboxTarget(operation: RepairOperation, request: RepairRequest): RepairPlan | null {
     const messageId = request.parameters["messageId"];
@@ -849,25 +848,11 @@ export class RepairService {
          FROM outbox WHERE ${where.join(" AND ")} ORDER BY created_at, message_id`,
       [...(messageId !== undefined ? [messageId] : []), ...(roleKey !== undefined ? [roleKey] : [])],
     );
-    const refusalOf = (row: (typeof rows)[number]): { refusal: string; reason: string } | null => {
-      if ((HOLDER_CLAIMED_KINDS as ReadonlySet<string>).has(row.kind)) {
-        return {
-          refusal: "HOLDER_CLAIMED",
-          reason: `a ${row.kind} is delivered by its holder's claim (role_owner_message_claim), and a retry cannot deliver it`,
-        };
-      }
-      if (row.status === "EXPIRED" || (row.status === "PENDING" && row.expires_at <= now)) {
-        return { refusal: "EXPIRED", reason: `it expired at ${row.expires_at}, and an expired message is never resent` };
-      }
-      if (row.status !== "PENDING") return { refusal: "NOT_PENDING", reason: `it is ${row.status}, not PENDING` };
-      if (row.attempts === 0) return { refusal: "NO_FAILED_ATTEMPT", reason: "no delivery attempt has failed; the delivery pass sends it" };
-      return null;
-    };
     // Keys the audit record keeps: it stores no `messages` and redacts any key ending in `key`.
     const listed = rows.map((row) => ({
       messageId: row.message_id, kind: row.kind, status: row.status, attempts: row.attempts, expiresAt: row.expires_at,
       role: row.role_key, bindingGeneration: row.binding_generation, targetSessionId: row.target_session_id,
-      ...refusalOf(row),
+      ...retryOutboxRefusal(row, now),
     }));
     const eligible = listed.filter((message) => !("refusal" in message));
     const evidence = {
@@ -976,6 +961,29 @@ const checked = (precondition: string, satisfied: boolean, evidence: unknown): R
   satisfied,
   evidence,
 });
+
+/**
+ * #1442 — why `retry_outbox` cannot deliver an outbox row, or null when it can: a holder-claimed kind is
+ * delivered by its holder's claim, never by the delivery pass; an expired row is never resent; and a row
+ * with no failed attempt is the delivery pass's to send.
+ */
+export const retryOutboxRefusal = (
+  row: { kind: string; status: string; attempts: number; expires_at: string },
+  now: string,
+): { refusal: string; reason: string } | null => {
+  if ((HOLDER_CLAIMED_KINDS as ReadonlySet<string>).has(row.kind)) {
+    return {
+      refusal: "HOLDER_CLAIMED",
+      reason: `a ${row.kind} is delivered by its holder's claim (role_owner_message_claim), and a retry cannot deliver it`,
+    };
+  }
+  if (row.status === "EXPIRED" || (row.status === "PENDING" && row.expires_at <= now)) {
+    return { refusal: "EXPIRED", reason: `it expired at ${row.expires_at}, and an expired message is never resent` };
+  }
+  if (row.status !== "PENDING") return { refusal: "NOT_PENDING", reason: `it is ${row.status}, not PENDING` };
+  if (row.attempts === 0) return { refusal: "NO_FAILED_ATTEMPT", reason: "no delivery attempt has failed; the delivery pass sends it" };
+  return null;
+};
 
 const alive = (pid: number): boolean => {
   if (!Number.isInteger(pid) || pid <= 0) return false;
