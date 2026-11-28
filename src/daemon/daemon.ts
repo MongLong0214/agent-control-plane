@@ -930,6 +930,7 @@ export class Daemon {
               bindingGeneration: message.bindingGeneration,
             })),
             reviewRounds: reviewRoundsFor(this.cp, runId.value),
+            revisions: this.cp.pipeline.revisions(runId.value),
           });
         }
 

@@ -493,6 +493,13 @@ export const ReasonCode = {
    */
   REVIEW_UNJUDGED_LIMIT_REACHED: "REVIEW_UNJUDGED_LIMIT_REACHED",
   /**
+   * #1454 — a result_submit refused before anything is frozen: the run's REVISION_LIMIT-th judged return asked for a
+   * re-plan, and its PLAN has not changed since. A changed PLAN through plan_submit clears it.
+   */
+  REVISION_LIMIT_REACHED: "REVISION_LIMIT_REACHED",
+  /** #1454 — the run's REVISION_BUDGET-th judged return: no revision was sent, and the run ended FAILED. */
+  REVISION_BUDGET_EXHAUSTED: "REVISION_BUDGET_EXHAUSTED",
+  /**
    * #1421 — private review evidence staged or attached whose rendered text, repeated in every reviewer prompt of the
    * run, leaves no workable chunk budget under the reviewer context bound. Deterministic: the answer carries the
    * measured size and the limit, and a smaller bundle is the only remedy.
