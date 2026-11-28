@@ -965,7 +965,8 @@ different procedure that needs its own rehearsal. It exists because the sealed p
 the database image it sealed, and that image predates whatever the daemon wrote after it.
 
 It is a procedure, not a command: nothing in `src/` runs it, and `state-admin` has no verb for it.
-Every step is something an operator reads, runs and checks.
+Every step is something an operator reads, runs and checks. Its conversion is rehearsed as written
+(`tests/unit/a-v60-database-returns-to-v59.test.ts`); the install and the v59 start proof are not.
 
 **What it applies to.** The source is a database at `user_version` 60 whose `schema_migrations`
 holds the v60 row exactly — `version = 60`, `migration_id = 'v60-review-completion-bootstrap-only'`,
@@ -1071,6 +1072,7 @@ SQL below to `$WORK/convert.sql` first — with an editor, or with `cat > "$WORK
 it and ending with Ctrl-D — and run it from that file. A shell heredoc needs a writable temporary
 directory, which a sandboxed shell or a read-only `TMPDIR` may not have.
 
+<!-- owner-actions:v60-to-v59-convert:start -->
     .bail on
     .dbconfig enable_trigger off
     BEGIN IMMEDIATE;
@@ -1094,6 +1096,7 @@ directory, which a sandboxed shell or a read-only `TMPDIR` may not have.
     COMMIT;
     PRAGMA wal_checkpoint(TRUNCATE);
     SELECT 'user_version', user_version FROM pragma_user_version;
+<!-- owner-actions:v60-to-v59-convert:end -->
 
 Then, in the same `bash` that took the copy, run it. This begins by running `quiet` and `check_copy`
 again: the source's digest is re-checked before the conversion, not only at the end, and the SQL never
@@ -1355,10 +1358,14 @@ has the flags and the checks. In order:
    migration must still be kept; a missing approval refuses.
 3. `state-admin backup --database <converted copy> --output IMAGE`.
 4. `node dist/deploy/rollback-pair.js record-replacement <the validate identity flags, with
-   --pair-id <P59>> --source <live db> --image IMAGE`. It requires the source to be quiescent and writes
-   `IMAGE.source.json`.
-5. `deploy/install-launchd.sh rollback --pair-id <P59> … --replacement-database IMAGE`, from a checkout
+   --pair-id <P59>> --source <live db> --image IMAGE`, from the v60 build. It requires the source to be
+   quiescent and writes `IMAGE.source.json`.
+5. `deploy/install-launchd.sh rollback --pair-id <P59> … --replacement-database IMAGE`, from a v60 checkout
    built with the replacement check (`rollback-pair validate … --replacement-database IMAGE` first).
+
+Steps 4 and 5 run from the v60 build. Both replay the retired approval on IMAGE, and the replay plans from
+the pair's version to the running build's own schema version: a v61 build plans 59→61, finds no such
+approval for a database at v60, and refuses as `ROLLBACK_PAIR_STALE_DATABASE`.
 
 A database-only `state-admin restore` must not be used: it leaves a v59 database under a v60 runtime.
 Record the source's `sha256` once more at the end; it must equal the value taken at the start. Keep
