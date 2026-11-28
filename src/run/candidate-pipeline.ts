@@ -48,6 +48,7 @@ import {
 } from "../snapshot/candidate-snapshot.ts";
 import type { Telemetry } from "../telemetry/telemetry.ts";
 import { type VerificationEngine, type VerificationReport, reportWithoutCapturedOutput } from "../verify/verification-engine.ts";
+import { pathHistory } from "../verify/path-history.ts";
 import {
   BASE_REF_NAMESPACE,
   CANDIDATE_REF_NAMESPACE,
@@ -632,7 +633,7 @@ export class CandidatePipeline {
       catch { return deny(ReasonCode.SNAPSHOT_DIGEST_MISMATCH, "attached review evidence cannot be frozen", { runId }); }
     }
 
-    const snapshot = participants.length === 0
+    const built = participants.length === 0
       ? buildNoRepositoryCandidateSnapshot(
           {
             runId,
@@ -655,6 +656,13 @@ export class CandidatePipeline {
           },
           this.clock,
         );
+    // #1457 — what earlier runs of the project did on the touched paths, bound into this candidate's digest.
+    const history = run.projectId === null ? null : pathHistory(this.db, {
+      projectId: run.projectId,
+      excludeRunId: runId,
+      touched: built.repositories.flatMap((repository) => repository.touchedPaths.map((path) => ({ repository: repository.identity, path }))),
+    });
+    const snapshot: CandidateSnapshot = history === null ? built : { ...built, pathHistory: history };
 
     // CEO (S6-B) — a candidate that is missing a SUCCEEDED task's own commit is refused here,
     // before it is ever persisted as this run's current candidate. Asked of the final candidate

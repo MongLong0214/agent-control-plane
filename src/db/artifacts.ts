@@ -10,6 +10,7 @@ import type { ArtifactKind } from "../domain/types.ts";
 import {
   candidateSnapshotDigest as digestCandidateSnapshot,
   candidateSnapshotSchema,
+  snapshotPathHistorySchema,
 } from "../snapshot/candidate-snapshot.ts";
 import { credentialRefusal, prohibitedDurableField } from "./audit.ts";
 import { registryView } from "./registry-view.ts";
@@ -933,6 +934,7 @@ const productionReadyEvidenceSchema = z
     changedRepositories: z.array(z.object({}).passthrough()),
     ctoRecommendation: z.string(),
     humanGate: z.object({}).passthrough(),
+    pathHistory: snapshotPathHistorySchema.optional(),
     createdAt: z.string().min(1),
   })
   .strict();
