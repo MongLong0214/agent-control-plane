@@ -174,7 +174,7 @@ export const deriveWorkBranch = (input: {
 };
 
 /** A repository-relative path in normal form: no leading `/`, no empty, `.` or `..` segment, no backslash. */
-const isNormalRelativePath = (path: string): boolean =>
+export const isNormalRelativePath = (path: string): boolean =>
   path.length > 0 &&
   !path.includes("\0") &&
   !path.includes("\\") &&
