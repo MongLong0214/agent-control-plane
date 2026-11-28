@@ -12,12 +12,7 @@ import { RefreshTrigger } from "../capacity/capacity-monitor.ts";
 import { BUZZ_BIND_CHALLENGE_TTL_MS } from "../buzz/buzz-bind-challenge.ts";
 import { BUZZ_CHANNEL_SERVER_NAME } from "../buzz/buzz-channel.ts";
 import type { ClaimRegistry } from "../claims/claim-registry.ts";
-import {
-  CanonicalCtoRestoreCondition,
-  latestCanonicalRestoreRefusal,
-  readCanonicalCtoRestoreTarget,
-  type ContinuityKernel,
-} from "../continuity/continuity-kernel.ts";
+import type { ContinuityKernel } from "../continuity/continuity-kernel.ts";
 import { latestReceiptLookupError } from "../conversation/turn-coordinator.ts";
 import type { AuditLog } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
@@ -256,24 +251,6 @@ export interface Finding {
 }
 
 export type DoctorStatus = "HEALTHY" | "DEGRADED" | "BLOCKED" | "ERROR";
-
-/** #1106 — what each unmet capacity-restore condition means to the person reading the finding. */
-const CANONICAL_CTO_RESTORE_CONDITION_PHRASE: Readonly<Record<string, string>> = {
-  [CanonicalCtoRestoreCondition.REVOKE_NOT_CAPACITY_ONLY]: "its newest revocation was not for capacity alone",
-  [CanonicalCtoRestoreCondition.REVOKE_REASON_UNDISTINGUISHED]:
-    "its revocation predates the capacity/runtime split and is never read as capacity",
-  [CanonicalCtoRestoreCondition.OWNER_SUSPENDED]: "the owner suspended the project since the revocation",
-  [CanonicalCtoRestoreCondition.REPLACED]: "a replacement or a later revocation happened since",
-  [CanonicalCtoRestoreCondition.RUNTIME_MOVED]: "its revoked runtime is gone, not READY, respawned or moved",
-  [CanonicalCtoRestoreCondition.CAPACITY_NOT_FRESH]: "no fresh HEALTHY measurement newer than the revocation",
-  [CanonicalCtoRestoreCondition.CAPACITY_WINDOW_NOT_RESET]: "the exhausted window has not reset",
-  [CanonicalCtoRestoreCondition.CAPACITY_ADMISSION_REFUSED]: "the role is not admitted on the fresh reading",
-  [CanonicalCtoRestoreCondition.NO_REATTACH_CONNECTION]:
-    "no open reattach connection of that session remains to prove it live (a daemon restart since the revocation ends it)",
-  [CanonicalCtoRestoreCondition.ATTACH_TARGET_NOT_LIVE]:
-    "its reattach connection is no longer attached to the session's live claude",
-  [CanonicalCtoRestoreCondition.LIVENESS_CHALLENGE_FAILED]: "its liveness challenge was not answered in time",
-};
 
 export interface DoctorReport {
   scope: DoctorScope;
@@ -674,48 +651,6 @@ export class Doctor {
   }
 
   /**
-   * #1106 — an unbound project whose canonical CTO continuity revoked: whether it comes back by
-   * itself on its own session, and when it will not, which condition stands in the way. Read from the
-   * same ledger question the restore asks (`readCanonicalCtoRestoreTarget`) and from its newest
-   * refused attempt; a role this path does not restore at all says nothing here, and the claim it is
-   * owed is still named by the coverage finding.
-   */
-  private canonicalCtoRestoreFindings(projectId: string): Finding[] {
-    const roleKey = roleKeyFor(Role.PRIMARY_CTO, { projectId });
-    const reading = readCanonicalCtoRestoreTarget(this.db, roleKey);
-    if (reading.kind === "NOT_APPLICABLE") return [];
-    const unmet = (condition: string, reasonCode: string | null): Finding => ({
-      code: "CANONICAL_CTO_RESTORE_UNMET",
-      severity: "ERROR",
-      scope: `project:${projectId}`,
-      blocking: false,
-      confidence: "HIGH",
-      observedEvidence: { roleKey, condition, reasonCode },
-      recommendedAction:
-        `${roleKey} is not restored automatically: ${CANONICAL_CTO_RESTORE_CONDITION_PHRASE[condition] ?? condition}; ` +
-        "until that changes it waits on a claim",
-    });
-    if (reading.kind === "UNMET") {
-      // An active holder is a held role, not a waiting one.
-      if (reading.condition === CanonicalCtoRestoreCondition.ANOTHER_HOLDER_ACTIVE) return [];
-      return [unmet(reading.condition, reading.reasonCode)];
-    }
-    const refused = latestCanonicalRestoreRefusal(this.db, roleKey, reading.target.revokeEventId);
-    if (refused?.condition) return [unmet(refused.condition, refused.reasonCode)];
-    return [{
-      code: "CANONICAL_CTO_RESTORE_PENDING",
-      severity: "WARN",
-      scope: `project:${projectId}`,
-      blocking: false,
-      confidence: "HIGH",
-      observedEvidence: { roleKey, condition: "AWAITING_RESTORE", generation: reading.target.revokedGeneration },
-      recommendedAction:
-        `${roleKey} can return on its original session at the next generation ` +
-        "when its unchanged runtime and authenticated reattach connection are confirmed live",
-    }];
-  }
-
-  /**
    * One project, one CTO process. Looks for what the launch doors cannot refuse because they never ran: two or
    * more live claude processes that resume a project's CTO conversation, sit in its checkout, or are its bound
    * session. Never blocking: a project's CTO is an availability fact, and the system report is the daemon's
@@ -863,7 +798,6 @@ export class Doctor {
     for (const project of projects) {
       if (!project) continue;
       const binding = this.bindings.activePrimaryCto(project.projectId);
-      if (!binding && !project.suspended) findings.push(...this.canonicalCtoRestoreFindings(project.projectId));
       const openRuns = this.runs
         .list({ projectId: project.projectId })
         .filter((r) =>

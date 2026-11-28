@@ -109,6 +109,7 @@ import {
   DEAD_BINDING_SWEEP_ACTOR,
 } from "./dead-binding-recovery.ts";
 import { SingleInstanceLock } from "./single-instance.ts";
+import { isAdoptedCanonicalRuntime } from "../registry/canonical-self-claim.ts";
 import { readProcessGroup } from "../bootstrap/attempt-writer-group.ts";
 
 /**
@@ -2007,9 +2008,15 @@ export class Daemon {
           : null;
         // Quota/coverage readings are advisory. A live holder keeps its role and gets the
         // next attempt; only loss of the session drives replacement or recovery.
+        // #1445 (R1) — a canonical PRIMARY_CTO is one conversation that is never revoked on a quota
+        // reading: unless its recorded process is proven DEAD it stays covered, even where its start
+        // token cannot be pinned. Nothing restores it after a revocation, so only a lost runtime may cause one.
         const currentStillCovered = session?.lifecycle === SessionLifecycle.READY &&
           currentCapacity?.runtimeHealth !== "UNAVAILABLE" &&
-          (currentCapacity?.runtimeHealth === "HEALTHY" || session.osPid === null || this.incumbentIsLive(session));
+          (currentCapacity?.runtimeHealth === "HEALTHY" || session.osPid === null || this.incumbentIsLive(session) ||
+            (required.role === Role.PRIMARY_CTO &&
+              isAdoptedCanonicalRuntime(this.cp.db, current.sessionId, current.assignmentId) &&
+              probeSessionLiveness(session.osPid, session.osProcessStartedAt) !== "DEAD"));
         // A new plan may prefer a recovered provider over an already healthy fallback.
         // That is restoration, not failure, and §15.8 keeps the acting owner in place
         // until the explicit non-preemptive restore path can safely move it.

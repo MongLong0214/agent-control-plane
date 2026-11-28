@@ -72,7 +72,7 @@ const ACP_ID_FORMATS: readonly RegExp[] = [
   /^sha256:[0-9a-f]{64}$/,
   /^[0-9a-f]{64}$/,
   /^acp-notice(?:-probe)?:[0-9a-f]{64}$/,
-  // `acp-restore-challenge:` is a canonical CTO restore challenge (daemon/agentcpd.ts restoreChallengeId).
+  // `acp-restore-challenge:` is a canonical CTO restore challenge id, on audit rows written before #1445.
   /^(?:repair|rf-write|owner-decision|telegram:owner-decision|acp-restore-challenge):sha256:[0-9a-f]{64}$/,
   // A Buzz message's sequence number is a count, bounded.
   /^(?:buzz:)?buzz-message:[0-9a-f]{64}(?::[0-9a-f]{64}|#\d{1,9})?$/,

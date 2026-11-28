@@ -393,9 +393,8 @@ interface PeerAdmittedDoor<T> {
  *
  * `roleKey` is the role of that binding, as the admission read it from the binding row the process
  * tree proved — never from anything the peer sent (review S2B-R2-01). The relay holds it with this
- * connection's tuple and takes a capacity restore's succession on this connection only when it
- * names exactly that role and tuple as its predecessor; the relay's own claim selectors can name
- * another project than the one this door admitted it for.
+ * connection's tuple and admits a reconnect only under exactly that role and tuple; the relay's own
+ * claim selectors can name another project than the one this door admitted it for.
  */
 export interface CanonicalCtoAdmittedTuple {
   roleKey: string;
