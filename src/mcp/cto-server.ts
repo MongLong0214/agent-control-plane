@@ -2,6 +2,8 @@ import { frontierReviewPolicy } from "../review/frontier-simplify-policy.ts";
 import { BOOTSTRAP_REVIEW_EVIDENCE_MAX_BYTES, collectBootstrapReviewEvidence, reviewEvidenceStageAccess, stageBootstrapReviewEvidence, type ReviewEvidenceStageInput } from "../bootstrap/bootstrap-review-evidence.ts";
 import { stageStandardReviewEvidence, type StandardReviewEvidenceStageInput } from "../review/standard-review-evidence.ts";
 import { collectBootstrapCeoDecisions } from "../bootstrap/bootstrap-ceo-decisions.ts";
+import { BEFORE_CHANGE_MAX_PATHS } from "../bootstrap/commitlore-commit.ts";
+import type { CommitLorePort } from "../bootstrap/commitlore-observation.ts";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { dirname } from "node:path";
 import { z } from "zod";
@@ -57,6 +59,7 @@ import {
   respond,
   type ToolResult,
 } from "./shared.ts";
+import { commitloreConstraintsForRun } from "./cto-commitlore-constraints.ts";
 
 const mutation = { idempotencyKey: z.string().min(1) };
 const runIdentity = { runId: z.string() };
@@ -92,6 +95,8 @@ export interface CtoMcpSource extends McpMutationSource {
   readonly tasks: TaskGraph;
   readonly workerTurns: WorkerTurnRunner;
   readonly workers: WorkerStaffing;
+  /** #1456 — the CommitLore `contract_get` reads a run's constraints with; the one worker turns read theirs with. */
+  readonly commitlore: CommitLorePort | null;
 }
 
 /** Only ports constructed below may be attached to an MCP server. */
@@ -240,6 +245,9 @@ export const createCtoMcpPort = (source: CtoMcpSource) => {
       // a credential. A stored PLAN also exposes its tasks for outcome reconciliation.
       return run.kind === RunKind.STANDARD_WORK && !plan ? { ...contract, tasks: standardWorkTasks(source, runId) } : contract;
     },
+    // #1456 — what CommitLore holds for the paths the CTO names, at the run's base; never a refusal of a path.
+    constraintsForRun: (runId: string, input: { paths: readonly string[]; repositoryIdentity?: string | undefined }) =>
+      commitloreConstraintsForRun(source, writeTargets, runId, input),
     bootstrapInputMutationAuthority: (runId: string, result: boolean) => bootstrapInputMutationAuthority(source, runId, result),
     bootstrapPlanStageAuthority: (peer: AuthenticatedMcpPeer, input: BootstrapPlanStageInput) => {
       const checked = bootstrapPlanStageAccess(source, peer, input);
@@ -714,10 +722,22 @@ const createCtoServerFromPort = (
   );
   server.registerTool(
     "contract_get",
-    { description: "The pinned task contract and verification contract for a run.", inputSchema: runIdentity },
-    async (args) => read("contract_get", (peer) => {
+    {
+      description:
+        "The pinned task contract and verification contract for a run. With paths (repository-relative; repositoryIdentity too when the run has more than one repository), it also answers constraints: what CommitLore's records hold for those paths at the run's base, the section a worker turn gets before it edits them. Advisory: a path is never refused here.",
+      inputSchema: {
+        ...runIdentity,
+        paths: z.array(z.string()).min(1).max(BEFORE_CHANGE_MAX_PATHS).optional(),
+        repositoryIdentity: z.string().min(1).optional(),
+      },
+    },
+    async (args) => read("contract_get", async (peer) => {
       const fenced = owner(peer, args.runId);
-      return fenced.allowed ? ok(port.contractForRun(args.runId)) : respond(fenced);
+      if (!fenced.allowed) return respond(fenced);
+      const contract = port.contractForRun(args.runId);
+      if (args.paths === undefined) return ok(contract);
+      const constraints = await port.constraintsForRun(args.runId, { paths: args.paths, repositoryIdentity: args.repositoryIdentity });
+      return constraints.allowed ? ok({ ...contract, constraints: constraints.value }) : respond(constraints);
     }),
   );
   server.registerTool(
@@ -754,7 +774,7 @@ const createCtoServerFromPort = (
   server.registerTool(
     "plan_submit",
     {
-      description: "Submit the lean plan and dynamic task graph.",
+      description: "Submit the lean plan and dynamic task graph. Before you cut it, contract_get with paths returns the CommitLore constraints (Warn, Limit, Ruled-out) for those paths at the run's base, and a path with [blocked] records will refuse its worker turn.",
       inputSchema: {
         ...mutation, ...runIdentity,
         bootstrapPlanDigest: z.string().optional(),

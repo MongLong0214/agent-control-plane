@@ -174,7 +174,7 @@ export const deriveWorkBranch = (input: {
 };
 
 /** A repository-relative path in normal form: no leading `/`, no empty, `.` or `..` segment, no backslash. */
-const isNormalRelativePath = (path: string): boolean =>
+export const isNormalRelativePath = (path: string): boolean =>
   path.length > 0 &&
   !path.includes("\0") &&
   !path.includes("\\") &&
@@ -339,7 +339,7 @@ export interface TaskWriteTargetPorts {
   readonly predecessorBase?: PredecessorBase;
 }
 
-interface RepositoryFacts {
+export interface RepositoryFacts {
   repositoryId: string;
   identity: string;
   checkoutPath: string;
@@ -657,6 +657,18 @@ export class TaskWriteTargets {
       });
     }
     return this.readBase(repository);
+  }
+
+  /**
+   * #1456 — the run's base for a repository as `pinnedBase` reads it (the run's pin, else its base branch where the
+   * resident keeps it, else in the registered checkout), and the resident clone, which holds it when the registered
+   * checkout may not yet. Read only: unlike `pinnedBase`, nothing is fetched into the registered checkout.
+   */
+  async baseOf(runId: string, repository: RepositoryFacts): Promise<Decision<{ baseSha: string; residentClone: string | null }>> {
+    const residentClone = residentBaseClone(this.ports.db, repository.repositoryId, repository.checkoutPath);
+    const pinned = runBasePin(this.ports.db, runId, repository.identity);
+    const read = pinned ? allow(ReasonCode.OK, pinned) : await this.readBase(residentClone === null ? repository : { ...repository, checkoutPath: residentClone });
+    return read.allowed ? allow(ReasonCode.OK, { baseSha: read.value, residentClone }) : (read as Decision<never>);
   }
 
   /** The commit the base branch names in `repository.checkoutPath` right now. */

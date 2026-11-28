@@ -346,6 +346,8 @@ export class ControlPlane {
   readonly tasks: TaskGraph;
   /** #512 — runs one worker turn for a task the CTO chose, and owns its receipts and evidence. */
   readonly workerTurns: WorkerTurnRunner;
+  /** #1456 — the CommitLore `contract_get` reads a run's constraints with, as worker turns read theirs. */
+  readonly commitlore: CommitLorePort;
   /** #512 — the production path that mints a task's first WORKER binding. */
   readonly workers: WorkerStaffing;
   /** #512 — revokes a run's WORKER bindings when it ends, and stops their sessions. */
@@ -699,6 +701,7 @@ export class ControlPlane {
           hasRoleScoped: (provider) => this.providers.hasRoleScoped(provider),
         },
       });
+      this.commitlore = config.commitlore ?? createCommitLoreCliPort();
       // #512 — the worker turn launches through the WORKER role's adapter, whose writable invocation
       // passes the same guard-backed broker as every other runtime write.
       this.workerTurns = new WorkerTurnRunner({
