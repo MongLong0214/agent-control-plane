@@ -203,6 +203,11 @@ describe("#1454 judged revisions are capped per run", () => {
       expect(f.footprint().run).toMatchObject({ state: "FAILED" });
       const failed = f.h.cp.audit.forRun(f.run.runId).filter((row) => row.kind === "RUN_TRANSITION" && row.evidence["to"] === "FAILED");
       expect(failed).toMatchObject([{ evidence: { from: "ACTIVE", reasonCode: "REVISION_BUDGET_EXHAUSTED", judgedRevisions: 6, candidateSnapshotDigests: candidates } }]);
+      // The CEO is told of the FAILED run on the ordinary FAILED-notice path, once.
+      const told = f.h.cp.outbox.listByRun(f.run.runId).filter((message) => message.kind === "CEO_NOTIFICATION").map((message) => message.payload as Args);
+      expect(told).toMatchObject([{ notification: "CRITICAL_SYSTEM_FAILURE", runId: f.run.runId, failureReasonCode: "REVISION_BUDGET_EXHAUSTED",
+        candidateSnapshotDigest: c6, judgedRevisions: 6, judgedRevisionBudget: 6, candidateSnapshotDigests: candidates, owner: "CEO" }]);
+      expect(f.h.cp.audit.forRun(f.run.runId).filter((row) => row.kind === "FINALIZATION_FAILED_NOTICE")).toEqual([]);
       // No seventh candidate is frozen.
       const frozen = f.footprint().frozen;
       f.change("c7");

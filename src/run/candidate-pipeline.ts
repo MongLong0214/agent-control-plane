@@ -28,6 +28,7 @@ import { requiredBaseFor, sourceProbeBranchesFor } from "../github/branch-contra
 import { currentBranch, mergeBase, revParse, tryRevParse } from "../git/git.ts";
 import { MessageKind } from "../outbox/envelope.ts";
 import type { Outbox } from "../outbox/outbox.ts";
+import { notifyRunFailed } from "../ceo/failed-run-notice.ts";
 import type { ProductionGate, ProductionReadyPacket } from "../ceo/production-gate.ts";
 import { currentContractChangeTarget, isContractChangeRun, sameContractChangeBinding, type WorkflowRevision } from "../registry/contract-change-plan.ts";
 import { contractChangeRevertFactsOf, firstActivationFactsOf } from "../registry/manifest-activation-grants.ts";
@@ -1951,7 +1952,19 @@ export class CandidatePipeline {
     if (!spent) return allow(ReasonCode.OK, null);
     const failure: RevisionBudgetSpent = { judgedRevisions: counted.length, candidateSnapshotDigests: counted };
     const failed = this.runs.transition(runId, RunState.FAILED, "judged revision budget exhausted", { reasonCode: ReasonCode.REVISION_BUDGET_EXHAUSTED, ...failure });
-    return failed.allowed ? allow(ReasonCode.OK, failure) : (failed as Decision<never>);
+    if (!failed.allowed) return failed as Decision<never>;
+    // The CEO is told with the run's end, as any FAILED run's CEO is: at once, or kept owed for the finalizer's sweep.
+    notifyRunFailed({ db: this.db, audit: this.audit, ceo: this.ceo }, runId, {
+      candidateSnapshotDigest: candidate,
+      failureReasonCode: ReasonCode.REVISION_BUDGET_EXHAUSTED,
+      owner: "CEO",
+      action: "the run ended FAILED; start a new run with a new plan if the change is still wanted",
+      blocker: `the run was returned for revision on ${counted.length} different candidates, its budget`,
+      judgedRevisionBudget: REVISION_BUDGET,
+      ...failure,
+      whyItMatters: "verification and review kept returning this run, a re-plan included, and nothing moves it now",
+    });
+    return allow(ReasonCode.OK, failure);
   }
 
   /**
