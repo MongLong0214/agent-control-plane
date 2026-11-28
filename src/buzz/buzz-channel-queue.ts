@@ -1,14 +1,12 @@
 import { existsSync, mkdirSync, readdirSync, watch, type FSWatcher } from "node:fs";
 import { join } from "node:path";
 
-import { verifyEvent } from "nostr-tools/pure";
-
 import type { Decision } from "../core/errors.ts";
 import { buzzMessageEventId, ownerMessagePointerOf } from "../ingress/buzz-message.ts";
 import { outboxDeliveryReadback, type HolderIdentity, type OutboxMessage } from "../outbox/outbox.ts";
 import type { ChannelReceipt } from "./buzz-channel.ts";
 import { isChannelReceipt, replyParentOf } from "./buzz-channel.ts";
-import { BUZZ_CHANNEL_RECEIPT_SUFFIX, channelDir, readChannelReceipts } from "./buzz-channel-files.ts";
+import { BUZZ_CHANNEL_RECEIPT_SUFFIX, channelDir, readChannelReceipts, replyReceiptVerifies } from "./buzz-channel-files.ts";
 
 /**
  * The daemon's half of a CTO's Buzz channel: what the durable queue does with a channel's receipts.
@@ -151,27 +149,12 @@ const applyReply = (
   result: ChannelApplyResult,
   queue: Map<string, ChannelQueueMessage>,
 ): boolean => {
-  const event = receipt.event;
-  const rooms = event.tags.filter((tag) => tag[0] === "h").map((tag) => tag[1]);
   if (
     message.room === null ||
     message.room !== receipt.room ||
-    event.pubkey !== deps.boundActor(message.holder) ||
-    event.kind !== 9 ||
-    rooms.length !== 1 ||
-    rooms[0] !== message.room ||
-    (receipt.ack !== "ACCEPTED" && receipt.ack !== "DUPLICATE") ||
-    // A fresh seven-field copy: `verifyEvent` caches its verdict on the object it is given, and a
-    // spread of an already-verified event carries that verdict over a body that was changed after.
-    !verifyEvent({
-      id: event.id,
-      pubkey: event.pubkey,
-      created_at: event.created_at,
-      kind: event.kind,
-      tags: event.tags.map((tag) => [...tag]),
-      content: event.content,
-      sig: event.sig,
-    })
+    receipt.event.pubkey !== deps.boundActor(message.holder) ||
+    // The rest is the check the receipt writer applies too, so a stored copy it counts as written is one accepted here.
+    !replyReceiptVerifies(receipt)
   ) {
     result.ignored += 1;
     return false;
