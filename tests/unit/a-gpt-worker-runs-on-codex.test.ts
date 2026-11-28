@@ -310,8 +310,7 @@ describe("provisioning replaces a worker bound to a retired model (#1477)", () =
         },
         // The real registry revokes, and the replacement's bind is then refused: the revocation must not stand.
         bindings: {
-          active: (key) => harness.cp.bindings.active(key),
-          history: (key) => harness.cp.bindings.history(key),
+          latest: (key) => harness.cp.bindings.latest(key),
           revoke: (key, reason, options) => harness.cp.bindings.revoke(key, reason, options),
           bind: () => deny(ReasonCode.CONFLICT, "test: the replacement's bind is refused"),
         },

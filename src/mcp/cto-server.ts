@@ -24,7 +24,7 @@ import type { ArtifactStore } from "../db/artifacts.ts";
 import type { AuditLog } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
 import type { Doctor } from "../doctor/doctor.ts";
-import { retiredSessionOf } from "../domain/fixed-role-runtime.ts";
+import { currentBindingOf } from "../domain/fixed-role-runtime.ts";
 import { ArtifactKind, Role, RunKind, roleKeyFor } from "../domain/types.ts";
 import type { Outbox } from "../outbox/outbox.ts";
 import { ContractChangeRefusal, contractChangePlanForSubmission, isContractChangeRun } from "../registry/contract-change-plan.ts";
@@ -100,19 +100,19 @@ const CTO_MCP_PORTS = new WeakSet<object>();
 /**
  * #512 — what `contract_get` tells a STANDARD_WORK run's owner about the run's tasks, read from the
  * task graph, the WORKER bindings and the executions: each task's id, title, category, state, spec
- * (where its PLAN put the task's write target) and dependencies; its newest WORKER binding (session,
- * generation, binding status and the session's lifecycle) or null when none was ever bound; and its
+ * (where its PLAN put the task's write target) and dependencies; its newest WORKER binding (the session
+ * it runs on, generation, binding status and that session's lifecycle) or null when none was ever bound; and its
  * executions (id, state, attempt, start and end). Identities and states only: no credential, secret
  * or process detail is read here.
  */
 const standardWorkTasks = (source: CtoMcpSource, runId: string) => {
   const executions = source.tasks.executions(runId);
   return source.tasks.list(runId).map((task) => {
-    const worker = source.bindings.history(roleKeyFor(Role.WORKER, { taskId: task.taskId })).at(-1) ?? null;
-    // #1477 — an ACTIVE worker on a retired model is not reused: its replacement is provisioned, on the provider it ran.
-    // Judged from the active binding's current session, as staffing judges it, not from the history row's recorded one.
-    const active = worker?.status === "ACTIVE" ? source.bindings.active(roleKeyFor(Role.WORKER, { taskId: task.taskId })) : null;
-    const retired = active === null ? null : retiredSessionOf(active, source.sessions);
+    // #1477 — a worker on a retired model, ACTIVE or already revoked, is not reused: its replacement is provisioned,
+    // on the provider it ran. #1486 — read as staffing and the continuation read it, on the session it runs now.
+    const current = currentBindingOf(roleKeyFor(Role.WORKER, { taskId: task.taskId }), source.bindings, source.sessions);
+    const worker = current?.binding ?? null;
+    const retired = current?.retired ?? null;
     return {
       taskId: task.taskId,
       title: task.title,
