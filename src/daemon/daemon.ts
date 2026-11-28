@@ -33,6 +33,7 @@ import {
 } from "../run/run-engine.ts";
 import { BOOTSTRAP_PLAN_TASKS, receiptProcessIsRunning } from "../run/task-graph.ts";
 import { TASK_WRITE_TARGET_RECORDED, TaskWriteTargets } from "../run/task-write-target.ts";
+import { currentBindingOf } from "../domain/fixed-role-runtime.ts";
 import { TERMINAL_RUN_STATES } from "../domain/run-state.ts";
 import {
   BOOTSTRAP_PLAN_RECOVERY_WAKE,
@@ -3260,9 +3261,10 @@ export class Daemon {
    * - none of its tasks is RUNNING and none of its executions is RUNNING; it has a READY task, and no
    *   READY task of it has an execution or an attempt, so no execution was started, queued or tried
    *   for any of them, settled or not;
-   * - each READY task either never had a WORKER (UNSTAFFED) or holds an ACTIVE one that never ran
-   *   (STAFFED: provisioned, then interrupted before its first execution, CEO e64aa10b). A worker
-   *   that was revoked and not replaced is continuity's to answer, never a continuation's;
+   * - each READY task either never had a WORKER (UNSTAFFED), holds an ACTIVE one that never ran
+   *   (STAFFED: provisioned, then interrupted before its first execution, CEO e64aa10b), or its newest
+   *   WORKER, ACTIVE or revoked, runs a retired model (RETIRED, #1486: staffing replaces it). Any other
+   *   worker that was revoked and not replaced is continuity's to answer, never a continuation's;
    * - `owner` is exactly its owner as a PRIMARY_CTO (`#pinnedOwnerExact`), so its session is READY,
    *   which also rules out a draining CTO;
    * - the newest RUN_DISPATCH addressed to that owner generation and session is ACKED. One still
@@ -3298,9 +3300,14 @@ export class Daemon {
         [task.taskId],
       );
       if (executed || task.attemptCount > 0) return null;
-      const worker = this.cp.bindings.history(roleKeyFor(Role.WORKER, { taskId: task.taskId })).at(-1);
-      if (worker !== undefined && worker.status !== "ACTIVE") return null;
-      states.push(worker === undefined ? STANDARD_CONTINUATION_STATE.UNSTAFFED : STANDARD_CONTINUATION_STATE.STAFFED);
+      // #1486 — read as staffing and contract_get read it: a worker on a retired model, ACTIVE or revoked, is the
+      // owner's to replace, in a state of its own.
+      const worker = currentBindingOf(roleKeyFor(Role.WORKER, { taskId: task.taskId }), this.cp.bindings, this.cp.sessions);
+      if (worker !== null && worker.retired === null && worker.binding.status !== "ACTIVE") return null;
+      states.push(
+        worker === null ? STANDARD_CONTINUATION_STATE.UNSTAFFED
+          : worker.retired !== null ? STANDARD_CONTINUATION_STATE.RETIRED : STANDARD_CONTINUATION_STATE.STAFFED,
+      );
     }
     if (!this.#pinnedOwnerExact(run, owner, Role.PRIMARY_CTO)) return null;
     const dispatch = this.cp.db.get<{ message_id: string; status: string }>(
