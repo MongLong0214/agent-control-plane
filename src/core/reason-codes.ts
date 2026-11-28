@@ -1197,6 +1197,11 @@ export const ReasonCode = {
    * fresh pair sealed from the stopped current database, never a repair of this one.
    */
   ROLLBACK_PAIR_STALE_DATABASE: "ROLLBACK_PAIR_STALE_DATABASE",
+  /**
+   * #1453 — an IRREVERSIBLE candidate whose destructive path change came with other changes. It is returned to its
+   * CTO before verification: the reversible part is resubmitted, and the destructive part becomes its own run.
+   */
+  IRREVERSIBLE_MIXED_CHANGE: "IRREVERSIBLE_MIXED_CHANGE",
 } as const;
 
 export type ReasonCode = (typeof ReasonCode)[keyof typeof ReasonCode];

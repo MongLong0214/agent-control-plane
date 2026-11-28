@@ -6,9 +6,19 @@ import { digestOf, sha256 } from "../core/digest.ts";
 import type { Clock } from "../core/clock.ts";
 import { type Decision, allow, deny, fail } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
-import { binaryPaths, changedPaths, diffDigest, git, isClean, readBlob, revParse, treeOf, tryRevParse } from "../git/git.ts";
+import { PATCH_WITHOUT_PROGRAMS, binaryPaths, changedPaths, diffDigest, git, isClean, readBlob, revParse, treeOf, tryRevParse } from "../git/git.ts";
 import { classifyImport } from "../run/task-import.ts";
 import { canonical, isWithin } from "../guard/workspace-probe.ts";
+import {
+  type AddedBlock,
+  type BlastRadiusDeclaration,
+  type BlastRadiusRepositoryChange,
+  classifyBlastRadius,
+  isSchemaPath,
+  parseAddedBlocks,
+  snapshotBlastRadius,
+  snapshotBlastRadiusSchema,
+} from "./blast-radius.ts";
 
 export const CANDIDATE_SNAPSHOT_SCHEMA_ID = "agent-control-plane.candidate-snapshot.v1";
 
@@ -234,6 +244,8 @@ export const candidateSnapshotSchema = z
     canonicalCtoIdentity: snapshotCanonicalCtoIdentitySchema.optional(),
     /** Present only on a STANDARD_WORK or CONTRACT_CHANGE candidate frozen with CEO-attached review evidence. */
     reviewEvidence: snapshotReviewEvidenceSchema.optional(),
+    /** #1453 — present only on a WIDE or IRREVERSIBLE candidate; absent is CONTAINED (`snapshot/blast-radius.ts`). */
+    blastRadius: snapshotBlastRadiusSchema.optional(),
     createdAt: z.string().min(1),
   })
   .strict()
@@ -332,7 +344,8 @@ export const duplicateRepositoryRoles = (
  * fields it always did — the key is left out, not set to null — so no existing digest moves. The
  * same holds for a CONTRACT_CHANGE candidate's `contractChange` (#246 B2-a) and its canonical CTO
  * identity baseline (`canonicalCtoIdentity`), and a STANDARD_WORK or CONTRACT_CHANGE candidate's private review evidence
- * (`reviewEvidence`): a candidate frozen with other evidence is a different candidate, reviewed again.
+ * (`reviewEvidence`): a candidate frozen with other evidence is a different candidate, reviewed again. So does
+ * its lane (`blastRadius`, #1453), which verification, review and the gate then share through this digest.
  */
 export const candidateSnapshotDigest = (snapshot: CandidateSnapshot): string =>
   digestOf({
@@ -344,7 +357,39 @@ export const candidateSnapshotDigest = (snapshot: CandidateSnapshot): string =>
     ...(snapshot.contractChange === undefined ? {} : { contractChange: snapshot.contractChange }),
     ...(snapshot.canonicalCtoIdentity === undefined ? {} : { canonicalCtoIdentity: snapshot.canonicalCtoIdentity }),
     ...(snapshot.reviewEvidence === undefined ? {} : { reviewEvidence: snapshot.reviewEvidence }),
+    ...(snapshot.blastRadius === undefined ? {} : { blastRadius: snapshot.blastRadius }),
   });
+
+/** #1453 — what the lane is classified from besides the candidate: the manifest's declarations and the run's text. */
+export interface BlastRadiusInput {
+  declared?: BlastRadiusDeclaration | undefined;
+  /** The run's stated destructive actions (`deriveHumanGate`). */
+  textItems: readonly string[];
+}
+
+/**
+ * #1453 — what one repository's candidate changes, as the classifier reads it: its deleted paths (renames not
+ * detected), and the added lines of each schema path, read one path at a time with no context.
+ */
+const blastRadiusChangeOf = async (
+  checkoutPath: string,
+  repository: Pick<SnapshotRepository, "repositoryRole" | "baseHead" | "candidateHead" | "touchedPaths">,
+  declared: BlastRadiusDeclaration | undefined,
+): Promise<BlastRadiusRepositoryChange> => {
+  const range = `${repository.baseHead}..${repository.candidateHead}`;
+  const deleted = await git(checkoutPath, ["diff", "--name-only", "--no-renames", "--diff-filter=D", ...PATCH_WITHOUT_PROGRAMS, range]);
+  const addedLines: Record<string, AddedBlock[]> = {};
+  for (const path of repository.touchedPaths.filter((touched) => isSchemaPath(declared, repository.repositoryRole, touched))) {
+    const patch = await git(checkoutPath, ["diff", "--no-color", "--no-renames", "-U0", ...PATCH_WITHOUT_PROGRAMS, range, "--", `:(top,literal)${path}`]);
+    addedLines[path] = parseAddedBlocks(patch.stdout);
+  }
+  return {
+    repositoryRole: repository.repositoryRole,
+    touchedPaths: repository.touchedPaths,
+    deletedPaths: deleted.stdout.split("\n").map((line) => line.trim()).filter(Boolean),
+    addedLines,
+  };
+};
 
 /**
  * #1232 — opaque, potentially active imports the CTO PLAN manifest authorized and the candidate holds
@@ -409,6 +454,7 @@ export const buildCandidateSnapshot = async (
     contractChange?: SnapshotContractChange;
     canonicalCtoIdentity?: SnapshotCanonicalCtoIdentity;
     reviewEvidence?: SnapshotReviewEvidence;
+    blastRadius?: BlastRadiusInput;
   },
   clock: Clock,
 ): Promise<CandidateSnapshot> => {
@@ -460,6 +506,16 @@ export const buildCandidateSnapshot = async (
   // Deterministic ordering so repository iteration order cannot change the digest.
   repositories.sort((a, b) => (a.identity < b.identity ? -1 : a.identity > b.identity ? 1 : 0));
 
+  const changes: BlastRadiusRepositoryChange[] = [];
+  if (params.blastRadius !== undefined) {
+    for (const repository of repositories) {
+      const checkoutPath = params.repositories.find((input) => input.identity === repository.identity)!.checkoutPath;
+      changes.push(await blastRadiusChangeOf(checkoutPath, repository, params.blastRadius.declared));
+    }
+  }
+  const blastRadius = params.blastRadius === undefined ? undefined
+    : snapshotBlastRadius(classifyBlastRadius({ repositories: changes, declared: params.blastRadius.declared, textItems: params.blastRadius.textItems }));
+
   return candidateSnapshotSchema.parse({
     schema: CANDIDATE_SNAPSHOT_SCHEMA_ID,
     runId: params.runId,
@@ -468,6 +524,7 @@ export const buildCandidateSnapshot = async (
     ...(params.contractChange === undefined ? {} : { contractChange: params.contractChange }),
     ...(params.canonicalCtoIdentity === undefined ? {} : { canonicalCtoIdentity: params.canonicalCtoIdentity }),
     ...(params.reviewEvidence === undefined ? {} : { reviewEvidence: params.reviewEvidence }),
+    ...(blastRadius === undefined ? {} : { blastRadius }),
     createdAt: clock.nowIso(),
   });
 };
@@ -486,10 +543,14 @@ export const buildNoRepositoryCandidateSnapshot = (
     contractChange?: SnapshotContractChange;
     canonicalCtoIdentity?: SnapshotCanonicalCtoIdentity;
     reviewEvidence?: SnapshotReviewEvidence;
+    /** #1453 — with no repository only the run's text can place it in a lane. */
+    blastRadius?: BlastRadiusInput;
   },
   clock: Clock,
-): CandidateSnapshot =>
-  candidateSnapshotSchema.parse({
+): CandidateSnapshot => {
+  const blastRadius = params.blastRadius === undefined ? undefined
+    : snapshotBlastRadius(classifyBlastRadius({ repositories: [], textItems: params.blastRadius.textItems }));
+  return candidateSnapshotSchema.parse({
     schema: CANDIDATE_SNAPSHOT_SCHEMA_ID,
     runId: params.runId,
     contractDigest: params.contractDigest,
@@ -498,8 +559,10 @@ export const buildNoRepositoryCandidateSnapshot = (
     ...(params.contractChange === undefined ? {} : { contractChange: params.contractChange }),
     ...(params.canonicalCtoIdentity === undefined ? {} : { canonicalCtoIdentity: params.canonicalCtoIdentity }),
     ...(params.reviewEvidence === undefined ? {} : { reviewEvidence: params.reviewEvidence }),
+    ...(blastRadius === undefined ? {} : { blastRadius }),
     createdAt: clock.nowIso(),
   });
+};
 
 export interface FreshnessProbe {
   identity: string;

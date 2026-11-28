@@ -32,6 +32,17 @@ export const branchProfileSchema = z
 
 export type BranchProfile = z.infer<typeof branchProfileSchema>;
 
+/** #1453 — a prefix of repository-relative paths in one repository role, written in its normal form. */
+const blastRadiusPathSchema = z
+  .object({
+    repositoryRole: z.string().min(1),
+    path: z.string().min(1).refine(
+      (path) => !path.startsWith("/") && path !== "." && path !== ".." && !path.startsWith("../") && posix.normalize(path) === path,
+      "a blastRadius path is relative and normal: no leading '/', './' or '..', and no '//'",
+    ),
+  })
+  .strict();
+
 export const projectManifestSchema = z
   .object({
     schema: z.literal(PROJECT_MANIFEST_SCHEMA_ID),
@@ -180,6 +191,40 @@ export const projectManifestSchema = z
       .min(1)
       .optional(),
     /**
+     * #1453 — what the blast-radius classifier reads beside the candidate's SQL (`snapshot/blast-radius.ts`). Each path
+     * is a repository-relative prefix in one repository role, matched as write targets are. `.optional()` with no
+     * default, as `gateEntries` is, so every manifest written before it keeps its digest.
+     */
+    blastRadius: z
+      .object({
+        /** A touched path here makes the candidate WIDE. */
+        wide: z.array(blastRadiusPathSchema).default([]),
+        /** A touched path here makes the candidate IRREVERSIBLE. */
+        irreversible: z.array(blastRadiusPathSchema).default([]),
+        /** Migration code: its added lines are read for destructive SQL, and deleting a file here is IRREVERSIBLE. */
+        migrations: z.array(blastRadiusPathSchema).default([]),
+        /** How long an expand run must have settled before its contract run may be confirmed. */
+        contractDelayHours: z.number().int().min(1).default(24),
+        /**
+         * Each role's recovery commands, by `verificationCommands` id. Backup and restore run in CI, TRUSTED_CI or
+         * BOTH_REQUIRED: a sandboxed command gets no credentials (ADR-0004), so ACP cannot back up production itself.
+         */
+        recovery: z
+          .array(
+            z
+              .object({
+                repositoryRole: z.string().min(1),
+                backupCommand: z.string().min(1),
+                restoreCheckCommand: z.string().min(1),
+                referenceCheckCommand: z.string().min(1).optional(),
+              })
+              .strict(),
+          )
+          .default([]),
+      })
+      .strict()
+      .optional(),
+    /**
      * #1268 — IGNORED. CommitLore is used for every commit the control plane makes in a managed project, whatever
      * this field says. It stays in the schema, and stays parseable as `required`, `preferred` or `off`, only so a
      * manifest already stored with `preferred` or `off` keeps its digest; nothing reads the value to decide
@@ -294,6 +339,27 @@ export const projectManifestSchema = z
         message: "defaultBranch must be one of the long-lived branches",
         path: ["branchProfile", "defaultBranch"],
       });
+    }
+    const blastRadius = manifest.blastRadius;
+    if (blastRadius === undefined) return;
+    const issue = (message: string): void => ctx.addIssue({ code: z.ZodIssueCode.custom, message, path: ["blastRadius"] });
+    for (const entry of [...blastRadius.wide, ...blastRadius.irreversible, ...blastRadius.migrations, ...blastRadius.recovery]) {
+      if (!roles.has(entry.repositoryRole)) issue(`blastRadius names unknown repositoryRole '${entry.repositoryRole}'`);
+    }
+    const commands = new Map(manifest.verificationCommands.map((command) => [command.id, command]));
+    const recovered = new Set<string>();
+    for (const entry of blastRadius.recovery) {
+      if (recovered.has(entry.repositoryRole)) issue(`blastRadius.recovery declares repositoryRole '${entry.repositoryRole}' more than once`);
+      recovered.add(entry.repositoryRole);
+      for (const [field, id] of [["backupCommand", entry.backupCommand], ["restoreCheckCommand", entry.restoreCheckCommand],
+        ["referenceCheckCommand", entry.referenceCheckCommand]] as const) {
+        if (id === undefined) continue;
+        const command = commands.get(id);
+        if (command === undefined) issue(`blastRadius.recovery ${field} '${id}' is not a verificationCommand`);
+        else if (field !== "referenceCheckCommand" && command.evidenceMode === "LOCAL_COMMAND") {
+          issue(`blastRadius.recovery ${field} '${id}' runs only locally, where it has no credentials; declare it TRUSTED_CI or BOTH_REQUIRED`);
+        }
+      }
     }
   });
 
