@@ -236,15 +236,13 @@ export const BOOTSTRAP_POST_CONFIRM_LIFECYCLE: readonly BootstrapLifecycleItem[]
     id: "primary-cto-handoff",
     kind: BootstrapLifecycleKind.IMPLEMENTED_GUARANTEE,
     statement:
-      "A genesis bootstrap provisions the allocated resident Claude Opus CTO in tmux, requires its matching process, native start token, cwd, UUID and RC bridge, then waits for that canonical session's admitted claim and handoff ACK. It never replaces that resident with a driven session. Legacy stored pre-genesis executions retain their historical activation path.",
+      "A genesis bootstrap provisions the allocated resident Claude Opus CTO in tmux, requires its matching process, native start token, cwd, UUID and RC bridge, then waits for that canonical session's admitted claim and handoff ACK. It never replaces that resident with a driven session, and a retried activation never replaces any bound PRIMARY_CTO. Legacy stored pre-genesis executions retain their historical activation path.",
     sites: [
-      { file: ACTIVATION, symbol: "activate", enforces: ["this.cto.ensureDrivenPrimaryCto(projectId, input.runId, undeliverable ?? undefined)", "this.openActivationHandoff("] },
       {
         file: ACTIVATION,
-        symbol: "undeliverableHandoff",
-        enforces: ['drivenModeOf(this.db, binding.sessionId) !== "NONE"', "session.buzzActorId", 'message.status !== "REJECTED"', 'row?.status !== "PENDING"'],
+        symbol: "activate",
+        enforces: ['"awaiting resident canonical claim"', "this.cto.ensureDrivenPrimaryCto(projectId, input.runId)", "this.openActivationHandoff("],
       },
-      { file: ACTIVATION, symbol: "reissuedToReplacement", enforces: ["PRIMARY_CTO_UNDELIVERABLE_REPLACED", 'row?.status !== "PENDING"'] },
       { file: ACTIVATION, symbol: "acknowledgeActivationHandoffInTx", enforces: ["row.to_session_id !== ackBySessionId", "ack must come from the incoming session"] },
     ],
   },

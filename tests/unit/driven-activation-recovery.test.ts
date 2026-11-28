@@ -18,18 +18,15 @@ afterAll(cleanupTempDirs);
 afterEach(() => vi.restoreAllMocks());
 
 /**
- * #246 C4, live run_7717 — a bootstrap activation provisions its PRIMARY_CTO through the driven door, and
- * the activation retry recovers a project whose PRIMARY_CTO an earlier activation bound interactively:
+ * #246 C4 — a bootstrap activation provisions its PRIMARY_CTO through the driven door, and a retried
+ * activation never replaces the PRIMARY_CTO an earlier activation bound (#1461):
  *
  * - a fresh activation binds a driven PRIMARY_CTO with its spawn record; its HANDOFF_PACKAGE stays PENDING
  *   in band, never swept to Buzz; the daemon's wake runs a turn whose handoff_ack lands, and the re-CONFIRM
  *   completes;
- * - the live shape (an interactive binding with no Buzz identity, its handoff PENDING, its HANDOFF_PACKAGE
- *   REJECTED undeliverable) is recovered by the CEO's re-CONFIRM alone: the binding is replaced by a driven
- *   one in one switch with its reason, the handoff is reissued once as a new PENDING package, the new
- *   holder's ACK completes it, and GitHub is not called again;
- * - a healthy interactive binding with a Buzz identity is reused, not replaced;
- * - a second retry reissues nothing.
+ * - the live run_7717 shape (an interactive binding with no Buzz identity, its handoff PENDING, its
+ *   HANDOFF_PACKAGE REJECTED undeliverable) keeps its holder on retry: no switch, no reissue, no GitHub call;
+ * - a healthy interactive binding with a Buzz identity is reused, not replaced.
  *
  * The run, its review, the owner's approval and GitHub are the runner fixture's; the CTO socket and the
  * daemon's in-band wake are real, and only the model is scripted: its work turn does what the prompt asks.
@@ -224,8 +221,8 @@ describe("#246 C4: a bootstrap activation provisions a driven PRIMARY_CTO", () =
   });
 });
 
-describe("#246 C4, live run_7717: the activation retry recovers an undeliverable interactive PRIMARY_CTO", () => {
-  it("the re-CONFIRM replaces it with a driven holder in one switch, reissues the handoff once, and completes on the new holder's ACK with no GitHub call", async () => {
+describe("#1461, live run_7717: a retried activation never replaces its bound PRIMARY_CTO", () => {
+  it("an interactive holder whose package was rejected undeliverable keeps the role: no switch, no reissue, no GitHub call", async () => {
     await withWorld("da-live", async (w) => {
       const { cp } = w;
       const { handoffId: stale, holder } = await liveShape(w);
@@ -235,79 +232,16 @@ describe("#246 C4, live run_7717: the activation retry recovers an undeliverable
       expect(retried, JSON.stringify(retried)).toMatchObject({
         allowed: false,
         reasonCode: ReasonCode.BOOTSTRAP_ACTIVATION_INCOMPLETE,
-        evidence: { incomplete: ["handoffAck"] },
+        evidence: { incomplete: ["handoffAck"], pendingHandoffId: stale },
       });
-      expect(w.github()).toEqual(github);
-      const reissued = retried.evidence["pendingHandoffId"] as string;
-      expect(reissued).not.toBe(stale);
-
-      // The driven replacement, bound in the switch that revoked the interactive holder with its reason.
-      const driven = w.primary();
-      expect(driven.sessionId).not.toBe(holder.sessionId);
-      expect(driven.bindingGeneration).toBe(holder.bindingGeneration + 1);
-      expect(drivenModeOf(cp.db, driven.sessionId)).toBe("DRIVEN");
-      expect(w.audits(DRIVEN_PRIMARY_CTO_SPAWN_RECORD).map((row) => [row.sessionId, row.runId])).toEqual([[driven.sessionId, w.runId]]);
-      const revoked = cp.db.get<{ status: string; revoked_reason: string }>(
-        `SELECT status, revoked_reason FROM assignments WHERE assignment_id = ?`,
-        [holder.assignmentId],
-      );
-      expect(revoked?.status).toBe("REVOKED");
-      expect(revoked?.revoked_reason).toContain(stale);
-      const replaced = w.audits("PRIMARY_CTO_UNDELIVERABLE_REPLACED");
-      expect(replaced).toHaveLength(1);
-      expect(replaced[0]).toMatchObject({
-        sessionId: driven.sessionId,
-        runId: w.runId,
-        evidence: { handoffId: stale, fromSession: holder.sessionId, fromGeneration: holder.bindingGeneration, toGeneration: driven.bindingGeneration },
-      });
-      expect(cp.sessions.require(holder.sessionId).lifecycle).toBe(SessionLifecycle.STOPPED);
-
-      // The old records are kept; the reissued package is new, PENDING, in band, to the driven holder.
+      expect(w.primary()).toMatchObject({ assignmentId: holder.assignmentId, sessionId: holder.sessionId, bindingGeneration: holder.bindingGeneration });
+      expect(cp.sessions.require(holder.sessionId).lifecycle).toBe(SessionLifecycle.READY);
+      expect(w.audits(DRIVEN_PRIMARY_CTO_SPAWN_RECORD)).toEqual([]);
+      expect(w.audits("PRIMARY_CTO_UNDELIVERABLE_REPLACED")).toEqual([]);
+      expect(w.audits("HANDOFF_SUBMITTED")).toHaveLength(1);
       expect(w.handoff(stale)).toEqual({ status: "PENDING", to_session_id: holder.sessionId });
       expect(w.message(stale)).toMatchObject({ status: "REJECTED", attempts: 1 });
-      expect(w.handoff(reissued)).toEqual({ status: "PENDING", to_session_id: driven.sessionId });
-      expect(w.message(reissued)).toMatchObject({
-        status: "PENDING",
-        attempts: 0,
-        target_session_id: driven.sessionId,
-        binding_generation: driven.bindingGeneration,
-      });
-      expect(w.audits("HANDOFF_SUBMITTED").map((row) => row.evidence["reissuedFrom"] ?? null)).toEqual([null, stale]);
-      await w.prepared.harness.buzzAdapter.deliverPending();
-      expect(w.message(reissued)).toMatchObject({ status: "PENDING", attempts: 0 });
-
-      // The previous holder cannot ACK its old package, and nothing completes on it.
-      expect(cp.bootstrap.acknowledgeActivationHandoff(stale, holder.sessionId)).toMatchObject({ allowed: false, reasonCode: ReasonCode.HANDOFF_ACK_REQUIRED });
-      expect(w.handoff(stale)?.status).toBe("PENDING");
-      const refused = await w.confirm();
-      expect(refused, JSON.stringify(refused)).toMatchObject({
-        allowed: false,
-        reasonCode: ReasonCode.BOOTSTRAP_ACTIVATION_INCOMPLETE,
-        evidence: { incomplete: ["handoffAck"] },
-      });
-      expect(cp.runs.require(w.runId).state).toBe(RunState.READY_FOR_CEO_REVIEW);
-      expect(cp.artifacts.latest(w.runId, "BOOTSTRAP_ACTIVATION_RESULT")).toBeNull();
-
-      // The current PRIMARY_CTO's own turn acknowledges the reissued package; the re-CONFIRM completes.
-      await w.wake();
-      // The turn's handoff_ack answered: the row is ACKED and the turn read the answer.
-      await vi.waitFor(() => {
-        expect(w.handoff(reissued)?.status).toBe("ACKED");
-        expect(w.acks).toHaveLength(1);
-      }, { timeout: 15_000 });
-      expect(w.acks).toEqual([{ sessionId: driven.sessionId, handoffId: reissued, ok: true }]);
-      const ready = await w.activate();
-      expect(ready, JSON.stringify(ready)).toMatchObject({
-        allowed: true,
-        value: { primaryCtoBinding: { sessionId: driven.sessionId }, handoffAck: { handoffId: reissued } },
-      });
-      expect(await w.confirm()).toMatchObject({ allowed: true, value: { state: RunState.COMPLETED } });
-      expect(cp.artifacts.latest(w.runId, "BOOTSTRAP_ACTIVATION_RESULT")?.content).toMatchObject({
-        primaryCtoBinding: { sessionId: driven.sessionId, bindingGeneration: driven.bindingGeneration },
-        handoffAck: { handoffId: reissued },
-      });
       expect(w.github()).toEqual(github);
-      expect(cp.bootstrapApplications.get(w.runId)?.phase).toBe("COMPLETED");
     });
   });
 
@@ -347,38 +281,6 @@ describe("#246 C4, live run_7717: the activation retry recovers an undeliverable
       expect(await acknowledgeBootstrapHandoff(w.prepared.harness, handoffId, holder.sessionId)).toMatchObject({ allowed: true });
       expect(await w.activate()).toMatchObject({ allowed: true, value: { handoffAck: { handoffId } } });
       expect(await w.confirm()).toMatchObject({ allowed: true, value: { state: RunState.COMPLETED } });
-    });
-  });
-
-  it("a second retry does not reissue the handoff again, before the new ACK or after it", async () => {
-    await withWorld("da-once", async (w) => {
-      const { cp } = w;
-      const { handoffId: stale } = await liveShape(w);
-      const retried = await w.activate();
-      const reissued = retried.evidence["pendingHandoffId"] as string;
-      expect(reissued).not.toBe(stale);
-      const driven = w.primary();
-      const handoffsOf = () => cp.db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM handoffs WHERE project_id = ?`, [w.projectId])?.n;
-      expect(handoffsOf()).toBe(2);
-
-      const again = await w.activate();
-      expect(again, JSON.stringify(again)).toMatchObject({ allowed: false, evidence: { incomplete: ["handoffAck"], pendingHandoffId: reissued } });
-      expect(w.primary()).toMatchObject({ assignmentId: driven.assignmentId, bindingGeneration: driven.bindingGeneration });
-      expect(handoffsOf()).toBe(2);
-      expect(w.audits("PRIMARY_CTO_UNDELIVERABLE_REPLACED")).toHaveLength(1);
-      expect(w.audits("HANDOFF_SUBMITTED")).toHaveLength(2);
-
-      await w.wake();
-      // The turn's handoff_ack answered: the row is ACKED and the turn read the answer.
-      await vi.waitFor(() => {
-        expect(w.handoff(reissued)?.status).toBe("ACKED");
-        expect(w.acks).toHaveLength(1);
-      }, { timeout: 15_000 });
-      expect(await w.activate()).toMatchObject({ allowed: true, value: { handoffAck: { handoffId: reissued } } });
-      expect(handoffsOf()).toBe(2);
-      expect(w.audits("PRIMARY_CTO_UNDELIVERABLE_REPLACED")).toHaveLength(1);
-      expect(w.audits("HANDOFF_SUBMITTED")).toHaveLength(2);
-      expect(w.acks).toEqual([{ sessionId: driven.sessionId, handoffId: reissued, ok: true }]);
     });
   });
 });
