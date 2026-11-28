@@ -1,0 +1,4 @@
+Limit: the 60→59 replacement install (record-replacement and rollback --replacement-database under P59) runs only from the v60 build: the replay plans from the pair version to the running build schema, so a v61 build refuses a P59 replacement for a v60 database as ROLLBACK_PAIR_STALE_DATABASE
+Warn: the 60→59 conversion SQL in docs/ops/owner-actions.md is executable test input: tests/unit/a-v60-database-returns-to-v59.test.ts extracts it by its owner-actions:v60-to-v59-convert markers and runs it, so the markers and the block contents must stay intact
+Unverified: the 60→59 install under P59 and the v59 start proof are not rehearsed by any test; they need the v60 and v59 builds, which a v61 tree cannot run
+Provenance: reconstructed
