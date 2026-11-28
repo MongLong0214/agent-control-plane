@@ -96,6 +96,8 @@ export const makeHarness = (
      * commitlore-saw`): `finishExecution` then writes none.
      */
     commitloreReceipts?: boolean;
+    /** #1456 — the CommitLore the control plane is composed with; `settlingCommitLore()` when omitted. */
+    commitlore?: ControlPlaneConfig["commitlore"];
   } = {},
 ): Harness => {
   const root = options.root ?? tempDir("acp-harness-");
@@ -140,7 +142,7 @@ console.log('verification ok');`,
       preferred: { provider: "scripted", model: "scripted-reviewer", effort: "xhigh" },
       fallbacks: [],
     },
-    commitlore: settlingCommitLore(),
+    commitlore: options.commitlore ?? settlingCommitLore(),
     ...(options.githubClient ? { githubClient: options.githubClient } : {}),
     ...(options.githubKernelOptions ? { githubKernelOptions: options.githubKernelOptions } : {}),
     ...(options.githubAppEnvFile ? { githubAppEnvFile: options.githubAppEnvFile } : {}),
