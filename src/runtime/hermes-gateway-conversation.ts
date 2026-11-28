@@ -11,7 +11,7 @@ import {
 
 const PATH = "/v1/canonical-surface/events";
 /** U6 B1 — the Gateway route that may answer a CEO notification as a reply to the owner's `/acp` message. */
-const DAEMON_NOTICES_PATH = "/v1/canonical-surface/daemon-notices";
+export const DAEMON_NOTICES_PATH = "/v1/canonical-surface/daemon-notices";
 const MAX_REPLY_BYTES = 16_384;
 const MAX_REQUEST_BYTES = 16_384;
 /** U6 B1 — the largest body the daemon-notice route takes; a notice with an origin is sent there whole. */
@@ -171,7 +171,56 @@ export interface HermesGatewayDaemonNoticeOptions {
   port?: number;
   /** Tests only: the answer deadline; production keeps the conversation sender's 5 s. */
   timeoutMs?: number;
+  /** A caller that has stopped waiting: ends the identity lookup, and the request if it is already out. */
+  signal?: AbortSignal;
+  /**
+   * The endpoint, named by the caller. Without it the route is read from the signed text as the outbox's CEO
+   * notifications need it (`daemonNoticePath`: an origin sends it to the daemon-notice route, anything else to
+   * `/events`). A caller that sends a notice no request originated names the daemon-notice route itself and does
+   * not leave it to an origin it does not have.
+   */
+  path?: string;
 }
+
+/**
+ * Whether the Gateway at `port` serves the signed daemon-notice route, without sending it anything: one `HEAD` to
+ * the route, no body and no credential. The route is `POST`-only, so a Gateway that has it answers 405 with
+ * `Allow: POST` and a Gateway that has not answers 404. `OPTIONS` cannot say: the Gateway's CORS middleware
+ * answers it 403 for every path. Any other answer, or none, is "not confirmed", and the caller sends nothing.
+ */
+export const probeDaemonNoticeRoute = (options: { port?: number; signal?: AbortSignal; timeoutMs?: number }):
+  Promise<{ supported: boolean; detail: string }> => new Promise((resolve) => {
+  const port = options.port ?? DEFAULT_HERMES_GATEWAY_PORT;
+  let done = false;
+  const cleanups: Array<() => void> = [];
+  const finish = (supported: boolean, detail: string, req?: ReturnType<typeof request>) => {
+    if (done) return;
+    done = true;
+    for (const cleanup of cleanups) cleanup();
+    resolve({ supported, detail });
+    req?.destroy();
+  };
+  if (!Number.isSafeInteger(port) || port < 1 || port > 65535 || options.signal?.aborted) {
+    return finish(false, "probe not made");
+  }
+  const req = request({ hostname: HERMES_GATEWAY_HOST, family: 4, port, path: DAEMON_NOTICES_PATH, method: "HEAD",
+    agent: false }, (res) => {
+    const status = res.statusCode ?? 0;
+    // Method names are case-sensitive, and the only whitespace around a list element is HTTP's optional
+    // whitespace, SP and HTAB: `.trim()` would also strip a no-break space, so `Allow: POST\u00a0` would name POST.
+    const allow = String(res.headers["allow"] ?? "").split(",").map((method) => method.replace(/^[ \t]+|[ \t]+$/g, ""));
+    res.resume();
+    // Only the POST-only route refusing a HEAD names this route: 405 with `Allow: POST`. A 2xx (204 included),
+    // a 404, a 405 without POST in `Allow` and anything else is no route, and nothing is sent.
+    finish(status === 405 && allow.includes("POST"),
+      `HEAD answered ${status}${allow.includes("POST") ? " with Allow: POST" : ""}`, req);
+  });
+  req.on("error", () => finish(false, "HEAD failed"));
+  const timer = setTimeout(() => finish(false, "HEAD timed out", req), options.timeoutMs ?? 1_500);
+  cleanups.push(() => clearTimeout(timer));
+  options.signal?.addEventListener("abort", () => finish(false, "HEAD aborted", req), { once: true });
+  req.end();
+});
 
 /**
  * `acp-daemon-notice/v1`: one signed daemon notice to the CEO's existing canonical conversation, with
@@ -187,7 +236,8 @@ export interface HermesGatewayDaemonNoticeOptions {
 export const createHermesGatewayDaemonNoticeSender = (options: HermesGatewayDaemonNoticeOptions):
   ((body: DaemonNoticeBody) => Promise<DaemonNoticeSendOutcome>) => {
   const port = options.port ?? DEFAULT_HERMES_GATEWAY_PORT;
-  const readIdentity = createHermesGatewayIdentityReader({ apiKey: options.apiKey, port });
+  const readIdentity = createHermesGatewayIdentityReader({ apiKey: options.apiKey, port,
+    ...(options.signal ? { signal: options.signal } : {}) });
   return async (notice) => {
     const destination = notice?.destination;
     if (!Number.isSafeInteger(port) || port < 1 || port > 65535 || !/^[\x21-\x7e]+$/.test(options.apiKey) ||
@@ -198,7 +248,7 @@ export const createHermesGatewayDaemonNoticeSender = (options: HermesGatewayDaem
       return { kind: "NOT_SENT", reason: "INVALID" };
     }
     const body = JSON.stringify(notice);
-    const path = daemonNoticePath(notice.text);
+    const path = options.path ?? daemonNoticePath(notice.text);
     if (Buffer.byteLength(body) > (path === DAEMON_NOTICES_PATH ? DAEMON_NOTICE_MAX_REQUEST_BYTES : MAX_REQUEST_BYTES)) {
       return { kind: "NOT_SENT", reason: "INVALID" };
     }
@@ -254,9 +304,13 @@ export const createHermesGatewayDaemonNoticeSender = (options: HermesGatewayDaem
         });
         req.on("error", () => finish(lost("TRANSPORT_ERROR")));
         timer = setTimeout(() => { finish(lost("TIMEOUT")); req.destroy(); }, options.timeoutMs ?? TIMEOUT_MS);
-        let authorized = true;
-        try { authorized = options.preDispatch ? options.preDispatch() === true : true; }
-        catch { authorized = false; }
+        options.signal?.addEventListener("abort", () => { finish(lost("ABORTED")); req.destroy(); }, { once: true });
+        // An aborted caller has stopped waiting: the request is not begun, and `preDispatch` is not asked.
+        let authorized = options.signal?.aborted !== true;
+        if (authorized) {
+          try { authorized = options.preDispatch ? options.preDispatch() === true : true; }
+          catch { authorized = false; }
+        }
         if (!authorized) {
           finish({ kind: "NOT_SENT", reason: "STALE" });
           req.destroy();

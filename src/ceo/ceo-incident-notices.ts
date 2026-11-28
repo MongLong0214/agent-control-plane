@@ -26,7 +26,9 @@ import type { BindingRegistry } from "../session/binding-registry.ts";
  * nothing more is delivered for it; an ACK is receipt, never resolution. A notice of a resolved incident is
  * withdrawn rather than carried to a CEO it was not addressed to (`withdrawResolvedNotices`).
  *
- * Every CEO notice is enqueued here, by `enqueueCeoNotice`. Two keep their own keys and dedup: a candidate's
+ * Every CEO notice that goes into the outbox is enqueued here, by `enqueueCeoNotice`. The one that does not is a
+ * start refused before the database opens (`src/daemon/start-refusal-notice.ts`), sent to the Gateway directly
+ * because that start writes nothing to the database. Two keep their own keys and dedup: a candidate's
  * READY_FOR_CEO_REVIEW (`ProductionGate.buildPacket`, and its re-delivery after a CEO recovery, deduplicated by the
  * decision and the candidate, in `AgentOwnedWaits.redeliverPendingReviews`), and an agent-owned wait's RENOTIFY
  * and REASSIGN steps, which re-send that wait's own notice on its deadline ladder by design.

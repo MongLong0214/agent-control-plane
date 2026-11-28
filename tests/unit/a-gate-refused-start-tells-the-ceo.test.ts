@@ -1,0 +1,820 @@
+import Database from "better-sqlite3";
+import { createHash } from "node:crypto";
+import { performance } from "node:perf_hooks";
+import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
+import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import type { AddressInfo } from "node:net";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterAll, describe, expect, it, vi } from "vitest";
+
+import { BuzzCliTransport } from "../../src/buzz/buzz-adapter.ts";
+
+import { readProcessStartToken } from "../../src/core/process-argv.ts";
+import { processStartedAt } from "../../src/core/process-identity.ts";
+import { ReasonCode } from "../../src/core/reason-codes.ts";
+import { claimRefusalNoticeSend, readCrashLoopFile } from "../../src/daemon/crash-loop.ts";
+import { SingleInstanceLock } from "../../src/daemon/single-instance.ts";
+import { type StartGateConfig, refuseStartBeforeOpening, takeStartLock } from "../../src/daemon/start-gate.ts";
+import { DESTINATION_MISMATCH, TARGET_UNCONFIRMED, readActiveCeoBinding, refusalNoticeRouteFrom } from "../../src/daemon/start-refusal-notice.ts";
+import { Db } from "../../src/db/database.ts";
+import { DIGEST, LIVE, adoptedFixture } from "../helpers/adopted-ceo.ts";
+import {
+  type DaemonNoticeBody,
+  type DaemonNoticeDestination,
+  type DaemonNoticeSendOutcome,
+  daemonNoticeCanonical,
+  daemonNoticeKey,
+  daemonNoticeSignature,
+} from "../../src/runtime/acp-daemon-notice.ts";
+
+/**
+ * #1496 — a start the pre-open gate refused tells the CEO, through the CEO notice route's own transport and
+ * never through the database or the outbox. The transport here is a fake; the route and signer are the real
+ * ones (`start-refusal-notice.ts`), so what the fake receives is what the Gateway would.
+ */
+const LANE_SECRET = "refusal-notice-lane-secret";
+const DESTINATION: DaemonNoticeDestination = {
+  session_id: "hermes-session-live",
+  lineage_root_digest: `sha256:${"a".repeat(64)}`,
+  process_pid: 4242,
+  process_started_at: "Mon Nov 23 09:00:00 2026",
+};
+const T0 = Date.parse("2026-11-23T10:00:00.000Z");
+
+const dirs: string[] = [];
+afterAll(() => {
+  for (const dir of dirs) rmSync(dir, { recursive: true, force: true });
+});
+
+const newState = (): { root: string; database: string; config: StartGateConfig } => {
+  const root = mkdtempSync(join(tmpdir(), "acp-gate-ceo-notice-"));
+  dirs.push(root);
+  chmodSync(root, 0o700);
+  const secretsDir = join(root, "secrets");
+  mkdirSync(secretsDir, { mode: 0o700 });
+  const database = join(root, "state.sqlite");
+  new Db(database).close();
+  return {
+    root,
+    database,
+    config: { databasePath: database, worktreeRoot: join(root, "worktrees"), secretsDir, capacityDir: join(root, "capacity") },
+  };
+};
+
+const sha = (path: string): string => createHash("sha256").update(readFileSync(path)).digest("hex");
+
+/** The database as files, plus its audit row count read from a private copy (the original is never opened). */
+const imageOf = (root: string, database: string) => {
+  const probe = join(root, "..", `probe-${process.pid}-${Math.random().toString(36).slice(2)}.sqlite`);
+  copyFileSync(database, probe);
+  const raw = new Database(probe, { readonly: true });
+  const auditRows = (raw.prepare("SELECT COUNT(*) AS n FROM audit_events").get() as { n: number }).n;
+  const outboxRows = (raw.prepare("SELECT COUNT(*) AS n FROM outbox").get() as { n: number }).n;
+  raw.close();
+  rmSync(probe, { force: true });
+  return {
+    main: sha(database),
+    sidecars: readdirSync(root).filter((name) => name.startsWith("state.sqlite-")),
+    auditRows,
+    outboxRows,
+  };
+};
+
+const settled = (body: DaemonNoticeBody) => ({
+  kind: "RESPONDED" as const,
+  status: 200,
+  body: {
+    event_id: body.event_id,
+    payload_digest: body.payload_digest,
+    receipt: {
+      receipt_id: "receipt-1",
+      status: "completed",
+      session_id: DESTINATION.session_id,
+      lineage_root_digest: DESTINATION.lineage_root_digest,
+    },
+  },
+});
+
+interface Dispatch {
+  begin(): boolean;
+  signal: AbortSignal;
+  remainingMs(): number;
+}
+
+/**
+ * A route whose transport is a fake. Like the real sender it asks `dispatch.begin()` right before the request
+ * would leave and sends only when told yes; `sent` is what actually left.
+ */
+const fakeRoute = (
+  answer: (body: DaemonNoticeBody, dispatch: Dispatch) => Promise<DaemonNoticeSendOutcome> = async (body) => settled(body),
+  lookup: (signal: AbortSignal) => Promise<DaemonNoticeDestination> = async () => ({ ...DESTINATION }),
+) => {
+  const sent: DaemonNoticeBody[] = [];
+  return {
+    sent,
+    route: {
+      configured: true as const,
+      laneSecret: LANE_SECRET,
+      destination: lookup,
+      send: async (body: DaemonNoticeBody, dispatch: Dispatch): Promise<DaemonNoticeSendOutcome> => {
+        if (dispatch && !dispatch.begin()) return { kind: "NOT_SENT", reason: "STALE" };
+        sent.push(body);
+        return answer(body, dispatch);
+      },
+    },
+  };
+};
+
+const clockAt = (offsetMs: number) => () => new Date(T0 + offsetMs).toISOString();
+
+const noticePayload = (body: DaemonNoticeBody) => {
+  const head = /^ACP notification (\S+) part 1\/1: /.exec(body.text);
+  expect(head).not.toBeNull();
+  const wrapped = JSON.parse(body.text.slice(head![0].length)) as { messageId: string; kind: string; payload: Record<string, unknown> };
+  expect(wrapped.messageId).toBe(head![1]);
+  expect(wrapped.kind).toBe("CEO_NOTIFICATION");
+  return wrapped.payload;
+};
+
+describe("a gate-refused start tells the CEO outside the database (#1496)", () => {
+  it("sends exactly one notice with the refusal's id, reason, findings, stage, host and time, and leaves the database alone", async () => {
+    const { root, database, config } = newState();
+    const before = imageOf(root, database);
+    const { route, sent } = fakeRoute();
+
+    const refused = await refuseStartBeforeOpening(config, clockAt(0), { route, host: "build-host-1" });
+
+    expect(refused).not.toBeNull();
+    expect(refused!.decision.reasonCode).toBe(ReasonCode.DOCTOR_BLOCKED);
+    expect(sent).toHaveLength(1);
+    const body = sent[0]!;
+    expect(body.destination).toEqual(DESTINATION);
+    expect(body.signature).toBe(daemonNoticeSignature(daemonNoticeKey(LANE_SECRET), daemonNoticeCanonical({
+      protocol: body.protocol, principal: body.principal, binding: body.binding, event_id: body.event_id,
+      destination: body.destination, text: body.text,
+    })));
+    const loop = readCrashLoopFile(root, clockAt(0)());
+    const payload = noticePayload(body);
+    expect(loop.lastRefusal?.refusalId).toMatch(/^[0-9a-f-]{36}$/);
+    expect(payload).toMatchObject({
+      refusalId: loop.lastRefusal!.refusalId,
+      reasonCode: ReasonCode.DOCTOR_BLOCKED,
+      stage: "before-open",
+      host: "build-host-1",
+      at: "2026-11-23T10:00:00.000Z",
+      databaseWritten: false,
+    });
+    expect((payload["blockingFindings"] as Array<{ code: string }>).map((finding) => finding.code)).toContain(
+      "TRUSTED_GATE_CREDENTIAL_MISSING",
+    );
+    expect(payload["blockingFindings"]).toEqual(loop.lastRefusal!.blockingFindings);
+    // The database: same bytes, no sidecar, no audit row, no outbox row.
+    expect(imageOf(root, database)).toEqual(before);
+  });
+
+  it("records the refusalId and the delivery outcome in crash-loop.json", async () => {
+    const { root, config } = newState();
+    const { route, sent } = fakeRoute();
+
+    const refused = await refuseStartBeforeOpening(config, clockAt(0), { route, host: "h" });
+
+    const loop = readCrashLoopFile(root, clockAt(0)());
+    expect(loop.failures).toBe(1);
+    expect(loop.lastRefusal).toMatchObject({
+      host: "h",
+      notice: { outcome: "delivered", eventId: sent[0]!.event_id, receiptId: "receipt-1" },
+    });
+    expect(refused!.decision.evidence).toMatchObject({ refusalId: loop.lastRefusal!.refusalId });
+  });
+
+  it("does not resend on a retry inside the backoff, and a new refusal gets a new id and its own notice", async () => {
+    const { root, config } = newState();
+    const { route, sent } = fakeRoute();
+    await refuseStartBeforeOpening(config, clockAt(0), { route, host: "h" });
+    const first = readCrashLoopFile(root, clockAt(0)()).lastRefusal!;
+
+    const retry = await refuseStartBeforeOpening(config, clockAt(1_000), { route, host: "h" });
+
+    expect(retry!.decision.reasonCode).toBe(ReasonCode.DAEMON_BACKOFF_ACTIVE);
+    expect(sent).toHaveLength(1);
+    expect(readCrashLoopFile(root, clockAt(0)()).lastRefusal).toEqual(first);
+
+    const later = await refuseStartBeforeOpening(config, clockAt(10 * 60_000), { route, host: "h" });
+
+    expect(later!.decision.reasonCode).toBe(ReasonCode.DOCTOR_BLOCKED);
+    expect(sent).toHaveLength(2);
+    const second = readCrashLoopFile(root, clockAt(0)()).lastRefusal!;
+    expect(second.refusalId).not.toBe(first.refusalId);
+    expect(noticePayload(sent[1]!)["refusalId"]).toBe(second.refusalId);
+    expect(sent[1]!.event_id).not.toBe(sent[0]!.event_id);
+  });
+
+  it.each([
+    ["a transport answer that was never read (the request was out: unknown, not failed)", async (): Promise<DaemonNoticeSendOutcome> => ({ kind: "UNCERTAIN", reason: "TIMEOUT" }), "UNCERTAIN: TIMEOUT", "unknown"],
+    ["a request that never left", async (): Promise<DaemonNoticeSendOutcome> => ({ kind: "NOT_SENT", reason: "STALE" }), "NOT_SENT: STALE", "failed"],
+    ["a Gateway refusal", async (): Promise<DaemonNoticeSendOutcome> => ({ kind: "RESPONDED", status: 401, body: { error: "daemon_notice_signature_invalid" } }), "not settled (status 401)", "failed"],
+    ["a transport that throws after the request was released", async (): Promise<DaemonNoticeSendOutcome> => { throw new Error("socket exploded"); }, "socket exploded", "unknown"],
+  ])("%s is recorded and does not change the refusal", async (_name, answer, reason, outcome) => {
+    const baseline = newState();
+    const ok = await refuseStartBeforeOpening(baseline.config, clockAt(0), { route: fakeRoute().route, host: "h" });
+    const { root, database, config } = newState();
+    const before = imageOf(root, database);
+    const { route, sent } = fakeRoute(answer);
+
+    const refused = await refuseStartBeforeOpening(config, clockAt(0), { route, host: "h" });
+
+    expect(sent).toHaveLength(1);
+    expect(refused!.decision.reasonCode).toBe(ok!.decision.reasonCode);
+    expect({ failures: refused!.failures, backoffSeconds: refused!.backoffSeconds }).toEqual({
+      failures: ok!.failures, backoffSeconds: ok!.backoffSeconds,
+    });
+    const notice = readCrashLoopFile(root, clockAt(0)()).lastRefusal?.notice;
+    expect(notice).toMatchObject({ outcome });
+    expect((notice as { reason: string }).reason).toContain(reason);
+    expect(imageOf(root, database)).toEqual(before);
+  });
+
+  it("(b) a POST that has started and stalls past the bound is unknown, not failed, and is aborted", async () => {
+    const { root, config } = newState();
+    let aborted = false;
+    const { route, sent } = fakeRoute((_body, dispatch) => new Promise<DaemonNoticeSendOutcome>(() => {
+      dispatch.signal.addEventListener("abort", () => { aborted = true; });
+    }));
+
+    const refused = await refuseStartBeforeOpening(config, clockAt(0), { route, host: "h", timeoutMs: 60 });
+
+    expect(sent).toHaveLength(1);
+    expect(refused!.decision.reasonCode).toBe(ReasonCode.DOCTOR_BLOCKED);
+    const notice = readCrashLoopFile(root, clockAt(0)()).lastRefusal?.notice;
+    expect(notice).toMatchObject({
+      outcome: "unknown", eventId: sent[0]!.event_id,
+      reason: "request in flight at timeout; receipt cannot be assumed either way",
+    });
+    expect(aborted).toBe(true);
+  });
+
+  it("(a) an identity lookup that resolves after the bound never lets a POST begin, and the outcome is a pre-send timeout", async () => {
+    const { root, database, config } = newState();
+    const before = imageOf(root, database);
+    let release: (destination: DaemonNoticeDestination) => void = () => undefined;
+    let lookupAborted = false;
+    const { route, sent } = fakeRoute(undefined, (signal) => new Promise<DaemonNoticeDestination>((resolve) => {
+      signal.addEventListener("abort", () => { lookupAborted = true; });
+      release = resolve;
+    }));
+
+    const refused = await refuseStartBeforeOpening(config, clockAt(0), { route, host: "h", timeoutMs: 60 });
+
+    expect(refused!.decision.reasonCode).toBe(ReasonCode.DOCTOR_BLOCKED);
+    expect(readCrashLoopFile(root, clockAt(0)()).lastRefusal?.notice).toMatchObject({
+      outcome: "failed", reason: "timeout after 60ms before the request began; nothing was sent",
+    });
+    expect(lookupAborted).toBe(true);
+    // The lookup now finishes, late. Wait past it: no request is ever begun.
+    release({ ...DESTINATION });
+    await new Promise<void>((resolveWait) => setTimeout(resolveWait, 250));
+    expect(sent).toHaveLength(0);
+    expect(readCrashLoopFile(root, clockAt(0)()).lastRefusal?.notice).toMatchObject({ outcome: "failed" });
+    expect(imageOf(root, database)).toEqual(before);
+  });
+
+  it("bounds a transport that never answers: the refusal waits no longer than the bound", async () => {
+    const { root, config } = newState();
+    const { route } = fakeRoute(() => new Promise<DaemonNoticeSendOutcome>(() => undefined));
+
+    const started = Date.now();
+    const refused = await refuseStartBeforeOpening(config, clockAt(0), { route, host: "h", timeoutMs: 80 });
+
+    expect(Date.now() - started).toBeLessThan(2_000);
+    expect(refused!.decision.reasonCode).toBe(ReasonCode.DOCTOR_BLOCKED);
+    // The request was out when the bound expired: neither delivery nor failure is claimed.
+    expect(readCrashLoopFile(root, clockAt(0)()).lastRefusal?.notice).toMatchObject({
+      outcome: "unknown", reason: "request in flight at timeout; receipt cannot be assumed either way",
+    });
+  });
+
+  it("an unconfigured route sends nothing and says so", async () => {
+    const { root, config } = newState();
+    let touched = false;
+    const route = {
+      configured: false as const,
+      reason: "ACP_DAEMON_NOTICE_ENABLED is not 1",
+      destination: async () => { touched = true; return DESTINATION; },
+      send: async () => { touched = true; return { kind: "NOT_SENT" as const, reason: "x" }; },
+    };
+
+    const refused = await refuseStartBeforeOpening(config, clockAt(0), { route, host: "h" });
+
+    expect(touched).toBe(false);
+    expect(refused!.decision.reasonCode).toBe(ReasonCode.DOCTOR_BLOCKED);
+    expect(readCrashLoopFile(root, clockAt(0)()).lastRefusal?.notice).toMatchObject({
+      outcome: "route-unconfigured", reason: "ACP_DAEMON_NOTICE_ENABLED is not 1",
+    });
+    expect(existsSync(join(root, "state.sqlite-wal"))).toBe(false);
+  });
+
+  it("a start given no route at all records route-unconfigured", async () => {
+    const { root, config } = newState();
+
+    await refuseStartBeforeOpening(config, clockAt(0));
+
+    expect(readCrashLoopFile(root, clockAt(0)()).lastRefusal?.notice).toMatchObject({ outcome: "route-unconfigured" });
+  });
+});
+
+const NOTICE_PATH = "/v1/canonical-surface/daemon-notices";
+
+/**
+ * A loopback Gateway, as aiohttp serves the contract: the identity it reports; the daemon-notice route is
+ * POST-only, so `HEAD` on it answers 405 with `Allow: POST` (404 when the receiver has no such route); and
+ * `/events` takes only an ordinary event, so a signed notice there is the 400 the deployed build gives.
+ * `requests` is every request it saw, `posts` every POST body that reached a route that takes it.
+ */
+const loopbackGateway = async (
+  identity: DaemonNoticeDestination,
+  options: {
+    noticeRoute?: boolean;
+    /** What a HEAD on the notice route answers, instead of the contract's 405 with `Allow: POST`. */
+    head?: { status: number; allow?: string };
+    onHead?: () => void;
+    /** A POST that is read and recorded but never answered. */
+    stallPost?: boolean;
+  } = {},
+) => {
+  const noticeRoute = options.noticeRoute ?? true;
+  const posts: DaemonNoticeBody[] = [];
+  const requests: Array<{ method: string; path: string; headers: string[] }> = [];
+  const server = createServer((req: IncomingMessage, res: ServerResponse) => {
+    res.setHeader("Content-Type", "application/json");
+    requests.push({ method: req.method ?? "", path: req.url ?? "", headers: Object.keys(req.headers).sort() });
+    if (req.method === "GET") return void res.end(JSON.stringify(identity));
+    if (req.method === "HEAD") {
+      options.onHead?.();
+      if (options.head) {
+        if (options.head.allow !== undefined) res.setHeader("Allow", options.head.allow);
+        res.statusCode = options.head.status;
+        return void res.end();
+      }
+      if (noticeRoute && req.url === NOTICE_PATH) res.setHeader("Allow", "POST");
+      res.statusCode = noticeRoute && req.url === NOTICE_PATH ? 405 : 404;
+      return void res.end();
+    }
+    let raw = "";
+    req.on("data", (chunk: Buffer) => (raw += chunk.toString("utf8")));
+    req.on("end", () => {
+      if (!(noticeRoute && req.url === NOTICE_PATH)) {
+        res.statusCode = req.url === "/v1/canonical-surface/events" ? 400 : 404;
+        return void res.end(JSON.stringify({ error: { code: "canonical_invalid_request" } }));
+      }
+      const body = JSON.parse(raw) as DaemonNoticeBody;
+      posts.push(body);
+      if (options.stallPost) return;
+      res.end(JSON.stringify({
+        event_id: body.event_id, payload_digest: body.payload_digest,
+        receipt: { receipt_id: "rcpt", status: "completed", session_id: body.destination.session_id,
+          lineage_root_digest: body.destination.lineage_root_digest },
+      }));
+    });
+  });
+  await new Promise<void>((resolveListen) => server.listen(0, "127.0.0.1", resolveListen));
+  return {
+    posts,
+    requests,
+    port: (server.address() as AddressInfo).port,
+    close: () => new Promise<void>((resolveClose) => { server.closeAllConnections(); server.close(() => resolveClose()); }),
+  };
+};
+
+/** The state directory of a daemon whose CEO is the Hermes Gateway running as this very process. */
+const adoptedState = (): { root: string; database: string; config: StartGateConfig; startToken: string } => {
+  const root = mkdtempSync(join(tmpdir(), "acp-gate-ceo-bound-"));
+  dirs.push(root);
+  chmodSync(root, 0o700);
+  const fixture = adoptedFixture({ root, livePid: process.pid });
+  fixture.h.cp.close();
+  const secretsDir = join(root, "secrets");
+  mkdirSync(secretsDir, { recursive: true, mode: 0o700 });
+  const startToken = readProcessStartToken(process.pid)!;
+  const database = join(root, "state.sqlite");
+  return {
+    root, database, startToken,
+    config: { databasePath: database, worktreeRoot: join(root, "worktrees"), secretsDir, capacityDir: join(root, "capacity") },
+  };
+};
+
+describe("the notice goes only to the Gateway the active CEO binding names (#1496 P1-a)", () => {
+  const routeFor = (gateway: { port: number }, database: string, lineage = DIGEST) => refusalNoticeRouteFrom({
+    noticeEnabled: true,
+    adoption: { apiKey: "loopback-key", port: gateway.port, lineageRootDigest: lineage },
+    laneSecret: LANE_SECRET,
+    databasePath: database,
+  });
+
+  it("a loopback Gateway with the right lineage but another session and a pid that does not exist gets nothing, and no binding is recorded as the reason", async () => {
+    const { root, database, config } = newState();
+    const gateway = await loopbackGateway({ session_id: "some-other-session", lineage_root_digest: DIGEST,
+      process_pid: 2_147_000_000, process_started_at: "darwin-tv:1790000000.000001" });
+    try {
+      const before = imageOf(root, database);
+
+      const refused = await refuseStartBeforeOpening(config, clockAt(0), { route: routeFor(gateway, database), host: "h" });
+
+      expect(refused!.decision.reasonCode).toBe(ReasonCode.DOCTOR_BLOCKED);
+      expect(gateway.posts).toHaveLength(0);
+      expect(readCrashLoopFile(root, clockAt(0)()).lastRefusal?.notice).toMatchObject({
+        outcome: "failed", reason: DESTINATION_MISMATCH,
+      });
+      expect(imageOf(root, database)).toEqual(before);
+    } finally {
+      await gateway.close();
+    }
+  });
+
+  it("an origin-less notice goes to the daemon-notice route, probed first with a HEAD that carries no credential, and nowhere else", async () => {
+    const { root, database, config, startToken } = adoptedState();
+    const gateway = await loopbackGateway({ session_id: LIVE, lineage_root_digest: DIGEST, process_pid: process.pid,
+      process_started_at: startToken });
+    try {
+      const before = imageOf(root, database);
+
+      await refuseStartBeforeOpening(config, clockAt(0), { route: routeFor(gateway, database), host: "h" });
+
+      expect(gateway.requests.map((request) => `${request.method} ${request.path}`)).toEqual([
+        "GET /v1/canonical-surface/identity",
+        `HEAD ${NOTICE_PATH}`,
+        // The sender reads the identity again as the last thing before the POST, as it always has.
+        "GET /v1/canonical-surface/identity",
+        `POST ${NOTICE_PATH}`,
+      ]);
+      expect(gateway.requests[1]!.headers).not.toContain("authorization");
+      expect(gateway.requests[3]!.headers).toEqual(expect.arrayContaining(["authorization", "content-type", "content-length"]));
+      expect(gateway.posts).toHaveLength(1);
+      const sent = gateway.posts[0]!;
+      expect(Object.keys(sent).sort()).toEqual(
+        ["binding", "destination", "event_id", "payload_digest", "principal", "protocol", "signature", "text"],
+      );
+      expect(noticePayload(sent)).not.toHaveProperty("origin");
+      expect(readCrashLoopFile(root, clockAt(0)()).lastRefusal?.notice).toMatchObject({ outcome: "delivered" });
+      expect(imageOf(root, database)).toEqual(before);
+
+      // Never again for this refusalId: a retry inside the backoff reads it from crash-loop.json and sends nothing.
+      const retry = await refuseStartBeforeOpening(config, clockAt(1_000), { route: routeFor(gateway, database), host: "h" });
+      expect(retry!.decision.reasonCode).toBe(ReasonCode.DAEMON_BACKOFF_ACTIVE);
+      expect(gateway.requests).toHaveLength(4);
+    } finally {
+      await gateway.close();
+    }
+  });
+
+  it("a receiver with no daemon-notice route is sent nothing: not the notice route, not /events, not Buzz", async () => {
+    const { root, database, config, startToken } = adoptedState();
+    const gateway = await loopbackGateway({ session_id: LIVE, lineage_root_digest: DIGEST, process_pid: process.pid,
+      process_started_at: startToken }, { noticeRoute: false });
+    const buzz = Object.getOwnPropertyNames(BuzzCliTransport.prototype)
+      .filter((name) => name !== "constructor" && typeof (BuzzCliTransport.prototype as unknown as Record<string, unknown>)[name] === "function")
+      .map((name) => vi.spyOn(BuzzCliTransport.prototype as unknown as Record<string, () => unknown>, name));
+    try {
+      const before = imageOf(root, database);
+
+      const refused = await refuseStartBeforeOpening(config, clockAt(0), { route: routeFor(gateway, database), host: "h" });
+
+      expect(refused!.decision.reasonCode).toBe(ReasonCode.DOCTOR_BLOCKED);
+      expect(gateway.requests.map((request) => `${request.method} ${request.path}`)).toEqual([
+        "GET /v1/canonical-surface/identity",
+        `HEAD ${NOTICE_PATH}`,
+      ]);
+      expect(gateway.posts).toHaveLength(0);
+      expect(readCrashLoopFile(root, clockAt(0)()).lastRefusal?.notice).toMatchObject({
+        outcome: "failed", reason: "receiver has no signed daemon-notice route", detail: "HEAD answered 404",
+      });
+      expect(buzz.length).toBeGreaterThan(0);
+      for (const spy of buzz) expect(spy).not.toHaveBeenCalled();
+      expect(imageOf(root, database)).toEqual(before);
+    } finally {
+      vi.restoreAllMocks();
+      await gateway.close();
+    }
+  });
+
+  it.each([
+    ["a 204 with no Allow header", { status: 204 }, "HEAD answered 204"],
+    ["a 200 that names POST", { status: 200, allow: "POST" }, "HEAD answered 200 with Allow: POST"],
+    ["a 405 whose Allow does not name POST", { status: 405, allow: "GET" }, "HEAD answered 405"],
+    ["a 405 with no Allow header", { status: 405 }, "HEAD answered 405"],
+    ["a 405 whose Allow says `post`: method names are case-sensitive", { status: 405, allow: "post" }, "HEAD answered 405"],
+    ["a 405 whose Allow says `Post, GET`", { status: 405, allow: "Post, GET" }, "HEAD answered 405"],
+    ["a 405 whose Allow says `POST` followed by a no-break space (0xA0)", { status: 405, allow: "POST\u00a0" }, "HEAD answered 405"],
+    ["a 405 whose Allow says `GET,\u00a0POST`", { status: 405, allow: "GET,\u00a0POST" }, "HEAD answered 405"],
+  ])("%s is no route: nothing is sent", async (_name, head, detail) => {
+    const { root, database, config, startToken } = adoptedState();
+    const gateway = await loopbackGateway({ session_id: LIVE, lineage_root_digest: DIGEST, process_pid: process.pid,
+      process_started_at: startToken }, { head });
+    try {
+      await refuseStartBeforeOpening(config, clockAt(0), { route: routeFor(gateway, database), host: "h" });
+
+      expect(gateway.posts).toHaveLength(0);
+      expect(gateway.requests.map((request) => request.method)).toEqual(["GET", "HEAD"]);
+      expect(readCrashLoopFile(root, clockAt(0)()).lastRefusal?.notice).toMatchObject({
+        outcome: "failed", reason: "receiver has no signed daemon-notice route", detail,
+      });
+    } finally {
+      await gateway.close();
+    }
+  });
+
+  it("a bound process that exits while the route is being probed is sent nothing, though the Gateway still reports it", async () => {
+    const { root, database, config, startToken } = adoptedState();
+    let alive = true;
+    const ports = {
+      processStartedAt: (pid: number | null | undefined) => (alive ? processStartedAt(pid) : null),
+      processStartToken: (pid: number) => (alive ? readProcessStartToken(pid) : null),
+    };
+    // The Gateway goes on answering with the identity it had: only the process behind it is gone.
+    const gateway = await loopbackGateway({ session_id: LIVE, lineage_root_digest: DIGEST, process_pid: process.pid,
+      process_started_at: startToken }, { onHead: () => { alive = false; } });
+    try {
+      const route = refusalNoticeRouteFrom({
+        noticeEnabled: true,
+        adoption: { apiKey: "loopback-key", port: gateway.port, lineageRootDigest: DIGEST },
+        laneSecret: LANE_SECRET,
+        databasePath: database,
+        ports,
+      });
+      const before = imageOf(root, database);
+
+      const refused = await refuseStartBeforeOpening(config, clockAt(0), { route, host: "h" });
+
+      expect(refused!.decision.reasonCode).toBe(ReasonCode.DOCTOR_BLOCKED);
+      expect(gateway.posts).toHaveLength(0);
+      expect(gateway.requests.map((request) => request.method)).not.toContain("POST");
+      expect(readCrashLoopFile(root, clockAt(0)()).lastRefusal?.notice).toMatchObject({
+        outcome: "failed", reason: "destination changed before dispatch",
+      });
+      expect(imageOf(root, database)).toEqual(before);
+    } finally {
+      await gateway.close();
+    }
+  });
+
+  it("a final process read that stalls past the budget authorizes no send: the deadline is checked after the recheck, before the POST", async () => {
+    const { root, database, config, startToken } = adoptedState();
+    // The recheck reads the process twice (processStartedAt, then the token): the second pass is the one right
+    // before the POST. It blocks the loop, as a stuck `ps` would, so the timer cannot fire during it.
+    let reads = 0;
+    const budgetMs = 1_500;
+    const ports = {
+      processStartedAt: (pid: number | null | undefined) => processStartedAt(pid),
+      processStartToken: (pid: number) => {
+        reads += 1;
+        if (reads === 2) {
+          const until = performance.now() + budgetMs + 300;
+          while (performance.now() < until) { /* a read that does not return in time */ }
+        }
+        return readProcessStartToken(pid);
+      },
+    };
+    const gateway = await loopbackGateway({ session_id: LIVE, lineage_root_digest: DIGEST, process_pid: process.pid,
+      process_started_at: startToken });
+    try {
+      const route = refusalNoticeRouteFrom({
+        noticeEnabled: true,
+        adoption: { apiKey: "loopback-key", port: gateway.port, lineageRootDigest: DIGEST },
+        laneSecret: LANE_SECRET,
+        databasePath: database,
+        ports,
+      });
+      const before = imageOf(root, database);
+
+      const refused = await refuseStartBeforeOpening(config, clockAt(0), { route, host: "h", timeoutMs: budgetMs });
+
+      expect(reads).toBe(2);
+      expect(refused!.decision.reasonCode).toBe(ReasonCode.DOCTOR_BLOCKED);
+      expect(gateway.posts).toHaveLength(0);
+      expect(gateway.requests.map((request) => request.method)).not.toContain("POST");
+      expect(readCrashLoopFile(root, clockAt(0)()).lastRefusal?.notice).toMatchObject({
+        outcome: "failed", reason: `timeout after ${budgetMs}ms before the request began; nothing was sent`,
+      });
+      expect(imageOf(root, database)).toEqual(before);
+    } finally {
+      await gateway.close();
+    }
+  }, 20_000);
+
+  it("a destination that is not the binding's is sent nothing, and is not even probed", async () => {
+    const { root, database, config, startToken } = adoptedState();
+    const gateway = await loopbackGateway({ session_id: LIVE, lineage_root_digest: DIGEST, process_pid: 2_147_000_000,
+      process_started_at: startToken });
+    try {
+      await refuseStartBeforeOpening(config, clockAt(0), { route: routeFor(gateway, database), host: "h" });
+
+      expect(gateway.requests.map((request) => `${request.method} ${request.path}`)).toEqual([
+        "GET /v1/canonical-surface/identity",
+      ]);
+      expect(gateway.posts).toHaveLength(0);
+      expect(readCrashLoopFile(root, clockAt(0)()).lastRefusal?.notice).toMatchObject({
+        outcome: "target-unconfirmed", reason: TARGET_UNCONFIRMED,
+      });
+    } finally {
+      await gateway.close();
+    }
+  });
+
+  it("with an active CEO binding, only the Gateway whose session, pid and start token are the binding's is told", async () => {
+    const { root, database, config, startToken } = adoptedState();
+    const mine = { session_id: LIVE, lineage_root_digest: DIGEST, process_pid: process.pid, process_started_at: startToken };
+    const cases: Array<[string, DaemonNoticeDestination, "delivered" | "target-unconfirmed" | "mismatch"]> = [
+      ["the bound process", mine, "delivered"],
+      ["another pid", { ...mine, process_pid: 2_147_000_000 }, "target-unconfirmed"],
+      ["the bound pid with another start token", { ...mine, process_started_at: "darwin-tv:1790000000.000001" }, "target-unconfirmed"],
+      ["another lineage", { ...mine, lineage_root_digest: `sha256:${"e".repeat(64)}` }, "mismatch"],
+    ];
+    for (const [name, identity, result] of cases) {
+      const told = result === "delivered";
+      const gateway = await loopbackGateway(identity);
+      try {
+        const before = imageOf(root, database);
+
+        await refuseStartBeforeOpening(config, clockAt(0), { route: routeFor(gateway, database), host: "h" });
+
+        expect(gateway.posts, name).toHaveLength(told ? 1 : 0);
+        expect(readCrashLoopFile(root, clockAt(0)()).lastRefusal?.notice, name).toMatchObject(
+          result === "delivered" ? { outcome: "delivered" }
+            : result === "target-unconfirmed" ? { outcome: "target-unconfirmed", reason: TARGET_UNCONFIRMED }
+            : { outcome: "failed", reason: DESTINATION_MISMATCH },
+        );
+        expect(imageOf(root, database), name).toEqual(before);
+      } finally {
+        await gateway.close();
+      }
+      // Each case is its own refusal, past the last one's backoff.
+      rmSync(join(root, "crash-loop.json"), { force: true });
+    }
+  });
+});
+
+describe("a restarted Gateway is told only once the binding has confirmed it (#1496 review P1)", () => {
+  const routeFor = (gateway: { port: number }, database: string) => refusalNoticeRouteFrom({
+    noticeEnabled: true,
+    adoption: { apiKey: "loopback-key", port: gateway.port, lineageRootDigest: DIGEST },
+    laneSecret: LANE_SECRET,
+    databasePath: database,
+  });
+
+  it("the Gateway restarted as another process that no daemon has adopted gets no POST and a recorded reason; once the binding names it, it is delivered", async () => {
+    const restartedPid = process.ppid;
+    const restartedStart = readProcessStartToken(restartedPid);
+    expect(restartedStart).toBeTruthy();
+    // The Gateway has restarted: same session and lineage, a new process.
+    const restarted = { session_id: LIVE, lineage_root_digest: DIGEST, process_pid: restartedPid, process_started_at: restartedStart! };
+
+    // Not re-adopted: the binding still names the process the Gateway had before.
+    const stale = adoptedState();
+    const gatewayA = await loopbackGateway(restarted);
+    try {
+      const before = imageOf(stale.root, stale.database);
+      await refuseStartBeforeOpening(stale.config, clockAt(0), { route: routeFor(gatewayA, stale.database), host: "h" });
+
+      expect(gatewayA.posts).toHaveLength(0);
+      expect(gatewayA.requests.map((request) => request.method)).not.toContain("POST");
+      expect(readCrashLoopFile(stale.root, clockAt(0)()).lastRefusal?.notice).toMatchObject({
+        outcome: "target-unconfirmed", reason: TARGET_UNCONFIRMED,
+      });
+      expect(imageOf(stale.root, stale.database)).toEqual(before);
+    } finally {
+      await gatewayA.close();
+    }
+
+    // Re-adopted: the daemon's adoption recorded the new process, and only then is it told.
+    const root = mkdtempSync(join(tmpdir(), "acp-gate-ceo-readopted-"));
+    dirs.push(root);
+    chmodSync(root, 0o700);
+    adoptedFixture({ root, livePid: restartedPid }).h.cp.close();
+    mkdirSync(join(root, "secrets"), { recursive: true, mode: 0o700 });
+    const database = join(root, "state.sqlite");
+    const config: StartGateConfig = { databasePath: database, worktreeRoot: join(root, "worktrees"), secretsDir: join(root, "secrets"), capacityDir: join(root, "capacity") };
+    const gatewayB = await loopbackGateway(restarted);
+    try {
+      await refuseStartBeforeOpening(config, clockAt(0), { route: routeFor(gatewayB, database), host: "h" });
+
+      expect(gatewayB.posts).toHaveLength(1);
+      expect(gatewayB.posts[0]!.destination).toMatchObject({ process_pid: restartedPid, process_started_at: restartedStart });
+      expect(readCrashLoopFile(root, clockAt(0)()).lastRefusal?.notice).toMatchObject({ outcome: "delivered" });
+    } finally {
+      await gatewayB.close();
+    }
+  });
+});
+
+describe("one overall budget bounds the notice (#1496 review P2)", () => {
+  it("(a) a binding read that uses up the budget lets no POST begin, and the outcome is a pre-send timeout", async () => {
+    const { root, database, config, startToken } = adoptedState();
+    const gateway = await loopbackGateway({ session_id: LIVE, lineage_root_digest: DIGEST, process_pid: process.pid,
+      process_started_at: startToken });
+    const budgetMs = 300;
+    try {
+      const route = refusalNoticeRouteFrom({
+        noticeEnabled: true,
+        adoption: { apiKey: "loopback-key", port: gateway.port, lineageRootDigest: DIGEST },
+        laneSecret: LANE_SECRET,
+        databasePath: database,
+        ports: {
+          // The private copy of the database takes longer than the whole budget, blocking as a slow disk does.
+          readBinding: async (databasePath, lineage) => {
+            const until = performance.now() + budgetMs + 200;
+            while (performance.now() < until) { /* a copy that does not return in time */ }
+            return readActiveCeoBinding(databasePath, lineage);
+          },
+        },
+      });
+
+      await refuseStartBeforeOpening(config, clockAt(0), { route, host: "h", timeoutMs: budgetMs });
+
+      expect(gateway.posts).toHaveLength(0);
+      expect(gateway.requests.map((request) => request.method)).not.toContain("POST");
+      expect(readCrashLoopFile(root, clockAt(0)()).lastRefusal?.notice).toMatchObject({
+        outcome: "failed", reason: `timeout after ${budgetMs}ms before the request began; nothing was sent`,
+      });
+    } finally {
+      await gateway.close();
+    }
+  });
+
+  it("(b) a POST that started and was never answered within the budget is unknown, not failed", async () => {
+    const { root, database, config, startToken } = adoptedState();
+    const gateway = await loopbackGateway({ session_id: LIVE, lineage_root_digest: DIGEST, process_pid: process.pid,
+      process_started_at: startToken }, { stallPost: true });
+    try {
+      const route = refusalNoticeRouteFrom({
+        noticeEnabled: true,
+        adoption: { apiKey: "loopback-key", port: gateway.port, lineageRootDigest: DIGEST },
+        laneSecret: LANE_SECRET,
+        databasePath: database,
+      });
+
+      await refuseStartBeforeOpening(config, clockAt(0), { route, host: "h", timeoutMs: 1_500 });
+
+      expect(gateway.posts).toHaveLength(1);
+      expect(readCrashLoopFile(root, clockAt(0)()).lastRefusal?.notice).toMatchObject({ outcome: "unknown" });
+    } finally {
+      await gateway.close();
+    }
+  });
+});
+
+describe("a refusalId's notice is never sent twice (#1496 review P3)", () => {
+  it("the claim is taken once per refusalId, is kept through the notice outcome, and a new refusalId gets its own", async () => {
+    const { root, config } = newState();
+    const { route, sent } = fakeRoute(async () => ({ kind: "UNCERTAIN", reason: "TIMEOUT" }));
+    await refuseStartBeforeOpening(config, clockAt(0), { route, host: "h" });
+    const first = readCrashLoopFile(root, clockAt(0)()).lastRefusal!;
+
+    expect(sent).toHaveLength(1);
+    expect(first.notice).toMatchObject({ outcome: "unknown" });
+    expect(first.noticeSendClaimedAt).toBeTypeOf("string");
+    // Whatever reaches this refusalId again (a retry, another start), including after `unknown`: no claim, no POST.
+    expect(claimRefusalNoticeSend(root, first.refusalId, clockAt(5)())).toBe(false);
+    expect(claimRefusalNoticeSend(root, "another-id", clockAt(5)())).toBe(false);
+
+    await refuseStartBeforeOpening(config, clockAt(10 * 60_000), { route, host: "h" });
+    const second = readCrashLoopFile(root, clockAt(0)()).lastRefusal!;
+    expect(second.refusalId).not.toBe(first.refusalId);
+    expect(sent).toHaveLength(2);
+    expect(claimRefusalNoticeSend(root, second.refusalId, clockAt(0)())).toBe(false);
+  });
+});
+
+describe("a concurrent start cannot make the next one tell the CEO again (#1496 P1-b)", () => {
+  it("A's refusal waits on its Gateway, B is refused by the lock, C starts inside the backoff: one notice, and A's id and outcome stand", async () => {
+    const { root, database, config } = newState();
+    let release: () => void = () => undefined;
+    const held = new Promise<void>((resolveHeld) => { release = resolveHeld; });
+    const { route, sent } = fakeRoute(async (body) => { await held; return settled(body); });
+
+    const a = refuseStartBeforeOpening(config, clockAt(0), { route, host: "h" });
+    const until = Date.now() + 5_000;
+    while (sent.length === 0 && Date.now() < until) await new Promise<void>((resolveWait) => setTimeout(resolveWait, 10));
+    expect(sent).toHaveLength(1);
+    const idA = readCrashLoopFile(root, clockAt(0)()).lastRefusal!.refusalId;
+
+    // B: another daemon finds agentcpd.lock held and is refused by it; that refusal is counted.
+    const holder = new SingleInstanceLock(join(root, "agentcpd.lock"));
+    expect(holder.acquire(clockAt(0)()).allowed).toBe(true);
+    const b = takeStartLock(database, clockAt(500));
+    expect("refused" in b).toBe(true);
+    holder.release();
+    expect(readCrashLoopFile(root, clockAt(0)()).lastRefusal?.refusalId).toBe(idA);
+
+    release();
+    await a;
+
+    // C: a start inside the backoff B's count set.
+    const c = await refuseStartBeforeOpening(config, clockAt(1_000), { route, host: "h" });
+
+    expect(c!.decision.reasonCode).toBe(ReasonCode.DAEMON_BACKOFF_ACTIVE);
+    expect(sent).toHaveLength(1);
+    const loop = readCrashLoopFile(root, clockAt(0)());
+    expect(loop.failures).toBe(2);
+    expect(loop.lastRefusal).toMatchObject({ refusalId: idA, notice: { outcome: "delivered" } });
+  });
+});
