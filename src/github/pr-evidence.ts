@@ -2,7 +2,7 @@ import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 
 import { z } from "zod";
 
-import { digestOf, sha256 } from "../core/digest.ts";
+import { digestOf, sha256, sha256Hex } from "../core/digest.ts";
 import { type Decision, type Evidence, allow, deny, isAcpError } from "../core/errors.ts";
 import { parseGitHubIdentity } from "../core/ids.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
@@ -27,9 +27,11 @@ import type { RepositoryRecord } from "../registry/repository-registry.ts";
  * every patch GitHub left out is named in `incomplete`, and while that list is not empty the answer is
  * a COVERAGE_INCOMPLETE refusal carrying what was read, `requiredChecks.allSatisfied` is never true,
  * and nothing in it says "ok". A continuation page carries the read's running gap count in its signed cursor,
- * so a snapshot that was incomplete stays incomplete on every page of it, and `kc`, one digest of the compare's
- * gaps as a multiset as the last page that listed them saw them. A page that rereads the compare and finds the
- * same digest lists none of them again; a different digest sets `brief.compareGapsChanged` and lists all of them.
+ * so a snapshot that was incomplete stays incomplete on every page of it, and `ks`, the compare's gaps by class (a
+ * gap with its file left out) as the page before saw them: per class, how many and the power sums of their files'
+ * hashes. A page that rereads the compare lists only the gaps it cannot match to those: none while every class is as
+ * it was, the added ones first when a class grew by gaps naming no file or by up to four files, the whole class on any
+ * other change, named in `brief.compareGapsNotToldApart`. Any change sets `brief.compareGapsChanged`.
  *
  * Read in a prefix: Hermes shows its model only the first 2048 characters of a tool error, and only a
  * 1,500-character preview of an answer it moves to a spillover file. So `brief` is bounded whatever the
@@ -192,6 +194,10 @@ const BRIEF_WHERE_CHARS = 60;
  * the rest are counted in `incompleteNotListed` and by kind in the brief, so the diff text always gets the room.
  */
 const GAP_LIST_BUDGET_CHARS = 5_000;
+/** The most classes of compare gaps a cursor keeps: see `gapSummaryOf`. */
+const GAP_CLASSES_MAX = 16;
+/** The most files one class can add on a page and a continuation still tell which: the power sums it keeps per class. */
+const ADDED_TOLD_APART_MAX = 4;
 
 
 /**
@@ -209,8 +215,13 @@ export interface PrEvidenceBrief {
   /** As the answer's body says: false with COVERAGE_INCOMPLETE while any page of the read named a gap. */
   ok: boolean;
   reasonCode: string;
-  /** On a continuation page: the compare's gaps are not the ones the last page that listed them saw; all are listed. */
+  /** On a continuation page: the compare's gaps are not the ones the page before saw; those it cannot match to them are listed. */
   compareGapsChanged: boolean;
+  /**
+   * On a continuation page, each class of the compare's gaps (kind and detail) that changed in a way the page could not
+   * narrow to the gaps it added, with its count before and now: all of that class is listed, after the gaps it could.
+   */
+  compareGapsNotToldApart: Array<{ kind: PrEvidenceIncomplete["kind"]; detail: string; before: number; now: number }>;
   baseSha: string;
   headSha: string;
   page: { offset: number; chars: number; totalChars: number; textAt: string };
@@ -235,9 +246,9 @@ export interface PrEvidence {
   complete: boolean;
   /**
    * The gaps this page names, those naming no file first, then per-file gaps, then PATCH_OMITTED, within
-   * GAP_LIST_BUDGET_CHARS. A continuation page re-reads the compare: when its gaps are the ones the last page
-   * that listed them saw it lists only one SNAPSHOT_INCOMPLETE entry, which counts every gap the read has named;
-   * when they are not (`brief.compareGapsChanged`) it lists them all after that entry.
+   * GAP_LIST_BUDGET_CHARS. A continuation page re-reads the compare and lists one SNAPSHOT_INCOMPLETE entry, which
+   * counts every gap the read has named, then only the compare's gaps it cannot match to those the page before saw
+   * (`brief.compareGapsChanged`): the ones it can tell were added, then any changed class whole.
    */
   incomplete: PrEvidenceIncomplete[];
   /** Gaps this page counted but left out of `incomplete`. */
@@ -275,8 +286,10 @@ const cursorSchema = z.object({
   /** How many gaps the pages before this one named, and a digest chained over them page by page. */
   g: z.number().int().min(0),
   gd: z.string(),
-  /** `compareGapsDigest` of the compare's gaps as the last page that listed them saw them. */
-  kc: z.string().max(40),
+  /** `gapSummaryOf` the compare's gaps as the page before saw them: per class its tag, gap count and file-hash power sums. */
+  ks: z.array(z.tuple([
+    z.string().regex(/^[0-9a-f]{8}$/), z.number().int().min(1), z.array(z.number().int().min(0)).max(ADDED_TOLD_APART_MAX),
+  ])).max(GAP_CLASSES_MAX),
 }).strict();
 type Cursor = z.infer<typeof cursorSchema>;
 
@@ -390,21 +403,119 @@ const textCostOf = (code: number): number =>
   : code < 0x20 || (code >= 0xd800 && code <= 0xdfff) ? 13
   : 2;
 
-/**
- * One short digest of the compare's gaps as a multiset: each gap's digest, sorted, so the same gaps in any order
- * give the same value and a second identical gap changes it. Every page rereads the compare and recomputes it.
- */
-const compareGapsDigest = (gaps: PrEvidenceIncomplete[]): string =>
-  digestOf(gaps.map((entry) => digestOf(entry)).sort()).slice("sha256:".length, "sha256:".length + 24);
-
 /** Gaps naming no file first (a failed lookup, a missing merge-base), then per-file gaps, then omitted patches. */
 const gapRank = (entry: PrEvidenceIncomplete): number => entry.kind === "PATCH_OMITTED" ? 2 : entry.file === undefined ? 0 : 1;
 const failuresFirst = (gaps: PrEvidenceIncomplete[]): PrEvidenceIncomplete[] =>
   [0, 1, 2].flatMap((rank) => gaps.filter((entry) => gapRank(entry) === rank));
 
+/**
+ * The compare's gaps by class, a class being a gap with its file left out: the gaps of one class differ only in the
+ * file they name, and those naming none are identical. readComparedFiles's templates bound how many classes one
+ * compare has (ten at most occur together); the cursor keeps at most GAP_CLASSES_MAX, and a class it drops only
+ * reads as new on the next page.
+ */
+type GapSummary = Cursor["ks"];
+type NotToldApart = PrEvidenceBrief["compareGapsNotToldApart"];
+const classTagOf = ({ file: _file, ...rest }: PrEvidenceIncomplete): string =>
+  digestOf(rest).slice("sha256:".length, "sha256:".length + 8);
+/** The largest prime below 2^48: every power sum is an exact JSON number. */
+const FILE_HASH_PRIME = 2n ** 48n - 59n;
+const modPow = (base: bigint, exponent: bigint): bigint => {
+  let result = 1n;
+  for (let b = base % FILE_HASH_PRIME, e = exponent; e > 0n; e >>= 1n, b = b * b % FILE_HASH_PRIME) {
+    if (e & 1n) result = result * b % FILE_HASH_PRIME;
+  }
+  return result;
+};
+const fileHashOf = (entry: PrEvidenceIncomplete): bigint =>
+  BigInt(`0x${sha256Hex(entry.file ?? "").slice(0, 12)}`) % FILE_HASH_PRIME;
+/** The 1st to ADDED_TOLD_APART_MAX-th power sums of a class's file hashes; none for a class naming no file. */
+const powerSumsOf = (entries: PrEvidenceIncomplete[]): bigint[] => {
+  if (entries.every((entry) => entry.file === undefined)) return [];
+  const sums = Array.from({ length: ADDED_TOLD_APART_MAX }, () => 0n);
+  for (const entry of entries) {
+    const hash = fileHashOf(entry);
+    let power = hash;
+    for (let j = 0; j < sums.length; j += 1, power = power * hash % FILE_HASH_PRIME) sums[j] = (sums[j]! + power) % FILE_HASH_PRIME;
+  }
+  return sums;
+};
+
+/**
+ * The `grew` entries whose file hashes have the power sums `added`, or null when there are none such. By Newton's
+ * identities those hashes are the roots of one polynomial of degree `grew`; exactly `grew` entries must be its roots,
+ * and their power sums must be all of `added`, or the change was not `grew` additions alone.
+ */
+const addedAmong = (entries: PrEvidenceIncomplete[], grew: number, added: bigint[]): PrEvidenceIncomplete[] | null => {
+  if (grew < 1 || grew > added.length) return null;
+  const p = FILE_HASH_PRIME;
+  const elementary = [1n];
+  for (let k = 1; k <= grew; k += 1) {
+    let sum = 0n;
+    for (let i = 1; i <= k; i += 1) sum = (sum + (i % 2 === 1 ? 1n : p - 1n) * elementary[k - i]! % p * added[i - 1]!) % p;
+    elementary.push(sum * modPow(BigInt(k), p - 2n) % p);
+  }
+  // x^grew − e1·x^(grew−1) + e2·x^(grew−2) − …, by Horner.
+  const isRoot = (x: bigint): boolean =>
+    elementary.reduce((value, e, k) => (value * x + (k % 2 === 0 ? e : p - e)) % p, 0n) === 0n;
+  const roots = entries.filter((entry) => isRoot(fileHashOf(entry)));
+  return roots.length === grew && powerSumsOf(roots).every((sum, j) => sum === added[j]) ? roots : null;
+};
+const gapClassesOf = (gaps: PrEvidenceIncomplete[]): Map<string, PrEvidenceIncomplete[]> => {
+  const classes = new Map<string, PrEvidenceIncomplete[]>();
+  for (const entry of gaps) {
+    const tag = classTagOf(entry);
+    const members = classes.get(tag);
+    if (members) members.push(entry); else classes.set(tag, [entry]);
+  }
+  return classes;
+};
+const gapSummaryOf = (gaps: PrEvidenceIncomplete[]): GapSummary =>
+  [...gapClassesOf(gaps)].map(([tag, entries]): GapSummary[number] => [tag, entries.length, powerSumsOf(entries).map(Number)])
+    .sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0).slice(0, GAP_CLASSES_MAX);
+
+/**
+ * The compare's gaps a continuation page cannot match to those the page before saw, class by class. A class with the
+ * count and power sums it had lists nothing; a new class lists all of it. One that grew by gaps naming no file lists as
+ * many as it grew by; one that grew by up to ADDED_TOLD_APART_MAX files alone lists the gaps for those files. Any other
+ * change lists the whole class, after those, and names it in `notToldApart`, so a recurring gap may be counted again
+ * but a new one is never taken for a recurring one.
+ */
+const unmatchedGaps = (
+  gaps: PrEvidenceIncomplete[], before: GapSummary,
+): { changed: boolean; listed: PrEvidenceIncomplete[]; notToldApart: NotToldApart } => {
+  const seen = new Map(before.map(([tag, n, sums]) => [tag, { n, sums }]));
+  const classes = gapClassesOf(gaps);
+  let changed = before.some(([tag]) => !classes.has(tag));
+  const added: PrEvidenceIncomplete[] = [];
+  const whole: PrEvidenceIncomplete[] = [];
+  const notToldApart: NotToldApart = [];
+  for (const [tag, entries] of classes) {
+    const was = seen.get(tag);
+    const sums = powerSumsOf(entries);
+    if (was && entries.length === was.n && sums.every((sum, j) => Number(sum) === was.sums[j])) continue;
+    changed = true;
+    const grew = entries.length - (was?.n ?? 0);
+    if (!was || sums.length === 0) {
+      added.push(...entries.slice(0, Math.max(0, grew)));
+      continue;
+    }
+    const delta = sums.map((sum, j) => (sum - BigInt(was.sums[j] ?? 0) + FILE_HASH_PRIME) % FILE_HASH_PRIME);
+    const found = addedAmong(entries, grew, delta);
+    if (found) {
+      added.push(...found);
+      continue;
+    }
+    whole.push(...entries);
+    notToldApart.push({ kind: entries[0]!.kind, detail: clip(entries[0]!.detail, BRIEF_WHERE_CHARS), before: was.n, now: entries.length });
+  }
+  return { changed, listed: [...failuresFirst(added), ...failuresFirst(whole)], notToldApart };
+};
+
 /** `gaps` is every gap this page counts, listed or not. */
 const briefOf = (
-  gaps: PrEvidenceIncomplete[], root: string, pageIndex: number, evidence: PrEvidence, compareGapsChanged: boolean,
+  gaps: PrEvidenceIncomplete[], root: string, pageIndex: number, evidence: PrEvidence,
+  { changed: compareGapsChanged, notToldApart: compareGapsNotToldApart }: { changed: boolean; notToldApart: NotToldApart },
 ): PrEvidenceBrief => {
   const kinds: PrEvidenceBrief["gaps"]["kinds"] = {};
   for (const entry of gaps) kinds[entry.kind] = (kinds[entry.kind] ?? 0) + 1;
@@ -418,6 +529,7 @@ const briefOf = (
     ok: gaps.length === 0,
     reasonCode: gaps.length === 0 ? ReasonCode.OK : ReasonCode.COVERAGE_INCOMPLETE,
     compareGapsChanged,
+    compareGapsNotToldApart,
     baseSha: compared.baseSha,
     headSha: compared.headSha,
     page: { offset: page.offset, chars: page.chars, totalChars: page.totalChars, textAt: "diff.text, the last field of the JSON below" },
@@ -837,27 +949,26 @@ export const readPrEvidence = async (source: PrEvidenceSource, input: PrEvidence
 
   let summary: PrEvidenceSummary | null = null;
   // What the next cursor carries: every gap the read has named up to and including this page.
-  let carried = { g: 0, gd: "", kc: "" };
-  let compareGapsChanged = false;
+  let carried: Pick<Cursor, "g" | "gd" | "ks"> = { g: 0, gd: "", ks: [] };
+  let compareGaps: { changed: boolean; notToldApart: NotToldApart } = { changed: false, notToldApart: [] };
   if (cursor) {
-    // A continuation page re-reads the compare and so names the compare's gaps again. When they are the very
-    // gaps the last page that listed them saw (one digest over the multiset, duplicates included) they are
-    // already counted and are not listed again. When they are not, the compare changed: it lists all of them,
-    // counts them into the read's, and says so in its brief, with no attempt to tell which gap is the new one.
+    // A continuation page re-reads the compare and so names the compare's gaps again. Those it can match, class by
+    // class, to the ones the page before saw are already counted and are not listed again; the rest are listed,
+    // counted into the read's, and the brief says the compare changed. See `unmatchedGaps`.
     const own = incomplete.splice(0);
-    const digest = compareGapsDigest(own);
-    compareGapsChanged = digest !== cursor.kc;
-    const listed = compareGapsChanged ? failuresFirst(own) : [];
+    const { listed, ...unmatched } = unmatchedGaps(own, cursor.ks);
+    compareGaps = unmatched;
     carried = {
       g: cursor.g + listed.length,
       gd: listed.length === 0 ? cursor.gd : digestOf({ before: cursor.gd, gaps: listed }),
-      kc: digest,
+      ks: gapSummaryOf(own),
     };
     if (carried.g > 0) {
       incomplete.push({ kind: "SNAPSHOT_INCOMPLETE", lookup: pullLookup,
         detail: `this read has named ${carried.g} gap(s), ${cursor.g} before this page and ${listed.length} on it `
           + `(digest ${carried.gd}); every page of it is incomplete`
-          + (compareGapsChanged ? "; the compare's gaps changed since the page before, so this page lists them all" : "") }, ...listed);
+          + (compareGaps.changed ? "; the compare's gaps changed since the page before, so this page lists those it cannot match to that page's" : "") },
+      ...listed);
     }
   } else {
     const state = text(pull["state"]);
@@ -910,7 +1021,7 @@ export const readPrEvidence = async (source: PrEvidenceSource, input: PrEvidence
   // behind forty that say a file is binary. Sliced after every read of the snapshot, so the next cursor carries
   // the first page's whole gap list.
   const gaps = cursor ? incomplete : failuresFirst(incomplete);
-  if (!cursor) carried = { g: gaps.length, gd: digestOf(gaps), kc: compareGapsDigest(read.gaps) };
+  if (!cursor) carried = { g: gaps.length, gd: digestOf(gaps), ks: gapSummaryOf(read.gaps) };
   const pageIndex = cursor?.i ?? 1;
   const pageChars = input.pageChars ?? PR_EVIDENCE_DIFF_PAGE_MAX_CHARS;
   const cursorAt = (o: number): string => encodeCursor({
@@ -943,7 +1054,7 @@ export const readPrEvidence = async (source: PrEvidenceSource, input: PrEvidence
     summary,
     diff: page,
   };
-  evidence.brief = briefOf(gaps, root, pageIndex, evidence, compareGapsChanged);
+  evidence.brief = briefOf(gaps, root, pageIndex, evidence, compareGaps);
 
   // The page is as much as keeps the whole answer inline in Hermes: see PR_EVIDENCE_ANSWER_MAX_CHARS. Measured
   // with the page text empty and the longest cursor. The lists give way first, each to the longest prefix that
@@ -1000,7 +1111,7 @@ export const readPrEvidence = async (source: PrEvidenceSource, input: PrEvidence
   page.done = done;
   page.text = diff.slice(offset, end);
   evidence.complete = gaps.length === 0 && done;
-  evidence.brief = briefOf(gaps, root, pageIndex, evidence, compareGapsChanged);
+  evidence.brief = briefOf(gaps, root, pageIndex, evidence, compareGaps);
   return gaps.length === 0
     ? allow(ReasonCode.OK, evidence)
     : deny(ReasonCode.COVERAGE_INCOMPLETE,
