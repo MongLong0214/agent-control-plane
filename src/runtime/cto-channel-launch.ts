@@ -63,6 +63,19 @@ export const channelLaunchArgs = (input: ChannelLaunchInput): string[] => [
   `server:${BUZZ_CHANNEL_SERVER}`,
 ];
 
+/** Whether a claude argv, element by element, loads the acp-buzz-channel development channel. */
+export const argvCarriesChannel = (argv: readonly string[] | null | undefined): boolean => {
+  if (!argv) return false;
+  const wanted = `server:${BUZZ_CHANNEL_SERVER}`;
+  for (let at = 0; at < argv.length; at++) {
+    const element = argv[at]!;
+    if (element.startsWith(`${CHANNEL_DEV_FLAG}=`) && element.slice(CHANNEL_DEV_FLAG.length + 1).split(/[ ,]/).includes(wanted)) return true;
+    if (element !== CHANNEL_DEV_FLAG) continue;
+    for (let value = at + 1; value < argv.length && (value === at + 1 || !argv[value]!.startsWith("-")); value++) if (argv[value] === wanted) return true;
+  }
+  return false;
+};
+
 // ---- the folder Claude Code will start in is already trusted ------------------------------------
 //
 // The one keystroke below is sent on a screen read a moment earlier, and tmux cannot make reading a pane and pressing a key

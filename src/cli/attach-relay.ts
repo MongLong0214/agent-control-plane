@@ -1,4 +1,5 @@
 import { MAX_MCP_LINE_BYTES } from "../core/mcp-limits.ts";
+import { BUZZ_CHANNEL_SERVER, CHANNEL_DEV_FLAG } from "../runtime/cto-channel-launch.ts";
 import { execFileSync } from "node:child_process";
 import { createConnection, type Socket } from "node:net";
 import type { Readable, Writable } from "node:stream";
@@ -225,6 +226,13 @@ const RETRIED_REFUSALS: ReadonlySet<string> = new Set([
   "AUDIT_WRITE_FAILED",
   "DAEMON_STARTING",
 ]);
+
+/**
+ * A session launched without its Buzz channel (`SelfClaimRefusal.BUZZ_CHANNEL_NOT_LOADED`, copied for the reason the names
+ * above are). Only the branch name crosses the claim socket, so the relay names the launch flag the session is missing.
+ */
+const CHANNEL_NOT_LOADED = "BUZZ_CHANNEL_NOT_LOADED";
+const CHANNEL_NOT_LOADED_HINT = `relaunch claude with ${CHANNEL_DEV_FLAG} server:${BUZZ_CHANNEL_SERVER}`;
 
 /** Reason codes that say the daemon could not decide this time, whatever the branch: it is restarting or busy. */
 const RETRIED_REASON_CODES: ReadonlySet<string> = new Set(["DAEMON_LOCK_LOST", "OPERATOR_REQUEST_TIMEOUT", "PROBE_FAILED"]);
@@ -875,7 +883,8 @@ const claimUntilAnswered = async (options: AttachRelayOptions, deadline: number,
     if (claimed.kind === "malformed") return exitWith("attach: claim receipt malformed", ATTACH_EXIT.PROTOCOL);
     const line = claimed.kind === "unavailable"
       ? "attach: claim socket unavailable"
-      : `attach: claim refused ${claimed.reasonCode}${claimed.reason === null ? "" : ` ${claimed.reason}`}`;
+      : `attach: claim refused ${claimed.reasonCode}${claimed.reason === null ? "" : ` ${claimed.reason}`}` +
+        (claimed.reason === CHANNEL_NOT_LOADED ? `: ${CHANNEL_NOT_LOADED_HINT}` : "");
     const code = claimed.kind === "unavailable" ? ATTACH_EXIT.UNAVAILABLE : ATTACH_EXIT.CLAIM_REFUSED;
     if (claimed.kind === "refused") lastRefusal = line;
     // A daemon that is not listening yet — restarting, or not started — is asked again like any answer that can clear.
