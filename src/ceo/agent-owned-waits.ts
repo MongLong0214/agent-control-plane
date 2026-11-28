@@ -51,19 +51,23 @@ export type AgentWaitKind = (typeof AgentWaitKind)[keyof typeof AgentWaitKind];
  *   CEO included); a continuity hold gets a recovery attempt, continuity's own reconcile, which releases
  *   the hold once its role is covered;
  * - CEO_ESCALATION: a CRITICAL_SYSTEM_FAILURE notice to the CEO naming the owner, the recovery action and
- *   the blocker.
+ *   the blocker;
+ * - FAIL, a continuity hold's alone (#1447): the run, held for a role nothing covered through the whole
+ *   ladder, moves to FAILED with the hold cleared, so that this wait too ends without a person (#1189).
  *
- * After the last step the wait stays as it is, and its CRITICAL_SYSTEM_FAILURE reaches a CEO that replaced
- * the one it went to, once (`ceo-incident-notices.ts`). No step moves the run: a deadline is never a FAILED,
- * and a terminal outcome stays with the existing explicit paths (run_cancel, a CEO decision).
+ * After its CEO_ESCALATION the wait's CRITICAL_SYSTEM_FAILURE reaches a CEO that replaced the one it went to,
+ * once (`ceo-incident-notices.ts`). Every other wait stays as it is after the last step: only FAIL moves a run,
+ * and any other terminal outcome stays with the explicit paths (run_cancel, a CEO decision).
  */
 export const AgentWaitStep = {
   RENOTIFY: "RENOTIFY",
   REASSIGN: "REASSIGN",
   CEO_ESCALATION: "CEO_ESCALATION",
+  FAIL: "FAIL",
 } as const;
 export type AgentWaitStep = (typeof AgentWaitStep)[keyof typeof AgentWaitStep];
 const LADDER: readonly AgentWaitStep[] = [AgentWaitStep.RENOTIFY, AgentWaitStep.REASSIGN, AgentWaitStep.CEO_ESCALATION];
+const HOLD_LADDER: readonly AgentWaitStep[] = [...LADDER, AgentWaitStep.FAIL];
 
 /** How long each kind of wait may sit before its next step (configured on the daemon). */
 export interface AgentWaitDeadlines {
@@ -290,14 +294,12 @@ export class AgentOwnedWaits {
     const now = Date.parse(this.ports.clock.nowIso());
     for (const wait of this.waits()) {
       const markers = this.#markers(wait);
-      const step = LADDER[markers.length];
-      if (step === undefined) {
-        // #1189 round 2, item 1 — after its last step the wait's CRITICAL_SYSTEM_FAILURE is still its open
-        // incident. Stated again on every pass while the wait lasts, it reaches a CEO generation that has not
-        // had it, once; the CEO that already has it, ACKed or not, is not told again.
-        this.#restateEscalation(wait, markers.at(-1)?.evidence ?? {});
-        continue;
-      }
+      const step = (wait.kind === AgentWaitKind.CONTINUITY_HOLD ? HOLD_LADDER : LADDER)[markers.length];
+      // #1189 round 2, item 1 — after its CEO_ESCALATION the wait's CRITICAL_SYSTEM_FAILURE is still its open
+      // incident. Stated again on every pass while the wait lasts, it reaches a CEO generation that has not
+      // had it, once; the CEO that already has it, ACKed or not, is not told again.
+      if (markers.length >= LADDER.length) this.#restateEscalation(wait, markers[LADDER.length - 1]!.evidence);
+      if (step === undefined) continue;
       const deadlineMs = this.#deadlineOf(wait.kind);
       const from = markers.at(-1)?.at ?? wait.since;
       if (now - Date.parse(from) < deadlineMs) continue;
@@ -746,7 +748,12 @@ export class AgentOwnedWaits {
       let reassigned: boolean | null = null;
       let incidentEpisode: string | null = null;
       const recovery = step === AgentWaitStep.REASSIGN && wait.kind === AgentWaitKind.CONTINUITY_HOLD;
-      if (step === AgentWaitStep.CEO_ESCALATION) {
+      if (step === AgentWaitStep.FAIL) {
+        // The run's own edge clears the hold in the same statement (`runs_continuity_hold_only_while_blocked`).
+        const failed = this.ports.runs.transition(wait.runId, RunState.FAILED, `${wait.owner} was not covered by the end of its continuity hold's deadlines`,
+          { wait: wait.kind, episode: wait.episode, heldRole: wait.owner, steps: LADDER });
+        if (!failed.allowed) return failed as unknown as Decision<string | null>;
+      } else if (step === AgentWaitStep.CEO_ESCALATION) {
         // The wait's CRITICAL_SYSTEM_FAILURE is its run's RUN_STALLED incident: one notice per unchanged run,
         // whichever detector told the CEO first, delivered and deduplicated in `ceo-incident-notices.ts`.
         const ceo = this.#ceo();
@@ -784,7 +791,7 @@ export class AgentOwnedWaits {
           startedAt: wait.since,
           deadlineMs,
           owner: wait.owner,
-          action: recovery ? "CONTINUITY_RECONCILE" : step === AgentWaitStep.CEO_ESCALATION ? NotificationKind.CRITICAL_SYSTEM_FAILURE : "NOTIFY",
+          action: recovery ? "CONTINUITY_RECONCILE" : step === AgentWaitStep.FAIL ? RunState.FAILED : step === AgentWaitStep.CEO_ESCALATION ? NotificationKind.CRITICAL_SYSTEM_FAILURE : "NOTIFY",
           messageId,
           ...(holder ? { generation: holder.generation, sessionId: holder.sessionId } : {}),
           ...(reassigned === null ? {} : { reassigned }),
