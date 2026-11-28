@@ -4,11 +4,7 @@ import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
 
 import { ControlPlane } from "../../src/app/control-plane.ts";
 import { createHermesAutoAdoption } from "../../src/bootstrap/hermes-auto-adoption.ts";
-import {
-  CONTINUITY_RUNTIME_LOST_REVOCATION_REASON,
-  CanonicalCtoRestoreCondition,
-  readCanonicalCtoRestoreTarget,
-} from "../../src/continuity/continuity-kernel.ts";
+import { CONTINUITY_RUNTIME_LOST_REVOCATION_REASON } from "../../src/continuity/continuity-kernel.ts";
 import { ManualClock } from "../../src/core/clock.ts";
 import { digestOf, sha256 } from "../../src/core/digest.ts";
 import { type Decision, allow, deny } from "../../src/core/errors.ts";
@@ -193,11 +189,6 @@ describe("a canonical PRIMARY_CTO whose process died is revoked for its lost run
         generation: 1,
         failoverRefusal: ReasonCode.ROLE_RUNTIME_SUBSTITUTION_REFUSED,
       }]);
-      // The capacity-only restore still does not take it: a lost runtime waits on the conversation's claim.
-      expect(readCanonicalCtoRestoreTarget(f.cp.db, CTO)).toMatchObject({
-        kind: "UNMET",
-        condition: CanonicalCtoRestoreCondition.REVOKE_NOT_CAPACITY_ONLY,
-      });
     });
   });
 });

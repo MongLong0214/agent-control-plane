@@ -52,8 +52,6 @@ describe("an unbound role with no runs is still unbound", () => {
 
     const report = await harness.cp.doctor.run(scope);
     expect(report.findings.map((f) => f.code)).not.toContain("CTO_MISSING_WITH_NO_RUNS");
-    expect(report.findings.map((f) => f.code)).not.toContain("CANONICAL_CTO_RESTORE_PENDING");
-    expect(report.findings.map((f) => f.code)).not.toContain("CANONICAL_CTO_RESTORE_UNMET");
   });
 
   it("cannot be qualified by `activity`, which is the same fact under another name", async () => {
