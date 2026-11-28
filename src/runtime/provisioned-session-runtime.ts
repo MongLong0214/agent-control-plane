@@ -1170,9 +1170,10 @@ const STANDARD_PLAN_WORK_UNITS =
  * The audit kind that records one standard work continuation wake: an ACTIVE STANDARD_WORK run whose
  * PLAN was accepted and whose RUN_DISPATCH its driven owner acknowledged, left with a READY task no
  * execution was started for, with no worker or with the one it was given. Keyed by its run,
- * `evidence.taskId` and `evidence.taskState`, the continuation state (`STANDARD_CONTINUATION_STATE`);
- * `evidence.bindingGeneration` is recorded but is not part of the key, so a renewed owner generation
- * does not earn the same state another wake. Append only, as above.
+ * `evidence.taskId` and `evidence.taskState`, the continuation state (`STANDARD_CONTINUATION_STATE`),
+ * and, for a task with a worker, `evidence.workerBindingGeneration` (#1516: a replacement is a state of
+ * its own); `evidence.bindingGeneration` is recorded but is not part of the key, so a renewed owner
+ * generation does not earn the same state another wake. Append only, as above.
  */
 export const STANDARD_WORK_CONTINUATION_WAKE = "STANDARD_WORK_CONTINUATION_WAKE";
 
@@ -1214,10 +1215,13 @@ export const standardWorkContinuationTriggerKind = (runId: string, taskId: strin
 
 /**
  * The trigger id of one continuation wake: the runtime refuses a second wake for it as a duplicate.
- * Like the once-marker, it names no binding generation.
+ * Like the once-marker, it names no owner binding generation; #1516 — it names the task's worker
+ * generation when it has one, so a replacement's wake is not its predecessor's duplicate.
  */
-export const standardWorkContinuationTriggerId = (runId: string, taskId: string, taskState: string): string =>
-  `standard-work-continuation:${runId}:${taskId}:${taskState}`;
+export const standardWorkContinuationTriggerId = (
+  runId: string, taskId: string, taskState: string, workerBindingGeneration: number | null = null,
+): string =>
+  `standard-work-continuation:${runId}:${taskId}:${taskState}${workerBindingGeneration === null ? "" : `:worker-${workerBindingGeneration}`}`;
 
 /** F1 — the driven CTO's reading of a review-unavailable notice; see `#isUnjudgedReviewNotice`. */
 export const UNJUDGED_NOTICE_LINE =

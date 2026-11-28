@@ -3123,7 +3123,9 @@ export class Daemon {
    * no turn of its owner is running or queued and the run is still in that same state, the woken turn
    * made no progress, and the pass records one `STANDARD_WORK_CONTINUATION_STALLED` blocker for the
    * tuple and nothing more. Only progress names a new tuple: another task READY and unstarted once
-   * this one moved on. A change of the owner's binding generation is not progress (CEO 0d55e1de): the
+   * this one moved on, or (#1516) a new worker generation on the task, so a retired worker's
+   * replacement interrupted before its first execution is woken once for itself. A same-generation
+   * runtime move is not a new worker. A change of the owner's binding generation is not progress (CEO 0d55e1de): the
    * marker, the blocker and the trigger id leave it out, and both audit events carry it as evidence
    * only.
    */
@@ -3148,16 +3150,20 @@ export class Daemon {
       // A turn of the owner running or queued may be the one making progress: nothing is decided now.
       if (state === null || runtime.turnInProgress(owner.sessionId)) continue;
       const tuple = { runId, roleKey: owner.roleKey, bindingGeneration: owner.bindingGeneration, ...state };
-      // Keyed on (run, task, task state) alone: a renewed owner generation finds the same marker.
+      // Keyed on (run, task, task state, worker generation): a renewed owner generation finds the same marker.
+      // #1516 — a replacement worker does not: the marker its predecessor's staffing spent is not its own.
       const marked = (kind: string): boolean =>
         Boolean(this.cp.db.get<{ n: number }>(
           `SELECT 1 AS n FROM audit_events
             WHERE kind = ? AND run_id = ?
               AND json_extract(evidence_json, '$.taskId') = ?
               AND json_extract(evidence_json, '$.taskState') = ?
+              AND json_extract(evidence_json, '$.workerBindingGeneration') IS ?
             LIMIT 1`,
-          [kind, runId, tuple.taskId, tuple.taskState],
+          [kind, runId, tuple.taskId, tuple.taskState, tuple.workerBindingGeneration],
         ));
+      // An UNSTAFFED tuple has no worker and records none, as before.
+      const worker = tuple.workerBindingGeneration === null ? {} : { workerBindingGeneration: tuple.workerBindingGeneration };
       if (marked(STANDARD_WORK_CONTINUATION_WAKE)) {
         // The one wake this state earned has run, or was dropped, and the state is unchanged: the
         // owner made no progress on it. That is left as an explicit blocker, once, and never re-woken.
@@ -3197,6 +3203,7 @@ export class Daemon {
             bindingGeneration: tuple.bindingGeneration,
             taskId: tuple.taskId,
             taskState: tuple.taskState,
+            ...worker,
             messageId: tuple.messageId,
             reason: "the continuation wake for this task ran and the task is still in that state, READY with no execution; it is not woken again",
           },
@@ -3214,7 +3221,7 @@ export class Daemon {
       ) {
         continue;
       }
-      const triggerId = standardWorkContinuationTriggerId(runId, tuple.taskId, tuple.taskState);
+      const triggerId = standardWorkContinuationTriggerId(runId, tuple.taskId, tuple.taskState, tuple.workerBindingGeneration);
       // As for the bootstrap stages (R1-01): the turn starts behind awaits, so a task staffed, a run
       // moved or a binding changed meanwhile drops the trigger at the runtime's final check, and its
       // marker stays spent.
@@ -3238,6 +3245,7 @@ export class Daemon {
           bindingGeneration: tuple.bindingGeneration,
           taskId: tuple.taskId,
           taskState: tuple.taskState,
+          ...worker,
           messageId: tuple.messageId,
           triggerId,
         },
@@ -3273,7 +3281,7 @@ export class Daemon {
   #standardWorkContinuation(
     runId: string,
     owner: { roleKey: string; sessionId: string; sessionIncarnation: string; bindingGeneration: number },
-  ): { taskId: string; taskState: string; messageId: string } | null {
+  ): { taskId: string; taskState: string; workerBindingGeneration: number | null; messageId: string } | null {
     const run = this.cp.runs.get(runId);
     if (!run || run.state !== RunState.ACTIVE || run.kind !== RunKind.STANDARD_WORK || !run.projectId) return null;
     if (run.continuityHoldRoleKey) return null;
@@ -3293,7 +3301,7 @@ export class Daemon {
     if (executing) return null;
     const ready = tasks.filter((task) => task.state === TaskState.READY);
     if (ready.length === 0) return null;
-    const states: string[] = [];
+    const states: Array<{ taskState: string; workerBindingGeneration: number | null }> = [];
     for (const task of ready) {
       const executed = this.cp.db.get<{ n: number }>(
         `SELECT 1 AS n FROM task_executions WHERE task_id = ? LIMIT 1`,
@@ -3304,10 +3312,11 @@ export class Daemon {
       // owner's to replace, in a state of its own.
       const worker = currentBindingOf(roleKeyFor(Role.WORKER, { taskId: task.taskId }), this.cp.bindings, this.cp.sessions);
       if (worker !== null && worker.retired === null && worker.binding.status !== "ACTIVE") return null;
-      states.push(
-        worker === null ? STANDARD_CONTINUATION_STATE.UNSTAFFED
+      states.push({
+        taskState: worker === null ? STANDARD_CONTINUATION_STATE.UNSTAFFED
           : worker.retired !== null ? STANDARD_CONTINUATION_STATE.RETIRED : STANDARD_CONTINUATION_STATE.STAFFED,
-      );
+        workerBindingGeneration: worker?.binding.bindingGeneration ?? null,
+      });
     }
     if (!this.#pinnedOwnerExact(run, owner, Role.PRIMARY_CTO)) return null;
     const dispatch = this.cp.db.get<{ message_id: string; status: string }>(
@@ -3318,7 +3327,7 @@ export class Daemon {
       [runId, owner.bindingGeneration, owner.sessionId],
     );
     if (dispatch?.status !== "ACKED") return null;
-    return { taskId: ready[0]!.taskId, taskState: states[0]!, messageId: dispatch.message_id };
+    return { taskId: ready[0]!.taskId, ...states[0]!, messageId: dispatch.message_id };
   }
 
   /**
