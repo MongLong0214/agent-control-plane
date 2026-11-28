@@ -1766,6 +1766,27 @@ export class BindingRegistry {
   }
 
   /**
+   * #1486 — the role's newest assignment, whatever its status, on the runtime it last ran: its actor's
+   * current session, read as `active` reads an ACTIVE one. `history` keeps each row's recorded session,
+   * which a same-generation move leaves behind, so a binding moved and then revoked is read here. Null
+   * when the role was never held.
+   */
+  latest(roleKey: string): RoleBinding | null {
+    const row = this.db.get<RawAssignment>(
+      `SELECT a.*,
+              c.current_session_id AS live_session_id,
+              c.current_session_incarnation AS live_session_incarnation
+         FROM assignments a
+         LEFT JOIN conversational_actors c ON c.actor_id = a.actor_id
+        WHERE a.role_key = ?
+        ORDER BY a.binding_generation DESC
+        LIMIT 1`,
+      [roleKey],
+    );
+    return row ? hydrate(row) : null;
+  }
+
+  /**
    * Creates the conversational actor a binding names (#449).
    *
    * The actor holds the live runtime pointer, so failover can replace the session without
