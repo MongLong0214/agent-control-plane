@@ -1152,6 +1152,42 @@ describe("#1486 — a retired-model worker is replaced however it got there: mov
       expect(markers(f, STANDARD_WORK_CONTINUATION_STALLED, runId).map((evidence) => evidence["taskState"])).toEqual([RETIRED]);
     });
   });
+
+  it("#1516 — the replacement's interruption is woken once: the STAFFED wake and blocker its retired predecessor spent do not stand for it", async () => {
+    await withBootstrapRuntime(async (f) => {
+      const cp = f.harness.cp;
+      const { owner, runId, sessionId, roleKey, taskId } = await stalledAfterPlan(f, "std-replaced-staffed", "ignore");
+      const at = (taskState: string) => ({ runId, roleKey, bindingGeneration: 1, taskId, taskState });
+      const workerRole = roleKeyFor(Role.WORKER, { taskId });
+      const pass = async (expected: { woken: unknown[]; stalled: unknown[] }) => {
+        const turns = f.finishedTurns(sessionId);
+        expect(f.daemon.wakeStandardWorkContinuation()).toEqual(expected);
+        if (expected.woken.length > 0) await f.awaitFinishedTurns(sessionId, turns + 1);
+        await idle(f, sessionId);
+      };
+      // Generation 1 is staffed and interrupted before its first execution: woken once, then a blocker.
+      bindRunWorker(f, runId, taskId);
+      await pass({ woken: [at(STAFFED)], stalled: [] });
+      await pass({ woken: [], stalled: [at(STAFFED)] });
+      // It moves onto a retired model, its owner is woken for that, and generation 2 replaces it.
+      moveWorker(f, runId, taskId, { provider: "gpt", model: "gpt-6.1-sol" });
+      await pass({ woken: [at(RETIRED)], stalled: [] });
+      expect(cp.bindings.revoke(workerRole, "test: retired worker replaced").allowed).toBe(true);
+      bindRunWorker(f, runId, taskId, { provider: "gpt", model: "gpt-6.2-sol" });
+      expect(cp.bindings.active(workerRole)).toMatchObject({ bindingGeneration: 2 });
+      // The replacement's turn ended before its first execution: a STAFFED state of its own, woken once, then one blocker.
+      await pass({ woken: [at(STAFFED)], stalled: [] });
+      expect(owner.prompts.at(-1)).toContain(
+        `The control plane woke you for: ${standardWorkContinuationTriggerKind(runId, taskId, STAFFED)}.`,
+      );
+      await pass({ woken: [], stalled: [at(STAFFED)] });
+      expect(f.daemon.wakeStandardWorkContinuation()).toEqual(nothing);
+      const keyed = (kind: string) =>
+        markers(f, kind, runId).map((evidence) => [evidence["taskState"], evidence["workerBindingGeneration"]]);
+      expect(keyed(STANDARD_WORK_CONTINUATION_WAKE)).toEqual([[STAFFED, 1], [RETIRED, 1], [STAFFED, 2]]);
+      expect(keyed(STANDARD_WORK_CONTINUATION_STALLED)).toEqual([[STAFFED, 1], [STAFFED, 2]]);
+    });
+  });
 });
 
 describe("R1-01 (b), CEO e64aa10b — re-entry goes by the run's record, and a provisioned worker that never ran resumes once", () => {
