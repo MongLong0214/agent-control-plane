@@ -17,6 +17,7 @@ import type { CtoProcessReader, CtoRoleScope } from "../../src/cto/one-cto-per-p
 interface FakeProcess { pid: number; ppid: number; command: string; argv?: string[]; cwd?: string }
 import { formatHostProvisionerReason, hostProvisionerReason, hostReasonKind, hostRefusalText } from "../../src/runtime/host-provisioner-reason.ts";
 import { cleanupTempDirs, commitAll, gitSync, tempDir } from "../helpers/fixtures.ts";
+import { execFileSync } from "node:child_process";
 import { createServer, type Server, type Socket } from "node:net";
 import { mkdirSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -125,6 +126,9 @@ interface World {
 
 const results = (w: World): Array<[string, string]> => w.out.filter((l) => typeof l["result"] === "string" && typeof l["step"] === "string").map((l) => [l["step"] as string, l["result"] as string]);
 const last = (w: World): Record<string, unknown> => w.out[w.out.length - 1]!;
+/** Where Claude Code keeps a conversation's transcript: under $CLAUDE_CONFIG_DIR when the world sets it, else ~/.claude. */
+const transcriptIn = (w: World, cwd: string, uuid: string): string =>
+  `${w.ports.env["CLAUDE_CONFIG_DIR"] || `${HOME}/.claude`}/projects/${cwd.replace(/[^A-Za-z0-9]/g, "-")}/${uuid}.jsonl`;
 
 const makeWorld = (overrides: Partial<CtoRecord> = {}, env: Record<string, string | undefined> = { ACP_OPERATOR_TOKEN: "operator-test-credential" }): World => {
   const files = new Map<string, string>([
@@ -722,7 +726,7 @@ describe("a canonical relaunch resumes the role's bound conversation", () => {
     w.procs = [{ pid: CLAUDE, ppid: 1, command: argv.join(" "), argv }];
     w.panes = new Map([[CLAUDE, "logic-claude-handoff"]]);
     w.tmux = new Set(["logic-claude-handoff"]);
-    const transcript = `${HOME}/.claude/projects/${cwd.replace(/[^A-Za-z0-9]/g, "-")}/${CONVERSATION}.jsonl`;
+    const transcript = transcriptIn(w, cwd, CONVERSATION);
     w.files.set(transcript, "{}");
     w.mtimes.set(transcript, NOW - (IDLE_SECONDS + 60) * 1000);
     return { w, cwd };
@@ -765,6 +769,27 @@ describe("a canonical relaunch resumes the role's bound conversation", () => {
     expect(results(w)).toEqual([["idle", "done"], ["trust", "failed"]]);
     expect(JSON.stringify(w.out)).toContain("no-record");
     expect(w.changes).toEqual([]);
+  });
+
+  it("#1482: with CLAUDE_CONFIG_DIR set, the idle check reads the transcript under it, not a stale one under ~/.claude", async () => {
+    const { w, cwd } = canonicalWorld();
+    // Claude Code is mid-turn in the transcript it writes under the config dir; an old copy under ~/.claude says nothing about it.
+    w.mtimes.set(transcriptIn(w, cwd, CONVERSATION), NOW - 5_000);
+    const stale = `${HOME}/.claude/projects/${cwd.replace(/[^A-Za-z0-9]/g, "-")}/${CONVERSATION}.jsonl`;
+    w.files.set(stale, "{}");
+    w.mtimes.set(stale, NOW - (IDLE_SECONDS + 60) * 1000);
+    expect(await runCtoCommand(["relaunch", P, "--apply"], w.ports)).toBe(1);
+    expect(results(w)).toEqual([["idle", "failed"]]);
+    expect(w.changes).toEqual([]);
+  });
+
+  it("#1482: the launcher gives claude agentctl's CLAUDE_CONFIG_DIR, whatever the tmux server's environment holds", async () => {
+    const { w } = canonicalWorld();
+    expect(await runCtoCommand(["relaunch", P, "--apply"], w.ports)).toBe(0);
+    // A window of a tmux server that is already running gets the server's environment, not agentctl's: the script sets it itself.
+    const lines = w.files.get(w.launched.command!)!.split("\n").filter((line) => /^(unset|export) /.test(line)).join("\n");
+    const seen = execFileSync("/bin/sh", ["-c", `${lines}\nprintf '%s' "\${CLAUDE_CONFIG_DIR-unset}"`], { env: { PATH: process.env["PATH"], CLAUDE_CONFIG_DIR: "/the/tmux/servers" }, encoding: "utf8", timeout: 10_000 });
+    expect(seen).toBe(w.ports.env["CLAUDE_CONFIG_DIR"]);
   });
 
   it("add --canonical resumes an existing conversation the same way", async () => {
@@ -865,7 +890,7 @@ describe("a canonical relaunch resumes the role's bound conversation", () => {
       const { w, cwd } = canonicalWorld();
       const U = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
       w.switchovers = [{ toSessionUuid: U, state: "PENDING" }];
-      w.files.set(`${HOME}/.claude/projects/${cwd.replace(/[^A-Za-z0-9]/g, "-")}/${U}.jsonl`, "{}");
+      w.files.set(transcriptIn(w, cwd, U), "{}");
       expect(await runCtoCommand(["relaunch", P, "--fresh", "--apply"], w.ports)).toBe(0);
       const argv = launched(w);
       expect(argv.slice(argv.indexOf("--resume"), argv.indexOf("--resume") + 2)).toEqual(["--resume", U]);
@@ -927,7 +952,7 @@ describe("a canonical relaunch resumes the role's bound conversation", () => {
       expect(launched(w)).toContain("--session-id");
       // U ran, wrote its transcript and exited without a claim.
       w.procs = w.procs.filter((p) => p.pid !== 30000);
-      w.files.set(`${HOME}/.claude/projects/${cwd.replace(/[^A-Za-z0-9]/g, "-")}/${U}.jsonl`, "{}");
+      w.files.set(transcriptIn(w, cwd, U), "{}");
       w.launched.claims = true;
       w.out.length = 0; w.changes.length = 0;
       expect(await runCtoCommand(["relaunch", P, "--fresh", "--apply"], w.ports)).toBe(0);
@@ -963,7 +988,7 @@ describe("a canonical relaunch resumes the role's bound conversation", () => {
       const first = handoffFile(w).history!.before;
       // U exited without claiming; the retry comes two minutes later.
       w.procs = w.procs.filter((p) => p.pid !== 30000);
-      w.files.set(`${HOME}/.claude/projects/${cwd.replace(/[^A-Za-z0-9]/g, "-")}/${U}.jsonl`, "{}");
+      w.files.set(transcriptIn(w, cwd, U), "{}");
       await w.ports.sleep(120_000);
       w.launched.claims = true;
       w.out.length = 0; w.changes.length = 0;
@@ -1282,6 +1307,55 @@ describe("a canonical relaunch resumes the role's bound conversation", () => {
         expect(w.rotateCalls).toHaveLength(0);
         expect(mutations(w)).toEqual([]);
       });
+
+      it("Q (#1487): during the mcp step's read of the acp-cto entry, claude mcp remove is not run", async () => {
+        const { w, cwd } = canonicalWorld();
+        w.switchovers = [{ toSessionUuid: U1, state: "PENDING" }];
+        // The entry is read through the file port, so the config is there too.
+        const config = join(w.ports.env["CLAUDE_CONFIG_DIR"]!, ".claude.json");
+        w.files.set(config, JSON.stringify({ projects: { [cwd]: { hasTrustDialogAccepted: true } } }));
+        await withRealHold(w, async (cut) => {
+          const read = w.ports.files.read;
+          let reads = 0;
+          // After the launcher step, the mcp step's done reads the entry first; its run's ownership check is the second read.
+          w.ports.files.read = (path) => { if (path === config && w.out.some((l) => l["step"] === "launcher" && l["result"]) && ++reads === 2) cut(); return read(path); };
+          expect(await runCtoCommand(["relaunch", P, "--fresh", "--apply"], w.ports)).toBe(1);
+          expect(reads).toBe(2);
+        });
+        expect(w.mcpCalls).toEqual([]);
+        expect(mutations(w)).toEqual([]);
+      });
+
+      it("R (#1487): during the fallback handoff write, a second write does not keep --cwd", async () => {
+        const { w, cwd } = canonicalWorld();
+        const dir = realpathSync(tempDir("acp-cto-newdir-"));
+        writeFileSync(join(w.ports.env["CLAUDE_CONFIG_DIR"]!, ".claude.json"), JSON.stringify({ projects: { [cwd]: { hasTrustDialogAccepted: true }, [dir]: { hasTrustDialogAccepted: true } } }));
+        w.files.set(`${dir}/.keep`, "");
+        await withRealHold(w, async (cut) => {
+          const replace = w.ports.files.replace;
+          let writes = 0;
+          // No handoff is stored, so the first handoff write is the one ACP writes from the binding.
+          w.ports.files.replace = (path, body, mode) => { replace(path, body, mode); if (path.includes("handoff-") && ++writes === 1) cut(); };
+          expect(await runCtoCommand(["relaunch", P, "--fresh", "--cwd", dir, "--apply"], w.ports)).toBe(1);
+          expect(writes).toBe(1);
+        });
+        expect(JSON.parse(w.files.get(`${STATE}/cto-refresh/handoff-${P}.json`)!)).not.toHaveProperty("cwd");
+        expect(mutations(w)).toEqual([]);
+      });
+
+      it("S (#1487): during the launch's history write, cto-launch-<project>.sh is not replaced a second time", async () => {
+        const { w } = canonicalWorld();
+        w.switchovers = [{ toSessionUuid: U1, state: "PENDING" }];
+        let at = -1;
+        await withRealHold(w, async (cut) => {
+          const replace = w.ports.files.replace;
+          // After the stop, the first handoff write is the launch's history cutoff, right before it rewrites the launcher.
+          w.ports.files.replace = (path, body, mode) => { replace(path, body, mode); if (at < 0 && path.includes("handoff-") && stopped(w)) { at = w.changes.length; cut(); } };
+          expect(await runCtoCommand(["relaunch", P, "--fresh", "--apply"], w.ports)).toBe(1);
+        });
+        expect(at).toBeGreaterThan(0);
+        expect(w.changes.slice(at).filter((c) => c.includes(`cto-launch-${P}.sh`) || c.startsWith("tmux new-"))).toEqual([]);
+      });
     });
 
     describe("--cwd: the new conversation starts in another folder", () => {
@@ -1321,7 +1395,7 @@ describe("a canonical relaunch resumes the role's bound conversation", () => {
         const { w, dir } = withFolder();
         const U = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
         w.switchovers = [{ toSessionUuid: U, state: "PENDING" }];
-        w.files.set(`${HOME}/.claude/projects/${dir.replace(/[^A-Za-z0-9]/g, "-")}/${U}.jsonl`, "{}");
+        w.files.set(transcriptIn(w, dir, U), "{}");
         expect(await runCtoCommand(["relaunch", P, "--fresh", "--cwd", dir, "--apply"], w.ports)).toBe(0);
         const argv = (w.out.find((l) => l["step"] === "launch" && l["result"] === "done")!["detail"] as { argv: string[] }).argv;
         expect(argv).toContain("--resume");
@@ -1368,6 +1442,59 @@ describe("a canonical relaunch resumes the role's bound conversation", () => {
         const U = JSON.parse(w.files.get(`${STATE}/cto-refresh/handoff-${P}.json`)!).next as string;
         expect(last(w)).toEqual({ refused: `swap to ${U} already started in ${dir}; rerun without --cwd or with --cwd ${dir}; nothing was changed`, nothingChanged: true });
         expect([w.changes.length, w.files.get(`${STATE}/cto-refresh/handoff-${P}.json`)]).toEqual(before);
+      });
+
+      it("#1482: the folder a pending swap keeps is read under the hold, so one the previous holder kept refuses another --cwd", async () => {
+        const { w, dir } = withFolder();
+        const other = realpathSync(tempDir("acp-cto-newdir2-"));
+        const U = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+        const path = `${STATE}/cto-refresh/handoff-${P}.json`;
+        // The run that held the project until now kept its swap's conversation and folder just before it let go.
+        const hold = w.ports.operator.hold!;
+        w.ports.operator.hold = async (method, params) => {
+          w.files.set(path, JSON.stringify({ ...JSON.parse(w.files.get(path)!), next: U, cwd: other }));
+          return hold(method, params);
+        };
+        expect(await runCtoCommand(["relaunch", P, "--fresh", "--cwd", dir, "--apply"], w.ports)).toBe(2);
+        expect(last(w)).toEqual({ refused: `swap to ${U} already started in ${other}; rerun without --cwd or with --cwd ${other}; nothing was changed`, nothingChanged: true });
+        expect(w.changes).toEqual([]);
+        expect(w.hold.released).toBe(1);
+      });
+
+      it("#1482: a folder the trust step refuses is not kept with the handoff, so a rerun can name another one", async () => {
+        const { w, cwd, dir } = withFolder();
+        const other = realpathSync(tempDir("acp-cto-newdir2-"));
+        // A pending switchover: the handoff step writes its conversation down before the trust step runs.
+        w.switchovers = [{ toSessionUuid: "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", state: "PENDING" }];
+        writeFileSync(join(w.ports.env["CLAUDE_CONFIG_DIR"]!, ".claude.json"), JSON.stringify({ projects: { [cwd]: { hasTrustDialogAccepted: true }, [other]: { hasTrustDialogAccepted: true } } }));
+        expect(await runCtoCommand(["relaunch", P, "--fresh", "--cwd", dir, "--apply"], w.ports)).toBe(1);
+        expect(results(w).at(-1)).toEqual(["trust", "failed"]);
+        expect(JSON.parse(w.files.get(`${STATE}/cto-refresh/handoff-${P}.json`)!)).not.toHaveProperty("cwd");
+        expect(await runCtoCommand(["relaunch", P, "--fresh", "--cwd", other, "--apply"], w.ports)).toBe(0);
+        expect(w.files.get(w.launched.command!)).toContain(`cd '${other}'`);
+        expect(JSON.parse(w.files.get(`${STATE}/cto-refresh/handoff-${P}.json`)!)).toMatchObject({ cwd: other });
+      });
+
+      it("#1482: another project's entry where Claude Code keeps a git folder's settings (its root, a worktree's main checkout) is never overwritten", async () => {
+        const { w, cwd } = withFolder();
+        const root = realpathSync(tempDir("acp-cto-repo-"));
+        const sub = join(root, "sub");
+        mkdirSync(sub);
+        const main = realpathSync(tempDir("acp-cto-main-"));
+        const linked = realpathSync(tempDir("acp-cto-linked-"));
+        // A checkout's .git is a directory; a linked worktree's is a file naming its gitdir, whose commondir leads to the main checkout's.
+        w.files.set(`${root}/.git/HEAD`, "ref: refs/heads/main\n");
+        w.files.set(`${linked}/.git`, `gitdir: ${main}/.git/worktrees/linked\n`);
+        w.files.set(`${main}/.git/worktrees/linked/commondir`, "../..\n");
+        for (const [folder, keptUnder] of [[sub, root], [linked, main]] as const) {
+          writeFileSync(join(w.ports.env["CLAUDE_CONFIG_DIR"]!, ".claude.json"), JSON.stringify({ projects: { [cwd]: { hasTrustDialogAccepted: true }, [folder]: { hasTrustDialogAccepted: true } } }));
+          seed(w, { [keptUnder]: { mcpServers: { "acp-cto": theirs } } }, w.ports.env["CLAUDE_CONFIG_DIR"]!);
+          expect(await runCtoCommand(["relaunch", P, "--fresh", "--cwd", folder, "--apply"], w.ports)).toBe(1);
+          expect(results(w).at(-1)).toEqual(["trust", "failed"]);
+          expect(JSON.stringify(w.out)).toContain(`(kept under ${keptUnder}) belongs to prj_other`);
+        }
+        expect(w.mcpCalls).toEqual([]);
+        expect(w.changes.filter((c) => c.startsWith("SIGTERM") || c.startsWith("tmux new-"))).toEqual([]);
       });
 
       it("home through a symlink, and a regular file, are refused before any write, a dry run included", async () => {
@@ -1534,7 +1661,7 @@ describe("deploy135 live defects", () => {
     w.record = { ...w.record, repositories: [{ repositoryId: "repo_1", identity: `github:${REPO}`, checkoutPath: cwd }] };
     w.ports = { ...w.ports, env: { ...w.ports.env, CLAUDE_CONFIG_DIR: config } };
     w.procs = [{ pid: CLAUDE, ppid: 1, command: `${LOCAL_CLAUDE} --resume ${CONVERSATION}`, argv: [LOCAL_CLAUDE, "--resume", CONVERSATION] }];
-    const transcript = `${HOME}/.claude/projects/${cwd.replace(/[^A-Za-z0-9]/g, "-")}/${CONVERSATION}.jsonl`;
+    const transcript = transcriptIn(w, cwd, CONVERSATION);
     w.files.set(transcript, "{}");
     w.mtimes.set(transcript, NOW - (IDLE_SECONDS + 60) * 1000);
     w.pane = "flood";
@@ -1551,7 +1678,7 @@ describe("deploy135 live defects", () => {
     w.record = { ...w.record, repositories: [{ repositoryId: "repo_1", identity: `github:${REPO}`, checkoutPath: cwd }] };
     w.ports = { ...w.ports, env: { ...w.ports.env, CLAUDE_CONFIG_DIR: config } };
     w.procs = [{ pid: CLAUDE, ppid: 1, command: `${LOCAL_CLAUDE} --resume ${CONVERSATION}`, argv: [LOCAL_CLAUDE, "--resume", CONVERSATION] }];
-    const transcript = `${HOME}/.claude/projects/${cwd.replace(/[^A-Za-z0-9]/g, "-")}/${CONVERSATION}.jsonl`;
+    const transcript = transcriptIn(w, cwd, CONVERSATION);
     w.files.set(transcript, "{}");
     w.mtimes.set(transcript, NOW - (IDLE_SECONDS + 60) * 1000);
     w.pane = "loading";
@@ -1610,7 +1737,7 @@ describe("one CTO per project, through the shared check (#1463)", () => {
     w.procs = [{ pid: CLAUDE, ppid: 1, command: argv.join(" "), argv, cwd: "/elsewhere" }];
     w.panes = new Map([[CLAUDE, "logic-claude-handoff"]]);
     w.tmux = new Set(["logic-claude-handoff"]);
-    const transcript = `${HOME}/.claude/projects/${cwd.replace(/[^A-Za-z0-9]/g, "-")}/${CONVERSATION}.jsonl`;
+    const transcript = transcriptIn(w, cwd, CONVERSATION);
     w.files.set(transcript, "{}");
     w.mtimes.set(transcript, NOW - (IDLE_SECONDS + 60) * 1000);
     return { w, cwd };
@@ -1668,7 +1795,7 @@ describe("#1463 r2: gone, alive and unavailable are three states", () => {
     const w = makeWorld({ kind: "canonical", resident: null, generation: 3, session: { pid: CLAUDE, startedAt: `start-${CLAUDE}`, workdir: cwd },
       repositories: [{ repositoryId: "repo_1", identity: `github:${REPO}`, checkoutPath: cwd }] }, { ACP_OPERATOR_TOKEN: "operator-test-credential", CLAUDE_CONFIG_DIR: config });
     w.procs = [{ pid: CLAUDE, ppid: 1, command: `${LOCAL_CLAUDE} --resume ${CONVERSATION}`, argv: [LOCAL_CLAUDE, "--resume", CONVERSATION], cwd }];
-    const transcript = `${HOME}/.claude/projects/${cwd.replace(/[^A-Za-z0-9]/g, "-")}/${CONVERSATION}.jsonl`;
+    const transcript = transcriptIn(w, cwd, CONVERSATION);
     w.files.set(transcript, "{}");
     w.mtimes.set(transcript, NOW - (IDLE_SECONDS + 60) * 1000);
     return w;
@@ -1735,7 +1862,7 @@ describe("#1463 final review repros", () => {
     const w = makeWorld({ kind: "canonical", resident: null, generation: 3, session: { pid: CLAUDE, startedAt: `start-${CLAUDE}`, workdir: cwd },
       repositories: [{ repositoryId: "repo_1", identity: `github:${REPO}`, checkoutPath: cwd }] }, { ACP_OPERATOR_TOKEN: "operator-test-credential", CLAUDE_CONFIG_DIR: config });
     w.procs = [{ pid: CLAUDE, ppid: 1, command: `${LOCAL_CLAUDE} --resume ${CONVERSATION}`, argv: [LOCAL_CLAUDE, "--resume", CONVERSATION], cwd }];
-    const transcript = `${HOME}/.claude/projects/${cwd.replace(/[^A-Za-z0-9]/g, "-")}/${CONVERSATION}.jsonl`;
+    const transcript = transcriptIn(w, cwd, CONVERSATION);
     w.files.set(transcript, "{}");
     w.mtimes.set(transcript, NOW - (IDLE_SECONDS + 60) * 1000);
     return w;

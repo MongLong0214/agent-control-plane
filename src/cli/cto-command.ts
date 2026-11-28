@@ -69,9 +69,10 @@ export const CTO_USAGE = `agentctl cto — a project CTO's lifecycle on this hos
       --apply first takes the daemon's hold on the project (ctoRefresh.hold) and keeps that connection open for
       the whole run, so a second run cannot exist; a hold lost mid-run stops before the next change.
       --cwd <dir> starts the new conversation in that existing folder instead of the old one's (never the home
-      folder; its acp-cto entry moves there and is removed from the old folder); it is kept with the handoff, so a
-      rerun without it uses the same folder. Roll forward only: after a failure, run the same command again; it continues on the same new
-      conversation and never goes back to the old one, which the switchover fences
+      folder; its acp-cto entry is added there, and the old folder's is left naming the fenced old conversation); once
+      the trust step accepts it, it is kept with the handoff, so a rerun without it uses the same folder. Roll forward
+      only: after a failure, run the same command again; it continues on the same new conversation and never goes back
+      to the old one, which the switchover fences
   agentctl cto retire <project> --reason <text> [--delete-repo --yes-delete-repo <owner/name>] [--apply]
       wait for an idle CTO, then agentctl project retire (stops the session, releases the binding,
       archives its room, retires its roster route, takes it off the fleet), confirm the session,
@@ -203,9 +204,11 @@ const keyFileOf = (ports: CtoPorts, projectId: string): string => join(ports.hom
 const bridgeFile = (ports: CtoPorts, name: string): string => join(ports.home, ".hermes", "bridge", name);
 const fleetDir = (ports: CtoPorts): string => join(ports.home, ".claude", "watchers", "fleet");
 const residentRequestOf = (ports: CtoPorts, projectId: string): string => join(fleetDir(ports), `${fleetNameOf(projectId)}.resident.json`);
-/** Claude Code keeps a conversation's transcript under its cwd with every non-alphanumeric character a dash. */
+/** Claude Code's own folder: `$CLAUDE_CONFIG_DIR` when set, else `~/.claude`. */
+const claudeDirOf = (ports: CtoPorts): string => ports.env["CLAUDE_CONFIG_DIR"] || join(ports.home, ".claude");
+/** Claude Code keeps a conversation's transcript in its own folder, under its cwd with every non-alphanumeric character a dash. */
 const transcriptOf = (ports: CtoPorts, cwd: string, uuid: string): string =>
-  join(ports.home, ".claude", "projects", cwd.replace(/[^A-Za-z0-9]/g, "-"), `${uuid}.jsonl`);
+  join(claudeDirOf(ports), "projects", cwd.replace(/[^A-Za-z0-9]/g, "-"), `${uuid}.jsonl`);
 const allocationString = (record: CtoRecord, field: string): string | null => {
   const value = record.resident?.allocation?.[field];
   return typeof value === "string" ? value : null;
@@ -507,8 +510,12 @@ const writeCanonicalLauncher = (ports: CtoPorts, projectId: string, plan: Canoni
       ...(launchId ? { launchId } : {}), ...(historyBefore !== undefined ? { historyBefore } : {}),
     }),
     ...plan.resume];
+  // A window of a tmux server that is already running gets the server's environment, not this one's: the script sets the config
+  // folder itself, so claude reads the one whose entries and transcripts this run checked.
+  const configDir = ports.env["CLAUDE_CONFIG_DIR"] ?? "";
   ports.files.replace(canonicalLauncherOf(ports, projectId), `#!/bin/sh\n# cto-launch: ${JSON.stringify(plan)}\n` +
     "unset ACP_OPERATOR_TOKEN ACP_OPERATOR_TOKEN_FILE ACP_MCP_TOKEN ACP_BUZZ_INGRESS_SECRET GH_TOKEN GITHUB_TOKEN\n" +
+    (configDir === "" ? "unset CLAUDE_CONFIG_DIR\n" : `export CLAUDE_CONFIG_DIR=${quoteShell(configDir)}\n`) +
     `cd ${quoteShell(plan.cwd)} || exit 1\nexec ${argv.map(quoteShell).join(" ")}\n`, 0o700);
   return argv;
 };
@@ -546,7 +553,7 @@ const readLegacyLauncher = (ports: CtoPorts, projectId: string): { tmux: string 
 const canonicalResumeSteps = (
   ports: CtoPorts, projectId: string, restart: boolean,
   // --fresh: the conversation to start is the switchover's (`uuid`, known once `prepare` ran or found it), never the bound one.
-  options: { fresh?: { uuid: string | null; cwd: () => string | null; old: string; prepare: CtoStep; prepared: () => Promise<boolean>; gate: () => Promise<Outcome | null> } } = {},
+  options: { fresh?: { uuid: string | null; cwd: () => string | null; old: string; prepare: CtoStep; prepared: () => Promise<boolean>; gate: () => Promise<Outcome | null>; keep: () => Promise<Outcome | null> } } = {},
 ): CtoStep[] => {
   const planned = fresh(ports, projectId);
   const wanted = (record: CtoRecord | null): string | null => (options.fresh ? options.fresh.uuid : record?.conversation ?? null);
@@ -554,25 +561,48 @@ const canonicalResumeSteps = (
   const cwd = options.fresh?.cwd() ?? (planned ? cwdOf(planned) : null);
   const launcher = canonicalLauncherOf(ports, projectId);
   type McpEntry = { command?: string; args?: string[] };
-  /** The acp-cto entry Claude Code keeps for a folder: in `$CLAUDE_CONFIG_DIR/.claude.json` when set, else `~/.claude.json`, under the folder's realpath. */
-  const entryAt = (folder: string): McpEntry | undefined => {
+  /**
+   * The folders whose entry Claude Code may use for `folder`, by realpath: its own and, in a git repository, the repository's root,
+   * where Claude Code keeps the local settings of every folder in it; a linked worktree's are kept with its main checkout, which its
+   * .git file's gitdir and that dir's commondir lead to. The last is the one `claude mcp add --scope local` writes.
+   */
+  const keysOf = (folder: string): string[] => {
+    const real = ports.files.real?.(folder)?.path ?? folder;
+    for (let at = real; ; at = dirname(at)) {
+      if (ports.files.exists(join(at, ".git"))) {
+        let main: string | null = null;
+        try {
+          const gitdir = /^gitdir: (.+)$/m.exec(ports.files.read(join(at, ".git")))?.[1]?.trim();
+          const common = gitdir ? resolve(at, gitdir, ports.files.read(join(resolve(at, gitdir), "commondir")).trim()) : null;
+          main = common !== null && basename(common) === ".git" ? dirname(common) : null;
+        } catch { /* .git is a directory, or its gitdir has no commondir: the folder holding it is the root */ }
+        return [...new Set([real, at, ...(main !== null ? [ports.files.real?.(main)?.path ?? main] : [])])];
+      }
+      if (dirname(at) === at) return [real];
+    }
+  };
+  /** The acp-cto entry under each of those folders, in `$CLAUDE_CONFIG_DIR/.claude.json` when set, else `~/.claude.json`. */
+  const entriesAt = (folder: string): Array<{ key: string; entry: McpEntry | undefined }> => {
     const dir = ports.env["CLAUDE_CONFIG_DIR"] ?? "";
     const config = join(dir === "" ? ports.home : dir, ".claude.json");
-    if (!ports.files.exists(config)) return undefined;
-    const key = ports.files.real?.(folder)?.path ?? folder;
-    try { return (JSON.parse(ports.files.read(config)) as { projects?: Record<string, { mcpServers?: Record<string, McpEntry> }> }).projects?.[key]?.mcpServers?.["acp-cto"]; } catch { return undefined; }
+    let projects: Record<string, { mcpServers?: Record<string, McpEntry> }> | undefined;
+    if (ports.files.exists(config)) {
+      try { projects = (JSON.parse(ports.files.read(config)) as { projects?: Record<string, { mcpServers?: Record<string, McpEntry> }> }).projects; } catch { projects = undefined; }
+    }
+    return keysOf(folder).map((key) => ({ key, entry: projects?.[key]?.mcpServers?.["acp-cto"] }));
   };
   /**
-   * --fresh: the destination's acp-cto entry names another project, which this run must not repoint. Only the new folder's entry is ever
-   * written; the old folder's is left alone (it may be shared with a git root or subfolder, or be another project's). It names the old,
-   * now fenced conversation, so an attach through it is refused, which is harmless.
+   * --fresh: an acp-cto entry Claude Code may use in the destination names another project, which this run must not repoint. Only the
+   * new folder's entry is ever written; the old folder's is left alone (it may be shared with a git root or subfolder, or be another
+   * project's). It names the old, now fenced conversation, so an attach through it is refused, which is harmless.
    */
   const mcpConflict = (target: string): string | null => {
-    const entry = options.fresh ? entryAt(target) : undefined;
-    if (!entry) return null;
-    const args = entry.args ?? [];
-    const owner = args.includes("--project-id") ? args[args.indexOf("--project-id") + 1] : undefined;
-    return owner === projectId ? null : `${target} already has an acp-cto entry that belongs to ${owner ?? "another project"}; nothing was changed`;
+    for (const { key, entry } of options.fresh ? entriesAt(target) : []) {
+      const args = entry?.args ?? [];
+      const owner = args.includes("--project-id") ? args[args.indexOf("--project-id") + 1] : undefined;
+      if (entry && owner !== projectId) return `the acp-cto entry Claude Code uses in ${target} (kept under ${key}) belongs to ${owner ?? "another project"}; nothing was changed`;
+    }
+    return null;
   };
   const bound = (): { record: CtoRecord; uuid: string; cwd: string } | string => {
     const record = fresh(ports, projectId);
@@ -625,12 +655,15 @@ const canonicalResumeSteps = (
   return [options.fresh ? { ...idleStep(ports, projectId), done: options.fresh.prepared } : idleStep(ports, projectId), {
     id: "trust",
     plan: `check Claude Code would find ${cwd ?? "the CTO's folder"} already trusted (launchFolderTrust); nothing is ever trusted here`,
-    run: () => {
+    run: async () => {
       const at = bound();
       if (typeof at === "string") return refused(at);
       const trust = launchFolderTrust(at.cwd, { home: ports.home, env: ports.env });
-      if (trust.trusted) { const conflict = mcpConflict(at.cwd); return conflict ? refused(conflict) : ok({ folder: trust.folder }); }
-      return refused(`Claude Code would not find ${at.cwd} trusted (${trust.reason}); run ~/.claude/scripts/claude-trust-dir.sh ${at.cwd}, then run this again; nothing was stopped`);
+      if (!trust.trusted) return refused(`Claude Code would not find ${at.cwd} trusted (${trust.reason}); run ~/.claude/scripts/claude-trust-dir.sh ${at.cwd}, then run this again; nothing was stopped`);
+      const conflict = mcpConflict(at.cwd);
+      if (conflict) return refused(conflict);
+      // --fresh --cwd: the folder is kept with the handoff only once it is accepted here, so a rerun never starts in a refused one.
+      return (await options.fresh?.keep()) ?? ok({ folder: trust.folder });
     },
   }, {
     id: "channel",
@@ -710,7 +743,7 @@ const canonicalResumeSteps = (
       if (options.fresh && await newRunning()) return true;
       const at = bound();
       if (typeof at === "string") return false;
-      const entry = entryAt(at.cwd);
+      const entry = entriesAt(at.cwd).at(-1)?.entry;
       return entry?.command === runtimeNodeOf(ports) && JSON.stringify(entry.args ?? []) === JSON.stringify(acpCtoEntryArgs(ports, projectId, at.uuid));
     },
     run: async () => {
@@ -722,6 +755,9 @@ const canonicalResumeSteps = (
       const earlier = readCanonicalLauncher(ports, projectId);
       const claude = claudeBinaryOf(ports, earlier ? [earlier.claude] : readLegacyLauncher(ports, projectId)?.argv ?? null);
       if (!claude) return refused("the claude binary is not known: set ACP_CLAUDE_BINARY");
+      // The entry reads above blocked the event loop: the hold is verified again before the remove.
+      const gatedRemove = await options.fresh?.gate();
+      if (gatedRemove) return gatedRemove;
       // Absent is fine; the add below is what has to succeed.
       ports.run(claude, ["mcp", "remove", "--scope", "local", "acp-cto"], { cwd: at.cwd, timeoutMs: 30_000 });
       // The remove blocked the event loop: the hold is verified again before the add that follows it.
@@ -759,6 +795,9 @@ const canonicalResumeSteps = (
       if (options.fresh) {
         historyBefore = Math.floor(ports.now() / 1000);
         if (UUID.test(uuid)) markHandoff(ports.files, ports.stateDir, projectId, { history: { conversation: uuid, before: historyBefore } });
+        // The history write blocked the event loop: the hold is verified again before the launcher is replaced.
+        const gatedLauncher = await options.fresh.gate();
+        if (gatedLauncher) return gatedLauncher;
       }
       const argv = writeCanonicalLauncher(ports, projectId, planned, launchId, historyBefore);
       const tmuxRun = (args: string[]): CtoExecResult => ports.run("tmux", args, { timeoutMs: 10_000 });
@@ -940,8 +979,8 @@ interface SwitchoverStatus { holderSessionUuid: string | null; generation: numbe
 const freshSteps = (ports: CtoPorts, record: CtoRecord, next: string, hold: { open(): boolean; verify(): Promise<boolean> } | null, cwdFlag: string | null = null): CtoStep[] => {
   const projectId = record.projectId;
   const old = record.conversation!;
-  const target: { uuid: string | null; cwd: () => string | null; old: string; prepare: CtoStep; prepared: () => Promise<boolean>; gate: () => Promise<Outcome | null> } =
-    { uuid: null, cwd: () => null, old, prepare: undefined as unknown as CtoStep, prepared: async () => false, gate: async () => null };
+  const target: { uuid: string | null; cwd: () => string | null; old: string; prepare: CtoStep; prepared: () => Promise<boolean>; gate: () => Promise<Outcome | null>; keep: () => Promise<Outcome | null> } =
+    { uuid: null, cwd: () => null, old, prepare: undefined as unknown as CtoStep, prepared: async () => false, gate: async () => null, keep: async () => null };
   // The folder the new conversation starts in: --cwd, else the one an earlier attempt of this same swap kept with the handoff.
   target.cwd = () => {
     if (cwdFlag !== null) return cwdFlag;
@@ -976,6 +1015,15 @@ const freshSteps = (ports: CtoPorts, record: CtoRecord, next: string, hold: { op
     : boundNow() === old ? null
     : lateClaimed() ? ok({ skipped: "the new conversation holds the role" })
     : refused(`the bound conversation is ${boundNow() ?? "none"}, not ${old} that this run began with; nothing was changed`);
+  // --cwd, once the trust step accepted the folder: kept with the handoff, so a rerun without it starts there. The trust step's reads
+  // blocked the event loop, so the hold is verified first.
+  target.keep = async () => {
+    if (cwdFlag === null) return null;
+    const gated = await target.gate();
+    if (gated) return gated;
+    markHandoff(ports.files, ports.stateDir, projectId, { cwd: cwdFlag });
+    return null;
+  };
   target.prepare = {
     id: "switchover",
     plan: "ask the daemon for the switchover old -> a new conversation (canonicalCto.rotate, with the handoff as its package) unless one is pending, whose conversation is then reused; the new conversation is written into the handoff file first, and a lost answer is followed by a status read, never a blind retry",
@@ -1042,7 +1090,7 @@ const freshSteps = (ports: CtoPorts, record: CtoRecord, next: string, hold: { op
     plan: `use the handoff stored for ${old} (cto_handoff_write), else write ACP's from the binding and open runs (under 2 KB); it records the old conversation id`,
     done: async () => {
       const stored = readHandoff(ports.files, ports.stateDir, projectId);
-      return (await target.prepared()) && stored?.conversation === old && stored.next === target.uuid && (cwdFlag === null || stored.cwd === cwdFlag);
+      return (await target.prepared()) && stored?.conversation === old && stored.next === target.uuid;
     },
     run: async () => {
       let stored = readHandoff(ports.files, ports.stateDir, projectId);
@@ -1052,7 +1100,6 @@ const freshSteps = (ports: CtoPorts, record: CtoRecord, next: string, hold: { op
         if (!written.ok) return refused(written.reason);
         stored = written.handoff;
       }
-      if (cwdFlag !== null) markHandoff(ports.files, ports.stateDir, projectId, { cwd: cwdFlag });
       // The first read of the daemon's record: a pending switchover's conversation is written down now, before anything else can happen to it.
       const pending = pendingOf(await readStatus());
       if (pending !== null) { const gated = await target.gate(); if (gated) return gated; markHandoff(ports.files, ports.stateDir, projectId, { next: pending }); target.uuid = pending; }
@@ -1422,12 +1469,7 @@ export const runCtoCommand = async (args: readonly string[], ports: CtoPorts): P
     }
     if (flags.has("--fresh")) {
       if (record.kind !== "canonical" || !record.conversation) return refuse(ports, "--fresh needs a canonical CTO with a bound conversation");
-      // The folder is named in the retry until the handoff file keeps it, which is after the first steps; naming it after is the same folder.
-      // A swap already started in a folder is never moved to another: the stored folder is the one to rerun with.
-      const started = readHandoff(ports.files, ports.stateDir, projectId);
-      if (cwdReal !== null && started?.conversation === record.conversation && started.completed !== true && started.next && started.cwd && started.cwd !== cwdReal) {
-        return refuse(ports, `swap to ${started.next} already started in ${started.cwd}; rerun without --cwd or with --cwd ${started.cwd}; nothing was changed`);
-      }
+      // The folder is named in the retry until the handoff file keeps it, which is after the trust step; naming it after is the same folder.
       const again = `agentctl cto relaunch ${projectId} --fresh${cwdReal !== null ? ` --cwd ${/^[A-Za-z0-9._/:=@-]+$/.test(cwdReal) ? cwdReal : `'${cwdReal.replaceAll("'", "'\\''")}'`}` : ""} --apply`;
       // A second run at the same time cannot exist: --apply takes the daemon's hold on this project first and keeps that connection
       // open for the whole run (the daemon releases it when the connection closes). Nothing is rolled back; the recovery is this command again.
@@ -1441,6 +1483,12 @@ export const runCtoCommand = async (args: readonly string[], ports: CtoPorts): P
         // Read again under the hold: a run that held it before may have changed what the role is bound to.
         const current = fresh(ports, projectId);
         if (current?.kind !== "canonical" || !current.conversation) return refuse(ports, "--fresh needs a canonical CTO with a bound conversation");
+        // A swap already started in a folder is never moved to another: the stored folder is the one to rerun with. Read under the
+        // hold, so a run that held it until now has written all it will.
+        const started = readHandoff(ports.files, ports.stateDir, projectId);
+        if (cwdReal !== null && started?.conversation === current.conversation && started.completed !== true && started.next && started.cwd && started.cwd !== cwdReal) {
+          return refuse(ports, `swap to ${started.next} already started in ${started.cwd}; rerun without --cwd or with --cwd ${started.cwd}; nothing was changed`);
+        }
         return await executeCtoPlan(ports, { command: "relaunch", project: projectId, kind: current.kind, fresh: true, oldConversation: current.conversation },
           freshSteps(ports, current, ports.newUuid(), hold, cwdReal), apply, async () => (hold !== null && !(await hold.verify()) ? null : again));
       } finally { hold?.release(); }
