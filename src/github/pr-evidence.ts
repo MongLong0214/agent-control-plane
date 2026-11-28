@@ -75,9 +75,9 @@ const COMPARE_FILE_LIMIT = 300;
 const COMPARE_STATUSES: ReadonlySet<string> = new Set(["ahead", "behind", "diverged", "identical"]);
 const CHECK_PAGE_BOUND = 10;
 const RULE_PAGE_BOUND = 10;
-const SHA = /^[0-9a-f]{40}$/;
+export const SHA = /^[0-9a-f]{40}$/;
 /** A project id or repository role names a registry entry; a URL, a path or a remote identity is refused. */
-const NOT_A_NAME = /[/\\:\s]|[\u0000-\u001f\u007f]|^\.\.?$/;
+export const NOT_A_NAME = /[/\\:\s]|[\u0000-\u001f\u007f]|^\.\.?$/;
 
 export interface PrEvidenceIncomplete {
   kind: "LOOKUP_FAILED" | "PERMISSION_DENIED" | "MALFORMED_RESPONSE" | "PAGE_BOUND_REACHED" | "COUNT_MISMATCH"
@@ -314,12 +314,12 @@ const bool = (value: unknown): boolean | null => typeof value === "boolean" ? va
 const httpsUrl = (value: unknown): string | null => typeof value === "string" && value.startsWith("https://") ? value : null;
 
 /** The HTTP status a failed GET carries, when GitHub answered at all. The error's own text is never echoed. */
-const statusOf = (error: unknown): number | undefined => {
+export const statusOf = (error: unknown): number | undefined => {
   if (!isAcpError(error)) return undefined;
   const status = (error.evidence as { status?: unknown } | undefined)?.status;
   return typeof status === "number" ? status : undefined;
 };
-const isPermissionFailure = (error: unknown): boolean => {
+export const isPermissionFailure = (error: unknown): boolean => {
   const status = statusOf(error);
   return status === 401 || status === 403
     || (isAcpError(error) && error.reasonCode === ReasonCode.GITHUB_APP_PERMISSION_DENIED);
@@ -711,7 +711,10 @@ const evaluateRequired = (
 });
 
 /** The registered GitHub repository of the project the caller names; never one the caller describes. */
-const resolveRepository = (source: PrEvidenceSource, input: PrEvidenceInput): Decision<RepositoryRecord> => {
+export const resolveRepository = (
+  source: Pick<PrEvidenceSource, "projects" | "repositories">,
+  input: Pick<PrEvidenceInput, "projectId" | "repositoryRole">,
+): Decision<RepositoryRecord> => {
   if (!source.projects.get(input.projectId)) {
     return deny(ReasonCode.NOT_FOUND, "unknown project", { projectId: input.projectId });
   }

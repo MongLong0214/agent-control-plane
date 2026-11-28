@@ -9,7 +9,7 @@ import { acpError, isAcpError } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 
 /** The ordered registry is the only authority for changing a deployed schema. */
-export const SCHEMA_VERSION = 59;
+export const SCHEMA_VERSION = 61;
 
 const schemaPath = fileURLToPath(new URL("./schema.sql", import.meta.url));
 const historicalSchemaPath = fileURLToPath(new URL("./schema-v37.sql", import.meta.url));
@@ -28,6 +28,8 @@ const v55SchemaPath = fileURLToPath(new URL("./schema-v55.sql", import.meta.url)
 const v56SchemaPath = fileURLToPath(new URL("./schema-v56.sql", import.meta.url)); // released v56 reads only this
 const v57SchemaPath = fileURLToPath(new URL("./schema-v57.sql", import.meta.url)); // released v57 reads only this
 const v58SchemaPath = fileURLToPath(new URL("./schema-v58.sql", import.meta.url)); // released v58 reads only this
+const v59SchemaPath = fileURLToPath(new URL("./schema-v59.sql", import.meta.url)); // released v59 reads only this
+const v60SchemaPath = fileURLToPath(new URL("./schema-v60.sql", import.meta.url)); // released v60 reads only this
 export const schemaSql = (): string => readFileSync(schemaPath, "utf8");
 const historicalSchemaSql = (): string => readFileSync(historicalSchemaPath, "utf8");
 const schemaSqlAt = (version: number): string =>
@@ -46,7 +48,9 @@ const schemaSqlAt = (version: number): string =>
                           : version <= 55 ? readFileSync(v55SchemaPath, "utf8")
                             : version <= 56 ? readFileSync(v56SchemaPath, "utf8")
                               : version <= 57 ? readFileSync(v57SchemaPath, "utf8")
-                                : version <= LATEST_FROZEN_VERSION ? readFileSync(v58SchemaPath, "utf8") : schemaSql();
+                                : version <= 58 ? readFileSync(v58SchemaPath, "utf8")
+                                  : version <= 59 ? readFileSync(v59SchemaPath, "utf8")
+                                    : version <= LATEST_FROZEN_VERSION ? readFileSync(v60SchemaPath, "utf8") : schemaSql();
 
 /** Connection PRAGMAs are established by Db before any migration transaction begins. */
 export const schemaDdl = (): string =>
@@ -4478,6 +4482,63 @@ const v59: SchemaMigration = {
   checksum: () => migrationChecksum("v59-task-plan-key", 59),
 };
 
+/**
+ * v60 (#1452) adds `runs_review_completion_bootstrap_only` and `runs_kind_immutable`. READY_FOR_CEO_REVIEW → COMPLETED stays
+ * listed in both state guards for every kind, and the first trigger admits it only for a run that is PROJECT_BOOTSTRAP before
+ * and after the UPDATE, as v54's trigger narrows the post-approval cancel; the second makes `runs.kind` immutable so the kind
+ * cannot be swapped around a completion. They name no other object and move no row, so it can be renumbered behind another step: only
+ * `version`, the id and the prior version below change.
+ */
+const V60_ADDED_TRIGGERS = ["runs_review_completion_bootstrap_only", "runs_kind_immutable"] as const;
+const v60: SchemaMigration = {
+  id: "v60-review-completion-bootstrap-only",
+  fromVersion: 59,
+  toVersion: 60,
+  apply(raw) {
+    const objects = stepTriggerObjects(60, V60_ADDED_TRIGGERS);
+    assertStepNames(raw, 60, objects, "before");
+    raw.exec(dropsFor([...V60_ADDED_TRIGGERS]));
+    raw.exec(triggerDdlFor([...V60_ADDED_TRIGGERS], 60));
+    assertStepNames(raw, 60, objects, "after");
+  },
+  checksum: () => migrationChecksum("v60-review-completion-bootstrap-only", 60),
+};
+
+/**
+ * v61 adds the repository rename table and its four guards, and replaces exactly one guard:
+ * projects_active_manifest_moves_by_grant also admits the move a recorded rename names, while the renamed
+ * repository still holds its old name. No table is rebuilt and no row moves. A name already held must hold
+ * schema.sql's definition (or, for the replaced guard, v60's) before the step, and schema.sql's after it.
+ */
+const V61_REPLACED_GUARDS = ["projects_active_manifest_moves_by_grant"] as const;
+const V61_RENAME_GUARDS = [
+  "repository_identity_renames_no_replace",
+  "repository_identity_renames_names_the_current_repository",
+  "repository_identity_renames_immutable",
+  "repository_identity_renames_no_delete",
+] as const;
+const v61Objects = (): StepObject[] => [
+  {
+    type: "table", name: "repository_identity_renames", table: "repository_identity_renames",
+    ddl: schemaObject(/CREATE TABLE IF NOT EXISTS repository_identity_renames \([\s\S]*?\n\) WITHOUT ROWID;/, "the repository_identity_renames table", 61),
+  },
+  ...stepTriggerObjects(61, V61_RENAME_GUARDS),
+  ...stepTriggerObjects(61, V61_REPLACED_GUARDS, { version: 60, names: V61_REPLACED_GUARDS }),
+];
+const v61: SchemaMigration = {
+  id: "v61-repository-identity-rename",
+  fromVersion: 60,
+  toVersion: 61,
+  apply(raw) {
+    const objects = v61Objects();
+    assertStepNames(raw, 61, objects, "before");
+    raw.exec(dropsFor([...V61_REPLACED_GUARDS]));
+    for (const object of objects) raw.exec(object.ddl);
+    assertStepNames(raw, 61, objects, "after");
+  },
+  checksum: () => migrationChecksum("v61-repository-identity-rename", 61),
+};
+
 export const MIGRATIONS: readonly SchemaMigration[] = Object.freeze([
   v12,
   v13,
@@ -4527,6 +4588,8 @@ export const MIGRATIONS: readonly SchemaMigration[] = Object.freeze([
   v57,
   v58,
   v59,
+  v60,
+  v61,
 ]);
 
 interface RequiredTrigger {
@@ -4729,6 +4792,9 @@ const REQUIRED_SCHEMA_TRIGGERS: ReadonlyArray<RequiredTrigger> = [
   { name: "runs_contract_change_completes_activated", sentinel: "CONTRACT_CHANGE_NOT_ACTIVATED", introducedIn: 44 },
   // #1189 B15 — v54 alone installs it.
   { name: "runs_cancel_after_approval_requires_no_grant", sentinel: "RUN_STATE_TRANSITION_ILLEGAL", introducedIn: 54 },
+  // #1452 — v60 alone installs it.
+  { name: "runs_review_completion_bootstrap_only", sentinel: "RUN_STATE_TRANSITION_ILLEGAL", introducedIn: 60 },
+  { name: "runs_kind_immutable", sentinel: "RUN_KIND_IMMUTABLE", introducedIn: 60 },
   { name: "manifest_first_activation_grants_born_unconsumed", sentinel: "MANIFEST_GRANT_IMMUTABLE", introducedIn: 45 },
   { name: "manifest_first_activation_grants_born_on_null", sentinel: "MANIFEST_FIRST_ACTIVATION_DENIED", introducedIn: 45 },
   { name: "manifest_first_activation_grants_no_replace", sentinel: "MANIFEST_GRANT_NO_REPLACE", introducedIn: 45 },
@@ -4760,6 +4826,10 @@ const REQUIRED_SCHEMA_TRIGGERS: ReadonlyArray<RequiredTrigger> = [
   { name: "canonical_cto_rotations_rides_a_pending_transfer", sentinel: "CANONICAL_ENTITLEMENT_TRANSFER_IMMUTABLE", introducedIn: 58 },
   { name: "canonical_cto_rotations_acknowledged_once", sentinel: "CANONICAL_ENTITLEMENT_TRANSFER_IMMUTABLE", introducedIn: 58 },
   { name: "canonical_cto_rotations_no_delete", sentinel: "CANONICAL_ENTITLEMENT_TRANSFER_IMMUTABLE", introducedIn: 58 },
+  { name: "repository_identity_renames_no_replace", sentinel: "REPOSITORY_RENAME_IMMUTABLE", introducedIn: 61 },
+  { name: "repository_identity_renames_names_the_current_repository", sentinel: "REPOSITORY_RENAME_IMMUTABLE", introducedIn: 61 },
+  { name: "repository_identity_renames_immutable", sentinel: "REPOSITORY_RENAME_IMMUTABLE", introducedIn: 61 },
+  { name: "repository_identity_renames_no_delete", sentinel: "REPOSITORY_RENAME_IMMUTABLE", introducedIn: 61 },
 ];
 
 const REQUIRED_LEDGER_TRIGGERS: ReadonlyArray<RequiredTrigger> = [
@@ -4911,6 +4981,8 @@ export const RECEIPT_VALUE_CHECKED_FROM = 47;
  * v56 is frozen as v57's prerequisite in schema-v56.sql, byte-identical to schema.sql at 60817e8f.
  * v57 is frozen as v58's prerequisite in schema-v57.sql, byte-identical to schema.sql at 4afa699e.
  * v58 is frozen as v59's prerequisite in schema-v58.sql, byte-identical to schema.sql at fab8b168.
+ * v59 is frozen as v60's prerequisite in schema-v59.sql, byte-identical to schema.sql at 744e9bef.
+ * v60 is frozen as v61's prerequisite in schema-v60.sql, byte-identical to schema.sql at d1e2b128.
  * v51 is frozen as v52's prerequisite in schema-v51.sql, byte-identical to schema.sql at 3915f78c; v50 is
  * frozen as v51's prerequisite in schema-v50.sql.
  * v49 is frozen as v50's prerequisite in schema-v49.sql, byte-identical to a620b8d2.
@@ -4919,7 +4991,7 @@ export const RECEIPT_VALUE_CHECKED_FROM = 47;
  * cannot leak back into what a database receives at its v48 step, and v48's checksum is the value the
  * pre-freeze build computed.
  */
-const LATEST_FROZEN_VERSION = 58;
+const LATEST_FROZEN_VERSION = 60;
 
 /**
  * The last version whose stored receipt is compared by value (`receiptMismatches`). It stays at 47 when

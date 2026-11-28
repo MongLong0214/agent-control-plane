@@ -39,6 +39,7 @@ import {
 } from "../guard/managed-write-guard.ts";
 import type { WorktreeAuthorization, WorktreeManager } from "../verify/worktree.ts";
 import { canonical } from "../guard/workspace-probe.ts";
+import { identityChainJson } from "../registry/repository-identity-chain.ts";
 import {
   RESERVATION_RELEASE_PRECONDITIONS,
   type RepoFactoryBootstrapRunner,
@@ -943,14 +944,15 @@ export class RepairService {
               AND a.status = 'ACTIVE'
               AND (a.run_id = r.run_id OR (a.role = 'PRIMARY_CTO' AND a.project_id = r.project_id))
              JOIN sessions s ON s.session_id = v.owner_session_id
-            WHERE v.repository_identity = ?
+            WHERE v.repository_identity IN (SELECT value FROM json_each(?))
               AND v.state IN ('CREATING','ACTIVE','DESTROYING')
               AND r.state NOT IN (${VERIFICATION_WORKTREE_OWNER_RELEASE_STATES.map(() => "?").join(", ")})
               AND r.owner_session_id = v.owner_session_id
               AND r.owner_binding_generation = v.owner_binding_generation
               AND r.owner_role_key = v.owner_role_key
               AND s.lifecycle IN ('STARTING','READY','DRAINING')`,
-          [repositoryIdentity, ...VERIFICATION_WORKTREE_OWNER_RELEASE_STATES],
+          // v61: a verification tree keeps the name its repository had when it was made.
+          [identityChainJson(this.db, repositoryIdentity), ...VERIFICATION_WORKTREE_OWNER_RELEASE_STATES],
         )
         .map((row) => row.worktree_id),
     );

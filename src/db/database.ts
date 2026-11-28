@@ -1497,6 +1497,7 @@ const TRIGGER_CODES: Record<string, ReasonCode> = {
   PINNED_MANIFEST_IMMUTABLE: ReasonCode.CANDIDATE_CANNOT_WEAKEN_CONTRACT,
   PINNED_RUN_SCOPED_COMMANDS_IMMUTABLE: ReasonCode.CANDIDATE_CANNOT_WEAKEN_CONTRACT,
   RUN_STATE_TRANSITION_ILLEGAL: ReasonCode.RUN_TRANSITION_ILLEGAL,
+  RUN_KIND_IMMUTABLE: ReasonCode.CONFLICT,
   RUN_STATE_TRANSITION_AUTHORITY_DENIED: ReasonCode.RUN_STATE_TRANSITION_AUTHORITY_DENIED,
   EVIDENCE_CANDIDATE_MISMATCH: ReasonCode.SNAPSHOT_DIGEST_MISMATCH,
   EVIDENCE_WRITE_AUTHORITY_DENIED: ReasonCode.COMPLETION_AUTHORITY_DENIED,
@@ -1559,6 +1560,7 @@ const TRIGGER_CODES: Record<string, ReasonCode> = {
   // v57 — a canonical entitlement transfer is never replaced or erased, keeps its identity, and is claimed or
   // revoked once; an entitlement is never granted to a conversation or a held Buzz actor a transfer names.
   CANONICAL_ENTITLEMENT_TRANSFER_IMMUTABLE: ReasonCode.CONFLICT,
+  REPOSITORY_RENAME_IMMUTABLE: ReasonCode.CONFLICT,
   // #246 B2-b — a manifest activation grant is one per run, fixed once written, consumed once; the
   // project's pointer moves only with a consumed grant, and a CONTRACT_CHANGE completes only with its own.
   MANIFEST_GRANT_NO_REPLACE: ReasonCode.CONFLICT,

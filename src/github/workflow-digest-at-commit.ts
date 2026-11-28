@@ -228,13 +228,16 @@ const readRemote = async (
   });
 };
 
-/** Evidence only: never refuses, never changes what was read. */
-const reachability = async (
-  client: GitHubClient,
+/**
+ * Evidence only: never refuses, never changes what was read. Also read by `repository_blob_get`, which
+ * judges the answer itself and passes no checkout, so GitHub's compare is the only source there.
+ */
+export const reachability = async (
+  client: Pick<GitHubClient, "request">,
   owner: string,
   repo: string,
   checkoutPath: string | null,
-  request: ExactCommitReadRequest,
+  request: Pick<ExactCommitReadRequest, "commitSha" | "defaultBranch">,
 ): Promise<{ reachable: ReachabilityEvidence; defaultBranchHead: string | null }> => {
   let head: string | null = null;
   try {

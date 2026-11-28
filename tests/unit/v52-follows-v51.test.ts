@@ -57,7 +57,7 @@ describe("v52 follows v51", () => {
   it("chains v50 → v51 → v52, and frozen v51 keeps the checksum it was released with", () => {
     // #1258 appends v53, #1189's run-state exits v54 and #1189 B5's revision re-entry v55 after v52; this row
     // is about v50 → v52, which the chain still runs in order.
-    expect(SCHEMA_VERSION).toBe(59);
+    expect(SCHEMA_VERSION).toBe(61);
     expect(MIGRATIONS.filter((step) => step.toVersion >= 50 && step.toVersion <= 52).map((step) => [step.id, step.fromVersion, step.toVersion])).toEqual([
       ["v50-post-merge-verification-reentry", 49, 50],
       ["v51-durable-recipient-delivery", 50, 51],
@@ -86,11 +86,11 @@ describe("v52 follows v51", () => {
     const plan = JSON.parse(writes.join("")) as Record<string, unknown>;
     expect(plan).toMatchObject({
       onDiskVersion: 50,
-      buildVersion: 59,
+      buildVersion: 61,
       plan: {
         fromVersion: 50,
-        toVersion: 59,
-        migrations: ["v51-durable-recipient-delivery", "v52-resident-project-provisioning", "v53-verification-result-history", "v54-run-state-exits", "v55-approved-run-revision-reentry", "v56-adopted-bootstrap-first-manifest", "v57-canonical-entitlement-transfer", "v58-canonical-cto-rotation", "v59-task-plan-key"],
+        toVersion: 61,
+        migrations: ["v51-durable-recipient-delivery", "v52-resident-project-provisioning", "v53-verification-result-history", "v54-run-state-exits", "v55-approved-run-revision-reentry", "v56-adopted-bootstrap-first-manifest", "v57-canonical-entitlement-transfer", "v58-canonical-cto-rotation", "v59-task-plan-key", "v60-review-completion-bootstrap-only", "v61-repository-identity-rename"],
       },
     });
     // The field the deployment refuses on is present across the whole 50 → 52 span, and empty here.
@@ -129,7 +129,7 @@ describe("v52 follows v51", () => {
 
     // Every row v50 held is still there, v52's new columns aside, and repositories keep their rowids.
     const after = contentDigests(path, 50);
-    expect(after.userVersion).toBe(59);
+    expect(after.userVersion).toBe(61);
     const { schema_migrations: receiptsBefore, ...restBefore } = before.tables;
     const { schema_migrations: receiptsAfter, ...restAfter } = after.tables;
     expect(Object.fromEntries(Object.keys(restBefore).map((name) => [name, restAfter[name]]))).toEqual(restBefore);
@@ -153,6 +153,8 @@ describe("v52 follows v51", () => {
           { version: 57, migration_id: "v57-canonical-entitlement-transfer", checksum: MIGRATIONS.find((step) => step.toVersion === 57)!.checksum() },
           { version: 58, migration_id: "v58-canonical-cto-rotation", checksum: MIGRATIONS.find((step) => step.toVersion === 58)!.checksum() },
           { version: 59, migration_id: "v59-task-plan-key", checksum: MIGRATIONS.find((step) => step.toVersion === 59)!.checksum() },
+          { version: 60, migration_id: "v60-review-completion-bootstrap-only", checksum: MIGRATIONS.find((step) => step.toVersion === 60)!.checksum() },
+          { version: 61, migration_id: "v61-repository-identity-rename", checksum: MIGRATIONS.find((step) => step.toVersion === 61)!.checksum() },
         ]);
       // v51's backfill survived the v52 rebuild.
       expect(raw.prepare("SELECT message_id FROM holder_message_terminals").pluck().all()).toEqual(["acked-before-v51"]);

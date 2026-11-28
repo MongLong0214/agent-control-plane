@@ -101,6 +101,8 @@ export const contentDigests = (path: string, throughVersion = Infinity): { userV
       if (throughVersion < 57 && table.name === 'canonical_entitlement_transfers') continue;
       // v58's canonical CTO switchover table, which an image taken through v57 does not have.
       if (throughVersion < 58 && table.name === 'canonical_cto_rotations') continue;
+      // v61's repository rename table, which an image taken through v60 does not have.
+      if (throughVersion < 61 && table.name === 'repository_identity_renames') continue;
       const v52Columns:Record<string,string[]> = {projects:['buzz_address','retired_at','supersedes_project_id'],repositories:['retired_at'],bootstrap_applications:['retired_at']};
       // #1258 — v53's attempt column, which an image taken through v52 does not have.
       const laterColumns:Record<string,string[]> = {...(throughVersion < 52 ? v52Columns : {}),...(throughVersion < 53 ? {verification_results:['attempt']} : {}),...(throughVersion < 59 ? {tasks:['plan_key']} : {})};

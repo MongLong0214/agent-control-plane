@@ -18,15 +18,16 @@
  *
  * It refuses to merge on anything but an observed-green head, because "the CI was green" is a claim
  * about a specific commit and the head can move between reading and merging; the same sha goes to
- * `--match-head-commit`, so GitHub merges that head or nothing. It refuses, too, a head that does
- * not already contain the base tip: CI checked the head's tree, and only then is the merge's tree
- * that same tree. GitHub's merge API takes no expected base, so the base is read back instead: a
- * base that moved in between fails loudly after the merge.
+ * `--match-head-commit`, so GitHub merges that head or nothing. The base branch's tip is read from
+ * origin right before the merge call, and it refuses a head that does not already contain that tip:
+ * CI checked the head's tree, and only then is the merge's tree that same tree. GitHub's merge API
+ * takes no expected base, so the merge is read back against that tip: a base that moved during the
+ * call fails loudly after the merge as MAIN_MOVED_DURING_MERGE, and is not retried.
  *
  * After the merge it is read back -- and any mismatch fails loudly, because the merge cannot be
  * undone: GitHub reports the pull request merged at that commit; its parents are exactly the base
- * read before the merge and the checked head, so the head is an ancestor; its tree is that head
- * merged onto that base (`git merge-tree`); and every CommitLore note the branch's commits carry
+ * tip read right before the merge call and the checked head, so the head is an ancestor; its tree is
+ * that head merged onto that tip (`git merge-tree`); and every CommitLore note the branch's commits carry
  * here is on origin after `commitlore sync`, because the commits' own bytes travel with the merge
  * but their notes do not.
  *
@@ -170,19 +171,45 @@ for (const status of (pr.statusCheckRollup ?? []).filter((c) => c.context === RE
   if (status.state !== "SUCCESS") fail(`the \`${REQUIRED_CHECK}\` commit status on ${short} is ${status.state}.`);
 }
 
-// The head must already contain the base tip. CI checked the head's tree; merged onto a base it does
-// not contain, the merge commit's tree is one no CI run saw, however green the head. GitHub's compare
-// answers it for these exact two shas, so nothing local has to be fetched first.
-const compared = ghJson(
-  ["api", `repos/{owner}/{repo}/compare/${base}...${head}`, "--jq", "{status: .status}"],
-  `how ${short} compares with the base ${base.slice(0, 7)}`,
-)?.status;
+// 4. The base branch's tip, read from origin right before the merge call: the head must contain it,
+//    and with the checked head it pins what the merge must be -- parents [tip, head], tree
+//    `git merge-tree tip head`. GitHub's baseRefOid is not that tip: it can still name an older base
+//    after the branch has moved on, and GitHub merges onto the branch as it is. #1504's baseRefOid
+//    said d1e2b128 while main was e1004978: the containment check passed a head without main's tip,
+//    and a read-back pinned to d1e2b128 failed a merge that was correct.
+const baseBranch = `refs/heads/${pr.baseRefName}`;
+let baseBefore;
+try {
+  const exact = run("git", ["ls-remote", "--exit-code", "origin", baseBranch]).split("\n")
+    .map((line) => line.split("\t")).filter(([, ref]) => ref === baseBranch);
+  if (exact.length === 1) baseBefore = exact[0][0];
+} catch (error) {
+  process.stdout.write(String(error.stdout ?? error.stderr ?? ""));
+}
+if (typeof baseBefore !== "string" || !FULL_SHA.test(baseBefore)) {
+  fail(`could not read ${pr.baseRefName}'s tip on origin right before the merge, so the merge could not be read back against it. Nothing was merged.`);
+}
+
+// The head must already contain that tip. CI checked the head's tree; merged onto a base it does not
+// contain, the merge commit's tree is one no CI run saw, however green the head. GitHub's compare
+// answers it for these exact two shas, so nothing local has to be fetched first. An answer that is
+// neither "contains" nor "does not contain" refuses: ancestry nobody could read is not a pass.
+let compared;
+try {
+  compared = JSON.parse(run("gh", ["api", `repos/{owner}/{repo}/compare/${baseBefore}...${head}`, "--jq", "{status: .status}"]))?.status;
+} catch (error) {
+  process.stdout.write(String(error.stdout ?? error.stderr ?? error.message ?? ""));
+}
+const tip = `${pr.baseRefName}'s tip ${baseBefore.slice(0, 7)}`;
+if (compared === "behind" || compared === "diverged") {
+  fail(`BASE_NOT_IN_HEAD: #${number}'s head ${short} does not contain the base, ${tip} on origin (GitHub compares it as ${compared}), so CI never checked the tree this merge would make. Update the branch, re-run CI. Nothing was merged.`);
+}
 if (compared !== "ahead" && compared !== "identical") {
-  fail(`#${number}'s head ${short} does not contain the base ${base.slice(0, 7)} (GitHub compares it as ${String(compared)}), so CI never checked the tree this merge would make. Update the branch, re-run CI.`);
+  fail(`BASE_ANCESTRY_UNKNOWN: could not tell whether #${number}'s head ${short} contains ${tip} on origin (GitHub answered ${String(compared)}). A check that cannot look reports that, not a verdict. Nothing was merged.`);
 }
 
 process.stdout.write(
-  `\n  #${number} ${pr.title}\n  head ${short} — \`${REQUIRED_CHECK}\` green in ${named}, contains base ${base.slice(0, 7)}\n`,
+  `\n  #${number} ${pr.title}\n  head ${short} — \`${REQUIRED_CHECK}\` green in ${named}, contains ${tip}\n`,
 );
 
 if (dryRun) {
@@ -190,7 +217,7 @@ if (dryRun) {
   process.exit(0);
 }
 
-// 4. Merge the head that was checked, as a merge commit and nothing else, with the body that was checked.
+// Merge the head that was checked, as a merge commit and nothing else, with the body that was checked.
 run("gh", ["pr", "merge", number, "--merge", "--match-head-commit", head, "--subject", subject, "--body-file", bodyOut]);
 
 // Everything after this point reads back a merge that cannot be undone, so a refusal says so.
@@ -227,8 +254,16 @@ let recordLines = 0;
 let notesCarried = 0;
 try {
   const parents = run("git", ["rev-list", "--parents", "-n", "1", merged]).trim().split(" ").slice(1);
-  if (parents.length !== 2 || parents[0] !== base || parents[1] !== head) {
-    mismatches.push(`${merged.slice(0, 8)}'s parents are [${parents.map((p) => p.slice(0, 8)).join(", ")}], not the base and head checked, [${base.slice(0, 8)}, ${head.slice(0, 8)}]`);
+  const found = `${merged.slice(0, 8)}'s parents are [${parents.map((p) => p.slice(0, 8)).join(", ")}]`;
+  const pinned = `not the base and head checked, [${baseBefore.slice(0, 8)}, ${head.slice(0, 8)}]`;
+  // The base moved between the read and the merge: still a merge of the checked head, but not the one
+  // pinned, so it is reported and never passed. The tree against the parent it did land on is printed
+  // as a diagnostic only.
+  const movedTo = parents.length === 2 && parents[1] === head && parents[0] !== baseBefore ? parents[0] : undefined;
+  if (movedTo !== undefined) {
+    mismatches.push(`MAIN_MOVED_DURING_MERGE: ${pr.baseRefName} was ${baseBefore.slice(0, 8)} right before the merge call and GitHub merged onto ${movedTo.slice(0, 8)}; ${found}, ${pinned}. The merge is not retried`);
+  } else if (parents.length !== 2 || parents[0] !== baseBefore || parents[1] !== head) {
+    mismatches.push(`${found}, ${pinned}`);
   }
   try {
     run("git", ["merge-base", "--is-ancestor", head, merged]);
@@ -236,14 +271,20 @@ try {
     mismatches.push(`the head checked, ${head.slice(0, 8)}, is not an ancestor of ${merged.slice(0, 8)}`);
   }
   const tree = run("git", ["rev-parse", "--verify", `${merged}^{tree}`]).trim();
-  let rebuilt = "";
-  try {
-    rebuilt = run("git", ["merge-tree", "--write-tree", base, head]).split("\n")[0]?.trim() ?? "";
-  } catch {
-    rebuilt = "";
-  }
+  const mergedOnto = (onto) => {
+    try {
+      return run("git", ["merge-tree", "--write-tree", onto, head]).split("\n")[0]?.trim() ?? "";
+    } catch {
+      return "";
+    }
+  };
+  const rebuilt = mergedOnto(baseBefore);
   if (rebuilt !== tree) {
-    mismatches.push(`its tree ${tree.slice(0, 8)} is not ${head.slice(0, 8)} merged onto ${base.slice(0, 8)} (${rebuilt ? rebuilt.slice(0, 8) : "that merge does not resolve"})`);
+    mismatches.push(`its tree ${tree.slice(0, 8)} is not ${head.slice(0, 8)} merged onto ${baseBefore.slice(0, 8)} (${rebuilt ? rebuilt.slice(0, 8) : "that merge does not resolve"})`);
+  }
+  if (movedTo !== undefined) {
+    const actual = mergedOnto(movedTo);
+    mismatches.push(`diagnostic only, not a pass: its tree ${tree.slice(0, 8)} ${actual === tree ? "is" : "is not"} ${head.slice(0, 8)} merged onto ${movedTo.slice(0, 8)}, the parent GitHub merged onto (${actual ? actual.slice(0, 8) : "that merge does not resolve"})`);
   }
   const branch = run("git", ["rev-list", `${base}..${head}`]).split("\n").filter(Boolean);
   for (const sha of branch) {
@@ -274,7 +315,7 @@ try {
     }
   }
   if (mismatches.length === 0) {
-    process.stdout.write(`  read back ${merged.slice(0, 7)}: parents ${base.slice(0, 7)} and ${head.slice(0, 7)}, tree ${tree.slice(0, 7)}, ` +
+    process.stdout.write(`  read back ${merged.slice(0, 7)}: parents ${baseBefore.slice(0, 7)} and ${head.slice(0, 7)}, tree ${tree.slice(0, 7)}, ` +
       `${recordLines} record line(s) kept on ${branch.length} branch commit(s), ${notesCarried} note(s) on origin\n`);
   }
 } catch (error) {

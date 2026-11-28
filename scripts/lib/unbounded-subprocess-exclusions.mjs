@@ -24,17 +24,4 @@
  */
 const reason = "not yet bounded; entered the census when it was first taken; tracked as #859";
 
-// Two calls are unbounded on purpose rather than pending, so they carry their own reason. A
-// shared "not yet" sentence would say something false about them and would invite someone to
-// close the gap by adding a timeout that breaks the operation.
-const deliberate = {
-  restore:
-    "deliberately unbounded: this is the state-admin database restore inside a rollback. A " +
-    "timeout here kills the process mid-write, and the pair exists precisely because the " +
-    "database must end up whole — a partial restore is the state rollback is meant to escape. " +
-    "It is bounded by the operator watching it, not by a number.",
-};
-
-export const UNBOUNDED_SUBPROCESS_EXCLUSIONS = new Map([
-  ["src/deploy/rollback-pair.ts:2359", deliberate.restore],
-]);
+export const UNBOUNDED_SUBPROCESS_EXCLUSIONS = new Map([]);

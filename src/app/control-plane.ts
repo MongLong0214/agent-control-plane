@@ -84,6 +84,7 @@ import { type CommitLorePort, createCommitLoreCliPort } from "../bootstrap/commi
 import { mergeCommitCheck } from "../github/merge-commit-check.ts";
 import { releaseCancelledBootstrapReservation } from "../bootstrap/cancelled-reservation-release.ts";
 import { RepoFactoryBootstrapRunner } from "../bootstrap/repo-factory-bootstrap-run.ts";
+import { RepositoryRenames } from "../registry/repository-rename.ts";
 import { BootstrapApplications } from "../bootstrap/bootstrap-applications.ts";
 import { Daemon, type DaemonOptions } from "../daemon/daemon.ts";
 import type { DaemonFinalizationAuthorities } from "../daemon/finalizer.ts";
@@ -377,6 +378,8 @@ export class ControlPlane {
   readonly residentProjects: ResidentProjectProvisioning;
   /** #1227 — moves each resident project's worker turns off the resident's clone, into their own checkout. */
   readonly workerCheckouts: WorkerCheckouts;
+  /** v61 — adopts GitHub's new name for the same repository (operator only). */
+  readonly repositoryRenames: RepositoryRenames;
   /** The explicit canonical-CTO adoption of a PROJECT_BOOTSTRAP run: one validator for every door. */
   readonly bootstrapAdoptions: CanonicalCtoBootstrapAdoptions;
   readonly bootstrap: BootstrapActivation;
@@ -908,6 +911,7 @@ export class ControlPlane {
       // write request starts, after any read the port method makes first. #1240 — a Repo Factory
       // project's STANDARD_WORK issues go through the same port, under their own write guard.
       const repoFactoryGitHub = config.repoFactory?.githubPort ?? createBootstrapGitHubWritePort();
+      this.repositoryRenames = new RepositoryRenames({ db: this.db, clock: this.clock, audit: this.audit, github: repoFactoryGitHub });
       this.tasks.attach({
         workScope: new WorkScopeTracking({ db: this.db, audit: this.audit, artifacts: this.artifacts, runs: this.runs, tasks: this.tasks, github: repoFactoryGitHub }),
       });
