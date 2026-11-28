@@ -3,8 +3,9 @@ import { randomUUID } from "node:crypto";
 import type { ControlPlane } from "../app/control-plane.ts";
 import type { ProjectManifest } from "../contracts/manifest.ts";
 import { NotificationKind } from "../ceo/production-gate.ts";
+import { FAILED_NOTICE, notifyRunFailed } from "../ceo/failed-run-notice.ts";
 import { MCP_THROWN_REFUSAL_WRITER, REDACTED, redactCredentialShapes } from "../core/credential-shapes.ts";
-import { type Decision, acpError, allow, deny, isAcpError } from "../core/errors.ts";
+import { type Decision, allow, deny, isAcpError } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import { redact } from "../db/audit.ts";
 import { registryView } from "../db/registry-view.ts";
@@ -68,30 +69,6 @@ const HAND_OFF_NOTICE_FIELDS = [
   "candidateSnapshotDigest", "failureReasonCode", "failureClass", "failureCause", "limit", "owner", "action", "blocker",
   "retries", "retryCap", "reason",
 ] as const;
-
-/**
- * #1189 — a FAILED run's CEO notice that could not be enqueued when the run ended (no CEO bound, or the outbox
- * refused it) is kept owed in this record: the notice, with `delivered: false`, as a cap's hand-off is kept
- * (`deliverOwedHandOff`). Once the sweep has sent it, a second record with `delivered: true` names the first
- * (`owedEventId`). A notice enqueued at once writes none.
- */
-const FAILED_NOTICE = "FINALIZATION_FAILED_NOTICE";
-
-/**
- * #1189 — what a FAILED notice's owed record keeps when the audit log refuses the notice's own text (a refusal
- * message holding a credential shape, say): the failure's codes, its counts and ACP's own words, with the blocker's
- * shapes redacted. The refusal's free text (`reason`, `evidence`) and the attempt ids are left out.
- */
-const MINIMAL_FAILED_NOTICE_FIELDS = [
-  "candidateSnapshotDigest", "failureReasonCode", "failureClass", "failureCause", "limit", "outcome", "merged", "owner",
-  "action", "refusals", "failureRetryCap", "retries", "retryCap", "whyItMatters",
-] as const;
-
-const minimalFailedNotice = (notice: Record<string, unknown>): Record<string, unknown> => ({
-  ...Object.fromEntries(MINIMAL_FAILED_NOTICE_FIELDS.filter((field) => notice[field] !== undefined).map((field) => [field, notice[field]])),
-  blocker: redactCredentialShapes(String(notice["blocker"] ?? "")).slice(0, 200),
-  detailWithheld: true,
-});
 
 /**
  * What becomes of an approved run whose finalization was refused before any merge receipt existed. A retried
@@ -928,22 +905,11 @@ export class ApprovedRunFinalizer {
   }
 
   /**
-   * #1189 — a FAILED run's notice to the CEO, enqueued at once as before, in the transaction that ends the run
-   * (`returnApprovedCandidate`'s `onFailed`). One that could not be (no CEO bound, or the outbox refused it) is
-   * kept owed there instead, for `deliverOwedFailedNotices`, minimal (`minimalFailedNotice`) if the audit log refuses
-   * its text; the run never waits on it.
+   * #1189 — a FAILED run's notice to the CEO, in the transaction that ends the run (`returnApprovedCandidate`'s
+   * `onFailed`), or kept owed for `deliverOwedFailedNotices` (`notifyRunFailed`).
    */
   private notifyFailed(runId: string, notice: Record<string, unknown>): void {
-    this.cp.db.tx(() => {
-      const notified = this.cp.ceo.notify(NotificationKind.CRITICAL_SYSTEM_FAILURE, runId, notice);
-      if (notified.allowed) return;
-      const owed = { kind: FAILED_NOTICE, runId, reasonCode: notified.reasonCode };
-      if (this.cp.audit.record({ ...owed, evidence: { ...notice, delivered: false } }).allowed) return;
-      // The audit log would not keep the notice's own text: the obligation is kept without it. A refusal of that
-      // too is a fault, and rolls the run's end back with it.
-      const kept = this.cp.audit.record({ ...owed, evidence: { ...minimalFailedNotice(notice), delivered: false } });
-      if (!kept.allowed) throw acpError(kept.reasonCode, "the FAILED run's CEO notice could not be kept owed", { runId });
-    });
+    notifyRunFailed(this.cp, runId, notice);
   }
 
   private wasPostMergeResumed(runId: string): boolean {

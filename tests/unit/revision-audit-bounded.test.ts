@@ -93,6 +93,10 @@ describe("W3: the REVISION_RETURNED_TO_CTO row of a REVISE verdict keeps bounded
       omittedItems: 0,
       planDigest: review.content.bootstrapPlan!.planDigest,
       bootstrapPlanIntentDigest: review.content.bootstrapPlanIntentDigest,
+      // #1454 — the run's judged returns, this one included.
+      judgedRevisions: 1,
+      judgedRevisionLimit: 3,
+      judgedRevisionBudget: 6,
     });
     const stored = JSON.stringify(row.evidence);
     for (const text of FINDINGS) expect(stored).not.toContain(text.slice(0, 40));

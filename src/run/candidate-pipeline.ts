@@ -8,6 +8,7 @@ import {
   isProjectlessBootstrap,
   sameBootstrapPlanBinding,
 } from "../bootstrap/bootstrap-plan.ts";
+import { BootstrapApplications } from "../bootstrap/bootstrap-applications.ts";
 import { collectBootstrapCeoDecisions, frozenBootstrapCeoDecisions } from "../bootstrap/bootstrap-ceo-decisions.ts";
 import { collectBootstrapReviewEvidence } from "../bootstrap/bootstrap-review-evidence.ts";
 import { isPromptBudgetRefusal } from "../review/review-prompt-budget.ts";
@@ -19,7 +20,7 @@ import { ReasonCode } from "../core/reason-codes.ts";
 import { commandsForMode, type BranchProfile } from "../contracts/manifest.ts";
 import type { VerificationCommand } from "../contracts/verification-command.ts";
 import { EVIDENCE_PRODUCERS, type ArtifactStore } from "../db/artifacts.ts";
-import type { AuditLog } from "../db/audit.ts";
+import type { AuditLog, AuditRow } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
 import { OWNERLESS_STALL_OWED, attemptReleasedNoticeKey } from "../doctor/watchdog.ts";
 import { ArtifactKind, RunKind, type RunRow, RunState } from "../domain/types.ts";
@@ -27,6 +28,7 @@ import { requiredBaseFor, sourceProbeBranchesFor } from "../github/branch-contra
 import { currentBranch, mergeBase, revParse, tryRevParse } from "../git/git.ts";
 import { MessageKind } from "../outbox/envelope.ts";
 import type { Outbox } from "../outbox/outbox.ts";
+import { notifyRunFailed } from "../ceo/failed-run-notice.ts";
 import type { ProductionGate, ProductionReadyPacket } from "../ceo/production-gate.ts";
 import { currentContractChangeTarget, isContractChangeRun, sameContractChangeBinding, type WorkflowRevision } from "../registry/contract-change-plan.ts";
 import { contractChangeRevertFactsOf, firstActivationFactsOf } from "../registry/manifest-activation-grants.ts";
@@ -221,6 +223,28 @@ export const UNJUDGED_REVIEW_LIMIT_REFUSAL =
   "refused: this same unchanged candidate already went unjudged unjudgedAttemptLimit times in a row, so nothing was verified or reviewed for this submission. Do not resubmit it; open a CEO escalation for this run with escalation_open.";
 /** F1 — the audit row a refused submission leaves, so the refusal never counts as an attempt that ended the run of unjudged ones. */
 const UNJUDGED_REVIEW_LIMIT_REFUSED = "UNJUDGED_REVIEW_LIMIT_REFUSED";
+
+/**
+ * #1454 — judged returns to the CTO (a verification failure, a review REVISE, BLOCK or OMITTED_ITEMS_PRESENT, a PASS
+ * carrying a blocker) are counted per run by distinct candidate (`judgedRevisions`), never per PLAN, which the CTO can
+ * replace at will. The REVISION_LIMIT-th asks for a re-plan, and no result is taken until the PLAN changed; the
+ * REVISION_BUDGET-th, the re-plan's included, fails the run instead of returning it again.
+ */
+export const REVISION_LIMIT = 3;
+export const REVISION_BUDGET = 6;
+/** #1454 — the refusal of a result_submit after the REVISION_LIMIT-th judged return, while the PLAN is still the one it named. */
+export const REVISION_LIMIT_REFUSAL =
+  "refused: this run was returned for revision judgedRevisionLimit times on different candidates, so nothing was verified or reviewed for this submission. Re-plan first: submit a changed PLAN with plan_submit (a STANDARD_WORK PLAN may name supersedesTaskIds), then call result_submit again with a new idempotencyKey.";
+const REVISION_LIMIT_REFUSED = "REVISION_LIMIT_REFUSED";
+/** #1454 — the answer of the submission whose judged return was the run's REVISION_BUDGET-th: no revision was sent and the run is FAILED. */
+export const REVISION_BUDGET_EXHAUSTED_ANSWER =
+  "the run failed: this judged return was its judgedRevisionBudget-th, so no revision was sent and the run is FAILED with REVISION_BUDGET_EXHAUSTED.";
+/** #1454 — what spent the budget: the judged returns and their candidates, oldest first. */
+interface RevisionBudgetSpent { judgedRevisions: number; candidateSnapshotDigests: string[] }
+/** #1454 — the distinct candidates of a run's returns, first returned first. A row with no candidate digest is not counted. */
+const returnedCandidates = (rows: readonly AuditRow[]): string[] => [...new Set(rows
+  .map((row) => row.evidence["candidateSnapshotDigest"])
+  .filter((digest): digest is string => typeof digest === "string"))];
 
 /**
  * #1189 — the answer of a submission whose attempt no longer holds the run (released, reclaimed, expired, at its cap,
@@ -1017,6 +1041,21 @@ export class CandidatePipeline {
     const completeness = this.reviewEntry(run);
     if (!completeness.allowed) return completeness as Decision<PipelineOutcome>;
 
+    // #1454 — after the REVISION_LIMIT-th judged return nothing is frozen, verified or reviewed while the PLAN is the one
+    // that return named: refused as the unjudged bound refuses, with its own row and no state change. It is asked before
+    // the freeze rather than after it as the unjudged bound is, because it needs no candidate and a freeze would move one.
+    const replan = this.replanOwed(run);
+    if (replan !== null) {
+      const evidence = { runId: input.runId, attemptId, refusal: REVISION_LIMIT_REFUSED, ...replan };
+      const recorded = this.applyHolding(input, attemptId, () => {
+        const row = this.audit.record({ kind: REVISION_LIMIT_REFUSED, runId: input.runId, reasonCode: ReasonCode.REVISION_LIMIT_REACHED, evidence });
+        return row.allowed ? allow(ReasonCode.OK, undefined) : (row as Decision<void>);
+      }, { allowed: false, reasonCode: ReasonCode.REVISION_LIMIT_REACHED, stage: null, stageReasonCode: null, candidateSnapshotDigest: null });
+      if (recorded === null) return deny(ReasonCode.CANDIDATE_PIPELINE_ATTEMPT_STALE, STALE_ATTEMPT_NOT_APPLIED, { runId: input.runId, attemptId });
+      if (!recorded.allowed) return recorded as Decision<PipelineOutcome>;
+      return deny(ReasonCode.REVISION_LIMIT_REACHED, REVISION_LIMIT_REFUSAL, evidence);
+    }
+
     const frozen = await this.freeze(input.runId, attemptId);
     if (!frozen.allowed) return frozen as Decision<PipelineOutcome>;
     const snapshot = frozen.value;
@@ -1189,11 +1228,11 @@ export class CandidatePipeline {
 
       // §34.2 — a failed verification returns to CTO revision with the evidence still
       // bound to the candidate that failed: its excerpts, not the whole capture the review reads.
-      const returned = this.applyHolding(input, attemptId, () => this.returnToCto(input.runId, verified.reasonCode, {
+      const returned = this.returnHolding(input, attemptId, verified.reasonCode, {
         stage: "verification",
         candidateSnapshotDigest: snapshotDigest,
         report: reportWithoutCapturedOutput(report),
-      }, attemptId), appliedStage("VERIFICATION_FAILED", snapshotDigest, verified.reasonCode));
+      }, appliedStage("VERIFICATION_FAILED", snapshotDigest, verified.reasonCode));
       if (returned === null) return this.attemptLost(input.runId, attemptId, snapshotDigest, null);
       if (!returned.allowed) return returned as Decision<PipelineOutcome>;
       return allow(ReasonCode.OK, {
@@ -1456,11 +1495,11 @@ export class CandidatePipeline {
       });
     }
 
-    const returned = this.applyHolding(input, attemptId, () => this.returnToCto(runId, reviewed.reasonCode, {
+    const returned = this.returnHolding(input, attemptId, reviewed.reasonCode, {
       stage: "blind-review",
       candidateSnapshotDigest: snapshotDigest,
       ...reviewed.evidence,
-    }, attemptId), appliedStage("REVISION_REQUIRED", snapshotDigest, reviewed.reasonCode));
+    }, appliedStage("REVISION_REQUIRED", snapshotDigest, reviewed.reasonCode));
     if (returned === null) return this.attemptLost(runId, attemptId, snapshotDigest, reviewed);
     if (!returned.allowed) return returned as Decision<PipelineOutcome>;
     const packet = this.review.latestPacket(runId, snapshotDigest);
@@ -1764,7 +1803,9 @@ export class CandidatePipeline {
    * #1344 B — `receipt` is what the attempt answers once this outcome is applied: its APPLIED row commits with the
    * outcome, so a daemon that ends right after leaves the outcome's own answer for a replay of its key.
    */
-  private applyHolding<T>(input: SubmitResultInput, attemptId: string, apply: () => Decision<T>, receipt: AttemptReceipt): Decision<T> | null {
+  private applyHolding<T>(
+    input: SubmitResultInput, attemptId: string, apply: () => Decision<T>, receipt: AttemptReceipt | ((applied: T) => AttemptReceipt),
+  ): Decision<T> | null {
     let lost = false;
     const applied = this.db.txDecision(() => {
       if (!this.attemptHolds(input, attemptId)) {
@@ -1772,7 +1813,7 @@ export class CandidatePipeline {
         return deny<T>(ReasonCode.CANDIDATE_PIPELINE_ATTEMPT_STALE, "the attempt no longer holds the run", { runId: input.runId, attemptId });
       }
       const result = apply();
-      if (result.allowed) this.recordAttemptEnded(input, attemptId, "APPLIED", receipt);
+      if (result.allowed) this.recordAttemptEnded(input, attemptId, "APPLIED", typeof receipt === "function" ? receipt(result.value) : receipt);
       return result;
     });
     return lost ? null : applied;
@@ -1853,33 +1894,48 @@ export class CandidatePipeline {
    * PR #1114 BOOT-03 — each submission's verdict is its own revision cycle, so the delivery is keyed
    * by the attempt as well as the candidate: a second verdict on the same PLAN is a second message.
    * A delivery the outbox refuses is answered as that refusal, with nothing recorded as returned.
+   *
+   * #1454 — the delivery and the row carry the run's judged returns, this one included. The REVISION_LIMIT-th also
+   * carries `nextStep: "REPLAN"`, the PLAN it names and the prior returns; the REVISION_BUDGET-th sends nothing and ends
+   * the run FAILED in this transaction, answering what spent the budget (null for any other return).
    */
-  private returnToCto(runId: string, reasonCode: string, evidence: Record<string, unknown>, attemptId: string): Decision<void> {
+  private returnToCto(runId: string, reasonCode: string, evidence: Record<string, unknown>, attemptId: string): Decision<RevisionBudgetSpent | null> {
     const run = this.runs.require(runId);
     const roleKey = this.runs.ownerRoleKeyFor(run);
     const binding = roleKey ? this.bindings.active(roleKey) : null;
+    const candidate = String(evidence["candidateSnapshotDigest"]);
+    const prior = this.revisionReturns(runId);
+    const earlier = returnedCandidates(prior);
+    const counted = earlier.includes(candidate) ? earlier : [...earlier, candidate];
+    const counts = { judgedRevisions: counted.length, judgedRevisionLimit: REVISION_LIMIT, judgedRevisionBudget: REVISION_BUDGET };
+    const spent = counted.length >= REVISION_BUDGET;
+    // Only the return that reaches the limit asks for the re-plan; a candidate returned again does not ask twice.
+    const replan = !spent && counted.length === REVISION_LIMIT && counted.length > earlier.length && this.canReplan(run)
+      ? { nextStep: "REPLAN", planDigestAtLimit: this.artifacts.latest(runId, ArtifactKind.PLAN)?.digest ?? null }
+      : null;
 
-    if (binding) {
+    if (binding && !spent) {
       const enqueued = this.outbox.enqueue({
-        idempotencyKey: `revision:${runId}:${String(evidence["candidateSnapshotDigest"])}:${reasonCode}:${attemptId}`,
+        idempotencyKey: `revision:${runId}:${candidate}:${reasonCode}:${attemptId}`,
         roleKey: binding.roleKey,
         bindingGeneration: binding.bindingGeneration,
         targetSessionId: binding.sessionId,
         runId,
         kind: MessageKind.REVISION_REQUEST,
-        payload: { runId, reasonCode, ...evidence },
+        payload: { runId, reasonCode, ...evidence, ...counts, ...(replan === null ? {} : { ...replan, priorReturns: this.priorReturns(runId, prior) }) },
       });
-      if (!enqueued.allowed) return enqueued as Decision<void>;
+      if (!enqueued.allowed) return enqueued as Decision<never>;
     }
 
-    // The delivery above carries `evidence` whole; the row keeps a fixed field list (revisionAuditEvidence).
-    const review = evidence["stage"] === "blind-review" ? this.storedReview(runId, String(evidence["candidateSnapshotDigest"])) : null;
+    // The delivery above carries `evidence` whole; the row keeps a fixed field list (revisionAuditEvidence), and of the
+    // re-plan only the PLAN digest: the audit refuses the findings' free text.
+    const review = evidence["stage"] === "blind-review" ? this.storedReview(runId, candidate) : null;
     this.audit.record({
       kind: "REVISION_RETURNED_TO_CTO",
       runId,
       roleKey: binding?.roleKey ?? null,
       reasonCode: reasonCode as never,
-      evidence: revisionAuditEvidence(evidence, review),
+      evidence: { ...revisionAuditEvidence(evidence, review), ...counts, ...(replan ?? {}) },
     });
 
     // §31.3 — revision count is run-scope telemetry. The FSM keeps a blind-review
@@ -1893,7 +1949,94 @@ export class CandidatePipeline {
       text: reasonCode,
       dims: { stage: evidence["stage"] ?? null, mode: run.executionMode },
     });
-    return allow(ReasonCode.OK, undefined);
+    if (!spent) return allow(ReasonCode.OK, null);
+    const failure: RevisionBudgetSpent = { judgedRevisions: counted.length, candidateSnapshotDigests: counted };
+    const failed = this.runs.transition(runId, RunState.FAILED, "judged revision budget exhausted", { reasonCode: ReasonCode.REVISION_BUDGET_EXHAUSTED, ...failure });
+    if (!failed.allowed) return failed as Decision<never>;
+    // The CEO is told with the run's end, as any FAILED run's CEO is: at once, or kept owed for the finalizer's sweep.
+    notifyRunFailed({ db: this.db, audit: this.audit, ceo: this.ceo }, runId, {
+      candidateSnapshotDigest: candidate,
+      failureReasonCode: ReasonCode.REVISION_BUDGET_EXHAUSTED,
+      owner: "CEO",
+      action: "the run ended FAILED; start a new run with a new plan if the change is still wanted",
+      blocker: `the run was returned for revision on ${counted.length} different candidates, its budget`,
+      judgedRevisionBudget: REVISION_BUDGET,
+      ...failure,
+      whyItMatters: "verification and review kept returning this run, a re-plan included, and nothing moves it now",
+    });
+    return allow(ReasonCode.OK, failure);
+  }
+
+  /**
+   * #1454 — `returnToCto` under the attempt's hold, as `applyHolding` applies any outcome. A return that spent the
+   * run's budget is answered, and recorded for a replay, as REVISION_BUDGET_EXHAUSTED instead of `receipt`.
+   */
+  private returnHolding(
+    input: SubmitResultInput, attemptId: string, reasonCode: string, evidence: Record<string, unknown>, receipt: AttemptReceipt,
+  ): Decision<void> | null {
+    const candidate = String(evidence["candidateSnapshotDigest"]);
+    const returned = this.applyHolding(input, attemptId, () => this.returnToCto(input.runId, reasonCode, evidence, attemptId),
+      (spent) => spent === null ? receipt : appliedRefusal(ReasonCode.REVISION_BUDGET_EXHAUSTED, candidate));
+    if (returned === null || !returned.allowed) return returned as Decision<void> | null;
+    if (returned.value === null) return allow(ReasonCode.OK, undefined);
+    return deny(ReasonCode.REVISION_BUDGET_EXHAUSTED, REVISION_BUDGET_EXHAUSTED_ANSWER, {
+      runId: input.runId, candidateSnapshotDigest: candidate, judgedRevisionBudget: REVISION_BUDGET, ...returned.value,
+    });
+  }
+
+  /** #1454 — the run's REVISION_RETURNED_TO_CTO rows, oldest first. */
+  private revisionReturns(runId: string): AuditRow[] {
+    return this.audit.forRun(runId).filter((row) => row.kind === "REVISION_RETURNED_TO_CTO");
+  }
+
+  /** #1454 — the run's judged returns: its distinct returned candidates, against the limit and the budget (`run show`). */
+  revisions(runId: string): { judged: number; limit: number; budget: number } {
+    return { judged: returnedCandidates(this.revisionReturns(runId)).length, limit: REVISION_LIMIT, budget: REVISION_BUDGET };
+  }
+
+  /**
+   * #1454 — each earlier returned candidate as its latest return left it; a blind-review one with the findings (severity,
+   * path, summary) of the stored review that row names, read by the row's review digest rather than by candidate,
+   * because a replaced candidate's review is superseded. Private review evidence is no reason to hold them back: this
+   * delivery already carries the reviewer's packet to the same owner.
+   */
+  private priorReturns(runId: string, rows: readonly AuditRow[]): Array<Record<string, unknown>> {
+    const latest = new Map<string, AuditRow>();
+    for (const row of rows) {
+      const digest = row.evidence["candidateSnapshotDigest"];
+      if (typeof digest === "string") latest.set(digest, row);
+    }
+    const reviews = new Map(this.artifacts.list<ReviewPacket>(runId, ArtifactKind.BLIND_REVIEW)
+      .filter((artifact) => artifact.producedBy === EVIDENCE_PRODUCERS.BLIND_REVIEW)
+      .map((artifact) => [artifact.digest, artifact.content]));
+    return [...latest].map(([candidateSnapshotDigest, row]) => {
+      const stage = row.evidence["stage"] ?? null;
+      const findings = stage === "blind-review"
+        ? (reviews.get(String(row.evidence["reviewArtifactDigest"]))?.findings ?? []).map(({ severity, path, summary }) => ({ severity, path, summary }))
+        : undefined;
+      return { candidateSnapshotDigest, stage, reasonCode: row.reasonCode, ...(findings === undefined ? {} : { findings }) };
+    });
+  }
+
+  /**
+   * #1454 — whether the run can re-plan. A project-less bootstrap run whose PLAN is frozen cannot, so it gets no re-plan
+   * step and only the budget applies to it.
+   */
+  private canReplan(run: RunRow): boolean {
+    return !isProjectlessBootstrap(run) || new BootstrapApplications(this.db, this.clock, this.audit).assertNotFrozen(run.runId, "plan_submit").allowed;
+  }
+
+  /**
+   * #1454 — what refuses a result_submit after the run's REVISION_LIMIT-th judged return: that return asked for a
+   * re-plan, and the run's latest PLAN is still the one it named. Null once any changed PLAN is stored, and for a run
+   * that cannot re-plan (`canReplan`).
+   */
+  private replanOwed(run: RunRow): Record<string, unknown> | null {
+    const limit = this.revisionReturns(run.runId).find((row) => row.evidence["nextStep"] === "REPLAN");
+    if (limit === undefined || !this.canReplan(run)) return null;
+    const planDigestAtLimit = limit.evidence["planDigestAtLimit"] ?? null;
+    if ((this.artifacts.latest(run.runId, ArtifactKind.PLAN)?.digest ?? null) !== planDigestAtLimit) return null;
+    return { planDigestAtLimit, judgedRevisions: limit.evidence["judgedRevisions"] ?? null, judgedRevisionLimit: REVISION_LIMIT };
   }
 
   /**
@@ -1909,12 +2052,12 @@ export class CandidatePipeline {
     reviewed: Decision<ReviewPacket> | null,
   ): Decision<PipelineOutcome> {
     if (built.reasonCode !== ReasonCode.REVIEW_BLOCK || reviewed === null || !reviewed.allowed) return built as Decision<PipelineOutcome>;
-    const returned = this.applyHolding(input, attemptId, () => this.returnToCto(input.runId, ReasonCode.REVIEW_BLOCK, {
+    const returned = this.returnHolding(input, attemptId, ReasonCode.REVIEW_BLOCK, {
       stage: "blind-review",
       candidateSnapshotDigest: snapshotDigest,
       runId: input.runId,
       packet: reviewed.value,
-    }, attemptId), appliedRefusal(built.reasonCode as ReasonCode, snapshotDigest));
+    }, appliedRefusal(built.reasonCode as ReasonCode, snapshotDigest));
     if (returned === null) return this.attemptLost(input.runId, attemptId, snapshotDigest, reviewed);
     if (!returned.allowed) return returned as Decision<PipelineOutcome>;
     return built as Decision<PipelineOutcome>;
