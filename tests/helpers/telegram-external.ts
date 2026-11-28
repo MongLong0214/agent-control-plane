@@ -9,11 +9,12 @@ import { ControlPlane, type ControlPlaneConfig } from "../../src/app/control-pla
 import { ManualClock } from "../../src/core/clock.ts";
 import { digestOf } from "../../src/core/digest.ts";
 import { Role, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
-import type { TelegramExternalAnswer, TelegramExternalTurnIdentity } from "../../src/ingress/telegram-external.ts";
 import {
   configuredTelegramExternalConsumerConfig,
+  type TelegramExternalAnswer,
   type TelegramExternalConsumerConfig,
-} from "../../src/ingress/telegram-polling.ts";
+  type TelegramExternalTurnIdentity,
+} from "../../src/ingress/telegram-external.ts";
 import { REVIEWER_PROVIDER_ENDPOINTS } from "../../src/runtime/provider.ts";
 import type { HermesTargetBindResponse } from "../../src/runtime/hermes-target-bind.ts";
 import { TestProductionAdapter } from "./production-adapter.ts";

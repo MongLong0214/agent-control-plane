@@ -1,13 +1,12 @@
 import type { ControlPlane } from "../app/control-plane.ts";
+import type { OwnerIdentity } from "../ceo/owner-authority.ts";
+import type { ReceiptLookupQuery } from "../conversation/turn-coordinator.ts";
 import { digestOf } from "../core/digest.ts";
-import { type Decision, allow, deny } from "../core/errors.ts";
+import { type Decision, allow, deny, fail } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
-import { IngressGuard } from "./ingress-guard.ts";
+import { Role, roleKeyFor } from "../domain/types.ts";
+import { IngressGuard, type TurnIdentity } from "./ingress-guard.ts";
 import { TelegramIngress, type TelegramUpdate } from "./telegram.ts";
-import {
-  receiptIdentityForCurrentHermesCeo,
-  type TelegramExternalConsumerConfig,
-} from "./telegram-polling.ts";
 
 /**
  * U4: Hermes is the only Telegram consumer, and ACP still decides which owner messages become
@@ -45,6 +44,175 @@ export const TELEGRAM_EXTERNAL_SOCKET_NAME = "telegram-update.ingress.sock";
 export const TELEGRAM_EXTERNAL_MAX_REQUEST_BYTES = 64 * 1024;
 /** A4: how long a claim refused behind an in-doubt turn waits for one receipt sweep. */
 export const TELEGRAM_EXTERNAL_RECONCILE_BUDGET_MS = 3_000;
+
+/**
+ * The deployment facts the external-consumer lane runs on.
+ *
+ * Hermes polls the bot and is the only process that does. ACP holds no bot token and opens no
+ * connection to Telegram; Hermes hands each owner update to ACP's local socket and runs the turn
+ * only once ACP has claimed and dispatched it.
+ */
+export interface TelegramExternalConsumerConfig {
+  consumer: "hermes";
+  /** `ACP_TELEGRAM_OWNER_ID` / `ACP_TELEGRAM_ALLOWED_OWNER_IDS`, each declared in owner-identities. */
+  allowedOwnerIds: readonly string[];
+  /** `ACP_TELEGRAM_CHAT_ID` / `ACP_TELEGRAM_ALLOWED_CHAT_IDS`. */
+  allowedChatIds: readonly string[];
+  /** `ACP_TELEGRAM_EXTERNAL_SECRET`, the value Hermes presents with every update. */
+  sharedSecret: string;
+}
+
+/**
+ * Reads the external-consumer lane's configuration, or null when this deployment has no lane.
+ *
+ * The lane exists only when `ACP_TELEGRAM_EXTERNAL_CONSUMER=hermes` and `ACP_TELEGRAM_EXTERNAL_SECRET`
+ * are both set. The secret is an optional Keychain item, so a deployment that has the flag and not
+ * yet the secret starts without the lane rather than refusing. Once both are present, the owner and
+ * chat allowlists are required: owners are positive numeric ids declared as `telegram:<id>` in
+ * owner-identities, chats are numeric ids. No other `ACP_TELEGRAM_*` variable is read (#1444).
+ */
+export const configuredTelegramExternalConsumerConfig = (
+  ownerIdentities: readonly OwnerIdentity[],
+  environment: NodeJS.ProcessEnv = process.env,
+): TelegramExternalConsumerConfig | null => {
+  const consumer = configuredValue(environment, "ACP_TELEGRAM_EXTERNAL_CONSUMER");
+  if (!consumer) return null;
+  if (consumer !== "hermes") {
+    fail(
+      ReasonCode.DAEMON_STARTUP_FAILED,
+      "ACP_TELEGRAM_EXTERNAL_CONSUMER names a consumer this build does not know; the only accepted value is hermes",
+      { field: "ACP_TELEGRAM_EXTERNAL_CONSUMER" },
+    );
+  }
+  const sharedSecret = configuredValue(environment, "ACP_TELEGRAM_EXTERNAL_SECRET");
+  if (!sharedSecret) return null;
+  const ownerValues = splitConfig(configuredValue(environment, "ACP_TELEGRAM_OWNER_ID", "ACP_TELEGRAM_ALLOWED_OWNER_IDS"));
+  const chatValues = splitConfig(configuredValue(environment, "ACP_TELEGRAM_CHAT_ID", "ACP_TELEGRAM_ALLOWED_CHAT_IDS"));
+  const missing: string[] = [];
+  if (ownerValues.length === 0) missing.push("ACP_TELEGRAM_OWNER_ID or ACP_TELEGRAM_ALLOWED_OWNER_IDS");
+  if (chatValues.length === 0) missing.push("ACP_TELEGRAM_CHAT_ID or ACP_TELEGRAM_ALLOWED_CHAT_IDS");
+  if (missing.length > 0) {
+    fail(
+      ReasonCode.DAEMON_STARTUP_FAILED,
+      `Telegram external consumer configuration is partial; missing ${missing.join(", ")}`,
+      { missing },
+    );
+  }
+  for (const owner of ownerValues) {
+    if (!/^\d+$/u.test(owner) || !Number.isSafeInteger(Number(owner)) || Number(owner) <= 0) fail(
+      ReasonCode.DAEMON_STARTUP_FAILED,
+      `Telegram owner id is not a positive numeric id: ${owner}`,
+      { field: "ACP_TELEGRAM_OWNER_ID", value: owner },
+    );
+  }
+  for (const chat of chatValues) {
+    if (!/^-?\d+$/u.test(chat) || !Number.isSafeInteger(Number(chat))) fail(
+      ReasonCode.DAEMON_STARTUP_FAILED,
+      `Telegram chat id is not numeric: ${chat}`,
+      { field: "ACP_TELEGRAM_CHAT_ID", value: chat },
+    );
+  }
+  const declaredOwners = new Set(
+    ownerIdentities.filter((identity) => identity.channel === "telegram").map((identity) => identity.actor),
+  );
+  const undeclared = ownerValues.filter((owner) => !declaredOwners.has(owner));
+  if (undeclared.length > 0) {
+    fail(
+      ReasonCode.DAEMON_STARTUP_FAILED,
+      `Telegram owner id(s) are not declared in owner-identities: ${undeclared.join(", ")}`,
+      { undeclared },
+    );
+  }
+  return { consumer: "hermes", allowedOwnerIds: ownerValues, allowedChatIds: chatValues, sharedSecret };
+};
+
+const configuredValue = (environment: NodeJS.ProcessEnv, ...names: readonly string[]): string => names
+  .map((name) => environment[name]?.trim() ?? "")
+  .find((value) => value.length > 0) ?? "";
+
+const splitConfig = (value: string): string[] =>
+  value.split(",").map((part) => part.trim()).filter((part) => part.length > 0);
+
+/**
+ * Builds a receipt lookup only from the verified target proof that was live while the claim is
+ * admitted. A restart reads the immutable tuple from the claim; this callback never upgrades an
+ * old claim to a new target.
+ *
+ * `canonicalTurnTarget` refuses whenever more than one actor holds a current attestation, and a
+ * live deployment has the Hermes CEO beside several `PRIMARY_CTO` sessions, so that resolver names
+ * nothing there. This one asks only for the CEO role's own Hermes target, which is the one the lane
+ * claims for. It reads only the turn id and prompt digest from `identity`, so that is all it asks for.
+ */
+export const receiptIdentityForCurrentHermesCeo = (
+  cp: ControlPlane,
+  identity: Pick<TurnIdentity, "turnRequestId" | "promptDigest">,
+): ReceiptLookupQuery | null => {
+  const roleKey = roleKeyFor(Role.CEO);
+  const binding = cp.bindings.active(roleKey);
+  if (!binding || !cp.bindings.currentHermesTargetBindReceipt({
+    roleKey,
+    sessionId: binding.sessionId,
+    sessionIncarnation: binding.sessionIncarnation,
+  })) return null;
+
+  const rows = cp.db.all<{
+    actor_id: string;
+    binding_generation: number;
+    target_binding_id: string;
+    target_attestation_id: string;
+    executor_session_id: string;
+    executor_session_incarnation: string;
+  }>(
+    `SELECT a.actor_id, a.binding_generation, b.target_binding_id, t.target_attestation_id,
+            t.executor_session_id, t.executor_session_incarnation
+       FROM assignments a
+       JOIN conversational_actors c
+         ON c.actor_id = a.actor_id
+        AND c.current_session_id = a.session_id
+        AND c.current_session_incarnation = a.session_incarnation
+       JOIN sessions s
+         ON s.session_id = a.session_id
+        AND s.incarnation = a.session_incarnation
+        AND s.lifecycle = 'READY'
+       JOIN actor_target_bindings b
+         ON b.target_actor_id = a.actor_id
+        AND b.executor_kind = 'hermes'
+       JOIN actor_target_attestations t
+         ON t.target_binding_id = b.target_binding_id
+        AND t.assignment_id = a.assignment_id
+        AND t.executor_session_id = a.session_id
+        AND t.executor_session_incarnation = a.session_incarnation
+        AND t.binding_generation = a.binding_generation
+        AND t.protocol_version = 'hermes.target-bind/v1'
+        AND t.target_bind_receipt_json IS NOT NULL
+        AND t.target_bind_executor_runtime_identity IS NOT NULL
+      WHERE a.role_key = ?
+        AND a.status = 'ACTIVE'
+        AND a.assignment_id = ?
+        AND a.binding_generation = ?
+        AND a.session_id = ?
+        AND a.session_incarnation = ?`,
+    [
+      roleKey,
+      binding.assignmentId,
+      binding.bindingGeneration,
+      binding.sessionId,
+      binding.sessionIncarnation,
+    ],
+  );
+  if (rows.length !== 1) return null;
+  const target = rows[0]!;
+  return {
+    turnRequestId: identity.turnRequestId,
+    targetActorId: target.actor_id,
+    promptDigest: identity.promptDigest,
+    bindingGeneration: target.binding_generation,
+    targetBindingId: target.target_binding_id,
+    targetAttestationId: target.target_attestation_id,
+    executorSessionId: target.executor_session_id,
+    executorSessionIncarnation: target.executor_session_incarnation,
+  };
+};
 
 /** The eight fields `canonical_turns` fixes for a turn, which Hermes echoes in its receipt. */
 export interface TelegramExternalTurnIdentity {

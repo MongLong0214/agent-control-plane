@@ -24,6 +24,8 @@ const TELEGRAM_VARIABLES = [
   "ACP_TELEGRAM_DEFAULT_PROJECT_ID",
   "ACP_TELEGRAM_API_BASE_URL",
   "ACP_TELEGRAM_TRANSPORT_RETENTION_MS",
+  "ACP_TELEGRAM_EXTERNAL_CONSUMER",
+  "ACP_TELEGRAM_EXTERNAL_SECRET",
 ] as const;
 /**
  * Deleted from the child's environment unless a case asks for them, for the same reason the
@@ -103,10 +105,6 @@ const runMain = async (input: {
   telegram?: NodeJS.ProcessEnv;
   ownerIdentity?: boolean;
   seedState?: boolean;
-  expectTelegram?: boolean;
-  expectPromptFlow?: boolean;
-  /** Uses the real `TelegramBotApi` composition instead of the runner's fake transport. */
-  realTelegramTransport?: boolean;
   /** Configures the Buzz relay credential, which is what opens both Buzz ingress sockets. */
   buzz?: boolean;
   /** Declares the Buzz actor as an owner identity, which is what the message half also needs. */
@@ -161,9 +159,6 @@ const runMain = async (input: {
     ...(input.noCapacity ? { ACP_STARTUP_TEST_NO_CAPACITY: "1" } : {}),
     ...(input.reportSockets ? { ACP_STARTUP_TEST_REPORT_SOCKETS: "1" } : {}),
     ...(input.seedState ? { ACP_STARTUP_TEST_SEED: "1" } : {}),
-    ...(input.expectTelegram ? { ACP_STARTUP_TEST_EXPECT_TELEGRAM: "1" } : {}),
-    ...(input.expectPromptFlow ? { ACP_STARTUP_TEST_EXPECT_PROMPT_FLOW: "1" } : {}),
-    ...(input.realTelegramTransport ? { ACP_STARTUP_TEST_REAL_TELEGRAM_TRANSPORT: "1" } : {}),
     ...(input.expectBuzzMessage ? { ACP_STARTUP_TEST_EXPECT_BUZZ_MESSAGE: "1" } : {}),
     ...(input.telegram ?? {}),
     ...(input.canonical ?? {}),
@@ -212,32 +207,19 @@ const runMain = async (input: {
   }
 };
 
-describe("agentcpd main Telegram startup composition", () => {
-  it("starts the daemon through main with no Telegram configuration and no ingress", async () => {
+describe("#1444 agentcpd main starts one Telegram consumer, Hermes's lane", () => {
+  it("starts the daemon through main with no Telegram configuration", async () => {
     const result = await runMain({ seedState: true });
 
     expect(result.status, `stdout:\n${result.stdout}\nstderr:\n${result.stderr}`).toBe(0);
-    expect(result.stderr).toContain("Telegram ingress not configured");
     expect(result.stdout).not.toContain("Telegram ingress started");
+    expect(result.stdout).not.toContain("Telegram external consumer lane started");
   }, 40_000);
 
-  it("refuses partial Telegram configuration through main and names every missing requirement", async () => {
-    const result = await runMain({
-      telegram: { ACP_TELEGRAM_BOT_TOKEN: "partial-token" },
-    });
-
-    expect(result.status, `stdout:\n${result.stdout}\nstderr:\n${result.stderr}`).toBe(1);
-    expect(result.stderr).toContain('"reasonCode": "DAEMON_STARTUP_FAILED"');
-    expect(result.stderr).toContain("ACP_TELEGRAM_OWNER_ID or ACP_TELEGRAM_ALLOWED_OWNER_IDS");
-    expect(result.stderr).toContain("ACP_TELEGRAM_CHAT_ID or ACP_TELEGRAM_ALLOWED_CHAT_IDS");
-    expect(result.stderr).toContain("ACP_TELEGRAM_WEBHOOK_SECRET");
-  }, 40_000);
-
-  it("starts the Telegram ingress through main with complete configuration", async () => {
+  it("starts no Telegram poller for a long-poll configuration, which nothing reads any more", async () => {
     const result = await runMain({
       seedState: true,
       ownerIdentity: true,
-      expectTelegram: true,
       telegram: {
         ACP_TELEGRAM_BOT_TOKEN: "startup-test-bot-token",
         ACP_TELEGRAM_OWNER_ID: OWNER_ID,
@@ -248,69 +230,29 @@ describe("agentcpd main Telegram startup composition", () => {
       },
     });
 
-    expect(result.status, `stdout:\n${result.stdout}\nstderr:\n${result.stderr}`).toBe(0);
-    expect(result.stdout).toContain("Telegram ingress started");
-    expect(result.stdout).toContain("startup test Telegram poll observed");
-    // Polling alone shows the loop turning. This is what shows an inbound update reaches the
-    // router: without it the test passed even when route() never ran.
-    expect(result.stdout).toContain("startup test Telegram inbound routed");
-    // §6.1 DIRECT reaches the CEO conversation port rather than a formatted placeholder.
-    expect(result.stdout).toContain("startup test DIRECT answered by the CEO route");
-  }, 40_000);
-
-  it("#682 round 8 follow-up: starts the daemon but refuses Telegram ingress when the transport's retention is unknown", async () => {
-    // `ACP_TELEGRAM_API_BASE_URL` pointed at anything other than the official endpoint is a
-    // supported, deliberately-configured deployment (a self-hosted Bot API server) whose
-    // redelivery retention this repository has never measured — `TelegramBotApi` reports
-    // `redeliveryRetentionMs: null` for it (see ingress-retention-derives-from-transport.test.ts),
-    // and `IngressGuard` refuses to build a nonce floor it cannot bound. `realTelegramTransport`
-    // is required here: without it the runner's fake transport (which declares a real 24h
-    // retention) would stand in and this scenario could never be reached. No network call is
-    // ever made — `IngressGuard`'s constructor throws before `service.start()` is reached.
-    const result = await runMain({
-      seedState: true,
-      ownerIdentity: true,
-      realTelegramTransport: true,
-      telegram: {
-        ACP_TELEGRAM_BOT_TOKEN: "startup-test-bot-token",
-        ACP_TELEGRAM_OWNER_ID: OWNER_ID,
-        ACP_TELEGRAM_CHAT_ID: "-100999",
-        ACP_TELEGRAM_WEBHOOK_SECRET: "startup-test-webhook-secret",
-        ACP_TELEGRAM_API_BASE_URL: "https://self-hosted-bot-api.internal.example",
-      },
-    });
-
     const diagnostics = `status=${result.status}\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`;
-    // The daemon itself comes up — the whole point of this follow-up: an unmeasured Telegram
-    // transport must not take MCP listeners, Buzz and the operator door down with it.
     expect(result.status, diagnostics).toBe(0);
     expect(result.stdout, diagnostics).not.toContain("Telegram ingress started");
-    // Not "not configured" — the operator configured this deliberately, so the message has to
-    // say *why* Telegram did not start rather than imply nothing was ever set up.
-    expect(result.stderr, diagnostics).not.toContain("Telegram ingress not configured");
-    expect(result.stderr, diagnostics).toContain("Telegram ingress refused");
-    expect(result.stderr, diagnostics).toContain("redelivery retention is not known");
+    expect(result.stdout, diagnostics).not.toContain("Telegram external consumer lane started");
   }, 40_000);
 
-  it("emits and resolves an owner prompt through main without a test-side send", async () => {
+  it("starts Hermes's lane beside a leftover bot token instead of refusing startup", async () => {
     const result = await runMain({
-      ownerIdentity: true,
       seedState: true,
-      expectPromptFlow: true,
+      ownerIdentity: true,
       telegram: {
-        ACP_TELEGRAM_BOT_TOKEN: "startup-test-bot-token",
+        ACP_TELEGRAM_EXTERNAL_CONSUMER: "hermes",
+        ACP_TELEGRAM_EXTERNAL_SECRET: "startup-test-lane-secret",
         ACP_TELEGRAM_OWNER_ID: OWNER_ID,
-        ACP_TELEGRAM_CHAT_ID: "-100999",
-        ACP_TELEGRAM_WEBHOOK_SECRET: "startup-test-webhook-secret",
-        ACP_TELEGRAM_POLL_TIMEOUT_SECONDS: "1",
-        ACP_TELEGRAM_RETRY_DELAY_MS: "100",
+        ACP_TELEGRAM_CHAT_ID: OWNER_ID,
+        ACP_TELEGRAM_BOT_TOKEN: "startup-test-leftover-bot-token",
       },
     });
 
     const diagnostics = `status=${result.status}\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`;
-    expect(result.stdout, diagnostics).toContain("startup test owner prompt observed");
-    expect(result.stdout, diagnostics).toContain("startup test owner approval cleared gate");
-    expect(result.status, `stdout:\n${result.stdout}\nstderr:\n${result.stderr}`).toBe(0);
+    expect(result.status, diagnostics).toBe(0);
+    expect(result.stdout, diagnostics).toContain("Telegram external consumer lane started for hermes");
+    expect(result.stdout, diagnostics).not.toContain("Telegram ingress started");
   }, 40_000);
 });
 

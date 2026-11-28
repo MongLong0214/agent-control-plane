@@ -241,10 +241,10 @@ case "$account" in
       *) exit 44 ;;
     esac
     case "$account" in
-      ACP_TELEGRAM_BOT_TOKEN) printf 'telegram-bot-token\\n' ;;
+      ACP_TELEGRAM_EXTERNAL_CONSUMER) printf 'hermes\\n' ;;
       ACP_TELEGRAM_OWNER_ID) printf '424242\\n' ;;
       ACP_TELEGRAM_CHAT_ID) printf -- '-100999\\n' ;;
-      ACP_TELEGRAM_WEBHOOK_SECRET) printf 'telegram-webhook-secret\\n' ;;
+      ACP_TELEGRAM_EXTERNAL_SECRET) printf 'telegram-lane-secret\\n' ;;
       *) printf 'telegram-test-value\\n' ;;
     esac
     ;;
@@ -317,8 +317,8 @@ if [[ "$target" == *"agentcpd.js" ]]; then
   # put lsof at 25-26 when it is 23-24, and gave Hermes an overlapping 26-33. A comment restating a
   # derived position is the second authority the derivation was introduced to remove.
   printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\\n' "$ACP_MCP_TOKEN" "$ACP_OPERATOR_TOKEN" \\
-    "\${ACP_TELEGRAM_BOT_TOKEN-}" "\${ACP_TELEGRAM_OWNER_ID-}" \\
-    "\${ACP_TELEGRAM_CHAT_ID-}" "\${ACP_TELEGRAM_WEBHOOK_SECRET-}" \\
+    "\${ACP_TELEGRAM_EXTERNAL_CONSUMER-}" "\${ACP_TELEGRAM_OWNER_ID-}" \\
+    "\${ACP_TELEGRAM_CHAT_ID-}" "\${ACP_TELEGRAM_EXTERNAL_SECRET-}" \\
     "\${BUZZ_PRIVATE_KEY:-<unset>}" "\${ACP_BUZZ_BINARY:-<unset>}" \\
     "\${ACP_CLAUDE_BINARY:-<unset>}" "\${ACP_CODEX_BINARY:-<unset>}" \\
     "$(command -v claude || printf '<unresolvable>')" \\
@@ -573,7 +573,7 @@ const assertRenderedPlist = (harness: InstallerHarness): void => {
   expect(plist).toContain(`<key>HOME</key>`);
   expect(plist).not.toContain("__ACP_");
   expect(plist).not.toContain("ACP_MCP_TOKEN");
-  expect(plist).not.toContain("ACP_TELEGRAM_BOT_TOKEN");
+  expect(plist).not.toContain("ACP_TELEGRAM_EXTERNAL_SECRET");
   for (const name of CANONICAL_ACTIVATION_VARIABLES) expect(plist).not.toContain(name);
 };
 
@@ -1200,7 +1200,7 @@ exec /bin/cp "$@"
     expect(plist).not.toContain("__ACP_");
     expect(plist).not.toContain("REPLACE_WITH_");
     expect(plist).not.toContain("ACP_MCP_TOKEN");
-    expect(plist).not.toContain("ACP_TELEGRAM_BOT_TOKEN");
+    expect(plist).not.toContain("ACP_TELEGRAM_EXTERNAL_SECRET");
   });
 
   it("installs through fake launchctl/security and observes the rendered job", () => {
@@ -1320,7 +1320,7 @@ exec /bin/cp "$@"
       ...harness.env,
       BASH_ENV: launcherSecurity,
       ACP_TELEGRAM_KEYCHAIN_ACCOUNTS:
-        "ACP_TELEGRAM_BOT_TOKEN,ACP_TELEGRAM_OWNER_ID,ACP_TELEGRAM_CHAT_ID,ACP_TELEGRAM_WEBHOOK_SECRET",
+        "ACP_TELEGRAM_EXTERNAL_CONSUMER,ACP_TELEGRAM_OWNER_ID,ACP_TELEGRAM_CHAT_ID,ACP_TELEGRAM_EXTERNAL_SECRET",
     };
     delete launcherEnv["ACP_MCP_TOKEN"];
     delete launcherEnv["ACP_OPERATOR_TOKEN"];
@@ -1330,15 +1330,15 @@ exec /bin/cp "$@"
     });
 
     expect(launched.status).toBe(0);
-    const [mcpToken, operatorToken, telegramToken, telegramOwner, telegramChat, telegramSecret] =
+    const [mcpToken, operatorToken, telegramConsumer, telegramOwner, telegramChat, telegramSecret] =
       readFileSync(harness.launcherEnvLog, "utf8").trim().split("|");
     expect(mcpToken).toBe("mcp-provisioned-token");
     expect(operatorToken).toBe("operator-provisioned-token");
     expect(operatorToken).not.toBe(mcpToken);
-    expect(telegramToken).toBe("telegram-bot-token");
+    expect(telegramConsumer).toBe("hermes");
     expect(telegramOwner).toBe("424242");
     expect(telegramChat).toBe("-100999");
-    expect(telegramSecret).toBe("telegram-webhook-secret");
+    expect(telegramSecret).toBe("telegram-lane-secret");
   });
 
   it("starts cleanly and omits Telegram variables when the Keychain has none", () => {
@@ -1360,10 +1360,10 @@ exec /bin/cp "$@"
       ...harness.env,
       BASH_ENV: launcherSecurity,
       ACP_TELEGRAM_KEYCHAIN_ACCOUNTS: "",
-      ACP_TELEGRAM_BOT_TOKEN: "inherited-token-must-not-survive",
+      ACP_TELEGRAM_EXTERNAL_CONSUMER: "inherited-consumer-must-not-survive",
       ACP_TELEGRAM_OWNER_ID: "inherited-owner-must-not-survive",
       ACP_TELEGRAM_CHAT_ID: "inherited-chat-must-not-survive",
-      ACP_TELEGRAM_WEBHOOK_SECRET: "inherited-secret-must-not-survive",
+      ACP_TELEGRAM_EXTERNAL_SECRET: "inherited-secret-must-not-survive",
     };
     delete launcherEnv["ACP_MCP_TOKEN"];
     delete launcherEnv["ACP_OPERATOR_TOKEN"];
@@ -1373,9 +1373,9 @@ exec /bin/cp "$@"
     });
 
     expect(launched.status).toBe(0);
-    const [, , telegramToken, telegramOwner, telegramChat, telegramSecret] =
+    const [, , telegramConsumer, telegramOwner, telegramChat, telegramSecret] =
       readFileSync(harness.launcherEnvLog, "utf8").trim().split("|");
-    expect(telegramToken).toBe("");
+    expect(telegramConsumer).toBe("");
     expect(telegramOwner).toBe("");
     expect(telegramChat).toBe("");
     expect(telegramSecret).toBe("");

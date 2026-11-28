@@ -28,12 +28,12 @@ rollback from a current checkout with --app-root.
 The job always uses $HOME/.agent-control-plane because that is agentcpd's configured
 state root. Secrets never go in the plist: store ACP_MCP_TOKEN and ACP_OPERATOR_TOKEN (both required),
 optional Buzz variables, and optional Telegram variables as generic-password Keychain items under the
-selected service. Telegram is disabled when none of its variables are present and refuses a partial set.
+selected service.
 
-With ACP_TELEGRAM_EXTERNAL_CONSUMER=hermes, Hermes is the only Telegram consumer: ACP polls nothing
-and startup refuses if ACP_TELEGRAM_BOT_TOKEN is also stored. The lane opens only when
-ACP_TELEGRAM_EXTERNAL_SECRET (the value Hermes presents) is stored too, and then needs
-ACP_TELEGRAM_OWNER_ID and ACP_TELEGRAM_CHAT_ID, the owner declared as telegram:<id> in owner-identities.
+Hermes is the only Telegram consumer; ACP polls nothing and reads no bot token. With
+ACP_TELEGRAM_EXTERNAL_CONSUMER=hermes the lane opens only when ACP_TELEGRAM_EXTERNAL_SECRET (the value
+Hermes presents) is stored too, and then needs ACP_TELEGRAM_OWNER_ID and ACP_TELEGRAM_CHAT_ID, the owner
+declared as telegram:<id> in owner-identities. Without the flag there is no Telegram ingress.
 
 BUZZ_PRIVATE_KEY has a second source. When no such item exists under the selected service,
 the launcher falls back to the Buzz desktop app's own store, whose layout is a JSON object
@@ -548,10 +548,7 @@ export ACP_OPERATOR_TOKEN="$(required_keychain_value ACP_OPERATOR_TOKEN)"
 # provisioner keeps the default written in its own script.
 for optional in ACP_OPERATOR_ACTOR BUZZ_PRIVATE_KEY ACP_BUZZ_INGRESS_SECRET ACP_BUZZ_ALLOWED_ACTORS BUZZ_RELAY_URL ACP_BUZZ_BINARY ACP_BUZZ_CHANNEL \
   ACP_OWNER_APPROVAL_BUZZ_IDENTITY ACP_REPO_FACTORY_PROJECT_ID ACP_BUZZ_ADMISSION_COMMAND \
-  ACP_TELEGRAM_BOT_TOKEN ACP_TELEGRAM_OWNER_ID ACP_TELEGRAM_ALLOWED_OWNER_IDS \
-  ACP_TELEGRAM_CHAT_ID ACP_TELEGRAM_ALLOWED_CHAT_IDS ACP_TELEGRAM_WEBHOOK_SECRET \
-  ACP_TELEGRAM_POLL_TIMEOUT_SECONDS ACP_TELEGRAM_RETRY_DELAY_MS \
-  ACP_TELEGRAM_DEFAULT_PROJECT_ID ACP_TELEGRAM_API_BASE_URL ACP_TELEGRAM_TRANSPORT_RETENTION_MS \
+  ACP_TELEGRAM_OWNER_ID ACP_TELEGRAM_ALLOWED_OWNER_IDS ACP_TELEGRAM_CHAT_ID ACP_TELEGRAM_ALLOWED_CHAT_IDS \
   ACP_TELEGRAM_EXTERNAL_CONSUMER ACP_TELEGRAM_EXTERNAL_SECRET ACP_DAEMON_NOTICE_ENABLED ACP_DAEMON_NOTICE_PROBE \
   ACP_CANONICAL_SESSIONS_JSON ACP_CANONICAL_CTO_PEER_PROTOCOL ACP_CANONICAL_CTO_BUZZ_PURPOSE \
   ACP_HERMES_LINEAGE_ROOT_DIGEST ACP_HERMES_EXECUTABLE ACP_HERMES_PROFILE \

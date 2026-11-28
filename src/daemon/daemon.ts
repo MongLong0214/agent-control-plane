@@ -617,32 +617,6 @@ interface TimerFailure {
 }
 
 /**
- * Whether an optional ingress channel is actually running, for `health.json` — the surface
- * `OPERATOR_METHOD.DAEMON_STATUS` (`agentctl daemon status`) reads verbatim.
- *
- * Found missing by review (#682, round 8's second follow-up): a daemon that comes up healthy
- * while Telegram silently never started (an unmeasured transport's redelivery retention refused
- * `IngressGuard`'s construction) had no health surface saying so — `mode: "NORMAL"` and a
- * healthy `lockHeld` look identical whether Telegram is running or was refused. `configured`
- * is false for a deployment that never set any `ACP_TELEGRAM_*` variable; `running` is the
- * outcome; `disabledReason` names *why* when `configured && !running`, distinct from "never
- * configured" for the same reason the stderr line at startup does not say "not configured" for
- * this case (the operator set this up on purpose).
- */
-export interface IngressChannelStatus {
-  configured: boolean;
-  running: boolean;
-  disabledReason: string | null;
-  /** Exact terminal reply whose acknowledgement can resume this live listener, when there is one. */
-  recoveryNonce?: string | null;
-}
-
-/** The one live ingress action an authenticated terminal-reply acknowledgement may trigger. */
-export interface TelegramIngressController {
-  resumeAfterAcknowledgement(nonce: string): Promise<boolean>;
-}
-
-/**
  * #1422 — the review-round projection shown by `run show`: a read of records that already exist,
  * for the operator and the host. No gate, reviewer packet, merge decision or CEO verdict reads it.
  * A failed read is reported as unavailable rather than hiding the run the operator asked about.
@@ -695,9 +669,6 @@ export class Daemon {
   #timerFailures = new Map<string, TimerFailure>();
   /** The last failure message recorded for each role whose dead-holder release threw, until it succeeds. */
   #sweepReleaseFailures = new Map<string, string>();
-  // Unset until `main`'s composition root reports Telegram's outcome — `null` renders in
-  // `health.json` as "this daemon has no opinion yet", distinct from `configured: false`.
-  #telegramIngress: IngressChannelStatus | null = null;
   /**
    * The mention subscriber's receipt, and when it started counting.
    *
@@ -706,7 +677,6 @@ export class Daemon {
    * a live one (#841).
    */
   #buzzMentionReceipt: { startedAtMs: number; configuredIdentities: number; counters(): BuzzMentionCounters } | null = null;
-  #telegramIngressController: TelegramIngressController | null = null;
   #continuityCoordinatorInstalled = false;
   #continuityReconciling = false;
   /** One BOOTSTRAP_CTO reclaim pass at a time: `runPeriodic` has no overlap guard of its own. */
@@ -1117,19 +1087,6 @@ export class Daemon {
             reasonCode: reasonCode.value,
             evidenceDigest: evidenceDigest.value,
           });
-          if (!acknowledged.allowed) return acknowledged;
-
-          // Choose recovery over process exit here because this authenticated, exact-nonce
-          // acknowledgement is already the operator decision UNKNOWN delivery requires. The
-          // listener keeps the live daemon composition and can safely redeliver the inbound
-          // update: its terminal reply remains UNRESOLVED and is never sent again. If the process
-          // dies after the durable acknowledgement but before this call, its supervisor starts a
-          // fresh listener, which reaches the same durable no-resend state and advances normally.
-          // A different nonce must not revive this stop: it says nothing about the ambiguous send
-          // that caused it.
-          if (acknowledged.value.deliveryStatus === "UNRESOLVED") {
-            await this.#telegramIngressController?.resumeAfterAcknowledgement(nonce.value);
-          }
           return acknowledged;
         }
 
@@ -3446,15 +3403,14 @@ export class Daemon {
     capacitySensor.unref();
     this.#timers.push(capacitySensor);
 
-    // #639 contract 6's active half: ask, on a schedule, rather than wait to be told. Before #638
-    // this always asks a port that answers `found: false` — a real sweep that genuinely runs, not
-    // the absence of one. Two independent facts still limit it, both stated in full in
-    // `reconcileUnresolved`'s docstring: (1) `canonical_turns` holds no rows in the running
-    // deployment — `ConversationTurnCoordinator.claim()` now has two production callers, the
-    // Telegram router's and the Buzz mention path's, but both sit behind doors that are shut — so
-    // `unresolvedIdentities()` returns empty here regardless of what the port would say; and (2)
-    // even once it does not, a `COMPLETED` receipt is refused unconditionally today, because no
-    // reply-outbox mechanism is wired to this ledger. (1) resolving does not resolve (2).
+    // #639 contract 6's active half: ask, on a schedule, rather than wait to be told. The port it
+    // asks is the Hermes Gateway's receipt store whenever the Gateway key is configured
+    // (`withConfiguredHermesGatewayReceipt`), and `NEVER_FOUND_RECEIPT_PORT` otherwise.
+    // `ConversationTurnCoordinator.claim()` has two production callers: Hermes's Telegram lane
+    // (`telegram-external.ts`) and the Buzz mention path (`agentcpd.ts`). Read on the live host on
+    // 2026-11-28 (#1444), `canonical_turns` held one row, SETTLED, and none IN_DOUBT. The sweep stays
+    // because the kept lane configures that receipt port, and a lane turn whose receipt Hermes has
+    // not yet written stays in doubt until this asks.
     //
     // The interval also has to fit the sweep's own budget, for the same reason the capacity
     // sweep's budget is asserted against its interval rather than left to chance — a pass that
@@ -3561,11 +3517,6 @@ export class Daemon {
   }
 
   /**
-   * Recorded whenever the composition root or live listener changes Telegram's state, and
-   * written into `health.json` immediately rather than waiting for the next periodic tick. A
-   * listener that stops after startup must replace its earlier running state just as promptly.
-   */
-  /**
    * Installs the mention subscriber's counters so `doctor` can read receipt rather than config.
    *
    * The composition root calls this once, with the handle it just started. Nothing here polls it;
@@ -3573,24 +3524,9 @@ export class Daemon {
    */
   setBuzzMentionReceipt(receipt: { configuredIdentities: number; counters(): BuzzMentionCounters }): void {
     this.#buzzMentionReceipt = { startedAtMs: Date.now(), ...receipt };
-    // Written immediately, as `setTelegramIngressStatus` does: an operator reading `health.json`
-    // after startup must see that a subscriber exists, without waiting for whatever writes next.
+    // Written immediately: an operator reading `health.json` after startup must see that a
+    // subscriber exists, without waiting for whatever writes next.
     this.writeHealth(null);
-  }
-
-  setTelegramIngressStatus(status: IngressChannelStatus): void {
-    this.#telegramIngress = status;
-    this.writeHealth(null);
-  }
-
-  /** Installs the controller before operator acknowledgement can be used to recover this listener. */
-  attachTelegramIngressController(controller: TelegramIngressController): void {
-    this.#telegramIngressController = controller;
-  }
-
-  /** A closing old listener cannot detach a replacement installed after it. */
-  detachTelegramIngressController(controller: TelegramIngressController): void {
-    if (this.#telegramIngressController === controller) this.#telegramIngressController = null;
   }
 
   /**
@@ -3616,7 +3552,6 @@ export class Daemon {
    */
   private supplementalSystemFindings(): Finding[] {
     return [
-      ...this.telegramIngressFindings(),
       ...this.buzzMentionSubscriberFindings(),
       ...this.buzzMentionLivenessFindings(),
     ];
@@ -3756,26 +3691,6 @@ export class Daemon {
     }];
   }
 
-  private telegramIngressFindings(): Finding[] {
-    const status = this.#telegramIngress;
-    if (!status?.configured || status.running) return [];
-    return [{
-      code: "TELEGRAM_INGRESS_STOPPED",
-      severity: "ERROR",
-      scope: "telegram",
-      blocking: false,
-      confidence: "HIGH",
-      observedEvidence: {
-        running: false,
-        disabledReason: status.disabledReason,
-        ...(status.recoveryNonce ? { recoveryNonce: status.recoveryNonce } : {}),
-      },
-      recommendedAction: status.recoveryNonce
-        ? `inspect the UNKNOWN Telegram send, then run agentctl telegram reply acknowledge ${status.recoveryNonce} <reason-code> <evidence-digest> to resume this listener`
-        : "correct the reported Telegram ingress condition and restart the daemon",
-    }];
-  }
-
   /**
    * §33.1 — health endpoint. A file the supervisor can read, and the one place a parked
    * daemon's `mode` is legible without the operator token that the socket method requires.
@@ -3822,9 +3737,6 @@ export class Daemon {
         status: this.#timerFailures.size === 0 ? "HEALTHY" : "DEGRADED",
         failures: Object.fromEntries(this.#timerFailures),
       },
-      // `null` until `main` reports an outcome — a daemon whose composition root has not
-      // gotten there yet, as opposed to one that checked and found nothing configured.
-      telegram: this.#telegramIngress,
     };
     writeFileSync(join(this.options.stateDir, "health.json"), JSON.stringify(health, null, 2), {
       mode: 0o600,

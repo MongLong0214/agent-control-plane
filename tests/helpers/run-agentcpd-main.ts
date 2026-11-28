@@ -1,14 +1,10 @@
 import { main } from "../../src/daemon/agentcpd.ts";
 import { ControlPlane, defaultConfig } from "../../src/app/control-plane.ts";
-import { NotificationKind } from "../../src/ceo/production-gate.ts";
-import { digestOf } from "../../src/core/digest.ts";
 import { isAcpError } from "../../src/core/errors.ts";
 import { systemClock } from "../../src/core/clock.ts";
-import { ExecutionMode, Role, RunKind, RunState, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
+import { Role, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
 import { ScriptedAdapter } from "../../src/runtime/scripted-adapter.ts";
 import { HeadlessRuntimeDouble } from "./headless-runtime.ts";
-import type { TelegramBotTransport } from "../../src/ingress/telegram-polling.ts";
-import type { TelegramUpdate } from "../../src/ingress/telegram.ts";
 import { allow } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { IngressGuard, ingressSignature } from "../../src/ingress/ingress-guard.ts";
@@ -89,73 +85,6 @@ const exchangeSocketLine = (socketPath: string, line: unknown): Promise<string> 
 
 class StartupAdapter extends ScriptedAdapter {
   override readonly isProduction = true;
-}
-
-class StartupTelegramTransport implements TelegramBotTransport {
-  // This transport runs through `main()` -> `startTelegramLongPollListener`, which now derives
-  // IngressGuard's retention floor from this value (#682, round 8). Declared as the real
-  // measured figure since this stand-in behaves like ordinary Telegram long-polling.
-  readonly redeliveryRetentionMs = 24 * 60 * 60 * 1000;
-  polls = 0;
-  promptObserved = false;
-  approvalSent = false;
-  /** Replies the router produced for an inbound message, as opposed to prompts it initiated. */
-  routedReplies = 0;
-  /** The text of the last reply the router produced for an inbound update. */
-  lastRoutedReply = "";
-  private nextMessageId = 1;
-  private updates: TelegramUpdate[] = [];
-
-  constructor(private readonly expectPromptFlow: boolean) {}
-
-  async getUpdates(_options: { offset?: number; timeoutSeconds: number; signal?: AbortSignal }): Promise<readonly TelegramUpdate[]> {
-    this.polls += 1;
-    await new Promise<void>((resolve) => setTimeout(resolve, 1));
-    const updates = this.updates;
-    this.updates = [];
-    return updates;
-  }
-
-  /** Queues one inbound update for the next poll. */
-  enqueue(update: TelegramUpdate): void {
-    this.updates.push(update);
-  }
-
-  async sendMessage(input: {
-    chatId: string;
-    text: string;
-    replyToMessageId?: number;
-    correlationId: string;
-  }): Promise<{ messageId: number }> {
-    const messageId = this.nextMessageId++;
-    // correlationIdFor() stamps a routed reply as telegram:<update_id>:<message_id>. Owner
-    // prompts use telegram:owner-gate:/owner-prompt:, so the numeric shape is what marks a
-    // reply the router produced for an inbound update rather than one it initiated.
-    if (/^telegram:\d+:/.test(input.correlationId)) {
-      this.routedReplies += 1;
-      this.lastRoutedReply = input.text;
-    }
-    if (input.replyToMessageId !== undefined) {
-      this.approvalSent = true;
-    } else if (this.expectPromptFlow && input.text.startsWith("OWNER DECISION REQUIRED")) {
-      const runId = input.text.match(/^run: (.+)$/mu)?.[1]?.trim();
-      const item = input.text.match(/^- (.+)$/mu)?.[1]?.trim();
-      if (!runId || !item) throw new Error("startup test could not parse the owner prompt");
-      this.promptObserved = true;
-      this.updates.push({
-        update_id: 900,
-        message: {
-          message_id: 901,
-          date: 1_700_000_000,
-          text: `/approve ${runId} ${item}`,
-          from: { id: 424242 },
-          chat: { id: -100999 },
-          reply_to_message: { message_id: messageId },
-        },
-      });
-    }
-    return { messageId };
-  }
 }
 
 const root = process.env["ACP_STARTUP_TEST_ROOT"];
@@ -349,149 +278,12 @@ if (process.env["ACP_STARTUP_TEST_NO_CAPACITY"] === "1") {
   }
 }
 
-const expectTelegram = process.env["ACP_STARTUP_TEST_EXPECT_TELEGRAM"] === "1";
-const expectPromptFlow = process.env["ACP_STARTUP_TEST_EXPECT_PROMPT_FLOW"] === "1";
-// Off by default so this fake stands in for the transport, the same as every other startup
-// scenario. Set to exercise the *real* `TelegramBotApi` composition — no fake transport at all —
-// so `ACP_TELEGRAM_API_BASE_URL` actually reaches it and its `redeliveryRetentionMs` is computed
-// from the real class rather than this fixture's own declared value.
-const useRealTelegramTransport = process.env["ACP_STARTUP_TEST_REAL_TELEGRAM_TRANSPORT"] === "1";
 const expectBuzzMessage = process.env["ACP_STARTUP_TEST_EXPECT_BUZZ_MESSAGE"] === "1";
-const startupTransport = new StartupTelegramTransport(expectPromptFlow);
 
 try {
   await main({
     config,
-    telegramStartOptions: {
-      ...(useRealTelegramTransport ? {} : { transport: startupTransport }),
-      ...(expectPromptFlow ? { start: false } : {}),
-    },
     waitForShutdown: async (shutdown, context) => {
-      if (expectPromptFlow) {
-        if (!context.telegram) throw new Error("Telegram startup test did not compose the listener");
-        const gateItem = "owner confirms prompt";
-        const ceoSession = context.cp.sessions.create({ provider: "claude", model: "startup-test-ceo" });
-        const ceoReady = context.cp.sessions.transition(
-          ceoSession.sessionId,
-          SessionLifecycle.READY,
-          "startup prompt-flow test",
-        );
-        if (!ceoReady.allowed) throw new Error(ceoReady.message);
-        const ceoBinding = context.cp.bindings.bind({
-          roleKey: roleKeyFor(Role.CEO),
-          role: Role.CEO,
-          sessionId: ceoSession.sessionId,
-        });
-        if (!ceoBinding.allowed) throw new Error(ceoBinding.message);
-
-        const created = context.cp.runs.create({
-          kind: RunKind.PROJECT_BOOTSTRAP,
-          executionMode: ExecutionMode.GUARDED,
-          contract: {
-            goal: "owner prompt startup regression",
-            why: "exercise production owner-response delivery",
-            scope: [],
-            nonGoals: [],
-            acceptance: ["owner can resolve the gate"],
-            priority: "NORMAL",
-            humanGate: [gateItem],
-            references: [],
-          },
-        });
-        if (!created.allowed) throw new Error(created.message);
-        const runId = created.value.runId;
-        // Dispatch staffs the run's BOOTSTRAP_CTO on the Claude adapter and pins it (#246). A CTO
-        // is constituted only with a Buzz route, and this startup scenario runs with no Buzz
-        // binary; the flow under test is Telegram's, so the CTO lifecycle gets an in-process route.
-        context.cp.cto.attach({
-          buzz: {
-            connect: async (sessionId) => allow(ReasonCode.OK, `startup-test-room:${sessionId}`),
-            disconnect: async () => undefined,
-          },
-        });
-        const dispatched = await context.cp.runs.dispatch(runId);
-        if (!dispatched.allowed) throw new Error(`${dispatched.reasonCode}: ${dispatched.message}`);
-        const candidateSnapshotDigest = digestOf({ runId, candidate: "startup-owner-prompt" });
-        context.cp.runs.promoteCandidate(runId, candidateSnapshotDigest);
-        const awaiting = context.cp.runs.transition(
-          runId,
-          RunState.AWAITING_HUMAN,
-          "startup prompt-flow test human gate",
-          { candidateSnapshotDigest },
-        );
-        if (!awaiting.allowed) throw new Error(`${awaiting.reasonCode}: ${awaiting.message}`);
-        const notified = context.cp.ceo.notify(NotificationKind.READY_FOR_CEO_REVIEW, runId, {
-          goal: created.value.goal,
-          candidateSnapshotDigest,
-          humanGate: { required: true, items: [gateItem], satisfied: false },
-        });
-        if (!notified.allowed) throw new Error(`${notified.reasonCode}: ${notified.message}`);
-
-        context.telegram.service.start();
-        const deadline = Date.now() + 10_000;
-        while (
-          (!startupTransport.promptObserved ||
-            !startupTransport.approvalSent ||
-            !context.cp.ceo.humanGateStatus(runId).satisfied ||
-            context.cp.runs.require(runId).state !== RunState.ACTIVE) &&
-          Date.now() < deadline
-        ) {
-          await new Promise<void>((resolve) => setTimeout(resolve, 5));
-        }
-        if (
-          !startupTransport.promptObserved ||
-          !startupTransport.approvalSent ||
-          !context.cp.ceo.humanGateStatus(runId).satisfied ||
-          context.cp.runs.require(runId).state !== RunState.ACTIVE
-        ) {
-          throw new Error(
-            `startup prompt-flow test timed out: prompt=${startupTransport.promptObserved} ` +
-              `approval=${startupTransport.approvalSent} ` +
-              `gate=${context.cp.ceo.humanGateStatus(runId).satisfied} ` +
-              `state=${context.cp.runs.require(runId).state}`,
-          );
-        }
-        process.stdout.write("startup test owner prompt observed\n");
-        process.stdout.write("startup test owner approval cleared gate\n");
-      }
-      if (expectTelegram) {
-        // A polling cycle only shows the loop is turning. Seeding a real owner message and
-        // requiring the router's reply is what shows an inbound update is carried through
-        // routing — without it this passed even if route() never ran.
-        startupTransport.enqueue({
-          update_id: 800,
-          message: {
-            message_id: 801,
-            date: 1_700_000_000,
-            text: "startup routing probe",
-            from: { id: 424242 },
-            chat: { id: -100999 },
-          },
-        });
-        const deadline = Date.now() + 15_000;
-        while (
-          (startupTransport.polls === 0 || startupTransport.routedReplies === 0) &&
-          Date.now() < deadline
-        ) {
-          await new Promise<void>((resolve) => setTimeout(resolve, 5));
-        }
-        if (startupTransport.polls === 0) throw new Error("Telegram startup test observed no polling cycle");
-        if (startupTransport.routedReplies === 0) {
-          throw new Error("Telegram startup test polled but never routed an inbound message");
-        }
-        // Routing alone does not show which handler answered. Production supplies `onDirect`
-        // from the CEO conversation port; no CEO peer is connected here, so that port is the
-        // only thing that can produce this reason code. Without the wiring the reply is the
-        // router's own formatted string and this fails.
-        if (!startupTransport.lastRoutedReply.includes("CEO_CONVERSATION_UNAVAILABLE")) {
-          throw new Error(
-            `Telegram startup test reply did not come from the CEO route: ${startupTransport.lastRoutedReply}`,
-          );
-        }
-        process.stdout.write("startup test Telegram poll observed\n");
-        process.stdout.write("startup test Telegram inbound routed\n");
-        process.stdout.write("startup test DIRECT answered by the CEO route\n");
-      }
       if (expectBuzzMessage) {
         // #627: an owner Buzz message reaches the CEO through the daemon's own socket, and no
         // session child is started to answer it. Everything here goes through the composition

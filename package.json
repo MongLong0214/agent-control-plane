@@ -22,7 +22,6 @@
     "test:unit": "vitest run tests/unit",
     "test:scenarios": "vitest run tests/scenarios",
     "test:e2e": "vitest run tests/e2e --testTimeout=600000",
-    "acceptance:disposable-realm": "NODE_DISABLE_COMPILE_CACHE=1 node --experimental-transform-types scripts/run-disposable-realm-probe.ts",
     "lint": "eslint .",
     "reason-codes": "node scripts/verify-reason-codes.mjs",
     "reason-codes:usage": "node scripts/verify-reason-code-usage.mjs",

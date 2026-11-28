@@ -48,6 +48,20 @@ plane rather than from Telegram.**
   `agentcpd` the server, so no new transport, port, or credential is introduced. Hermes
   declares the `sampling` capability during its handshake.
 
+> **Amended 2026-11-28 (#1444).** The long-poll listener and its sampling hand-off are withdrawn.
+> Hermes polls the bot and is its only `getUpdates` consumer; it hands each owner update to the
+> daemon's lane socket (`src/ingress/telegram-external.ts`, U4), where `IngressGuard` admits it
+> against the declared `telegram:` owner identity and the control plane claims and dispatches the
+> canonical turn before Hermes runs it. ACP holds no bot token. The CEO turn transport for every
+> door is the Hermes Gateway turn on the `acp-canonical-ceo` binding. MCP sampling is left only as
+> the Buzz path's fallback on a deployment without the Gateway, until #1444 removes it.
+>
+> Chosen by a read-only reading of the live host on 2026-11-28: no Telegram admission in the
+> previous 30 days and one ever (2026-10-09, made by the lane); 166 daemon starts logged the lane
+> and none the long-poll listener; no bot token stored, every Hermes adoption variable stored.
+> Owner approval in the Telegram chat went with the long-poll; the lane admits messages, not
+> approvals.
+
 ## Consequences
 
 The owner's experience is unchanged — same bot, same chat, same counterpart. What changes is
