@@ -10,7 +10,7 @@ import { digestOf } from "../core/digest.ts";
 import { type Decision, allow, deny, fail } from "../core/errors.ts";
 import { newRunId } from "../core/ids.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
-import { deriveHumanGate } from "../ceo/human-gate.ts";
+import { deriveHumanGate } from "../snapshot/blast-radius.ts";
 import type { AuditLog } from "../db/audit.ts";
 import type { ArtifactStore } from "../db/artifacts.ts";
 import type { Db, RunStateTransitionAuthority } from "../db/database.ts";

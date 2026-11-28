@@ -1,6 +1,6 @@
 import { afterAll, describe, expect, it } from "vitest";
 
-import { deriveHumanGate } from "../../src/ceo/human-gate.ts";
+import { deriveHumanGate } from "../../src/snapshot/blast-radius.ts";
 import { digestOf } from "../../src/core/digest.ts";
 import { allow } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";

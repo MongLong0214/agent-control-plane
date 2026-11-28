@@ -10,7 +10,7 @@ import {
   enqueueCeoNotice,
   runEndedSince,
 } from "./ceo-incident-notices.ts";
-import { deriveHumanGate } from "./human-gate.ts";
+import { deriveHumanGate } from "../snapshot/blast-radius.ts";
 import { admitOwnerDecisionReason } from "./owner-decision-reason.ts";
 import {
   bootstrapPlanIntentTasks,

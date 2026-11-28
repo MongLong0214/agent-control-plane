@@ -22,7 +22,7 @@ import { EVIDENCE_PRODUCERS, type ArtifactStore } from "../db/artifacts.ts";
 import type { AuditLog } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
 import { OWNERLESS_STALL_OWED, attemptReleasedNoticeKey } from "../doctor/watchdog.ts";
-import { ArtifactKind, RunKind, type RunRow, RunState } from "../domain/types.ts";
+import { ArtifactKind, ExecutionMode, RunKind, type RunRow, RunState } from "../domain/types.ts";
 import { requiredBaseFor, sourceProbeBranchesFor } from "../github/branch-contract.ts";
 import { currentBranch, mergeBase, revParse, tryRevParse } from "../git/git.ts";
 import { MessageKind } from "../outbox/envelope.ts";
@@ -36,7 +36,9 @@ import { residentBaseClone } from "../registry/resident-repositories.ts";
 import type { BlindReviewGate, BlindReviewInvoker, ReviewPacket, ReviewProgressStep } from "../review/blind-review.ts";
 import { captureContractChangeReviewContext, readCanonicalCtoIdentity, storeContractChangeReviewContext } from "../review/contract-change-review-context.ts";
 import type { BindingRegistry } from "../session/binding-registry.ts";
+import { type BlastRadiusDeclaration, BlastRadiusLane, deriveHumanGate, pathsOutsideContract } from "../snapshot/blast-radius.ts";
 import {
+  type BlastRadiusInput,
   type CandidateSnapshot,
   type SnapshotRepositoryInput,
   type SnapshotReviewEvidence,
@@ -146,6 +148,10 @@ const unavailableReviewEvidence = (candidateSnapshotDigest: string, denial: Evid
  */
 const FINDING_SEVERITIES = ["INFO", "MINOR", "MAJOR", "BLOCKER"] as const;
 const MAX_AUDITED_FINDING_DIGESTS = 50;
+/** #1453 — the paths a mixed-change return names; the count beside them is whole. */
+const MAX_RETURNED_OUTSIDE_PATHS = 50;
+/** #1453 — the audit row a freeze writes when its candidate's lane raised the run's mode. */
+const EXECUTION_MODE_RAISED = "EXECUTION_MODE_RAISED";
 
 const revisionAuditEvidence = (
   delivered: Record<string, unknown>,
@@ -163,6 +169,17 @@ const revisionAuditEvidence = (
       observedInputs: boundedScalar(report?.observedInputs) ?? null,
       results: Array.isArray(report?.results) ? report.results.length : null,
       gaps: Array.isArray(report?.gaps) ? report.gaps.length : null,
+    } as Evidence;
+  }
+  if (delivered["stage"] === "blast-radius") {
+    // #1453 — the items are bound in the candidate's snapshot artifact; the row keeps their digest and counts.
+    const items = Array.isArray(delivered["items"]) ? delivered["items"] : [];
+    return {
+      stage: "blast-radius",
+      candidateSnapshotDigest,
+      itemsDigest: digestOf(items),
+      items: items.length,
+      outsidePaths: boundedScalar(delivered["outsidePathCount"]) ?? null,
     } as Evidence;
   }
   if (review === null) return { stage: "blind-review", candidateSnapshotDigest, reviewArtifactDigest: null } as Evidence;
@@ -632,6 +649,19 @@ export class CandidatePipeline {
       catch { return deny(ReasonCode.SNAPSHOT_DIGEST_MISMATCH, "attached review evidence cannot be frozen", { runId }); }
     }
 
+    // #1453 — the lane is classified from what the candidate changes, the pinned manifest's declarations and the
+    // destructive actions the run's contract states, and is bound into the snapshot.
+    const taskContract = this.pinnedContract(runId, run.contractDigest);
+    if (!taskContract.allowed) return taskContract as Decision<CandidateSnapshot>;
+    const blastRadius: BlastRadiusInput = {
+      declared: this.blastRadiusDeclaration(run),
+      textItems: deriveHumanGate({
+        executionMode: run.executionMode,
+        goal: run.goal,
+        scope: taskContract.value.scope,
+        declaredItems: taskContract.value.humanGate,
+      }).items,
+    };
     const snapshot = participants.length === 0
       ? buildNoRepositoryCandidateSnapshot(
           {
@@ -641,6 +671,7 @@ export class CandidatePipeline {
             ...(contractChange === undefined ? {} : { contractChange }),
             ...(canonicalCtoIdentity === undefined ? {} : { canonicalCtoIdentity }),
             ...(reviewEvidence === null ? {} : { reviewEvidence }),
+            blastRadius,
           },
           this.clock,
         )
@@ -652,6 +683,7 @@ export class CandidatePipeline {
             ...(contractChange === undefined ? {} : { contractChange }),
             ...(canonicalCtoIdentity === undefined ? {} : { canonicalCtoIdentity }),
             ...(reviewEvidence === null ? {} : { reviewEvidence }),
+            blastRadius,
           },
           this.clock,
         );
@@ -812,6 +844,7 @@ export class CandidatePipeline {
         this.artifacts.put(runId, ArtifactKind.CANDIDATE_SNAPSHOT, snapshot, digest);
         const reviewContextOutcome = reviewContext === null ? null : storeContractChangeReviewContext(this.artifacts, reviewContext);
         this.runs.promoteCandidate(runId, digest);
+        this.raiseExecutionMode(runId, snapshot, digest);
         this.audit.record(frozenRecord(reviewContextOutcome));
         seen.moved = movedCheckoutHeadNow(snapshot.repositories, repositories);
         return seen.moved === null
@@ -830,10 +863,35 @@ export class CandidatePipeline {
     const reviewContextOutcome = reviewContext === null ? null : storeContractChangeReviewContext(this.artifacts, reviewContext);
     // One transaction records the new candidate and stales everything bound to an older
     // one, so no window exists in which superseded evidence still reads as current.
-    this.runs.promoteCandidate(runId, digest);
+    this.db.tx(() => {
+      this.runs.promoteCandidate(runId, digest);
+      this.raiseExecutionMode(runId, snapshot, digest);
+    });
     await removeSupersededRefs();
     this.audit.record(frozenRecord(reviewContextOutcome));
     return allow(ReasonCode.OK, snapshot);
+  }
+
+  /** #1453 — the pinned manifest's blast-radius declarations, if it has any. */
+  private blastRadiusDeclaration(run: RunRow): BlastRadiusDeclaration | undefined {
+    return run.pinnedManifestDigest ? this.projects.manifest(run.pinnedManifestDigest)?.blastRadius : undefined;
+  }
+
+  /**
+   * #1453 — a WIDE or IRREVERSIBLE candidate is verified with the GUARDED profile, whatever mode the run was created
+   * with. Called inside the transaction that promotes the candidate; it only ever raises, so no candidate lowers it.
+   */
+  private raiseExecutionMode(runId: string, snapshot: CandidateSnapshot, candidateSnapshotDigest: string): void {
+    const lane = snapshot.blastRadius?.lane;
+    if (lane !== BlastRadiusLane.WIDE && lane !== BlastRadiusLane.IRREVERSIBLE) return;
+    const from = this.runs.require(runId).executionMode;
+    if (from === ExecutionMode.GUARDED) return;
+    this.db.run(`UPDATE runs SET execution_mode = ? WHERE run_id = ?`, [ExecutionMode.GUARDED, runId]);
+    this.audit.record({
+      kind: EXECUTION_MODE_RAISED,
+      runId,
+      evidence: { from, to: ExecutionMode.GUARDED, lane, candidateSnapshotDigest },
+    });
   }
 
   async submitResult(input: SubmitResultInput): Promise<Decision<PipelineOutcome>> {
@@ -1008,7 +1066,7 @@ export class CandidatePipeline {
       input.ownerBindingGeneration,
     );
     if (!owner.allowed) return owner as Decision<PipelineOutcome>;
-    const run = owner.value;
+    let run = owner.value;
 
     if (run.state !== RunState.ACTIVE) {
       return deny(ReasonCode.RUN_TRANSITION_ILLEGAL, `run is ${run.state}`, { runId: input.runId });
@@ -1020,6 +1078,8 @@ export class CandidatePipeline {
     const frozen = await this.freeze(input.runId, attemptId);
     if (!frozen.allowed) return frozen as Decision<PipelineOutcome>;
     const snapshot = frozen.value;
+    // #1453 — the freeze may have raised the run's mode; commands and review are resolved from the run as it is now.
+    run = this.runs.require(input.runId);
     const snapshotDigest = candidateSnapshotDigest(snapshot);
     const boundAttempt = this.bindAttemptCandidate(input.runId, attemptId, snapshotDigest);
     if (!boundAttempt.allowed) return boundAttempt as Decision<PipelineOutcome>;
@@ -1153,6 +1213,22 @@ export class CandidatePipeline {
       } finally {
         sourceReadLease.value.release();
       }
+    }
+
+    // #1453 — a destructive path change ships alone: with anything else beside it, the candidate goes back to its CTO
+    // before verification, and the destructive part becomes its own run.
+    const outside = pathsOutsideContract(snapshot.blastRadius, snapshot.repositories, this.blastRadiusDeclaration(run));
+    if (outside.length > 0) {
+      const returned = this.applyHolding(input, attemptId, () => this.returnToCto(input.runId, ReasonCode.IRREVERSIBLE_MIXED_CHANGE, {
+        stage: "blast-radius",
+        candidateSnapshotDigest: snapshotDigest,
+        items: snapshot.blastRadius!.items,
+        outsidePaths: outside.slice(0, MAX_RETURNED_OUTSIDE_PATHS),
+        outsidePathCount: outside.length,
+      }, attemptId), appliedStage("REVISION_REQUIRED", snapshotDigest, ReasonCode.IRREVERSIBLE_MIXED_CHANGE));
+      if (returned === null) return this.attemptLost(input.runId, attemptId, snapshotDigest, null);
+      if (!returned.allowed) return returned as Decision<PipelineOutcome>;
+      return allow(ReasonCode.OK, { stage: "REVISION_REQUIRED", reasonCode: ReasonCode.IRREVERSIBLE_MIXED_CHANGE, snapshotDigest });
     }
 
     const commands = this.resolveCommands(
