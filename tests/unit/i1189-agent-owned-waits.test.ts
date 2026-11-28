@@ -31,7 +31,7 @@ afterAll(cleanupTempDirs);
  * - B1: OWNER_DECISION_REQUIRED, with or without a human gate, names an owner-only reason (PRD §21) and
  *   the action it blocks; a CEO-scope judgement is refused with the CEO's own path; nothing forces CONFIRM;
  * - B4/B6/B7/B10: an agent-owned wait has a deadline that re-notifies, then reassigns (or attempts a
- *   recovery), then escalates to the CEO as CRITICAL_SYSTEM_FAILURE, and never becomes FAILED; after a CEO
+ *   recovery), then escalates to the CEO as CRITICAL_SYSTEM_FAILURE, and never becomes FAILED (a continuity hold alone does, one deadline later: #1447); after a CEO
  *   recovery the pending reviews are delivered again, deduplicated by the decision and the current
  *   candidate, never by an earlier holder's ACK;
  * - B12/C2: a stall nobody watches reaches the CEO as CRITICAL_SYSTEM_FAILURE with its owner, recovery
@@ -217,7 +217,7 @@ describe("#1189 B1 — OWNER_DECISION_REQUIRED names an owner-only reason and th
   });
 });
 
-describe("#1189 B4/B6/B7/B10 — an agent-owned wait's deadline re-notifies, reassigns, then escalates to the CEO; nothing becomes FAILED", () => {
+describe("#1189 B4/B6/B7/B10 — an agent-owned wait's deadline re-notifies, reassigns, then escalates to the CEO; only a continuity hold later becomes FAILED (#1447)", () => {
   it("an unresolved escalation: RENOTIFY at one deadline, REASSIGN to the recovered CEO at two, CRITICAL_SYSTEM_FAILURE at three, then nothing", async () => {
     const harness = makeHarness();
     const run = await activeRun(harness);
@@ -366,7 +366,7 @@ describe("#1189 B4/B6/B7/B10 — an agent-owned wait's deadline re-notifies, rea
     expect(recover).not.toHaveBeenCalled();
   });
 
-  it("a continuity hold: its REASSIGN step is a recovery attempt (continuity's reconcile), and the hold is never failed", async () => {
+  it("a continuity hold: its REASSIGN step is a recovery attempt (continuity's reconcile), and the hold is not failed at its escalation", async () => {
     const harness = makeHarness();
     const run = await activeRun(harness);
     const held = harness.cp.runs.pauseForContinuity(run.runId, run.ownerRoleKey!, "coverage lost", {

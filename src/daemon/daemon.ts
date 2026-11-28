@@ -319,6 +319,8 @@ export interface DaemonOptions {
    * falls back to `DEFAULT_AGENT_WAIT_DEADLINES`.
    */
   agentWaitDeadlines?: Partial<AgentWaitDeadlines>;
+  /** #1447 — how long a completed resident project whose PRIMARY_CTO is unbound waits between relaunches. Default 5 min. */
+  residentRelaunchBackoffMs?: number;
 }
 
 /**
@@ -2488,6 +2490,8 @@ export class Daemon {
       const decision = this.cp.ceo.submitCeoDecision({...confirmation,decision:"CONFIRM",rationale:confirmation.rationale ?? ""});
       if (decision.allowed) this.cp.residentProjects.complete(confirmation.runId);
     }
+    // #1447 — a completed project whose resident died is relaunched; a refusal is recorded on its row, never thrown.
+    for (const runId of this.cp.residentProjects.relaunchable(this.options.residentRelaunchBackoffMs ?? 5 * 60_000)) await this.cp.residentProjects.relaunch(runId);
     // #1227 — a resident project's worker turns run in their own checkout, never the resident's clone:
     // a project activated above, or one registered at its clone by an earlier build, is moved here.
     await this.cp.workerCheckouts.ensureAll();

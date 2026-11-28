@@ -25,7 +25,7 @@ import { redact } from '../../src/db/audit.ts';
 import { MIGRATIONS } from '../../src/db/migrations.ts';
 import { makeHarness } from '../helpers/harness.ts';
 import { cleanupTempDirs, tempDir } from '../helpers/fixtures.ts';
-import { RunKind } from '../../src/domain/types.ts';
+import { Role, RunKind, SessionLifecycle } from '../../src/domain/types.ts';
 
 afterAll(cleanupTempDirs);
 // The genesis fixtures, with CI checks that carry real Actions provenance (review V52-R1-02).
@@ -400,6 +400,89 @@ describe('durable resident provisioning and retirement',() => {
     expect(raw.prepare('SELECT count(*) AS n FROM repositories').get()).toEqual({n:2});
     expect(raw.prepare('PRAGMA table_info(projects)').all()).toEqual(expect.arrayContaining([expect.objectContaining({name:'buzz_address'}),expect.objectContaining({name:'retired_at'})]));raw.close();
     const fresh = new Db(join(tempDir('genesis-fresh-'),'state.sqlite'));fresh.close();
+  });
+});
+
+describe('#1447 the daemon relaunches a dead resident CTO',() => {
+  const backoff = 5 * 60_000;
+  /** A COMPLETE provisioning row whose project has no ACTIVE PRIMARY_CTO, as after its dead binding was released (#1448). */
+  const completed = async () => {
+    const host = new FakeHost();const invoke = host.invoke.bind(host);
+    const asked:Array<{op:HostOperation;packet:unknown}> = [];
+    let ensureResident:(() => Promise<HostObservation>) | null = null;
+    host.invoke = async (op,a,packet) => {asked.push({op,packet});return op === 'ensure-resident' && ensureResident ? ensureResident() : invoke(op,a,packet);};
+    const h = makeHarness({residentProvisioner:{home:join(tempDir('resident-relaunch-'),'home'),port:host}});
+    const run = h.cp.runs.create({kind:RunKind.PROJECT_BOOTSTRAP,executionMode:'STANDARD',contract});if (!run.allowed) throw new Error(run.message);
+    h.cp.projects.register({projectId:'resident',name:'resident'});
+    h.cp.residentProjects.attachSubscriber(async () => true);
+    h.cp.residentProjects.remember({runId:run.value.runId,candidateSnapshotDigest:'candidate',ceoSessionId:'ceo'},'resident',{});
+    await h.cp.residentProjects.ensure({runId:run.value.runId,projectId:'resident',repositoryIdentity:'github:acme/fixture',repositoryNodeId:'R_node',head:'f'.repeat(40),packet:{bytes:'approved'}});
+    h.cp.residentProjects.complete(run.value.runId);
+    asked.length = 0;
+    const daemon = new Daemon(h.cp,{stateDir:join(h.root,'daemon'),residentRelaunchBackoffMs:backoff});
+    const relaunches = () => {const n = asked.filter(x => x.op === 'ensure-resident');asked.length = 0;return n;};
+    return {h,daemon,runId:run.value.runId,asked,relaunches,slow:(next:typeof ensureResident) => {ensureResident = next;}};
+  };
+
+  it('relaunches the resident once per backoff window, with no packet, and never while its role is bound',async () => {
+    const {h,daemon,relaunches} = await completed();
+    // The row was just completed: the first relaunch waits out one backoff window from it.
+    await daemon.resumeResidentProjects();
+    expect(relaunches()).toEqual([]);
+    h.clock.advance(backoff);
+    await daemon.resumeResidentProjects();
+    expect(relaunches()).toEqual([{op:'ensure-resident',packet:undefined}]);
+    await daemon.resumeResidentProjects();
+    h.clock.advance(backoff - 1);
+    await daemon.resumeResidentProjects();
+    expect(relaunches()).toEqual([]);
+    h.clock.advance(1);
+    await daemon.resumeResidentProjects();
+    expect(relaunches()).toHaveLength(1);
+    // Its role bound again: the resident is alive, and nothing is relaunched however long it stays bound.
+    const session = h.cp.sessions.create({provider:'scripted',model:'scripted-cto'});
+    h.cp.sessions.transition(session.sessionId,SessionLifecycle.READY,'test');
+    expect(h.cp.bindings.bind({role:Role.PRIMARY_CTO,projectId:'resident',sessionId:session.sessionId}).allowed).toBe(true);
+    for (let i = 0; i < 3; i++) {h.clock.advance(backoff);await daemon.resumeResidentProjects();}
+    expect(relaunches()).toEqual([]);
+    h.cp.close();
+  });
+
+  it('acknowledges a recorded exit and relaunches on the next tick its backoff allows',async () => {
+    const {h,daemon,runId,asked,relaunches,slow} = await completed();
+    const reason = {binary:'claude',operation:'ensure-resident',kind:'non-zero exit',exitCode:2} as const;
+    slow(async () => {throw new HostOperationFailure('ensure-resident','host project provisioner refused operation: claude in ensure-resident: non-zero exit with exit code 2\n');});
+    h.clock.advance(backoff);
+    await expect(daemon.resumeResidentProjects()).resolves.toBeUndefined();
+    expect(asked.map(x => x.op)).toEqual(['ensure-resident','acknowledge-resident-exit']);
+    expect(asked[1]!.packet).toEqual({residentExitReason:reason});
+    expect(h.cp.residentProjects.row(runId)?.last_error).toBe('provisioning readback pending or refused: claude in ensure-resident: non-zero exit with exit code 2');
+    asked.length = 0;slow(null);
+    h.clock.advance(backoff);
+    await daemon.resumeResidentProjects();
+    expect(relaunches()).toHaveLength(1);
+    h.cp.close();
+  });
+
+  it('never asks for a second launch of a resident still starting: a slow relaunch in flight, then one that has not claimed its role yet',async () => {
+    const {h,daemon,relaunches,slow} = await completed();
+    // Only the first launch is slow, so a second one asked meanwhile would return and be counted.
+    let started:(() => void) | undefined;
+    slow(() => started ? Promise.resolve({fleet:true}) : new Promise<HostObservation>(resolve => {started = () => resolve({fleet:true});}));
+    h.clock.advance(backoff);
+    const first = daemon.resumeResidentProjects();
+    await vi.waitFor(() => expect(started).toBeTypeOf('function'));
+    // The watchdog's next pass, past another whole window, while the host is still starting it.
+    h.clock.advance(backoff);
+    await daemon.resumeResidentProjects();
+    started!();await first;
+    expect(relaunches()).toHaveLength(1);
+    // Started, but its CTO has not claimed the role yet: not asked again inside the window.
+    slow(null);
+    h.clock.advance(backoff - 1);
+    await daemon.resumeResidentProjects();
+    expect(relaunches()).toEqual([]);
+    h.cp.close();
   });
 });
 

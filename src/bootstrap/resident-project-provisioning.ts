@@ -118,32 +118,55 @@ export class ResidentProjectProvisioning {
       this.save(a.runId,'readbacks',evidence);
       return evidence;
     } catch (error) {
-      // Only the host's own allowlisted reason, as the shared module parsed it; any other failure keeps the fixed text.
-      const reason = error instanceof HostOperationFailure ? error.reason : null;
-      const detail = reason ? `: ${formatHostProvisionerReason(reason)}` : '';
-      // The launcher confirms Claude Code's development-channels warning and nothing else; a launch whose channel
-      // did not come up is on the audit log, and the doctor names the provisioning row that carries it.
-      if (reason?.binary === 'claude' && reason.operation === 'ensure-resident' && channelStartupReasonKinds.includes(reason.kind)) {
-        if (this.audit) this.audit.record({kind:'CTO_CHANNEL_STARTUP_REFUSED',reasonCode:ReasonCode.CTO_CHANNEL_STARTUP_REFUSED,runId:input.runId,projectId:input.projectId,evidence:{reason:reason.kind}});
-      }
-      // A launch that never started because the folder is not trusted is its own refusal: nothing was launched or pressed.
-      if (reason?.binary === 'claude' && reason.operation === 'ensure-resident' && reason.kind === hostReasonKind.launchFolderNotTrusted) {
-        if (this.audit) this.audit.record({kind:'CTO_CHANNEL_CWD_NOT_TRUSTED',reasonCode:ReasonCode.CTO_CHANNEL_CWD_NOT_TRUSTED,runId:input.runId,projectId:input.projectId,evidence:{reason:reason.kind}});
-      }
-      this.db.run(`UPDATE resident_project_provisioning SET last_error = ?, updated_at = ? WHERE run_id = ?`,[`provisioning readback pending or refused${detail}`,this.clock.nowIso(),input.runId]);
-      // The ledger commit is the durable consumer acknowledgement. If the host response is lost before
-      // or after its marker write, a later retry either repeats this reason or safely relaunches it; it
-      // can never consume the only copy before the diagnostic is durable here.
-      if (reason?.binary === 'claude' && reason.operation === 'ensure-resident' &&
-        (reason.kind === 'non-zero exit' || reason.kind === 'exited')) {
-        const allocation = this.allocation(input.runId);
-        if (allocation) {
-          try {await this.host!.invoke('acknowledge-resident-exit',allocation,{residentExitReason:reason});}
-          catch { /* A missing ACK deliberately causes the host to repeat the already durable reason. */ }
-        }
-      }
-      throw Object.assign(new Error(`resident provisioning pending or refused${detail}; inspect provisioning ledger`),reason ? {reason} : {});
+      throw await this.#refused(input.runId,input.projectId,error);
     } finally {this.#running.delete(input.runId);}
+  }
+  /** #1447 — COMPLETE rows whose PRIMARY_CTO is unbound (#1448) and not written within `backoffMs`; each relaunch writes its row. */
+  relaunchable(backoffMs:number): string[] {
+    return this.db.all<{run_id:string}>(`SELECT r.run_id FROM resident_project_provisioning r JOIN projects p ON p.project_id = r.project_id WHERE r.status = 'COMPLETE'
+      AND r.updated_at <= ? AND p.retired_at IS NULL AND p.suspended = 0 AND NOT EXISTS (SELECT 1 FROM project_retirements x WHERE x.project_id = r.project_id)
+      AND NOT EXISTS (SELECT 1 FROM assignments b WHERE b.project_id = r.project_id AND b.role = 'PRIMARY_CTO' AND b.status = 'ACTIVE') ORDER BY r.run_id`,
+    [new Date(Date.parse(this.clock.nowIso()) - backoffMs).toISOString()]).map(row => row.run_id);
+  }
+  /**
+   * #1447 — ensure-resident with no packet: the host reuses the one it recorded, and its own guards (a live resident, another CTO
+   * process, a pane still settling) never launch a live window twice. A refusal is recorded on the row; a later tick asks again.
+   */
+  async relaunch(runId:string):Promise<void> {
+    const a = this.allocation(runId);
+    if (!a || !this.configured() || this.#running.has(runId)) return;
+    this.#running.add(runId);
+    try {await this.step('ensure-resident',a);}
+    catch (error) {await this.#refused(runId,a.projectId,error);}
+    finally {this.#running.delete(runId);}
+  }
+  /** A refused or failed provisioning step, recorded on its row; returns the error its caller throws, if it throws. */
+  async #refused(runId:string,projectId:string,error:unknown):Promise<Error> {
+    // Only the host's own allowlisted reason, as the shared module parsed it; any other failure keeps the fixed text.
+    const reason = error instanceof HostOperationFailure ? error.reason : null;
+    const detail = reason ? `: ${formatHostProvisionerReason(reason)}` : '';
+    // The launcher confirms Claude Code's development-channels warning and nothing else; a launch whose channel
+    // did not come up is on the audit log, and the doctor names the provisioning row that carries it.
+    if (reason?.binary === 'claude' && reason.operation === 'ensure-resident' && channelStartupReasonKinds.includes(reason.kind)) {
+      if (this.audit) this.audit.record({kind:'CTO_CHANNEL_STARTUP_REFUSED',reasonCode:ReasonCode.CTO_CHANNEL_STARTUP_REFUSED,runId,projectId,evidence:{reason:reason.kind}});
+    }
+    // A launch that never started because the folder is not trusted is its own refusal: nothing was launched or pressed.
+    if (reason?.binary === 'claude' && reason.operation === 'ensure-resident' && reason.kind === hostReasonKind.launchFolderNotTrusted) {
+      if (this.audit) this.audit.record({kind:'CTO_CHANNEL_CWD_NOT_TRUSTED',reasonCode:ReasonCode.CTO_CHANNEL_CWD_NOT_TRUSTED,runId,projectId,evidence:{reason:reason.kind}});
+    }
+    this.db.run(`UPDATE resident_project_provisioning SET last_error = ?, updated_at = ? WHERE run_id = ?`,[`provisioning readback pending or refused${detail}`,this.clock.nowIso(),runId]);
+    // The ledger commit is the durable consumer acknowledgement. If the host response is lost before
+    // or after its marker write, a later retry either repeats this reason or safely relaunches it; it
+    // can never consume the only copy before the diagnostic is durable here.
+    if (reason?.binary === 'claude' && reason.operation === 'ensure-resident' &&
+      (reason.kind === 'non-zero exit' || reason.kind === 'exited')) {
+      const allocation = this.allocation(runId);
+      if (allocation) {
+        try {await this.host!.invoke('acknowledge-resident-exit',allocation,{residentExitReason:reason});}
+        catch { /* A missing ACK deliberately causes the host to repeat the already durable reason. */ }
+      }
+    }
+    return Object.assign(new Error(`resident provisioning pending or refused${detail}; inspect provisioning ledger`),reason ? {reason} : {});
   }
   evidence(runId:string): ProvisioningEvidence | null {
     const row = this.row(runId); if (!row) return null;

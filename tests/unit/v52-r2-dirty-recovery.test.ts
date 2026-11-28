@@ -1,11 +1,13 @@
 import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { afterAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
 import { git } from "../../src/git/git.ts";
+import { ExecFileHostProjectProvisioner } from "../../src/runtime/host-project-provisioner.ts";
 import { cleanupTempDirs } from "../helpers/fixtures.ts";
-import { commit, residentGitHost } from "../helpers/resident-git-host.ts";
+import { commit, hostScript, residentGitHost } from "../helpers/resident-git-host.ts";
 
 afterAll(cleanupTempDirs);
+afterEach(() => { vi.unstubAllEnvs(); });
 
 /**
  * Review V52-R2-01 — after a CTO dies, `ensure-resident` relaunches it over the project's own clone with
@@ -16,14 +18,19 @@ afterAll(cleanupTempDirs);
  * Real Git; only GitHub's identity lookup, Claude, tmux, ps and lsof are doubles.
  */
 describe("V52-R2-01 recovery relaunches the resident over unfinished work", () => {
-  it("restarts the allocated resident with unfinished work preserved", async () => {
+  it("the daemon's relaunch, with no packet, restarts the allocated resident with unfinished work preserved", async () => {
     const h = await residentGitHost();
     await h.invoke("ensure-checkout");
     await h.invoke("ensure-resident");
     h.killResident();
     writeFileSync(join(h.clone, "test.js"), "unfinished tracked edits");
     writeFileSync(join(h.clone, "new.txt"), "unfinished new file");
-    await expect(h.invoke("ensure-resident")).resolves.toMatchObject({ fleet: true, checkout: { head: h.genesis } });
+    // #1447 — the daemon's own runner, as `ResidentProjectProvisioning.relaunch` asks it.
+    for (const [key, value] of Object.entries(h.env)) if (value !== undefined && process.env[key] !== value) vi.stubEnv(key, value);
+    const daemon = new ExecFileHostProjectProvisioner(hostScript, h.home, h.state, 30_000);
+    await expect(daemon.invoke("ensure-resident", h.a)).resolves.toMatchObject({ fleet: true, checkout: { head: h.genesis } });
+    expect(JSON.parse(readFileSync(join(h.home, "fake.json"), "utf8")).launched).toBe(true);
+    expect(readFileSync(join(h.state, "resident-test.sh"), "utf8")).toContain("--resume");
     expect(readFileSync(join(h.clone, "test.js"), "utf8")).toBe("unfinished tracked edits");
     expect(readFileSync(join(h.clone, "new.txt"), "utf8")).toBe("unfinished new file");
     expect(await h.head()).toBe(h.genesis);

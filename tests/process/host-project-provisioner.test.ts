@@ -128,6 +128,11 @@ save();
   return {home,state,bin,resolvedBin,runtimeNode,runtimeCli,a,database,script,env,invoke};
 };
 const runtimeCommand = (f:ReturnType<typeof fixture>) => [f.runtimeNode,f.runtimeCli,'attach','resident-cto','--claimed-session-id',f.a.sessionUuid,'--project-id',f.a.projectId];
+/** #1447 — the daemon's relaunch of a completed project: ensure-resident with no packet, as `ResidentProjectProvisioning.relaunch` sends it. */
+const relaunch = (f:{script:string;env:NodeJS.ProcessEnv;a:ProjectAllocation}) => new Promise<{code:number;stderr:string}>(resolve => {
+  const child = execFile(process.execPath,[f.script],{env:f.env,timeout:30_000},(error,_out,stderr) => resolve({code:error ? Number((error as {code?:unknown}).code ?? 1) : 0,stderr:String(stderr)}));
+  child.stdin!.end(JSON.stringify({version:1,operation:'ensure-resident',allocation:f.a}));
+});
 
 const liveV1Roster = (version:1|undefined) => ({
   ...(version === undefined ? {} : {version}),
@@ -471,26 +476,12 @@ describe('one CTO per project at the resident launch door',() => {
     const f = await ready();
     const old = await oldPlainPath(f);
     patchFake(f,{others:[{...old,cwd:'/elsewhere'}]});
-    const failure = await refusal(daemon(f).invoke('ensure-resident',f.a));
+    const failure = await refusal(daemon(f).invoke('ensure-resident',f.a,{productIntent:'bytes'}));
     expect(failure.message).toMatch(new RegExp(`^host provisioner ensure-resident failed: CTO_ALREADY_RUNNING: project test already has a CTO process: pid=${old.pid} started="[^"]+" conversation=${CONVERSATION} tmux=none by=conversation$`));
     expect(failure.reason).toBeNull();
     expect(fakeState(f)).toMatchObject({launches:0});
   });
 
-  it('names the refusal for the fleet watcher in the host\'s one line, and the daemon-side failure carries it',async () => {
-    const f = await ready();
-    const old = await oldPlainPath(f);
-    patchFake(f,{others:[{...old,cwd:'/elsewhere'}]});
-    const recoveryScript = fileURLToPath(new URL('../../dist/host/resident-fleet-up.mjs',import.meta.url));
-    mkdirSync(join(f.home,'.claude','watchers','fleet'),{recursive:true});
-    const request = {allocation:f.a,packet:{productIntent:'bytes'}};
-    writeFileSync(join(f.home,'.claude','watchers','fleet','acp-test.resident.json'),JSON.stringify(request));
-    const result = await new Promise<{code:number|null;stderr:string}>(resolve => {execFile(process.execPath,[recoveryScript],{env:{...f.env,ACP_HOST_PROJECT_PROVISIONER:f.script},timeout:30_000},(error,_out,stderr) => resolve({code:error ? (error as {code?:number}).code ?? 1 : 0,stderr}));});
-    expect(result.code).toBe(1);
-    expect(result.stderr).toContain(`resident not started: acp-test.resident.json: CTO_ALREADY_RUNNING: project test already has a CTO process: pid=${old.pid} `);
-    expect(result.stderr).toContain('resident recovery pending: acp-test.resident.json');
-    expect(fakeState(f)).toMatchObject({launches:0});
-  });
 });
 
 it('counts a channel that does not register after the confirmation as a failure, with one key pressed',async () => {
@@ -597,9 +588,8 @@ it.each(['normal','lost-response-after-create','ambiguity'])('runs packaged host
   expect(readFileSync(a.privateKeyFile,'utf8')).toBe(key);expect(readFileSync(join(home,'.hermes','bridge','required-mentions.json'),'utf8')).toBe(roster);expect(readFileSync(join(home,'.claude','watchers','fleet','manifest.tsv'),'utf8')).toBe(fleet);
   const effects = JSON.parse(readFileSync(join(home,'fake.json'),'utf8')) as {creates:number;launches:number;launched:boolean;pane:boolean};expect(effects.creates).toBe(1);expect(effects.launches).toBe(1);
   effects.launched=false;effects.pane=false;writeFileSync(join(home,'fake.json'),JSON.stringify(effects));
-  // The watcher recovery entry uses exactly the same resident launcher and preserves its UUID.
-  const recoveryScript = fileURLToPath(new URL('../../dist/host/resident-fleet-up.mjs',import.meta.url));
-  await new Promise<void>((resolve,reject) => {execFile(process.execPath,[recoveryScript],{env:{...env,ACP_HOST_PROJECT_PROVISIONER:script},timeout:30_000},error=>error ? reject(error) : resolve());});
+  // The daemon's relaunch uses exactly the same resident launcher and preserves its UUID.
+  expect(await relaunch({script,env,a})).toEqual({code:0,stderr:''});
   expect(readFileSync(join(state,'resident-test.sh'),'utf8')).toContain('--resume');
   const recovered = JSON.parse(readFileSync(join(home,'fake.json'),'utf8'));expect(recovered.launches).toBe(2);recovered.launched=false;recovered.pane=false;writeFileSync(join(home,'fake.json'),JSON.stringify(recovered));
   writeFileSync(join(a.clonePath,'dirty.txt'),'owner edits');
@@ -1555,45 +1545,35 @@ it('replaces a retained dead launcher pane after its exit is acknowledged, never
   expect(fakeLaunchState(f)).toMatchObject({launches:2,kills:1});
 });
 
-const fleetRecovery = fileURLToPath(new URL('../../dist/host/resident-fleet-up.mjs',import.meta.url));
-// The sweep's host is the packaged script behind a recorder of each operation the sweep asks of it.
-const sweep = (f:ReturnType<typeof fixture>) => new Promise<{code:unknown;stderr:string}>(resolve => {
-  const host = join(f.home,'recording-host.mjs');
-  writeFileSync(host,`import {appendFileSync,readFileSync} from 'node:fs';import {spawnSync} from 'node:child_process';
-const input = readFileSync(0,'utf8');appendFileSync(${JSON.stringify(join(f.home,'host-operations'))},JSON.parse(input).operation+'\\n');
-process.exitCode = spawnSync(process.execPath,[${JSON.stringify(f.script)}],{input,stdio:['pipe','inherit','inherit']}).status ?? 1;\n`);
-  execFile(process.execPath,[fleetRecovery],{env:{...f.env,ACP_HOST_PROJECT_PROVISIONER:host},timeout:30_000},(error,_stdout,stderr) => resolve({code:error ? error.code : 0,stderr:String(stderr)}));
-});
-const sweptOperations = (f:ReturnType<typeof fixture>) => {
-  const file = join(f.home,'host-operations');const operations = existsSync(file) ? readFileSync(file,'utf8').split('\n').filter(Boolean) : [];
-  rmSync(file,{force:true});return operations;
-};
-
-it('fleet recovery logs a completed project\'s recorded Claude exit, acknowledges it and relaunches once',async () => {
+it('#1447: a relaunch without a packet starts the dead resident from the request this host recorded, and refuses without one',async () => {
   const f = fixture();
-  await f.invoke('ensure-checkout');await f.invoke('ensure-buzz');await f.invoke('ensure-resident');
-  expect(await launchResident(f)).toBe(2);
+  await f.invoke('ensure-checkout');await f.invoke('ensure-buzz');
+  const request = join(f.home,'.claude','watchers','fleet','acp-test.resident.json');
+  // Never launched here: there is nothing to relaunch, and nothing is written or started.
+  expect(await relaunch(f)).toEqual({code:1,stderr:expect.stringContaining('no recorded resident request to relaunch')});
+  expect([existsSync(request),existsSync(f.a.bootPacket),fakeState(f)['launches'],fakeState(f)['mcp']]).toEqual([false,false,0,undefined]);
+  await f.invoke('ensure-resident');
   residentGone(f);
-  // No daemon pass resumes a completed row, so no daemon acknowledgment arrives: the watcher's log line is the durable copy.
-  expect(await sweep(f)).toEqual({code:0,stderr:'resident exited: acp-test.resident.json: claude in ensure-resident: non-zero exit with exit code 2\n'});
-  expect(sweptOperations(f)).toEqual(['ensure-resident','acknowledge-resident-exit','ensure-resident']);
+  expect(await relaunch(f)).toEqual({code:0,stderr:''});
   expect(fakeLaunchState(f).launches).toBe(2);
-  // The relaunched resident is alive: a later sweep never starts it again.
-  expect(await sweep(f)).toEqual({code:0,stderr:''});
-  expect(fakeLaunchState(f).launches).toBe(2);
+  expect(readFileSync(join(f.state,'resident-test.sh'),'utf8')).toContain(`'--resume' '${f.a.sessionUuid}'`);
+  // The approved package of the first launch is kept, in the request and in the boot packet.
+  expect(JSON.parse(readFileSync(request,'utf8')).packet).toEqual({productIntent:'bytes'});
+  expect(JSON.parse(readFileSync(f.a.bootPacket,'utf8')).approvedPackage).toEqual({productIntent:'bytes'});
 });
 
-it('fleet recovery reports claude failing in provisioning as a provisioning failure, never as a resident exit',async () => {
+it('#1447: a relaunch never starts a second CTO beside one that is alive, or one still starting',async () => {
   const f = fixture();
   await f.invoke('ensure-checkout');await f.invoke('ensure-buzz');await f.invoke('ensure-resident');
-  // The resident stays healthy; only ensure-resident's own `claude mcp` calls exit 23, in the same reason shape as a recorded exit.
-  writeFileSync(join(f.home,'fail-claude'),'');
-  const marker = readFileSync(join(f.state,'launched-test'),'utf8');
-  expect(await sweep(f)).toEqual({code:1,stderr:'resident provisioning failed: acp-test.resident.json: claude in ensure-resident: non-zero exit with exit code 23\nresident recovery pending: acp-test.resident.json\n'});
-  expect(sweptOperations(f)).toEqual(['ensure-resident']);
-  expect(readFileSync(join(f.state,'launched-test'),'utf8')).toBe(marker);
-  expect(existsSync(join(f.state,'resident-test.exit.json'))).toBe(false);
-  expect(fakeLaunchState(f)).toMatchObject({launches:1,launched:true});
+  // Its binding read as released (a liveness check that raced it), but the CTO is alive: read, and nothing launched.
+  expect(await relaunch(f)).toEqual({code:0,stderr:''});
+  expect(fakeLaunchState(f)).toMatchObject({launches:1,pane:true});
+  // Slow but alive: its process runs and its Remote Control has not registered yet. Refused, nothing launched or killed.
+  const rc = join(f.home,'.claude','sessions',`${process.pid}.json`);
+  writeFileSync(rc,JSON.stringify({sessionId:f.a.sessionUuid,cwd:f.a.clonePath,bridgeSessionId:null}));
+  expect((await relaunch(f)).code).toBe(1);
+  expect(fakeLaunchState(f)).toMatchObject({launches:1,pane:true});
+  expect(fakeLaunchState(f).kills).toBeUndefined();
 });
 
 it('an exit record for one session never explains another session of the same project',async () => {
@@ -1658,18 +1638,18 @@ it('fleet recovery follows the switchover record: while it is pending nothing is
   const requestFile = join(f.home,'.claude','watchers','fleet','acp-test.resident.json');
   const provisioned = readFileSync(requestFile,'utf8');
   recordRotation(f,'t-pending',OLD,NEW,false);
-  // The launcher stopped the old conversation; its pane is gone. Pending: the watcher relaunches nobody and rewrites nothing.
+  // The launcher stopped the old conversation; its pane is gone. Pending: the relaunch starts nobody and rewrites nothing.
   residentGone(f);
   const before = hostState(f);
-  const held = await sweep(f);
+  const held = await relaunch(f);
   expect(held.code).toBe(1);
-  expect(held.stderr).toContain('resident recovery pending: acp-test.resident.json');
+  expect(held.stderr).toContain('canonical CTO switchover t-pending is pending');
   const during = hostState(f);
   expect([during.launches,during.mcpAdds.length]).toEqual([before.launches,before.mcpAdds.length]);
-  // Acknowledged: the fake host's processes are now the new conversation's, and the watcher recovers it.
+  // Acknowledged: the fake host's processes are now the new conversation's, and the relaunch recovers it.
   acknowledge(f,'t-pending');
   writeFileSync(join(f.home,'allocation.json'),JSON.stringify({...f.a,sessionUuid:NEW}));
-  expect(await sweep(f)).toEqual({code:0,stderr:''});
+  expect(await relaunch(f)).toEqual({code:0,stderr:''});
   const after = hostState(f);
   expect(after.launches).toBe(before.launches + 1);
   expect(after.mcpAdds.at(-1)).toEqual(['mcp','add','--scope','local','acp-cto','--',f.runtimeNode,f.runtimeCli,'attach','resident-cto','--claimed-session-id',NEW,'--project-id',f.a.projectId]);
@@ -1677,10 +1657,10 @@ it('fleet recovery follows the switchover record: while it is pending nothing is
   expect(launcher).toContain(`'${NEW}'`);expect(launcher).not.toContain(OLD);
   expect(readFileSync(join(f.home,'.claude','watchers','fleet','manifest.tsv'),'utf8')).toBe([f.a.fleetName,f.a.clonePath,'test CTO',f.a.bootPacket,NEW].join('\t')+'\n');
   expect(JSON.parse(readFileSync(f.a.bootPacket,'utf8')).sessionUuid).toBe(NEW);
-  // The watcher's request keeps the allocation it was provisioned with: the record, not a second store, names the target.
+  // The recorded request keeps the allocation it was provisioned with: the record, not a second store, names the target.
   expect(readFileSync(requestFile,'utf8')).toBe(provisioned);
-  // A later sweep finds the new conversation alive and starts nothing; the old conversation's UUID is never named again.
-  expect(await sweep(f)).toEqual({code:0,stderr:''});
+  // A later relaunch finds the new conversation alive and starts nothing; the old conversation's UUID is never named again.
+  expect(await relaunch(f)).toEqual({code:0,stderr:''});
   const settled = hostState(f);
   expect(settled.launches).toBe(after.launches);
   expect(settled.mcpAdds.slice(before.mcpAdds.length).flat()).not.toContain(OLD);
@@ -1688,7 +1668,7 @@ it('fleet recovery follows the switchover record: while it is pending nothing is
   const NEXT = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd';
   recordRotation(f,'t-next',NEW,NEXT,true);residentGone(f);
   writeFileSync(join(f.home,'allocation.json'),JSON.stringify({...f.a,sessionUuid:NEXT}));
-  expect(await sweep(f)).toEqual({code:0,stderr:''});
+  expect(await relaunch(f)).toEqual({code:0,stderr:''});
   expect(readFileSync(join(f.state,'resident-test.sh'),'utf8')).toContain(`'${NEXT}'`);
   expect(readFileSync(join(f.home,'.claude','watchers','fleet','manifest.tsv'),'utf8')).toContain(NEXT);
 });

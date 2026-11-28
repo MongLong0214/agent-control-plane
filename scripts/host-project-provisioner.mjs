@@ -102,7 +102,7 @@ try {
   }
   // v58 — a canonical CTO switchover moves the project's CTO to a new conversation as the same actor, and its record
   // in the daemon's database is the one source of which conversation that is now: the acknowledged switchovers are
-  // followed from the allocation's conversation. The allocation and the watcher's request keep what was provisioned;
+  // followed from the allocation's conversation. The allocation and the recorded resident request keep what was provisioned;
   // nothing else stores the target. While a switchover is pending its outgoing conversation is fenced and the rotation
   // launcher starts the new one, so ensure-resident starts nobody; a conversation switched over from is never named
   // again, neither in acp-cto nor in a launch.
@@ -153,7 +153,7 @@ try {
   // checkout holds. Nothing here ever resets, cleans, stashes or checks out.
   // `bootstrap` — activation's requirement until a resident of this allocation has been observed on
   // it: attached to dev, clean, exactly at the approved genesis head.
-  // `development` — once the CTO owns the clone (fleet recovery, and activation passes after that
+  // `development` — once the CTO owns the clone (a relaunch, and activation passes after that
   // observation): the project's own clone whose HEAD's history contains the approved genesis head, in
   // any working state — uncommitted or untracked edits, any branch, or a detached HEAD (a CTO may
   // detach to bisect or inspect) — all preserved as they are.
@@ -619,8 +619,11 @@ try {
       result = {}; break;
     }
     case 'ensure-resident': {
-      // Also the fleet watcher's recovery path after a CTO dies: it relaunches over unfinished work.
+      // Also the daemon's relaunch after a CTO dies (#1447), over unfinished work: it sends no packet, and the one recorded at the first launch is kept.
       check(!switchoverPending,`canonical CTO switchover ${switchoverPending?.transfer_id} is pending: its launcher starts the new conversation, and the outgoing one is never relaunched`);
+      const residentRequest = join(dirname(a.bootPacket),`${a.fleetName}.resident.json`);
+      const packet = req.packet ?? (existsSync(residentRequest) ? read(residentRequest).packet : undefined);
+      check(packet !== undefined,'no recorded resident request to relaunch');
       const observedCheckout = checkout(checkoutRequirement);
       run(join(home,'.claude','scripts','claude-trust-dir.sh'),[a.clonePath]);
       const runtimeNode = join(state,'current','dist','bin','node');
@@ -641,8 +644,8 @@ try {
         run('claude',['mcp','add','--scope','local','acp-cto','--',runtimeNode,runtimeCli,'attach','resident-cto','--claimed-session-id',a.sessionUuid,'--project-id',a.projectId],{cwd:a.clonePath});
       }
       check(mcpMatches(run('claude',['mcp','get','acp-cto'],{cwd:a.clonePath})),'MCP readback mismatch');
-      atomic(join(dirname(a.bootPacket),`${a.fleetName}.resident.json`),JSON.stringify({allocation:req.allocation,packet:req.packet}));
-      atomic(a.bootPacket,JSON.stringify({schema:"acp.resident-boot.v1",projectId:a.projectId,sessionUuid:a.sessionUuid,roomId:a.roomId,identity:{name:a.identityName,pubkey:pub()},attachment:{stateDir:state,socketPath:a.socketPath},approvedPackage:req.packet},null,2)+'\n');
+      atomic(residentRequest,JSON.stringify({allocation:req.allocation,packet}));
+      atomic(a.bootPacket,JSON.stringify({schema:"acp.resident-boot.v1",projectId:a.projectId,sessionUuid:a.sessionUuid,roomId:a.roomId,identity:{name:a.identityName,pubkey:pub()},attachment:{stateDir:state,socketPath:a.socketPath},approvedPackage:packet},null,2)+'\n');
       const line = [a.fleetName,a.clonePath,`${a.projectId} CTO`,a.bootPacket,a.sessionUuid].join('\t');
       const lines = existsSync(fleetFile) ? readFileSync(fleetFile,'utf8').trimEnd().split('\n').filter(Boolean) : [];
       const existing = lines.find(l => l.split('\t')[0] === a.fleetName);
@@ -654,8 +657,8 @@ try {
       let alive = false; try { observeResident(); alive = true; } catch { /* A tmux shell alone is never health. */ }
       if (!alive) {
         // Keep surfacing a completed launch's exact exit until its caller acknowledges that the reason is
-        // durable on its side: the daemon after its ledger commit, the fleet watcher (the only recovery for
-        // a completed row) after its log line. The record and marker remain untouched while a response may be lost.
+        // durable on its side: the daemon after its ledger commit, for a pending row and a completed row's
+        // relaunch alike. The record and marker remain untouched while a response may be lost.
         const priorExit = recordedLaunchExit();
         if (priorExit && priorExit.marker.exitReported !== true) {
           throw new RecordedExitRefusal(formatHostProvisionerReason(priorExit.reason));
