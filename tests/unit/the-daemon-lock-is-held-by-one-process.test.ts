@@ -1,5 +1,16 @@
 import { spawn, type ChildProcess } from "node:child_process";
-import { existsSync, readFileSync, renameSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import {
+  copyFileSync,
+  existsSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterAll, afterEach, describe, expect, it } from "vitest";
@@ -208,6 +219,36 @@ describe("#1070 ACP-WORKER-03-LOCK one process holds the daemon lock", () => {
     const refused = lock.acquire(new Date().toISOString());
     expect(refused.allowed, "the lock was taken on whatever the link pointed at").toBe(false);
     expect(lock.held()).toBe(false);
+  });
+
+  // #1497: the link used to be refused only after SQLite had opened what it named. Opening a WAL database and
+  // closing it again checkpoints it and removes its sidecars, so the refusal came after the write.
+  it("a lock file that is a symbolic link to a WAL database is refused before what it names is opened", () => {
+    const state = tempDir("acp-lock-symlink-wal-");
+    const source = tempDir("acp-lock-symlink-wal-source-");
+    const database = join(state, "state.sqlite");
+    // A WAL database with frames not yet checkpointed and no connection open: a stopped daemon's files.
+    const writer = new Database(join(source, "state.sqlite"));
+    writer.pragma("journal_mode = WAL");
+    writer.pragma("wal_autocheckpoint = 0");
+    writer.exec("CREATE TABLE t (n INTEGER); INSERT INTO t VALUES (1), (2), (3)");
+    for (const suffix of ["", "-wal", "-shm"]) copyFileSync(join(source, `state.sqlite${suffix}`), `${database}${suffix}`);
+    writer.close();
+    const digest = (path: string): string => createHash("sha256").update(readFileSync(path)).digest("hex");
+    const before = { main: digest(database), wal: digest(`${database}-wal`), shm: existsSync(`${database}-shm`) };
+    expect(statSync(`${database}-wal`).size).toBeGreaterThan(0);
+    const lock = new SingleInstanceLock(join(state, "agentcpd.lock"));
+    symlinkSync(database, lock.lockDatabasePath);
+
+    const refused = lock.acquire(new Date().toISOString());
+
+    expect(refused.allowed).toBe(false);
+    expect(lock.held()).toBe(false);
+    expect({
+      main: digest(database),
+      wal: existsSync(`${database}-wal`) ? digest(`${database}-wal`) : null,
+      shm: existsSync(`${database}-shm`),
+    }, "the database the link named was opened and checkpointed").toEqual(before);
   });
 
   it("with the holder's record gone, the operating-system lock alone still refuses a second process", async () => {
