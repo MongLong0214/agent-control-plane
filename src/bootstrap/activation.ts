@@ -8,14 +8,8 @@ import { ReasonCode } from "../core/reason-codes.ts";
 import { type ProjectManifest, manifestDigest } from "../contracts/manifest.ts";
 import type { AuditLog } from "../db/audit.ts";
 import type { ArtifactStore } from "../db/artifacts.ts";
-import { ArtifactKind, Role, type RoleBinding, RunKind, RunState, roleKeyFor } from "../domain/types.ts";
-import {
-  PRIMARY_CTO_UNDELIVERABLE_REPLACED,
-  missingHandoffFields,
-  type CtoLifecycle,
-  type HandoffPackage,
-  type UndeliverablePrimaryCto,
-} from "../cto/cto-lifecycle.ts";
+import { ArtifactKind, Role, RunKind, RunState, roleKeyFor } from "../domain/types.ts";
+import { missingHandoffFields, type CtoLifecycle, type HandoffPackage } from "../cto/cto-lifecycle.ts";
 import type { Db } from "../db/database.ts";
 import { MessageKind } from "../outbox/envelope.ts";
 import type { Outbox } from "../outbox/outbox.ts";
@@ -443,10 +437,8 @@ export class BootstrapActivation {
     // A retried activation must not try to bind a role that is already bound. The existing
     // binding *is* the activation fact; re-binding would burn a generation for nothing. The binding
     // registry never lets a session that served as a bootstrap CTO take this role, so the fact
-    // reported here is read, not assumed. The one exception is an interactive holder this run's
-    // handoff could not reach (`undeliverableRecipient`): the retry replaces it with a driven one.
+    // reported here is read, not assumed, and never replaced (#1461).
     const alreadyBound = this.bindings.active(primaryRoleKey);
-    const undeliverable = alreadyBound && !adopted ? this.undeliverableRecipient(input.runId, projectId, alreadyBound) : null;
     if (adopted) {
       // Exactly the adopted binding, never a replacement, a driven spawn or a new Buzz identity.
       const held = adopted.value.binding;
@@ -461,7 +453,7 @@ export class BootstrapActivation {
     } else if (provisioning) {
       if (!alreadyBound || alreadyBound.sessionId !== provisioning.claimSessionId) return deny(ReasonCode.BOOTSTRAP_ACTIVATION_INCOMPLETE,"awaiting resident canonical claim",{runId:input.runId});
       primaryCtoBinding = {roleKey:primaryRoleKey,sessionId:alreadyBound.sessionId,bindingGeneration:alreadyBound.bindingGeneration,promotedFromBootstrap:false};
-    } else if (alreadyBound && !undeliverable) {
+    } else if (alreadyBound) {
       await this.cto.ensureBuzz(alreadyBound.sessionId, `primary-cto:${projectId}`);
       primaryCtoBinding = {
         roleKey: primaryRoleKey,
@@ -472,7 +464,7 @@ export class BootstrapActivation {
     } else {
       // #246 C4 — the activation's own door: a fresh session driven on the headless runtime, whose
       // handoff is delivered in band and acknowledged by its own turn, never over Buzz.
-      const provisioned = await this.cto.ensureDrivenPrimaryCto(projectId, input.runId, undeliverable ?? undefined);
+      const provisioned = await this.cto.ensureDrivenPrimaryCto(projectId, input.runId);
       if (!provisioned.allowed) return provisioned as Decision<ACPBootstrapActivationResult>;
       primaryCtoBinding = {
         roleKey: provisioned.value.roleKey,
@@ -793,8 +785,7 @@ export class BootstrapActivation {
     }
     // Review of run_7717 (F3) — the handoff was opened to, and is acknowledged only by, one session. The
     // CONFIRM completes only while that session is the project's PRIMARY_CTO: a replacement bound since
-    // has received and acknowledged nothing. The only redelivery is activation's own replacement of an
-    // undeliverable recipient (#246 C4), which reissues the handoff, and so this artifact, to it.
+    // has received and acknowledged nothing.
     if (primary !== null && primary.sessionId !== handoffArtifact.content.toSessionId) {
       return deny(
         ReasonCode.HANDOFF_ACK_REQUIRED,
@@ -971,11 +962,9 @@ export class BootstrapActivation {
     // persisted before they were delivered) is reissued: a fresh PENDING handoff, to the current
     // PRIMARY_CTO, of the same package with the observed facts, for a new ACK. Only that differs; the
     // earlier handoff row and artifact are kept as they are, and its ACK, if any, is evidence of nothing.
-    // #246 C4 — so is one whose recipient this activation replaced as undeliverable (`reissuedToReplacement`).
     // #1302 — and one whose adopted recipient a proven same-conversation restart succeeded (`reissuedToTakeoverSuccessor`).
     const reissues = recorded !== null &&
       (this.reissuable(projectId, recorded.content, handoff) ||
-        this.reissuedToReplacement(projectId, recorded.content, toSessionId, handoff) ||
         this.reissuedToTakeoverSuccessor(runId, projectId, recorded.content, toSessionId, handoff) ||
         this.reissuesUnreadablePackage(projectId, recorded.content, toSessionId, handoff));
     if (recorded && !reissues) {
@@ -1125,95 +1114,6 @@ export class BootstrapActivation {
     if (!chain || !run || chain.adoption.projectId !== projectId || chain.adoption.sessionId !== toSessionId) return false;
     if (!this.#adoptions.pinHolds(run, chain.adoption).allowed) return false;
     return chain.through.slice(0, -1).includes(recorded.toSessionId);
-  }
-
-  /**
-   * #246 C4 — whether a recorded BOOTSTRAP handoff is reissued to `toSessionId` because this activation
-   * replaced its recipient as undeliverable: it was never acknowledged (PENDING), the replacement
-   * recorded with the switch names it, its recipient and `toSessionId`, and `handoff` differs from it
-   * in nothing but the observed facts. The earlier row and artifact are kept; its ACK is never reused.
-   */
-  private reissuedToReplacement(
-    projectId: string,
-    recorded: { handoffId: string; projectId: string; toSessionId: string; handoff: HandoffPackage },
-    toSessionId: string,
-    handoff: HandoffPackage,
-  ): boolean {
-    if (recorded.projectId !== projectId || recorded.toSessionId === toSessionId) return false;
-    const row = this.db.get<{ status: string; to_session_id: string }>(
-      `SELECT status, to_session_id FROM handoffs WHERE handoff_id = ? AND kind = 'BOOTSTRAP' AND project_id = ?`,
-      [recorded.handoffId, projectId],
-    );
-    if (row?.status !== "PENDING" || row.to_session_id !== recorded.toSessionId) return false;
-    const replaced = this.db.get<{ held: number }>(
-      `SELECT 1 AS held FROM audit_events
-        WHERE kind = ? AND project_id = ? AND session_id = ?
-          AND json_extract(evidence_json, '$.handoffId') = ? AND json_extract(evidence_json, '$.fromSession') = ?
-        LIMIT 1`,
-      [PRIMARY_CTO_UNDELIVERABLE_REPLACED, projectId, toSessionId, recorded.handoffId, recorded.toSessionId],
-    );
-    const factless = (pkg: Partial<HandoffPackage>) => digestOf({ ...pkg, repositoryFacts: [] });
-    return replaced !== undefined && factless(recorded.handoff) === factless(handoff);
-  }
-
-  /**
-   * #246 C4 — the run's activation handoff could not reach `binding`'s session: it is an interactive
-   * PRIMARY_CTO (DrivenMode NONE, not a canonical runtime) with no Buzz identity to address, the run's
-   * recorded handoff names it and is still PENDING, and that handoff's HANDOFF_PACKAGE was REJECTED at
-   * its generation as a contract failure no retry will deliver. Then the retry replaces it with a
-   * driven PRIMARY_CTO and reissues the handoff to it; a binding that is short of any of these, a
-   * healthy interactive or canonical CTO included, is reused as before.
-   */
-  private undeliverableRecipient(runId: string, projectId: string, binding: RoleBinding): UndeliverablePrimaryCto | null {
-    const observed = this.undeliverableHandoff(runId, projectId, binding);
-    if (!observed) return null;
-    return {
-      binding,
-      reason: `bootstrap activation ${runId}: handoff ${observed.handoffId} was rejected undeliverable to an interactive PRIMARY_CTO with no Buzz identity`,
-      stillUndeliverable: () => this.undeliverableHandoff(runId, projectId, binding)?.messageId === observed.messageId,
-      evidence: { handoffId: observed.handoffId, messageId: observed.messageId, failureClass: "contract" },
-    };
-  }
-
-  private undeliverableHandoff(runId: string, projectId: string, binding: RoleBinding): { handoffId: string; messageId: string } | null {
-    if (binding.role !== Role.PRIMARY_CTO || binding.projectId !== projectId) return null;
-    if (drivenModeOf(this.db, binding.sessionId) !== "NONE") return null;
-    if (isAdoptedCanonicalRuntime(this.db, binding.sessionId)) return null;
-    const session = this.sessions.get(binding.sessionId);
-    if (!session || session.buzzActorId) return null;
-    const recorded = this.activationHandoff<{ handoffId?: string; projectId?: string; toSessionId?: string }>(runId);
-    const handoffId = recorded?.content.handoffId;
-    if (!handoffId || recorded.content.projectId !== projectId || recorded.content.toSessionId !== binding.sessionId) return null;
-    const row = this.db.get<{ status: string; to_session_id: string }>(
-      `SELECT status, to_session_id FROM handoffs WHERE handoff_id = ? AND kind = 'BOOTSTRAP' AND project_id = ?`,
-      [handoffId, projectId],
-    );
-    if (row?.status !== "PENDING" || row.to_session_id !== binding.sessionId) return null;
-    const message = this.db.get<{
-      message_id: string;
-      kind: string;
-      status: string;
-      failure_class: string | null;
-      retry_eligible: number;
-      target_session_id: string;
-      binding_generation: number;
-    }>(
-      `SELECT message_id, kind, status, failure_class, retry_eligible, target_session_id, binding_generation
-         FROM outbox WHERE idempotency_key = ?`,
-      [`bootstrap-handoff:${handoffId}`],
-    );
-    if (
-      !message ||
-      message.kind !== MessageKind.HANDOFF_PACKAGE ||
-      message.status !== "REJECTED" ||
-      message.failure_class !== "contract" ||
-      message.retry_eligible !== 0 ||
-      message.target_session_id !== binding.sessionId ||
-      message.binding_generation !== binding.bindingGeneration
-    ) {
-      return null;
-    }
-    return { handoffId, messageId: message.message_id };
   }
 
   /** The ack, as recorded by the incoming session itself. */
