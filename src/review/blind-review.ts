@@ -3720,8 +3720,9 @@ const importManifestSection = (entry: SnapshotImport): string =>
 /**
  * #1232 — the snapshot as the reviewer reads it: a repository's imports are counted; each is a manifest
  * entry in the diff. Each import the freeze did not bind is stated with its refusal, in every chunk.
+ * The touched paths' history (#1457) is gate evidence and is not shown (ADR-0006).
  */
-const snapshotForReviewer = (snapshot: CandidateSnapshot): unknown => ({
+const snapshotForReviewer = ({ pathHistory: _gateOnly, ...snapshot }: CandidateSnapshot): unknown => ({
   ...snapshot,
   repositories: snapshot.repositories.map(({ imports, refusedImports, ...repository }) => ({
     ...repository,

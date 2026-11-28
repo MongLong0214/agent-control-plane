@@ -63,6 +63,7 @@ import {
   candidateSnapshotSchema,
   expectedCheckoutHead,
   type CandidateSnapshot,
+  type SnapshotPathHistory,
 } from "../snapshot/candidate-snapshot.ts";
 
 /** PRD §19.1 — what Hermes receives by default. */
@@ -92,6 +93,8 @@ export interface ProductionReadyPacket {
   changedRepositories: Array<{ identity: string; baseHead: string; candidateHead: string; files: number }>;
   ctoRecommendation: string;
   humanGate: { required: boolean; items: string[]; satisfied: boolean };
+  /** #1457 — the frozen snapshot's `pathHistory`, copied as it was frozen; absent when the snapshot has none. */
+  pathHistory?: SnapshotPathHistory;
   createdAt: string;
 }
 
@@ -530,6 +533,7 @@ export class ProductionGate {
       })),
       ctoRecommendation: input.approval.recommendation,
       humanGate,
+      ...(snapshot.value.pathHistory === undefined ? {} : { pathHistory: snapshot.value.pathHistory }),
       createdAt: this.clock.nowIso(),
     };
 

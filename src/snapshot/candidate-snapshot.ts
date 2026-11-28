@@ -216,6 +216,25 @@ export const snapshotReviewEvidenceSchema = z
   .strict();
 export type SnapshotReviewEvidence = z.infer<typeof snapshotReviewEvidenceSchema>;
 
+/**
+ * #1457 — what earlier runs of the project did on the paths this candidate touches, read at the freeze
+ * (`verify/path-history.ts`). A post-merge failure is attributed to every path its run's latest candidate
+ * touched (`postMergeAttribution`), not to the path that failed.
+ */
+export const snapshotPathHistorySchema = z
+  .object({
+    entries: z.array(z.object({
+      repository: z.string().min(1),
+      path: z.string().min(1),
+      returnedRuns: z.number().int().nonnegative(),
+      postMergeBlockedRuns: z.number().int().nonnegative(),
+    }).strict()).min(1),
+    omitted: z.number().int().nonnegative(),
+    postMergeAttribution: z.literal("RUN"),
+  })
+  .strict();
+export type SnapshotPathHistory = z.infer<typeof snapshotPathHistorySchema>;
+
 export const candidateSnapshotSchema = z
   .object({
     schema: z.literal(CANDIDATE_SNAPSHOT_SCHEMA_ID),
@@ -234,6 +253,8 @@ export const candidateSnapshotSchema = z
     canonicalCtoIdentity: snapshotCanonicalCtoIdentitySchema.optional(),
     /** Present only on a STANDARD_WORK or CONTRACT_CHANGE candidate frozen with CEO-attached review evidence. */
     reviewEvidence: snapshotReviewEvidenceSchema.optional(),
+    /** Present only when a touched path has history in earlier runs; every other snapshot omits the key. */
+    pathHistory: snapshotPathHistorySchema.optional(),
     createdAt: z.string().min(1),
   })
   .strict()
@@ -332,7 +353,8 @@ export const duplicateRepositoryRoles = (
  * fields it always did — the key is left out, not set to null — so no existing digest moves. The
  * same holds for a CONTRACT_CHANGE candidate's `contractChange` (#246 B2-a) and its canonical CTO
  * identity baseline (`canonicalCtoIdentity`), and a STANDARD_WORK or CONTRACT_CHANGE candidate's private review evidence
- * (`reviewEvidence`): a candidate frozen with other evidence is a different candidate, reviewed again.
+ * (`reviewEvidence`): a candidate frozen with other evidence is a different candidate, reviewed again. So
+ * does the touched paths' history (`pathHistory`, #1457).
  */
 export const candidateSnapshotDigest = (snapshot: CandidateSnapshot): string =>
   digestOf({
@@ -344,6 +366,7 @@ export const candidateSnapshotDigest = (snapshot: CandidateSnapshot): string =>
     ...(snapshot.contractChange === undefined ? {} : { contractChange: snapshot.contractChange }),
     ...(snapshot.canonicalCtoIdentity === undefined ? {} : { canonicalCtoIdentity: snapshot.canonicalCtoIdentity }),
     ...(snapshot.reviewEvidence === undefined ? {} : { reviewEvidence: snapshot.reviewEvidence }),
+    ...(snapshot.pathHistory === undefined ? {} : { pathHistory: snapshot.pathHistory }),
   });
 
 /**
