@@ -1,9 +1,10 @@
 import { execFileSync, spawn } from "node:child_process";
 import { readFileSync, readdirSync, realpathSync } from "node:fs";
 import { createRequire } from "node:module";
-import { join } from "node:path";
+import { join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import ts from "typescript";
 import { afterAll, afterEach, describe, expect, it } from "vitest";
 
 import {
@@ -255,11 +256,112 @@ describe("no other path of the channel keeps the database", () => {
     ...readdirSync(join(root, "src", "buzz")).filter((name) => name.startsWith("buzz-channel")).map((name) => join("src", "buzz", name)),
     join("src", "cli", "buzz-channel.ts"),
   ];
+  const readsModule = join("src", "buzz", "buzz-channel-daemon-reads.ts");
+
+  /**
+   * Every call of the daemon's database opener in `files`, and every variable, parameter or field whose type holds what one
+   * returns, each as `file function: calls|keeps text`. A call is the opener's when what it returns is an `OpenedDaemonDb`,
+   * so `openDaemonDb(stateDir)`, an injected `options.open(stateDir)` and an alias are found alike, whatever their names.
+   * `planted` adds sources that exist only for this census, at the path given, so a control can show what it must see.
+   */
+  const openerCensus = (files: readonly string[], planted: Readonly<Record<string, string>>): string[] => {
+    const options = ts.convertCompilerOptionsFromJson(
+      (ts.readConfigFile(join(root, "tsconfig.json"), ts.sys.readFile).config as { compilerOptions: unknown }).compilerOptions,
+      root,
+    ).options;
+    const host = ts.createCompilerHost(options);
+    const plants = new Map(Object.entries(planted).map(([file, text]) => [join(root, file), text]));
+    const { fileExists, readFile, getSourceFile } = host;
+    host.fileExists = (path) => plants.has(path) || fileExists(path);
+    host.readFile = (path) => plants.get(path) ?? readFile(path);
+    host.getSourceFile = (path, language, ...rest) => {
+      const text = plants.get(path);
+      return text === undefined ? getSourceFile(path, language, ...rest) : ts.createSourceFile(path, text, language);
+    };
+    const roots = [...files.map((file) => join(root, file)), ...plants.keys()];
+    const program = ts.createProgram(roots, options, host);
+    const checker = program.getTypeChecker();
+    const module = checker.getSymbolAtLocation(program.getSourceFile(join(root, readsModule))!)!;
+    const opened = checker.getDeclaredTypeOfSymbol(checker.getExportsOfModule(module).find((symbol) => symbol.name === "OpenedDaemonDb")!);
+    const holdsOpened = (type: ts.Type): boolean => type === opened || (type.isUnion() && type.types.includes(opened));
+    const enclosing = (node: ts.Node): string => {
+      for (let at = node.parent; at !== undefined; at = at.parent) {
+        if (ts.isConstructorDeclaration(at)) return "constructor";
+        if (ts.isFunctionLike(at) && at.name !== undefined) return at.name.getText();
+        if (ts.isFunctionLike(at) && ts.isVariableDeclaration(at.parent)) return at.parent.name.getText();
+        if (ts.isClassLike(at) && at.name !== undefined) return at.name.text;
+      }
+      return "(module)";
+    };
+    const found: string[] = [];
+    for (const path of roots) {
+      const record = (node: ts.Node, what: string): void => {
+        found.push(`${relative(root, path)} ${enclosing(node)}: ${what}`);
+      };
+      const visit = (node: ts.Node): void => {
+        if (ts.isCallExpression(node)) {
+          const signature = checker.getResolvedSignature(node);
+          if (signature !== undefined && holdsOpened(checker.getReturnTypeOfSignature(signature))) record(node, `calls ${node.getText()}`);
+        }
+        if (
+          (ts.isVariableDeclaration(node) || ts.isParameter(node) || ts.isPropertyDeclaration(node) || ts.isBindingElement(node)) &&
+          holdsOpened(checker.getTypeAtLocation(node.name))
+        ) {
+          record(node, `keeps ${node.name.getText()}`);
+        }
+        ts.forEachChild(node, visit);
+      };
+      visit(program.getSourceFile(path)!);
+    }
+    return found;
+  };
+  const buzzSources = [
+    ...readdirSync(join(root, "src", "buzz")).filter((name) => name.endsWith(".ts")).map((name) => join("src", "buzz", name)),
+    join("src", "cli", "buzz-channel.ts"),
+  ];
+  // What the control plants: a channel function that calls openDaemonDb() itself and keeps it, and a field kept from an
+  // injected opener. They share the census's one program, since building that program is most of what the census costs.
+  const direct = join("src", "buzz", "buzz-channel-planted-direct.ts");
+  const injected = join("src", "buzz", "buzz-channel-planted-injected.ts");
+  const plants = {
+    [direct]: `import { openDaemonDb } from "./buzz-channel-daemon-reads.ts";
+      export const keepsTheDatabase = (stateDir: string) => {
+        const db = openDaemonDb(stateDir);
+        return () => db?.reads.get<{ v: string }>("SELECT v FROM t");
+      };`,
+    [injected]: `import type { DaemonDbOpener, OpenedDaemonDb } from "./buzz-channel-daemon-reads.ts";
+      export class KeepsAnInjectedHandle {
+        readonly #db: OpenedDaemonDb | null;
+        constructor(stateDir: string, options: { readonly open: DaemonDbOpener }) {
+          this.#db = options.open(stateDir);
+        }
+      }`,
+  };
+  let censused: string[] | undefined;
+  const census = (): string[] => (censused ??= openerCensus(buzzSources, plants));
+  const isPlanted = (line: string): boolean => line.startsWith(direct) || line.startsWith(injected);
 
   it("opens SQLite in one place, the daemon-reads module, and nowhere else in the channel", () => {
     expect(channelSources.length).toBeGreaterThan(3);
     const opening = channelSources.filter((file) => /better-sqlite3|new Database\(|node:sqlite|DatabaseSync/u.test(readFileSync(join(root, file), "utf8")));
-    expect(opening).toEqual([join("src", "buzz", "buzz-channel-daemon-reads.ts")]);
+    expect(opening).toEqual([readsModule]);
+  });
+
+  it("calls the opener in one place, readDaemonDb, and nothing in src/buzz or the entry keeps what it returns", () => {
+    expect(buzzSources.length).toBeGreaterThan(5);
+    expect(census().filter((line) => !isPlanted(line))).toEqual([
+      `${readsModule} readDaemonDb: keeps opened`,
+      `${readsModule} readDaemonDb: calls open(stateDir)`,
+    ]);
+  });
+
+  it("control: the census sees a channel function that calls openDaemonDb() itself and keeps it, and a field kept from an injected opener", () => {
+    expect(census().filter(isPlanted)).toEqual([
+      `${direct} keepsTheDatabase: keeps db`,
+      `${direct} keepsTheDatabase: calls openDaemonDb(stateDir)`,
+      `${injected} KeepsAnInjectedHandle: keeps #db`,
+      `${injected} constructor: calls options.open(stateDir)`,
+    ]);
   });
 
   it("never keeps what the opener returns: the entry has no handle variable, only readers that open for one read", () => {
@@ -267,9 +369,8 @@ describe("no other path of the channel keeps the database", () => {
     expect(entry).not.toMatch(/openDaemon|\bdaemon\s*(:|=|\?\?=)/u);
     expect(entry).toMatch(/ceoPubkeyResolver\(/u);
     expect(entry).toMatch(/backlogReader\(/u);
-    const reads = readFileSync(join(root, "src", "buzz", "buzz-channel-daemon-reads.ts"), "utf8");
-    // The one call of the opener is inside the function that closes what it opened.
-    expect(reads.match(/open\(stateDir\)/gu)).toHaveLength(1);
+    const reads = readFileSync(join(root, readsModule), "utf8");
+    // The one call of the opener (counted by the census above) is inside the function that closes what it opened.
     expect(reads).toMatch(/finally\s*\{[^}]*close\(\)/u);
   });
 });
