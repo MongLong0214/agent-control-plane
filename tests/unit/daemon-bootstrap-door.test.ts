@@ -13,6 +13,7 @@ import {
 } from "../../src/daemon/daemon.ts";
 import { createOperatorClient, dispatch, main as cliMain } from "../../src/cli/agentctl.ts";
 import { startBootstrapOperatorDoor } from "../../src/daemon/agentcpd.ts";
+import { StartTracker, gracefulStop } from "../../src/daemon/graceful-stop.ts";
 import type { Decision } from "../../src/core/errors.ts";
 import type { AuthenticatedOperatorPeer } from "../../src/daemon/daemon.ts";
 import type { DoctorReport, Finding } from "../../src/doctor/doctor.ts";
@@ -42,10 +43,9 @@ const COVERAGE = finding("ROLE_COVERAGE_NO_VALID_COVERAGE", "continuity");
 /**
  * The unparkable example these cases need.
  *
- * It used to be CTO_BINDING_POINTS_AT_DEAD_SESSION, and that stopped being true when the parked
- * door gained `binding.recoverDead` — a finding an operator *can* now clear is exactly the wrong
- * illustration for "a block that drifts into one no observation can answer", and using it here
- * made these two cases hang rather than fail, because the daemon correctly kept waiting.
+ * It used to be CTO_BINDING_POINTS_AT_DEAD_SESSION. That finding is not unparkable-by-accident:
+ * the daemon's own liveness sweep clears a proven-dead binding, so it is the wrong illustration
+ * for "a block that drifts into one no observation can answer".
  *
  * ACTIVE_RUN_WITHOUT_OWNER is the replacement: CRITICAL, blocking, raised by `checkRuns`, and
  * answerable only by re-pinning the run's owner or failing the run — neither of which is on the
@@ -174,12 +174,6 @@ const status = (daemon: Daemon) =>
  * sentence true rather than aspirational.
  */
 const PARKED_DOOR = [
-  // The dead canonical binding recovery. It releases one PRIMARY_CTO assignment whose session's
-  // process this machine can prove is gone, under an owner approval it verifies before it acts,
-  // and it spawns nothing. Admitted for the same reason the two conversation pairs are: without
-  // it the doctor named a blocking state that no command reachable from a parked daemon could
-  // clear, and the door that could clear it opened only after start() had already refused.
-  "binding.recoverDead",
   "capacity.observe",
   "conversation.adjudicate",
   "conversation.contradictions",
@@ -588,8 +582,8 @@ describe("#568: the documented capacity remedy is reachable in the state that ne
     // The check exists for a finding the *sweep* produces rather than the doctor-only re-check:
     // the pass that can create one is the promote attempt, so a scope check placed only where the
     // finding cannot appear is not a check. CTO_BINDING_POINTS_AT_DEAD_SESSION was the original
-    // motivating example and is no longer unparkable — the parked door can clear it now — so the
-    // case is carried by ACTIVE_RUN_WITHOUT_OWNER, which the same argument covers.
+    // motivating example, and the daemon's liveness sweep clears it now, so the case is carried by
+    // ACTIVE_RUN_WITHOUT_OWNER, which the same argument covers.
     const { harness, daemon } = makeDaemon([
       report("BLOCKED", [COVERAGE]),
       report("HEALTHY", []),
@@ -947,5 +941,56 @@ describe("the adjudication door promotes the daemon, not just the ledger", () =>
 
     daemon.stop();
     await starting;
+  });
+});
+
+describe("a stop closes off the bootstrap promotion first", () => {
+  it("a healthy re-check that lands while the stop drains workers does not promote the start", async () => {
+    // Parked, then a healthy observation arrives and its re-check is running when the stop begins. The
+    // stop's worker drain is slow: the abandon used to be recorded only after it, so the re-check promoted
+    // the start (DAEMON_BOOTSTRAP_PROMOTED, then DAEMON_STARTED) while the daemon was being stopped.
+    const { harness, daemon } = makeDaemon([report("BLOCKED", [COVERAGE]), report("HEALTHY", [])], [0, 250]);
+    const door = recordingDoor();
+    const tracker = new StartTracker();
+    const starting = tracker.track(
+      daemon.start({
+        bootstrapDoor: async () => {
+          tracker.park();
+          const opened = await door.open();
+          return {
+            close: async () => {
+              tracker.resume();
+              await opened.close();
+            },
+          };
+        },
+      }),
+    );
+    await vi.waitFor(() => expect(door.opened).toHaveLength(1));
+    const drain = harness.cp.workerTurns.shutdown.bind(harness.cp.workerTurns);
+    vi.spyOn(harness.cp.workerTurns, "shutdown").mockImplementation(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 400));
+      return drain();
+    });
+
+    const stopping = gracefulStop(tracker, {
+      begin: () => daemon.beginStop(),
+      closeListeners: async () => undefined,
+      stopDaemon: () => daemon.stop({ leaveLockHeld: true }),
+      closeDatabase: () => undefined,
+      fenceUnconfirmed: () => undefined,
+      releaseLock: () => daemon.lock.release(),
+    });
+    // The healthy observation, while the drain is running.
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    await observe(daemon);
+    await stopping;
+    const started = await starting;
+
+    const kinds = harness.cp.db.all<{ kind: string }>("SELECT kind FROM audit_events ORDER BY event_id").map((row) => row.kind);
+    expect(started.allowed).toBe(false);
+    expect(kinds).not.toContain("DAEMON_BOOTSTRAP_PROMOTED");
+    expect(kinds).not.toContain("DAEMON_STARTED");
+    expect(kinds.at(-1)).toBe("DAEMON_STOPPED");
   });
 });

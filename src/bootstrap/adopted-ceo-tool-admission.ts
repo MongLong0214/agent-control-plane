@@ -78,6 +78,11 @@ export interface AdoptedCeoToolAdmissionOptions {
 
 /** What one admitted connection holds. Downstream consumes this; nothing re-derives it. */
 export interface AdoptedCeoAdmission {
+  /**
+   * The CEO role key. With the four below it is what the tool socket's acknowledgement names, so a
+   * relay that reconnects after a restart can refuse an admission under any other binding.
+   */
+  roleKey: string;
   assignmentId: string;
   bindingGeneration: number;
   sessionId: string;
@@ -192,6 +197,7 @@ export const createAdoptedCeoToolAdmission = (cp: ControlPlane, options: Adopted
     }
 
     return allow(ReasonCode.OK, {
+      roleKey,
       assignmentId: binding.assignmentId,
       bindingGeneration: binding.bindingGeneration,
       sessionId: binding.sessionId,

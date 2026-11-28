@@ -1,0 +1,43 @@
+{
+  "about": "GitHub REST answers for one repository after its owner renamed it, in the shapes GitHub documents: GET of the old path answers 301 Moved Permanently naming /repositories/<id>, and GET of the new path answers the same node_id with the new full_name. Assembled from GitHub's documented response shapes for project myeotnyeon's repository (node id R_kgDOVXh6fA, renamed to youtube-factory); it is not a live capture, because the rename has not happened. Only fields ACP reads, and the ones beside them in GitHub's answer, are kept.",
+  "renamed": {
+    "from": "MongLong0214/myeotnyeon",
+    "to": "MongLong0214/youtube-factory",
+    "nodeId": "R_kgDOVXh6fA",
+    "id": 1433959036
+  },
+  "responses": [
+    {
+      "method": "GET",
+      "path": "repos/MongLong0214/myeotnyeon",
+      "status": 301,
+      "headers": { "location": "https://api.github.com/repositories/1433959036" },
+      "body": {
+        "message": "Moved Permanently",
+        "url": "https://api.github.com/repositories/1433959036",
+        "documentation_url": "https://docs.github.com/v3/#http-redirects"
+      }
+    },
+    {
+      "method": "GET",
+      "path": "repos/MongLong0214/youtube-factory",
+      "status": 200,
+      "body": {
+        "id": 1433959036,
+        "node_id": "R_kgDOVXh6fA",
+        "name": "youtube-factory",
+        "full_name": "MongLong0214/youtube-factory",
+        "private": false,
+        "visibility": "public",
+        "owner": { "login": "MongLong0214", "type": "User" },
+        "html_url": "https://github.com/MongLong0214/youtube-factory",
+        "clone_url": "https://github.com/MongLong0214/youtube-factory.git",
+        "description": null,
+        "default_branch": "dev",
+        "allow_merge_commit": true,
+        "allow_squash_merge": false,
+        "allow_rebase_merge": false
+      }
+    }
+  ]
+}

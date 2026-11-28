@@ -159,6 +159,12 @@ export const git = async (
     isolatedConfig?: boolean;
     deadline?: GitDeadline;
     /**
+     * A probe that must leave the checkout as it found it. `--no-optional-locks` stops `git status` from
+     * refreshing `.git/index` (it rewrites the index when a tracked file's stat changed, content the
+     * same), which is a write to a repository nobody asked to change.
+     */
+    readOnly?: boolean;
+    /**
      * `latin1` maps each output byte to one character, so `Buffer.from(stdout, "latin1")` gives the
      * exact bytes (a blob that is not UTF-8 text); the default `utf8` is lossy for such bytes.
      */
@@ -197,7 +203,7 @@ export const git = async (
   };
   let settled: { stdout: string; stderr: string };
   try {
-    settled = await exec("git", ["-C", cwd, ...args], {
+    settled = await exec("git", ["-C", cwd, ...(options.readOnly ? ["--no-optional-locks"] : []), ...args], {
       maxBuffer: MAX_BUFFER,
       encoding: options.encoding ?? "utf8",
       timeout,
@@ -338,7 +344,7 @@ export const remoteUrl = async (cwd: string, remote = "origin"): Promise<string 
 };
 
 /** `withoutRepositoryPrograms`, optionally spending a deadline the caller shares. */
-const programFreeOptions = async (cwd: string, bound: { deadline?: GitDeadline }): Promise<string[]> => {
+const programFreeOptions = async (cwd: string, bound: { deadline?: GitDeadline; readOnly?: boolean }): Promise<string[]> => {
   const listed = await git(cwd, ["config", "--name-only", "--get-regexp", "^filter\\."], {
     allowFailure: true,
     ...bound,
@@ -406,11 +412,14 @@ export const withoutRepositoryPrograms = async (cwd: string): Promise<string[]> 
  */
 export const isClean = async (
   cwd: string,
-  options: { timeoutMs?: number } = {},
+  options: { timeoutMs?: number; readOnly?: boolean } = {},
 ): Promise<boolean> => {
   const deadline = deadlineAfter(cwd, options.timeoutMs);
-  const programs = await programFreeOptions(cwd, { deadline });
-  const status = await git(cwd, [...programs, "status", "--porcelain", "--ignore-submodules=dirty"], { deadline });
+  const programs = await programFreeOptions(cwd, { deadline, ...(options.readOnly ? { readOnly: true } : {}) });
+  const status = await git(cwd, [...programs, "status", "--porcelain", "--ignore-submodules=dirty"], {
+    deadline,
+    ...(options.readOnly ? { readOnly: true } : {}),
+  });
   return status.stdout.trim().length === 0;
 };
 

@@ -153,7 +153,7 @@ interface StubReport {
 const runTurn = async (mode: Mode) => {
   const core = makeCore();
   const world = seedWorkerWorld(core);
-  world.db.run("UPDATE sessions SET provider = 'gpt', model = 'gpt-6.1-sol' WHERE session_id = ?", [world.worker.sessionId]);
+  world.db.run("UPDATE sessions SET provider = 'gpt', model = 'gpt-6.2-sol' WHERE session_id = ?", [world.worker.sessionId]);
   const root = tempDir("acp-turn-scratch-");
   // Another execution's scratch, beside this turn's own.
   const sibling = realpathSync(acpScratchDir("acp-codex-turn-"));

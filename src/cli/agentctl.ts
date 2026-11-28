@@ -1,13 +1,14 @@
 #!/usr/bin/env node
 import { randomUUID } from "node:crypto";
 import { existsSync, readFileSync, realpathSync } from "node:fs";
-import { createConnection } from "node:net";
+import { createConnection, type Socket } from "node:net";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { defaultConfig } from "../app/control-plane.ts";
 import { AUTO_GENERATION, runAdoptedCeoAttachRelay, runAttachRelayCommand, type AttachRelayClaim } from "./attach-relay.ts";
 import { createCtoPorts, runCtoCommand } from "./cto-command.ts";
+import { readOperatorToken } from "./operator-token.ts";
 import { digestOf } from "../core/digest.ts";
 import { type Decision, deny, isAcpError } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
@@ -44,6 +45,12 @@ const USAGE = `agentctl — Agent Control Plane operator CLI
   agentctl project register <name> <path> register a project and its primary repository
   agentctl project retire <id> <reason>    retire a project, preserving history
   agentctl project list                   list projects with derived activity and CI observations
+  agentctl project rename-repository <id> <owner/name> [--role <role>] [--apply]
+                                           after the owner renamed the repository on GitHub, adopt the
+                                           new name for the SAME repository (GitHub must answer it with
+                                           the recorded node id; the project must have nothing in flight)
+                                           and point the local clones' origin at it. Prints the plan and
+                                           changes nothing without --apply; run it again to continue
   agentctl cto list                       every CTO: generation, live session, channel, room, last Buzz
   agentctl cto add|relaunch|retire <project> ...
                                            one command per CTO lifecycle step, composed from the ones
@@ -54,19 +61,6 @@ const USAGE = `agentctl — Agent Control Plane operator CLI
   agentctl actor unregister <id> <generation> <expected-set-generation> <reason>
   agentctl telegram reply acknowledge <nonce> <reason-code> <evidence-digest>
                                            record that a terminal reply was reviewed and will not retry
-  agentctl binding recover-dead <projectId> <sessionId> <incarnation> <generation>
-                                           release a PRIMARY_CTO binding whose session's OS process
-                                           this host can prove is gone. Refuses a live session and
-                                           refuses one whose liveness cannot be established. Mints
-                                           no session and no generation; the role is simply left
-                                           unbound. Reachable while agentcpd is parked, which is
-                                           the state this exists for. There is no owner approval
-                                           to present: the liveness proof is the whole bound, and
-                                           <generation> is what stops a repeat.
-  agentctl binding recover-dead-ceo <sessionId> <incarnation> <generation>
-                                           the same release for the CEO binding, on the same proof.
-                                           The same CEO actor then re-attaches at the next
-                                           generation through adopt hermes or bootstrap hermes.
   agentctl conversation contradictions     turns whose records disagree, with the ids to cite
   agentctl conversation adjudicate <actor> <turn> <reason-code> <evidence-digest> <id>...
   agentctl conversation unresolved         turns waiting on a person, with what each already holds
@@ -125,6 +119,22 @@ export interface OperatorClient {
     params?: Record<string, unknown>,
     idempotencyKey?: string,
   ): Promise<Decision<unknown>>;
+  /** A request whose answer leaves the connection open: the daemon's hold lasts as long as it does. */
+  hold?(method: string, params?: Record<string, unknown>): Promise<OperatorHold>;
+}
+
+export interface OperatorHold {
+  decision: Decision<unknown>;
+  /** The connection is still open, so the hold is still held. */
+  open(): boolean;
+  /**
+   * Whether the hold is still held, read now. `open()` is a flag the socket's close, end and error events set, and those run only when
+   * the event loop does: a blocking, synchronous subprocess call holds the loop, and a connection that closed meanwhile still reads as
+   * open. The kernel already has the close by then; two turns of the loop (a turn's poll phase is what reads it, and a turn already
+   * past its poll can run an immediate before it) deliver the events, and `open()` is read after them.
+   */
+  verify(): Promise<boolean>;
+  release(): void;
 }
 
 const OPERATOR_MUTATION_METHOD_NAMES = new Set([
@@ -145,6 +155,17 @@ const OPERATOR_MUTATION_METHOD_NAMES = new Set([
 
 /** Creates a daemon-only operator client. It never opens SQLite or constructs a service. */
 export const createOperatorClient = (options: OperatorClientOptions): OperatorClient => ({
+  hold: async (method, params = {}) => {
+    let held: Socket | null = null;
+    let closed = false;
+    const decision = await exchangeOperatorRequest(options, { requestId: randomUUID(), method, params }, (socket) => {
+      held = socket;
+      for (const event of ["close", "end", "error"] as const) socket.once(event, () => { closed = true; });
+    });
+    const open = (): boolean => held !== null && !closed && !(held as Socket).destroyed;
+    const turn = (): Promise<void> => new Promise((done) => setImmediate(done));
+    return { decision, open, verify: async () => { await turn(); await turn(); return open(); }, release: () => { closed = true; (held as Socket | null)?.destroy(); } };
+  },
   request: (method, params = {}, idempotencyKey) =>
     exchangeOperatorRequest(options, {
       requestId: randomUUID(),
@@ -194,10 +215,15 @@ export const main = async (argv: string[]): Promise<number> => {
   const owner = rest.includes("--owner");
   const args = command === "adopt" ? rest : rest.filter((arg) => arg !== "--owner");
 
+  const operatorToken = readOperatorToken(process.env);
+  if (!operatorToken.allowed) {
+    print(operatorToken);
+    return 1;
+  }
   const client = createOperatorClient({
     socketPath:
       process.env["ACP_OPERATOR_SOCKET"] ?? join(config.databasePath, "..", "agentcpd.operator.sock"),
-    token: process.env["ACP_OPERATOR_TOKEN"],
+    token: operatorToken.value,
   });
 
   // The CTO lifecycle group composes the operator methods below with host steps; it reads the token from this
@@ -577,44 +603,28 @@ export const dispatch = async (
     return fail(`unknown capacity subcommand: ${args[0] ?? ""}`);
   }
 
-  if (command === "binding") {
-    const [sub, projectId, sessionId, sessionIncarnation, generation] = args;
-    if (sub === "recover-dead") {
-      return call("binding.recoverDead", {
-        projectId: required(projectId, "projectId"),
-        // Fixed, not taken from the command line. The door recovers the canonical CTO binding and
-        // the CEO's (`recover-dead-ceo` below) and refuses any other role, so offering a role
-        // argument would only invite a request the daemon is going to refuse.
-        role: "PRIMARY_CTO",
-        sessionId: required(sessionId, "sessionId"),
-        sessionIncarnation: required(sessionIncarnation, "sessionIncarnation"),
-        expectedBindingGeneration: requiredInteger(generation, "expectedBindingGeneration", 1),
-        // There is no `nonce` and no `approved` here any more. This command used to require both,
-        // with `approved` hard-coded to `true` under a comment saying that reaching the command
-        // *was* the owner's approval — which is the whole argument for deleting them: a field
-        // that can only hold one value, and a nonce whose only job was to make that field's
-        // envelope unique, recorded a decision nobody had made. The generation above is what
-        // keeps a repeat from doing anything, and it did that before these two existed.
-      });
-    }
-    if (sub === "recover-dead-ceo") {
-      // The same door for its one other role. The CEO has no project, so the arguments shift by
-      // one and the project travels as an explicit null rather than as an omitted field.
-      const [, ceoSessionId, ceoSessionIncarnation, ceoGeneration] = args;
-      return call("binding.recoverDead", {
-        projectId: null,
-        role: "CEO",
-        sessionId: required(ceoSessionId, "sessionId"),
-        sessionIncarnation: required(ceoSessionIncarnation, "sessionIncarnation"),
-        expectedBindingGeneration: requiredInteger(ceoGeneration, "expectedBindingGeneration", 1),
-      });
-    }
-    return fail(`unknown binding subcommand: ${sub ?? ""}`);
-  }
-
   if (command === "project") {
     if (args[0] === "list") return call("project.list");
     if (args[0] === "retire") return call("project.retire",{projectId:required(args[1],"projectId"),reason:args.slice(2).join(" ") || "operator retirement"});
+    if (args[0] === "rename-repository") {
+      const [, projectId, to, ...rest] = args;
+      let role: string | undefined;
+      let apply = false;
+      for (let index = 0; index < rest.length; index += 1) {
+        if (rest[index] === "--apply") apply = true;
+        else if (rest[index] === "--role" && rest[index + 1] !== undefined) role = rest[++index];
+        else return fail(`unknown project rename-repository argument: ${rest[index] ?? ""}`);
+      }
+      const decision = await client.request("project.renameRepository", {
+        projectId: required(projectId, "projectId"),
+        to: required(to, "owner/name"),
+        ...(role === undefined ? {} : { role }),
+        apply,
+      });
+      print(decision.allowed ? decision.value : decision);
+      const clones = decision.allowed ? (decision.value as { clones?: Array<{ result?: string }> }).clones ?? [] : [];
+      return decision.allowed && !clones.some((clone) => clone.result === "FAILED") ? 0 : 1;
+    }
     if (args[0] === "register") {
       return call("project.register", {
         name: required(args[1], "name"),
@@ -780,6 +790,8 @@ const exchangeOneLineRequest = (
   requestBody: Record<string, unknown>,
   timeoutMs: number,
   messages: OneLineExchangeMessages,
+  /** Given the socket of an allowed answer, which is then left open for the caller instead of ended. */
+  keepOpen?: (socket: Socket) => void,
 ): Promise<Decision<unknown>> =>
   new Promise<Decision<unknown>>((resolveExchange) => {
     const socket = createConnection(socketPath);
@@ -790,7 +802,8 @@ const exchangeOneLineRequest = (
       if (settled) return;
       settled = true;
       if (timeout) clearTimeout(timeout);
-      socket.end();
+      if (keepOpen && result.allowed) keepOpen(socket);
+      else socket.end();
       resolveExchange(result);
     };
     const unavailable = (error: unknown): void =>
@@ -842,13 +855,14 @@ const OPERATOR_EXCHANGE_MESSAGES: OneLineExchangeMessages = {
 const exchangeOperatorRequest = (
   options: OperatorClientOptions,
   request: { requestId: string; method: string; params: Record<string, unknown>; idempotencyKey?: string },
+  keepOpen?: (socket: Socket) => void,
 ): Promise<Decision<unknown>> => {
   const token = options.token?.trim() ?? "";
   if (token.length === 0) {
     return Promise.resolve(
       deny(
         ReasonCode.OPERATOR_UNAUTHENTICATED,
-        "agentctl needs the separately provisioned ACP_OPERATOR_TOKEN to reach agentcpd",
+        "agentctl needs the separately provisioned ACP_OPERATOR_TOKEN (or ACP_OPERATOR_TOKEN_FILE) to reach agentcpd",
         { socketPath: options.socketPath },
       ),
     );
@@ -858,7 +872,7 @@ const exchangeOperatorRequest = (
   // this client timing out first and reporting a healthy daemon as unauthenticated or as having
   // lost its lock (#609).
   const timeoutMs = options.timeoutMs ?? DEFAULT_OPERATOR_CLIENT_TIMEOUT_MS;
-  return exchangeOneLineRequest(options.socketPath, { token, ...request }, timeoutMs, OPERATOR_EXCHANGE_MESSAGES);
+  return exchangeOneLineRequest(options.socketPath, { token, ...request }, timeoutMs, OPERATOR_EXCHANGE_MESSAGES, keepOpen);
 };
 
 /**

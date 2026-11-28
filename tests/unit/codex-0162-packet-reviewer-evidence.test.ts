@@ -52,7 +52,7 @@ const usage = { input_tokens: 120, cached_input_tokens: 0, cache_write_input_tok
 const codexStdout = (thread: string, answer: string): string => [
   line({ type: "thread.started", thread_id: thread }),
   line({ type: "turn.started" }),
-  line({ type: "thread_settings_applied", thread_settings: { model: "gpt-6.1-sol", reasoning_effort: "xhigh" } }),
+  line({ type: "thread_settings_applied", thread_settings: { model: "gpt-6.2-sol", reasoning_effort: "xhigh" } }),
   line({ type: "item.completed", item: { id: "item_0", type: "reasoning", text: "synthetic reasoning summary" } }),
   line({ type: "item.completed", item: { id: "item_1", type: "agent_message", text: answer } }),
   line({ type: "turn.completed", usage }),
@@ -161,7 +161,7 @@ const sharedCodexHome = (): string => {
 
 /** A private override home is claimed once; a chunked review needs a session per chunk, so it shares. */
 const setup = (options: { shared?: boolean } = {}): { harness: Harness; reviewer: CodexPacketReviewer } => {
-  const harness = makeHarness({ reviewer: { preferred: { provider: "gpt", model: "gpt-6.1-sol", effort: "xhigh" }, fallbacks: [] } });
+  const harness = makeHarness({ reviewer: { preferred: { provider: "gpt", model: "gpt-6.2-sol", effort: "xhigh" }, fallbacks: [] } });
   const root = options.shared ? null : provisionReviewerCodexHome();
   if (root) homes.push(root);
   const real = new CodexCliAdapter({
@@ -337,9 +337,9 @@ describe("a codex-cli 0.162 packet review through the real candidate gate", () =
     });
     stubProvider([JSON.stringify({ verdict: "PASS", coveredFiles: [], omittedItems: [], findings: [] })]);
     const isolation = { packetRoot, denyReadPaths: [], emptyEnvironment: true as const, network: "provider-only" as const, tools: "none" as const };
-    const handle = await adapter.startSession({ model: "gpt-6.1-sol", effort: "xhigh", workdir: packetRoot, purpose: "blind-review", isolation });
+    const handle = await adapter.startSession({ model: "gpt-6.2-sol", effort: "xhigh", workdir: packetRoot, purpose: "blind-review", isolation });
     const result = await adapter.invoke({
-      prompt: "Return the packet verdict.", workdir: packetRoot, timeoutMs: 5_000, model: "gpt-6.1-sol", effort: "high",
+      prompt: "Return the packet verdict.", workdir: packetRoot, timeoutMs: 5_000, model: "gpt-6.2-sol", effort: "high",
       readOnly: true, correlationId: "effort-mismatch", externalSessionId: handle.externalSessionId, isolation,
     });
     expect(result.ok).toBe(false);
@@ -501,7 +501,7 @@ describe("the stored reviewer-input digests are the digests of what the Claude a
  * gate's own, reached through the owner's `result_submit` on the real CTO socket.
  */
 describe("an off-schema bootstrap PLAN review keeps its candidate, so the official retry recognises it", () => {
-  const REVIEWER = { preferred: { provider: "gpt", model: "gpt-6.1-sol", effort: "xhigh" }, fallbacks: [] };
+  const REVIEWER = { preferred: { provider: "gpt", model: "gpt-6.2-sol", effort: "xhigh" }, fallbacks: [] };
   const harnessOptions = { reviewer: REVIEWER };
 
   const routeToCodex = (f: BootstrapRuntimeFixture) => {

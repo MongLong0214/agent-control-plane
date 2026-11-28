@@ -216,6 +216,11 @@ const EXPECTED_CONVERTED_SITES = [
   // diagnostics.
   { file: "run/worker-turn.ts", symbol: "conclude", label: "WorkerTurnRunner.conclude (success receipt and evidence)", evidence: "direct" },
   { file: "run/worker-turn.ts", symbol: "fail", label: "WorkerTurnRunner.fail (failure receipt and diagnostics)", evidence: "direct" },
+  // #1477: provisioning a replacement for a worker on a retired model revokes that binding and parks its session
+  // DRAINING before it binds the replacement; a bind that is then refused has to take both back, or the task would
+  // be left with no worker and a session that passes no readiness gate. Rollback witness (named in the census
+  // test's CONVERTED_SITES): "a refused replacement bind leaves the retired binding ACTIVE and its session READY".
+  { file: "run/worker-staffing.ts", symbol: "provision", label: "WorkerStaffing.provision (retire, then bind)", evidence: "direct" },
   // S-HOLD (#1162): continuity's BLOCKED hold is released with its RUN_TRANSITION record written first,
   // then a state UPDATE conditional on the state, hold, reason and owner pin it read; a run that moved in
   // between updates no row and is refused, and that refusal has to take the transition record back.

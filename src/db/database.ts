@@ -1497,6 +1497,7 @@ const TRIGGER_CODES: Record<string, ReasonCode> = {
   PINNED_MANIFEST_IMMUTABLE: ReasonCode.CANDIDATE_CANNOT_WEAKEN_CONTRACT,
   PINNED_RUN_SCOPED_COMMANDS_IMMUTABLE: ReasonCode.CANDIDATE_CANNOT_WEAKEN_CONTRACT,
   RUN_STATE_TRANSITION_ILLEGAL: ReasonCode.RUN_TRANSITION_ILLEGAL,
+  RUN_KIND_IMMUTABLE: ReasonCode.CONFLICT,
   RUN_STATE_TRANSITION_AUTHORITY_DENIED: ReasonCode.RUN_STATE_TRANSITION_AUTHORITY_DENIED,
   EVIDENCE_CANDIDATE_MISMATCH: ReasonCode.SNAPSHOT_DIGEST_MISMATCH,
   EVIDENCE_WRITE_AUTHORITY_DENIED: ReasonCode.COMPLETION_AUTHORITY_DENIED,
@@ -1559,6 +1560,7 @@ const TRIGGER_CODES: Record<string, ReasonCode> = {
   // v57 — a canonical entitlement transfer is never replaced or erased, keeps its identity, and is claimed or
   // revoked once; an entitlement is never granted to a conversation or a held Buzz actor a transfer names.
   CANONICAL_ENTITLEMENT_TRANSFER_IMMUTABLE: ReasonCode.CONFLICT,
+  REPOSITORY_RENAME_IMMUTABLE: ReasonCode.CONFLICT,
   // #246 B2-b — a manifest activation grant is one per run, fixed once written, consumed once; the
   // project's pointer moves only with a consumed grant, and a CONTRACT_CHANGE completes only with its own.
   MANIFEST_GRANT_NO_REPLACE: ReasonCode.CONFLICT,
@@ -1683,8 +1685,6 @@ export const translate = (err: unknown): unknown => {
 
 export const openDb = (filename: string, options?: DbOpenOptions): Db => new Db(filename, options);
 
-/** The one version an approved copy may start from, and the one this command exists for. */
-const APPROVED_COPY_FROM_VERSION = 25;
 const SQLITE_HEADER_BYTES = 100;
 const SQLITE_MAGIC = "SQLite format 3\u0000";
 
@@ -1739,7 +1739,7 @@ const assertApprovedCopyIdentity = (
   databasePath: string,
   descriptor: number,
   target: TargetIdentity,
-): void => {
+): number => {
   const opened = fstatSync(descriptor);
   if (!opened.isFile()) {
     throw acpError(ReasonCode.INTERNAL_ERROR, "refusing a target that is not a regular file", {});
@@ -1753,11 +1753,13 @@ const assertApprovedCopyIdentity = (
   }
   assertNotTheDeploymentsOwnDatabase(target);
 
+  // The copy's own version, which is also what `migration-plan` and `approve-migration` start from:
+  // the chain this command dry-runs is the one a start would run against this file, not a fixed one.
   const onDisk = versionFromDescriptor(descriptor);
-  if (onDisk !== APPROVED_COPY_FROM_VERSION) {
+  if (onDisk === 0 || onDisk >= SCHEMA_VERSION) {
     throw acpError(
       ReasonCode.INTERNAL_ERROR,
-      `this copy is at ${onDisk} and this command migrates a copy at ${APPROVED_COPY_FROM_VERSION}`,
+      `this copy is at ${onDisk} and this command migrates a versioned copy older than the build's ${SCHEMA_VERSION}`,
       {},
     );
   }
@@ -1776,7 +1778,7 @@ const assertApprovedCopyIdentity = (
       {},
     );
   }
-  const expected = migrationPlanFrom(APPROVED_COPY_FROM_VERSION);
+  const expected = migrationPlanFrom(onDisk);
   if (approval.fromVersion !== expected.fromVersion || approval.toVersion !== expected.toVersion) {
     throw acpError(
       ReasonCode.INTERNAL_ERROR,
@@ -1797,6 +1799,7 @@ const assertApprovedCopyIdentity = (
       {},
     );
   }
+  return onDisk;
 };
 
 /** What one approved-copy migration did, in the terms an operator can check (`U6` unit 3). */
@@ -1895,7 +1898,7 @@ export const migrateApprovedCopy = (databasePath: string): ApprovedCopyMigration
           device: opened.dev,
           inode: opened.ino,
         };
-        assertApprovedCopyIdentity(databasePath, descriptor, target);
+        const fromVersion = assertApprovedCopyIdentity(databasePath, descriptor, target);
 
         const writer = new Db(databasePath, { migrationLock: lock });
         try {
@@ -1947,9 +1950,9 @@ export const migrateApprovedCopy = (databasePath: string): ApprovedCopyMigration
           const receipts = writer.all<{ id: string; checksum: string | null }>(
             `SELECT migration_id AS id, checksum FROM schema_migrations
               WHERE version > ? ORDER BY version`,
-            [APPROVED_COPY_FROM_VERSION],
+            [fromVersion],
           );
-          const planned = migrationPlanFrom(APPROVED_COPY_FROM_VERSION).migrations;
+          const planned = migrationPlanFrom(fromVersion).migrations;
           if (
             receipts.length !== planned.length ||
             receipts.some((receipt, index) => receipt.id !== planned[index])

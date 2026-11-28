@@ -19,6 +19,7 @@ import {
   parseClaudeArgv,
   parseLsofCwds,
   parseProcessTable,
+  processExistsWith,
   unreadableScopeVerdict,
   type ClaudeOptionKind,
   type CtoProcess,
@@ -367,5 +368,24 @@ describe("the role's scope from the daemon's database", () => {
     const read = ctoRoleScope((sql, params) => harness.cp.db.all(sql, [...params]), projectId);
     expect(read.checkouts).toEqual([realpathSync(harness.repoPath)]);
     expect(read.bound).toEqual([{ pid: 90_001, startedAt: null }]);
+  });
+});
+
+/** #1463 final review: a process is not alive only by the kernel's word, never because `ps` failed. */
+describe("alive(): a pid the kernel still has is alive unless ps itself shows it a zombie", () => {
+  const fail = (code: unknown, stdout = ""): (() => Promise<{ stdout: string }>) => async () => { throw Object.assign(new Error("ps failed"), { code, stdout }); };
+  const kill = (code: string | null) => (): void => { if (code !== null) throw Object.assign(new Error(code), { code }); };
+
+  it("a surviving process whose ps exits 1 with diagnostics is alive, not gone", async () => {
+    expect(await processExistsWith(16590, kill(null), fail(1, "ps: diagnostics\n"))).toBe(true);
+    expect(await processExistsWith(16590, kill(null), fail(1))).toBe(true);
+    expect(await processExistsWith(16590, kill(null), fail("ETIMEDOUT"))).toBe(true);
+  });
+
+  it("is gone only when the kernel says so (ESRCH), or when ps answers that it is a zombie", async () => {
+    expect(await processExistsWith(16590, kill("ESRCH"), fail(1))).toBe(false);
+    expect(await processExistsWith(16590, kill(null), async () => ({ stdout: "Z\n" }))).toBe(false);
+    expect(await processExistsWith(16590, kill(null), async () => ({ stdout: "S\n" }))).toBe(true);
+    expect(await processExistsWith(16590, kill("EPERM"), fail(1))).toBe(true);
   });
 });

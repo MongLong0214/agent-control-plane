@@ -63,6 +63,8 @@ import {
 import { isProjectlessBootstrap } from "../bootstrap/bootstrap-plan.ts";
 import { REPAIR_OWNER_APPROVAL_OPERATION } from "../doctor/repair.ts";
 import { OWNERLESS_STALL_OWED, type ReleasedPipelineAttempt } from "../doctor/watchdog.ts";
+import { StopFailure } from "./graceful-stop.ts";
+import { type CrashLoopFile, backoffSecondsFor, clearCrashLoopFile, countStartupFailure, readCrashLoopFile } from "./crash-loop.ts";
 import { reapOrphanedReviewerEgress } from "../runtime/reviewer-egress.ts";
 import { describeStartStall, type StartStall } from "./start-stall.ts";
 import { routeUnreleasedWorkerOrphans } from "../run/worker-orphan-routing.ts";
@@ -103,8 +105,7 @@ import {
 import {
   probeSessionLiveness,
   recoverDeadCanonicalBinding,
-  parseDeadBindingRecoveryRequest,
-  type DeadBindingRecoveryReceipt,
+  DEAD_BINDING_SWEEP_ACTOR,
 } from "./dead-binding-recovery.ts";
 import { SingleInstanceLock } from "./single-instance.ts";
 import { readProcessGroup } from "../bootstrap/attempt-writer-group.ts";
@@ -273,6 +274,12 @@ const assertSweepFitsItsInterval = (refreshMs: number, budgetMs: number, provide
 
 export interface DaemonOptions {
   stateDir: string;
+  /**
+   * `agentcpd.lock` the caller already holds (migrate-before-start). The entry point takes it before it
+   * judges the start or opens the database, and hands it here so the daemon runs under the same lease
+   * instead of taking a second one. Absent, `start()` acquires it, as before.
+   */
+  lock?: SingleInstanceLock;
   watchdogIntervalMs?: number;
   deliveryIntervalMs?: number;
   /** Keeps the daemon-owned structured capacity sensors inside their freshness window. */
@@ -354,13 +361,6 @@ export const OPERATOR_METHOD = {
   OWNER_APPROVE: "owner.approve",
   ROLE_ATTACHMENT_ISSUE: ROLE_ATTACHMENT_OPERATION,
   ROLE_ATTACHMENT_REVOKE: "roleAttachment.revoke",
-  /**
-   * The parked daemon's recovery for CTO_BINDING_POINTS_AT_DEAD_SESSION: release a PRIMARY_CTO
-   * binding — or the CEO binding, the door's one other role — whose session's process is provably
-   * gone. It mints no session and no generation — see `dead-binding-recovery.ts` for why the
-   * spawning `CtoLifecycle.recoveryTakeover` is deliberately not what a parked daemon serves.
-   */
-  BINDING_RECOVER_DEAD: "binding.recoverDead",
   REPAIR_LIST: "repair.list",
   REPAIR_DRY_RUN: "repair.dry-run",
   REPAIR_EXECUTE: "repair.execute",
@@ -369,6 +369,12 @@ export const OPERATOR_METHOD = {
   PROJECT_LIST: "project.list",
   PROJECT_RETIRE: "project.retire",
   PROJECT_REGISTER: "project.register",
+  /**
+   * Adopts GitHub's new name for the same repository (`RepositoryRenames`). Deliberately not in
+   * OPERATOR_MUTATION_METHODS: running the same command again must read the world again and continue
+   * where it stopped, so its answer is never replayed from the idempotency cache.
+   */
+  PROJECT_RENAME_REPOSITORY: "project.renameRepository",
   ACTOR_LIST: "actor.list",
   ACTOR_REGISTER: "actor.register",
   ACTOR_UNREGISTER: "actor.unregister",
@@ -390,7 +396,6 @@ export const OPERATOR_MUTATION_METHODS: ReadonlySet<OperatorMethod> = new Set([
   OPERATOR_METHOD.OWNER_APPROVE,
   OPERATOR_METHOD.ROLE_ATTACHMENT_ISSUE,
   OPERATOR_METHOD.ROLE_ATTACHMENT_REVOKE,
-  OPERATOR_METHOD.BINDING_RECOVER_DEAD,
   OPERATOR_METHOD.REPAIR_DRY_RUN,
   OPERATOR_METHOD.REPAIR_EXECUTE,
   OPERATOR_METHOD.CAPACITY_OBSERVE,
@@ -424,15 +429,6 @@ export const BOOTSTRAP_OPERATOR_METHODS: ReadonlySet<OperatorMethod> = new Set([
   // could clear. #668.
   OPERATOR_METHOD.CONVERSATION_UNRESOLVED,
   OPERATOR_METHOD.CONVERSATION_RESOLVE,
-  // The remedy for CTO_BINDING_POINTS_AT_DEAD_SESSION, admitted here for the same reason the
-  // adjudication pair is: without it the doctor named a state that no command reachable from a
-  // parked daemon could clear, and the only door that could clear it was opened after start()
-  // had already refused. This method is narrower than the others on this list, not wider — it
-  // spawns nothing, mints no generation, and releases exactly one binding whose process this
-  // machine can prove is gone. The proof is what makes it narrow; it carried an owner approval
-  // too, until that approval turned out to be one this same door minted from the request that
-  // was asking for it.
-  OPERATOR_METHOD.BINDING_RECOVER_DEAD,
   OPERATOR_METHOD.DAEMON_STATUS,
 ]);
 
@@ -473,20 +469,7 @@ export const canParkForBootstrap = (blockingFindings: readonly BlockingFinding[]
       // and until one did, the rule read as "park for capacity" rather than as what it says.
       // Parking does not weaken the quarantine: a claim is refused by the ledger, not by the
       // daemon's mode, so a parked daemon admits no new turn for that actor either.
-      finding.code.startsWith("CANONICAL_TURN_") ||
-      // The CRITICAL that used to end the process. It is admitted here only because
-      // `OPERATOR_METHOD.BINDING_RECOVER_DEAD` exists to clear it: this entry and that method
-      // are one change and must not be separated. Alone, this line is the bypass — a daemon
-      // parking on a finding no reachable command can answer, waiting forever behind a held
-      // lock. Alone, that method is unreachable, because the door serving it only opens for a
-      // park this line has to permit.
-      //
-      // Parking is not admission. The daemon holds its lock, serves `BOOTSTRAP_OPERATOR_METHODS`
-      // and nothing else, runs no dispatch, no delivery timer and no continuity coordinator, and
-      // `parkForBootstrap` promotes only after the doctor itself stops blocking. A project that
-      // still owns live runs is refused by `BindingRegistry.revoke` and goes on blocking here,
-      // which is the property this must not cost.
-      finding.code === "CTO_BINDING_POINTS_AT_DEAD_SESSION",
+      finding.code.startsWith("CANONICAL_TURN_"),
   );
 
 /**
@@ -626,12 +609,6 @@ const LEGACY_RETRY_TRAIL_KINDS: readonly string[] = Object.freeze([
   BOOTSTRAP_PLAN_TASKS,
 ]);
 
-interface CrashLoopFile {
-  failures: number;
-  firstAt: string;
-  retryNotBefore?: string;
-}
-
 interface TimerFailure {
   consecutiveFailures: number;
   lastError: string;
@@ -692,6 +669,18 @@ export class Daemon {
   readonly attachments: RoleAttachmentCredentials;
   #timers: NodeJS.Timeout[] = [];
   #startedAt: string | null = null;
+  /**
+   * Whether `options.lock` arrived already held, and has not yet been used by a start. Only that one start
+   * may run under a lease it did not take; every later call on this instance acquires, finds the lock
+   * held by this very instance, and is refused, as a second start on one daemon always was.
+   */
+  #lockHandedOver = false;
+  /**
+   * Whether the lock is the caller's (`options.lock`). A start that refuses, fails or throws leaves it held:
+   * the caller closes the database first and gives it back after, so the lock is never released ahead of
+   * the close. A daemon that took its own lock gives it back itself, as before.
+   */
+  #lockIsTheCallers = false;
   #mode: DaemonMode = "NORMAL";
   #bootstrapBlocking: BlockingFinding[] = [];
   /** #1189 D1 — what this start is stalled on, in `health.json` until a start succeeds. */
@@ -703,6 +692,8 @@ export class Daemon {
   #bootstrapAbandoned = false;
   #bootstrapWaiter: (() => void) | null = null;
   #timerFailures = new Map<string, TimerFailure>();
+  /** The last failure message recorded for each role whose dead-holder release threw, until it succeeds. */
+  #sweepReleaseFailures = new Map<string, string>();
   // Unset until `main`'s composition root reports Telegram's outcome — `null` renders in
   // `health.json` as "this daemon has no opinion yet", distinct from `configured: false`.
   #telegramIngress: IngressChannelStatus | null = null;
@@ -766,7 +757,9 @@ export class Daemon {
   ) {
     mkdirSync(options.stateDir, { recursive: true });
     chmodSync(options.stateDir, 0o700);
-    this.lock = new SingleInstanceLock(join(options.stateDir, "agentcpd.lock"));
+    this.lock = options.lock ?? new SingleInstanceLock(join(options.stateDir, "agentcpd.lock"));
+    this.#lockHandedOver = options.lock?.held() === true;
+    this.#lockIsTheCallers = options.lock !== undefined;
     // #1336 R-1 — the same custody rule the MCP sockets apply (`drivenCredentialNotHeld` in agentcpd.ts):
     // an attachment is scoped to a PRIMARY_CTO, which is driven when its spawn record says DRIVEN.
     this.attachments = new RoleAttachmentCredentials(cp.sessions, cp.bindings, cp.clock, (sessionId) =>
@@ -996,17 +989,6 @@ export class Daemon {
         case OPERATOR_METHOD.ROLE_ATTACHMENT_REVOKE:
           return this.attachments.revoke(request.params);
 
-        case OPERATOR_METHOD.BINDING_RECOVER_DEAD: {
-          const recovered = this.executeDeadBindingRecovery(request, peer);
-          // Only a release that actually happened can change the doctor's mind, so a refused
-          // recovery must not consume the park's wake-up — the same rule the capacity and
-          // adjudication doors follow, for the same reason: an operator who applied the remedy
-          // should not then watch `daemon.status` report the stale finding for a recheck
-          // interval, and one who was refused should not see the daemon act as though they had.
-          if (recovered.allowed && this.#mode === "BOOTSTRAP") this.wakeBootstrap("OBSERVED");
-          return recovered;
-        }
-
         case OPERATOR_METHOD.REPAIR_LIST:
           return allow(ReasonCode.OK, this.cp.repair.catalog());
 
@@ -1043,6 +1025,18 @@ export class Daemon {
 
         case OPERATOR_METHOD.PROJECT_REGISTER:
           return this.registerProject(request.params);
+
+        case OPERATOR_METHOD.PROJECT_RENAME_REPOSITORY: {
+          const projectId = requiredOperatorString(request.params, "projectId");
+          if (!projectId.allowed) return projectId;
+          const to = requiredOperatorString(request.params, "to");
+          if (!to.allowed) return to;
+          const role = request.params["role"];
+          if (role !== undefined && (typeof role !== "string" || role.length === 0)) return invalidOperatorParam("role", role);
+          const apply = request.params["apply"];
+          if (typeof apply !== "boolean") return invalidOperatorParam("apply", apply);
+          return this.cp.repositoryRenames.rename({ projectId: projectId.value, to: to.value, ...(role === undefined ? {} : { role }), apply });
+        }
 
         case OPERATOR_METHOD.ACTOR_LIST:
           return allow(ReasonCode.OK, this.cp.actors.activeSet());
@@ -1251,42 +1245,6 @@ export class Daemon {
     });
   }
 
-  /**
-   * Releases a canonical PRIMARY_CTO binding, or the CEO binding, whose session's process is
-   * provably gone.
-   *
-   * No owner-approval envelope is minted, admitted or consumed here. This method used to build
-   * one and put it through `admitCliOwnerApproval`, and the reason it had to build its own rather
-   * than load one minted earlier was itself the tell: the state this recovers is one in which
-   * `start()` has already refused, `OWNER_APPROVE` is outside `BOOTSTRAP_OPERATOR_METHODS`, and
-   * in a real outage nobody had minted anything beforehand. So the door minted the approval for
-   * the caller, from the caller's own request, at the moment the caller asked — a decision that
-   * could only ever say yes, recorded as though someone had been asked.
-   *
-   * `peer.actor` still travels, and it is still the socket's authenticated identity rather than
-   * a request field, but it is now evidence written into the audit record instead of a name
-   * checked against `cp.config.ownerIdentities`. What the daemon proves before releasing anything
-   * is in `dead-binding-recovery.ts`: the named generation is the one in force and the process
-   * holding it is provably gone.
-   */
-  private executeDeadBindingRecovery(
-    request: OperatorRequest,
-    peer: AuthenticatedOperatorPeer,
-  ): Decision<DeadBindingRecoveryReceipt> {
-    const parsed = parseDeadBindingRecoveryRequest(request.params);
-    if (!parsed.allowed) return parsed;
-    return recoverDeadCanonicalBinding(peer.actor, parsed.value, {
-      db: this.cp.db,
-      audit: this.cp.audit,
-      sessions: this.cp.sessions,
-      bindings: this.cp.bindings,
-      // No liveness seam is threaded through here on purpose. The probe's own injection points
-      // exist so `probeSessionLiveness` can be exercised for the codes a test cannot provoke
-      // (EPERM in particular); the daemon path takes the real syscall, so a test that drives
-      // this method is measuring the same question production asks.
-    });
-  }
-
   private executeRepair(
     request: OperatorRequest,
     peer: AuthenticatedOperatorPeer,
@@ -1450,7 +1408,16 @@ export class Daemon {
       repositoryRole: "primary",
     });
     if (!repository.allowed) return repository;
-    return allow(ReasonCode.OK, { project: project.value, repository: repository.value });
+    // GitHub's node id for the repository at its registered name, which a later rename checks a new name
+    // against. The registration stands without it. Asked here rather than in `repositories.register`, which
+    // every registration (a bootstrap activation's included) goes through.
+    const nodeId = await this.cp.repositoryRenames.recordRegisteredNodeId(repository.value.repositoryId);
+    return allow(ReasonCode.OK, {
+      project: project.value,
+      repository: repository.value,
+      repositoryNodeId: nodeId.repositoryNodeId,
+      ...(nodeId.unrecorded === undefined ? {} : { repositoryNodeIdUnrecorded: nodeId.unrecorded }),
+    });
   }
 
   /**
@@ -1460,16 +1427,22 @@ export class Daemon {
    */
   async start(options: DaemonStartOptions = {}): Promise<Decision<ReconcileReport>> {
     const startedAt = this.cp.clock.nowIso();
-    const acquired = this.lock.acquire(startedAt);
-    if (!acquired.allowed) {
-      this.recordLockContention(acquired.evidence);
-      return acquired as Decision<ReconcileReport>;
+    // A lock the caller took before it opened anything is this daemon's already, for this one start. A
+    // repeat call does not inherit it: it acquires, and `acquire` refuses a lock this instance holds.
+    if (this.#lockHandedOver && this.lock.held()) {
+      this.#lockHandedOver = false;
+    } else {
+      const acquired = this.lock.acquire(startedAt);
+      if (!acquired.allowed) {
+        this.recordLockContention(acquired.evidence);
+        return acquired as Decision<ReconcileReport>;
+      }
     }
     this.#startedAt = startedAt;
 
     const priorFailures = this.readCrashLoop();
     if (priorFailures.retryNotBefore && Date.parse(priorFailures.retryNotBefore) > Date.parse(startedAt)) {
-      this.lock.release();
+      this.#giveBackLockUnlessCallerHoldsIt();
       this.#startedAt = null;
       const backoffSeconds = Math.ceil(
         (Date.parse(priorFailures.retryNotBefore) - Date.parse(startedAt)) / 1000,
@@ -1535,7 +1508,7 @@ export class Daemon {
             this.recordStartupFailure(reasonCode, { reconcile: report, stall });
             this.uninstallContinuityCoordinator();
             this.cp.doctor.clearSupplementalFindings(this.#doctorSupplier);
-            this.lock.release();
+            this.#giveBackLockUnlessCallerHoldsIt();
             this.#startedAt = null;
             return deny(reasonCode, "startup doctor did not permit dispatch resume", { reconcile: report });
           }
@@ -1543,7 +1516,7 @@ export class Daemon {
           this.recordStartupFailure(reasonCode, { reconcile: report, stall });
           this.uninstallContinuityCoordinator();
           this.cp.doctor.clearSupplementalFindings(this.#doctorSupplier);
-          this.lock.release();
+          this.#giveBackLockUnlessCallerHoldsIt();
           this.#startedAt = null;
           return deny(reasonCode, "startup doctor did not permit dispatch resume", { reconcile: report });
         }
@@ -1610,7 +1583,7 @@ export class Daemon {
       this.recordStartupFailure(ReasonCode.DAEMON_STARTUP_FAILED, evidence);
       this.uninstallContinuityCoordinator();
       this.cp.doctor.clearSupplementalFindings(this.#doctorSupplier);
-      this.lock.release();
+      this.#giveBackLockUnlessCallerHoldsIt();
       this.#startedAt = null;
       return deny(ReasonCode.DAEMON_STARTUP_FAILED, "daemon startup failed", evidence);
     }
@@ -1772,7 +1745,90 @@ export class Daemon {
       const result = this.cp.sessions.transition(session.sessionId, SessionLifecycle.ERROR, "session process is dead");
       if (result.allowed) settled.push(session.sessionId);
     }
+    this.releaseDeadCanonicalBindings();
     return settled;
+  }
+
+  /**
+   * Releases an ACTIVE canonical CTO or CEO binding whose bound session is settled (ERROR or
+   * STOPPED) and whose process is proven DEAD, so the role can be claimed again without a person
+   * running anything. It walks bindings, not the sessions settled just now: a session an earlier
+   * pass or an earlier build left ERROR is covered too.
+   *
+   * `recoverDeadCanonicalBinding` keeps every proof and no liveness seam is threaded in, so the
+   * real probe answers: it re-probes and refuses unless DEAD (EPERM stays ALIVE, anything it cannot
+   * decide is UNKNOWN), compares generation and incarnation, requires a moved binding's CURRENT runtime to be
+   * proven dead too (a surviving switch leaves the bound session behind), and refuses a binding that still owns
+   * live runs (REVOCATION_BLOCKED_ACTIVE_RUNS), which continuity's pause and revoke handles. A
+   * refusal changes nothing and is read again on the next tick. A release that throws is recorded
+   * (DAEMON_TIMER_FAILED, once per role and message) and does not stop the other bindings or the caller.
+   *
+   * The release is the plain one: it neither holds the role's queued peer mail for a successor nor takes
+   * over live runs, because it binds no successor. Queued role mail stays PENDING at the released generation
+   * and the next holder is handed it (`a-canonical-restart-keeps-the-ceo-peer-message.test.ts`); a holder
+   * that owns live runs is left to continuity's pause and revoke.
+   */
+  private releaseDeadCanonicalBindings(): void {
+    const bindings = [
+      ...this.cp.bindings.activePrimaryCtos(),
+      this.cp.bindings.active(roleKeyFor(Role.CEO)),
+    ];
+    const attempted = new Set<string>();
+    for (const binding of bindings) {
+      if (binding === null || (binding.role !== Role.CEO && binding.projectId === null)) continue;
+      const session = this.cp.sessions.get(binding.boundSessionId);
+      if (session?.lifecycle !== SessionLifecycle.ERROR && session?.lifecycle !== SessionLifecycle.STOPPED) continue;
+      attempted.add(binding.roleKey);
+      // One binding's failure must not starve the others or `reconcile()`: the release is its own
+      // transaction, so a throw leaves that binding exactly as it was, and the next sweep reads it again.
+      try {
+        recoverDeadCanonicalBinding(
+          DEAD_BINDING_SWEEP_ACTOR,
+          {
+            projectId: binding.role === Role.CEO ? null : binding.projectId,
+            role: binding.role,
+            sessionId: binding.boundSessionId,
+            sessionIncarnation: binding.boundSessionIncarnation,
+            expectedBindingGeneration: binding.bindingGeneration,
+          },
+          {
+            db: this.cp.db,
+            audit: this.cp.audit,
+            sessions: this.cp.sessions,
+            bindings: this.cp.bindings,
+          },
+        );
+        this.#sweepReleaseFailures.delete(binding.roleKey);
+      } catch (error) {
+        this.#recordSweepReleaseFailure(binding.roleKey, error);
+      }
+    }
+    // A binding no longer in the sweep's reach (released, replaced, or its holder alive again) owes no retry.
+    for (const roleKey of this.#sweepReleaseFailures.keys()) {
+      if (!attempted.has(roleKey)) this.#sweepReleaseFailures.delete(roleKey);
+    }
+  }
+
+  /**
+   * Records a release that threw, once per role and message until it succeeds or leaves the sweep's reach, so a
+   * persistent fault is visible without writing a row every tick. Recording is itself guarded: the audit log is
+   * a likely cause of the failure, and the sweep still has to reach the next binding.
+   */
+  #recordSweepReleaseFailure(roleKey: string, error: unknown): void {
+    const message = safeErrorMessage(error);
+    if (this.#sweepReleaseFailures.get(roleKey) === message) return;
+    this.#sweepReleaseFailures.set(roleKey, message);
+    try {
+      this.cp.audit.record({
+        kind: "DAEMON_TIMER_FAILED",
+        reasonCode: ReasonCode.DAEMON_TIMER_FAILED,
+        roleKey,
+        // `role`, not `roleKey`: the audit log redacts evidence keys that read as secrets.
+        evidence: { timer: "liveness-sweep", role: roleKey, error: message },
+      });
+    } catch {
+      // The reporting channel is the thing that failed; the next tick reads the binding again.
+    }
   }
 
   private async observeRepositories(): Promise<void> {
@@ -3551,9 +3607,6 @@ export class Daemon {
    * `cp.doctor.setSupplementalFindings` in `start()` is where it ends: this list has exactly one
    * caller now, and it is the doctor itself (#1010).
    */
-  // No `canonicalExecutorPinFindings` any more (#886, withdrawn 2026-09-27). It compared the
-  // claim's executor pin, ACP_CANONICAL_REQUIRED_EXECUTOR_VERSION, against a build a client declared.
-  // The claim no longer pins a build, so there is nothing to disagree and no such finding.
   private supplementalSystemFindings(): Finding[] {
     return [
       ...this.telegramIngressFindings(),
@@ -3839,21 +3892,11 @@ export class Daemon {
   }
 
   private recordStartupFailure(reasonCode: ReasonCodeValue, evidence: Record<string, unknown>): void {
-    const path = join(this.options.stateDir, "crash-loop.json");
-    const previous = this.readCrashLoop();
-    const now = this.cp.clock.nowIso();
-    const failures = previous.failures + 1;
-    const backoffSeconds = Math.min(300, 2 ** failures);
-    const next: CrashLoopFile = {
-      failures,
-      firstAt: previous.failures === 0 ? now : previous.firstAt,
-      retryNotBefore: new Date(Date.parse(now) + backoffSeconds * 1000).toISOString(),
-    };
-    writeFileSync(path, JSON.stringify(next), { mode: 0o600 });
+    const { next, backoffSeconds } = countStartupFailure(this.options.stateDir, this.cp.clock.nowIso());
 
     const threshold = this.options.crashLoopThreshold ?? 3;
     this.cp.audit.record({
-      kind: failures >= threshold ? "DAEMON_CRASH_LOOP" : "DAEMON_START_FAILED",
+      kind: next.failures >= threshold ? "DAEMON_CRASH_LOOP" : "DAEMON_START_FAILED",
       reasonCode,
       evidence: { ...next, threshold, backoffSeconds, ...evidence },
     });
@@ -3938,21 +3981,16 @@ export class Daemon {
   }
 
   private readCrashLoop(): CrashLoopFile {
-    return readJson<CrashLoopFile>(join(this.options.stateDir, "crash-loop.json")) ?? {
-      failures: 0,
-      firstAt: this.cp.clock.nowIso(),
-    };
+    return readCrashLoopFile(this.options.stateDir, this.cp.clock.nowIso());
   }
 
   private clearCrashLoop(): void {
-    writeFileSync(join(this.options.stateDir, "crash-loop.json"), JSON.stringify({ failures: 0 }), {
-      mode: 0o600,
-    });
+    clearCrashLoopFile(this.options.stateDir);
   }
 
   crashLoopState(): { failures: number; backoffSeconds: number } {
     const failures = this.readCrashLoop().failures;
-    return { failures, backoffSeconds: failures === 0 ? 0 : Math.min(300, 2 ** failures) };
+    return { failures, backoffSeconds: backoffSecondsFor(failures) };
   }
 
   /**
@@ -4094,6 +4132,21 @@ export class Daemon {
     }
   }
 
+  #giveBackLockUnlessCallerHoldsIt(): void {
+    if (!this.#lockIsTheCallers) this.lock.release();
+  }
+
+  /**
+   * The decision to stop, taken before anything else a stop does. A start parked for the bootstrap door
+   * would otherwise go on to promote while the stop drains workers (the abandon was only recorded once the
+   * drain ended): resuming runs, starting timers and writing DAEMON_STARTED after the stop had begun. Marking
+   * the park abandoned first, synchronously, means no promotion can follow; `stop()` records it again, which
+   * changes nothing.
+   */
+  beginStop(): void {
+    this.wakeBootstrap("ABANDONED");
+  }
+
   /**
    * Record the signal first, deliver second. `stop()` can land while the park is inside its
    * re-check with no waiter armed, so the abandon is latched rather than delivered — the loop
@@ -4113,11 +4166,25 @@ export class Daemon {
    * nor anyone reclaiming the lock lets a successor take authority while one of them may still run.
    * A caller that exits must report that, not exit as if the stop were clean.
    */
-  async stop(): Promise<{ complete: boolean }> {
+  /**
+   * `leaveLockHeld`: the caller gives the lock back itself, after it has closed the database, so the lock is
+   * never released ahead of the close. A stop that could not confirm its workers gone keeps the lock either way.
+   */
+  async stop(options: { leaveLockHeld?: boolean } = {}): Promise<{ complete: boolean }> {
     // #512 (ACP-WORKER-03) — before this daemon gives up its authority, every worker turn it owns is
     // aborted and drained. A process that would not be confirmed gone stays recorded as outstanding,
     // durably, so the next start reconciles it and no retry of its task runs first.
-    const workers = await this.cp.workerTurns.shutdown();
+    //
+    // A drain that threw, or returned no usable verdict, is a drain that did not confirm its workers gone:
+    // it is treated as exactly that (fenced, lock kept), never as permission to release the lock.
+    let drainFailure: unknown = null;
+    let workers: Awaited<ReturnType<ControlPlane["workerTurns"]["shutdown"]>> | null = null;
+    try {
+      workers = await this.cp.workerTurns.shutdown();
+    } catch (error) {
+      drainFailure = error;
+    }
+    const verdictKnown = workers !== null && typeof workers?.gitStopped === "boolean";
     this.wakeBootstrap("ABANDONED");
     for (const timer of this.#timers) clearInterval(timer);
     this.#timers = [];
@@ -4130,20 +4197,37 @@ export class Daemon {
     // and the lock goes stale, acquisition still refuses while any named group may still run, and
     // reclaims once each is gone — matched by group id and its leader's start time, so a reused id
     // never fences forever. A stop that names no group fences until an operator removes the fence.
-    const lockRetained = !workers.gitStopped;
-    // ACP-WORKER-03-FC-EMPTY: an incomplete stop that names no group is fenced as an unknown one.
+    const lockRetained = !verdictKnown || !workers!.gitStopped;
+    // ACP-WORKER-03-FC-EMPTY: an incomplete stop that names no group (or has no verdict to name any) is
+    // fenced as an unknown one.
     const fencedGroups = lockRetained
-      ? (workers.unconfirmedGroups && workers.unconfirmedGroups.length > 0 ? workers.unconfirmedGroups : null)
+      ? (verdictKnown && workers!.unconfirmedGroups && workers!.unconfirmedGroups.length > 0 ? workers!.unconfirmedGroups : null)
       : [];
     if (lockRetained) this.lock.fence(fencedGroups, this.cp.clock.nowIso());
-    this.cp.audit.record({
-      kind: "DAEMON_STOPPED",
-      evidence: {
-        pid: process.pid, drained: workers.drained, executions: workers.outstanding, gitStopped: workers.gitStopped, lockRetained,
-        fencedGroups: fencedGroups === null ? null : fencedGroups.map((group) => group.pgid),
-      },
-    });
-    if (!lockRetained) this.lock.release();
+    // The fence is down, and what it says is decided: from here a failure to write the audit row must not
+    // hide it. It is reported with the answer, so the caller keeps the lock for a stop that was incomplete.
+    let auditFailure: unknown = null;
+    try {
+      this.cp.audit.record({
+        kind: "DAEMON_STOPPED",
+        evidence: {
+          pid: process.pid,
+          drained: verdictKnown ? workers!.drained : false,
+          executions: verdictKnown ? workers!.outstanding : [],
+          gitStopped: verdictKnown ? workers!.gitStopped : false,
+          lockRetained,
+          fencedGroups: fencedGroups === null ? null : fencedGroups.map((group) => group.pgid),
+        },
+      });
+    } catch (error) {
+      auditFailure = error;
+    }
+    // Whatever failed, the answer about the workers is settled and reported with it: a drain that threw or
+    // lost an audit row, and the stop's own row, are failures of the stop, and none of them can make an
+    // unconfirmed stop read as complete.
+    const failure = drainFailure ?? (verdictKnown ? workers!.auditError : null) ?? auditFailure;
+    if (failure !== null && failure !== undefined) throw new StopFailure(failure, !lockRetained);
+    if (!lockRetained && options.leaveLockHeld !== true) this.lock.release();
     return { complete: !lockRetained };
   }
 }

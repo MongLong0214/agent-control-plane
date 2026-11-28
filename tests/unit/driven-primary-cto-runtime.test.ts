@@ -1199,7 +1199,7 @@ describe("#246 C4-R1 — a driven PRIMARY_CTO", () => {
         try {
           // The holder is attached on the real conversation port, with a live wake endpoint.
           await vi.waitFor(() => expect(listeners.ctoConversation.connected(binding.roleKey)).toBe(true));
-          const registered = await peer.callTool("role_wake_endpoint_register", { endpoint: endpoint.path });
+          const registered = await peer.callTool("role_owner_message_claim", { roleKey: binding.roleKey });
           expect(registered["ok"]).toBe(true);
           const settled = endpoint.connections();
           expect(settled).toBe(0);

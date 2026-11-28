@@ -6,7 +6,7 @@ import { fileURLToPath } from "node:url";
 
 import { BuzzChannelRelay, type ChannelNotification } from "../buzz/buzz-channel.ts";
 import { buildChannelMcpServer, emitChannelNotification } from "../buzz/buzz-channel-mcp.ts";
-import { ceoPubkeysFromDb, openDaemonReads, queuedBuzzBacklog, type DaemonReads } from "../buzz/buzz-channel-daemon-reads.ts";
+import { answeredSinceReader, backlogReader, ceoPubkeyResolver } from "../buzz/buzz-channel-daemon-reads.ts";
 import {
   appendChannelReceipt,
   fileChannelStateStore,
@@ -31,7 +31,7 @@ import { loadBuzzSubscriberKey, readBuzzSubscriberConfig } from "../buzz/buzz-me
 
 const USAGE =
   "usage: buzz-channel --project-id <id> --key-file <absolute path> --room <room id> [--room <room id>] " +
-  "--state-dir <dir> [--relay-url <wss url>] [--ceo-pubkey <hex>] [--key-encoding hex|nsec]";
+  "--state-dir <dir> [--relay-url <wss url>] [--ceo-pubkey <hex>] [--key-encoding hex|nsec] [--launch-id <id>] [--history-before <unix seconds>]";
 
 interface Args {
   projectId: string;
@@ -41,10 +41,14 @@ interface Args {
   stateDir: string;
   relayUrl: string | null;
   ceoPubkeys: string[];
+  /** The launch that started this server, written into every receipt so the launcher can tell its own. */
+  launchId: string | null;
+  /** A fresh conversation's switch time: a message signed before it is shown as history. */
+  historyBefore: number | null;
 }
 
-const parseArgs = (argv: readonly string[]): Args => {
-  const out: Args = { projectId: "", keyFile: "", keyEncoding: "hex", rooms: [], stateDir: "", relayUrl: null, ceoPubkeys: [] };
+export const parseBuzzChannelArgs = (argv: readonly string[]): Args => {
+  const out: Args = { projectId: "", keyFile: "", keyEncoding: "hex", rooms: [], stateDir: "", relayUrl: null, ceoPubkeys: [], launchId: null, historyBefore: null };
   for (let i = 0; i < argv.length; i += 2) {
     const flag = argv[i];
     const value = argv[i + 1];
@@ -58,6 +62,13 @@ const parseArgs = (argv: readonly string[]): Args => {
     else if (flag === "--state-dir") out.stateDir = value;
     else if (flag === "--relay-url") out.relayUrl = value;
     else if (flag === "--ceo-pubkey") out.ceoPubkeys.push(value);
+    else if (flag === "--launch-id") {
+      if (!/^[A-Za-z0-9][A-Za-z0-9-]{3,63}$/u.test(value)) throw new Error("--launch-id must be 4 to 64 letters, digits or dashes");
+      out.launchId = value;
+    } else if (flag === "--history-before") {
+      if (!/^[0-9]{1,12}$/u.test(value)) throw new Error("--history-before must be unix seconds");
+      out.historyBefore = Number(value);
+    }
     else throw new Error(`unknown argument ${flag}`);
   }
   if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/u.test(out.projectId)) throw new Error("--project-id is required");
@@ -72,48 +83,35 @@ const log = (line: string): void => {
   process.stderr.write(`buzz-channel: ${line}\n`);
 };
 
-/**
- * The bound CEO actor, read from the daemon's database when a message arrives rather than copied at launch, so a CEO
- * re-claim is followed, and by the daemon's own rule (see `ceoPubkeysFromDb`). Cached for a few seconds; nobody is heard
- * while the database cannot be read.
- */
-const canonicalCeoResolver = (reads: () => DaemonReads | null): (() => readonly string[]) => {
-  let cachedAt = 0;
-  let cached: readonly string[] = [];
-  return () => {
-    const now = Date.now();
-    if (now - cachedAt < 5_000) return cached;
-    cachedAt = now;
-    try {
-      const db = reads();
-      return (cached = db === null ? [] : ceoPubkeysFromDb(db));
-    } catch {
-      return (cached = []);
-    }
-  };
-};
-
 export const runBuzzChannel = async (argv: readonly string[]): Promise<number> => {
   let args: Args;
   try {
-    args = parseArgs(argv);
+    args = parseBuzzChannelArgs(argv);
   } catch (error) {
     log(`${(error as Error).message}\n${USAGE}`);
     return 2;
   }
 
   let relay!: BuzzChannelRelay;
-  const server = buildChannelMcpServer((input) => relay.reply(input));
+  // Claude Code completing the MCP handshake is the moment it has the server and its channel capability. A CTO with nothing
+  // queued emits no message, so this receipt, carrying the launch id, is what lets the launcher tell the channel came up.
+  const server = buildChannelMcpServer((input) => relay.reply(input), () => {
+    try {
+      appendChannelReceipt(args.stateDir, args.projectId, { type: "registered", registeredAt: Math.floor(Date.now() / 1000) }, args.launchId ?? undefined);
+    } catch {
+      log("the registration receipt could not be written");
+    }
+  });
 
   try {
     const relayUrl = args.relayUrl ?? readBuzzSubscriberConfig(args.stateDir)?.relayUrl ?? process.env["ACP_BUZZ_RELAY_URL"];
     if (!relayUrl?.startsWith("wss://")) throw new Error("no wss relay url: pass --relay-url or configure the daemon's relay");
     const key = loadBuzzSubscriberKey({ privateKeyFile: args.keyFile, encoding: args.keyEncoding, rooms: args.rooms }, "channel identity");
     trimChannelReceipts(args.stateDir, args.projectId);
-    // One read-only handle on the daemon's database, opened when first needed and again if it could not be.
-    let daemon: DaemonReads | null = null;
-    const reads = (): DaemonReads | null => (daemon ??= openDaemonReads(args.stateDir));
-    const ceoPubkeys = args.ceoPubkeys.length > 0 ? (): readonly string[] => args.ceoPubkeys : canonicalCeoResolver(reads);
+    // The bound CEO is read from the daemon's database when a message arrives, not copied at launch, so a CEO re-claim is
+    // followed, and by the daemon's own rule. The database is opened for each read and closed again: this process holds
+    // nothing of the daemon's between reads, so a deploy that stops the daemon finds no holder.
+    const ceoPubkeys = args.ceoPubkeys.length > 0 ? (): readonly string[] => args.ceoPubkeys : ceoPubkeyResolver(args.stateDir);
     relay = new BuzzChannelRelay({
       relayUrl,
       projectId: args.projectId,
@@ -123,16 +121,18 @@ export const runBuzzChannel = async (argv: readonly string[]): Promise<number> =
       ownerPubkeys: readBuzzOwnerPubkeys(args.stateDir),
       store: fileChannelStateStore(args.stateDir, args.projectId),
       // What the daemon's queue still holds for this role: delivered once, oldest first, when the relay first accepts the channel.
-      backlog: () => {
-        const db = reads();
-        return db === null ? [] : queuedBuzzBacklog(db, args.projectId);
-      },
+      backlog: backlogReader(args.stateDir, args.projectId),
+      // This CTO's own replies are asked for back to the oldest message still queued, so one posted by any path completes it.
+      answeredSince: answeredSinceReader(args.stateDir, args.projectId),
+      ...(args.historyBefore === null ? {} : { historyBefore: args.historyBefore }),
       onNotification: (n: ChannelNotification) => emitChannelNotification(server, n),
       onReceipt: (receipt) => {
         try {
-          appendChannelReceipt(args.stateDir, args.projectId, receipt);
+          appendChannelReceipt(args.stateDir, args.projectId, receipt, args.launchId ?? undefined);
+          return true;
         } catch {
           log("a receipt could not be written; the message stays pending in the control plane's queue");
+          return false;
         }
       },
       onDiagnostic: log,

@@ -47,7 +47,7 @@ const capsules: string[] = [];
 afterAll(() => { for (const root of capsules) rmSync(dirname(root), { recursive: true, force: true }); });
 
 const REVIEWER = {
-  preferred: { provider: "gpt", model: "gpt-6.1-sol", effort: "xhigh" },
+  preferred: { provider: "gpt", model: "gpt-6.2-sol", effort: "xhigh" },
   fallbacks: [{ provider: "claude", model: "opus", effort: null }],
 } as const;
 const harnessOptions = { reviewer: { preferred: { ...REVIEWER.preferred }, fallbacks: [{ ...REVIEWER.fallbacks[0] }] } };
@@ -213,7 +213,7 @@ describe("the packet reviewer falls back to claude only when its scope is UNCONF
       expect(fallback).toHaveLength(1);
       expect(fallback[0]!.evidence).toMatchObject({
         from: "gpt",
-        preferredModel: "gpt-6.1-sol",
+        preferredModel: "gpt-6.2-sol",
         provider: "claude",
         model: "opus",
         reason: REVIEWER_FALLBACK_SCOPE_UNCONFIGURED,

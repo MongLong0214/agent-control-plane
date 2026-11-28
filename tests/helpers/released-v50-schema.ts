@@ -39,8 +39,39 @@ export const V58_ADDED_TRIGGERS = [
 ];
 export const V58_CHANGED_GUARDS = ["actor_target_bindings_immutable"];
 
+/** The two triggers v60 adds, named independently of the migration. */
+export const V60_ADDED_TRIGGERS = ["runs_review_completion_bootstrap_only", "runs_kind_immutable"];
+
+/** The objects v61 adds, and the one guard it replaces, named independently of the migration. */
+export const V61_ADDED_TRIGGERS = [
+  "repository_identity_renames_no_replace", "repository_identity_renames_names_the_current_repository",
+  "repository_identity_renames_immutable", "repository_identity_renames_no_delete",
+];
+export const V61_CHANGED_GUARDS = ["projects_active_manifest_moves_by_grant"];
+
+/** A fixture built from a current database that claims to predate v61 holds no rename table and v60's pointer guard. */
+export const takeBackV61 = (raw: Database.Database): void => {
+  const snapshot = readFileSync(new URL("../../src/db/schema-v60.sql", import.meta.url), "utf8");
+  // The replaced guard first: its v61 body names the rename table, so it must go before the table does.
+  for (const name of V61_CHANGED_GUARDS) {
+    const ddl = new RegExp(`CREATE TRIGGER IF NOT EXISTS ${name}\\n[\\s\\S]*?\\nEND;`).exec(snapshot)?.[0];
+    if (!ddl) throw new Error(`${name} is absent from the v60 snapshot`);
+    raw.exec(`DROP TRIGGER IF EXISTS ${name}`);
+    raw.exec(ddl);
+  }
+  for (const name of V61_ADDED_TRIGGERS) raw.exec(`DROP TRIGGER IF EXISTS ${name}`);
+  raw.exec(`DROP TABLE IF EXISTS repository_identity_renames`);
+};
+
+/** A fixture built from a current database that claims to predate v60 holds no review-completion trigger. */
+export const takeBackV60 = (raw: Database.Database): void => {
+  takeBackV61(raw);
+  for (const name of V60_ADDED_TRIGGERS) raw.exec(`DROP TRIGGER IF EXISTS ${name}`);
+};
+
 /** A fixture built from a current database that claims to predate v59 holds no tasks.plan_key column or index. */
 export const takeBackV59 = (raw: Database.Database): void => {
+  takeBackV60(raw);
   raw.exec(`DROP INDEX IF EXISTS tasks_run_plan_key`);
   if (!(raw.pragma("table_xinfo(tasks)") as Array<{ name: string }>).some((column) => column.name === "plan_key")) return;
   raw.exec(`ALTER TABLE tasks DROP COLUMN plan_key`);

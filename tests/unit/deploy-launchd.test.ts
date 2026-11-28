@@ -37,15 +37,11 @@ const template = join(deploy, "com.agentcontrolplane.agentcpd.plist.template");
 const label = "com.agentcontrolplane.agentcpd";
 /**
  * What `install-launchd.sh` provisions and the generated launcher forwards and then unsets — the
- * installer's list, which this suite pins field by field. It is still six. The daemon's own
- * activation group is three (`agentcpd.ts` `CANONICAL_ACTIVATION_VARS`): the three executor-image
- * variables here reach the daemon and are read by nothing, which `daemon-startup.test.ts` asserts.
+ * installer's list, which this suite pins field by field. It is the daemon's own activation group
+ * (`agentcpd.ts` `CANONICAL_ACTIVATION_VARS`).
  */
 const CANONICAL_ACTIVATION_VARIABLES = [
   "ACP_CANONICAL_SESSIONS_JSON",
-  "ACP_CANONICAL_REQUIRED_EXECUTOR_VERSION",
-  "ACP_CANONICAL_EXPECTED_EXECUTOR_REALPATH",
-  "ACP_CANONICAL_EXPECTED_EXECUTOR_SHA256",
   "ACP_CANONICAL_CTO_PEER_PROTOCOL",
   "ACP_CANONICAL_CTO_BUZZ_PURPOSE",
 ] as const;
@@ -330,9 +326,7 @@ if [[ "$target" == *"agentcpd.js" ]]; then
     "$(started_of "\${ACP_CLAUDE_BINARY:-}"),$(started_of "\${ACP_CODEX_BINARY:-}")" \\
     "$(command -v node || printf '<unresolvable>')" \\
     "$(command -v acp-sibling-probe || printf '<unresolvable>')" \\
-    "\${ACP_CANONICAL_SESSIONS_JSON-}" "\${ACP_CANONICAL_REQUIRED_EXECUTOR_VERSION-}" \\
-    "\${ACP_CANONICAL_EXPECTED_EXECUTOR_REALPATH-}" "\${ACP_CANONICAL_EXPECTED_EXECUTOR_SHA256-}" \\
-    "\${ACP_CANONICAL_CTO_PEER_PROTOCOL-}" "\${ACP_CANONICAL_CTO_BUZZ_PURPOSE-}" \\
+    "\${ACP_CANONICAL_SESSIONS_JSON-}" "\${ACP_CANONICAL_CTO_PEER_PROTOCOL-}" "\${ACP_CANONICAL_CTO_BUZZ_PURPOSE-}" \\
     "$(command -v lsof || printf '<unresolvable>')" "$(lsof_scan)" \\
     "\${ACP_HERMES_LINEAGE_ROOT_DIGEST-}" "\${ACP_HERMES_EXECUTABLE-}" \\
     "\${ACP_HERMES_PROFILE-}" "\${ACP_HERMES_HOME-}" \\
@@ -1385,6 +1379,13 @@ exec /bin/cp "$@"
     expect(telegramOwner).toBe("");
     expect(telegramChat).toBe("");
     expect(telegramSecret).toBe("");
+  });
+
+  it("names none of the withdrawn executor pin variables", () => {
+    const harness = makeHarness();
+    expect(installWithPins(harness).status).toBe(0);
+    const launcher = readFileSync(launcherPath(harness), "utf8");
+    expect(launcher).not.toMatch(/REQUIRED_EXECUTOR|EXPECTED_EXECUTOR/);
   });
 
   it("clears all inherited canonical activation values together before any Keychain lookup", () => {

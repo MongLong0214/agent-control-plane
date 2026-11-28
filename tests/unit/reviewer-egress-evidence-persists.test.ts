@@ -17,7 +17,7 @@ afterAll(cleanupTempDirs);
  */
 const GATES = [
   { provider: "scripted", model: "scripted-reviewer" },
-  { provider: "gpt", model: "gpt-6.1-sol" },
+  { provider: "gpt", model: "gpt-6.2-sol" },
 ] as const;
 
 const harnessFor = (provider: (typeof GATES)[number]["provider"], model: string) => {

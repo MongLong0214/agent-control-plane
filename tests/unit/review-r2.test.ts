@@ -458,7 +458,7 @@ const gateWithReviewerPreferences = (
   setup.harness.cp.repositories,
   setup.harness.cp.telemetry,
   {
-    preferred: { provider: preferred.provider, model: "gpt-6.1-sol", effort: "xhigh" },
+    preferred: { provider: preferred.provider, model: "gpt-6.2-sol", effort: "xhigh" },
     fallbacks: [{ provider: fallback.provider, model: "opus", effort: null }],
   },
 );

@@ -9,6 +9,7 @@ import type { AuditLog } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
 import { RunState } from "../domain/types.ts";
 import { canonical } from "../guard/workspace-probe.ts";
+import { identityChainJson } from "../registry/repository-identity-chain.ts";
 import type { BindingRegistry } from "../session/binding-registry.ts";
 
 /** The run states in which its frozen candidate is the one reviewed or approved, and so the one merged. */
@@ -525,8 +526,9 @@ export class ClaimRegistry {
 
     const held = this.db.get<{ claim_id: string; run_id: string; owner_session_id: string }>(
       `SELECT c.claim_id, c.run_id, c.owner_session_id FROM resource_claims c
-        WHERE ${standingClaimSql("c")} AND c.repository_identity = ? AND c.${column} = ? AND c.run_id <> ?`,
-      [request.repositoryIdentity, value, request.runId],
+        WHERE ${standingClaimSql("c")} AND c.repository_identity IN (SELECT value FROM json_each(?)) AND c.${column} = ? AND c.run_id <> ?`,
+      // v61: a standing claim written under an earlier name of the repository still holds the same target.
+      [identityChainJson(this.db, request.repositoryIdentity), value, request.runId],
     );
     if (!held) return null;
 
@@ -684,8 +686,8 @@ export class ClaimRegistry {
     return this.readAfterExpirySweep(() => {
       const others = this.db.all<{ run_id: string; declared_path: string }>(
         `SELECT run_id, declared_path FROM resource_claims
-          WHERE status = 'HELD' AND repository_identity = ? AND run_id <> ? AND declared_path IS NOT NULL`,
-        [repositoryIdentity, runId],
+          WHERE status = 'HELD' AND repository_identity IN (SELECT value FROM json_each(?)) AND run_id <> ? AND declared_path IS NOT NULL`,
+        [identityChainJson(this.db, repositoryIdentity), runId],
       );
       const overlaps: Array<{ path: string; otherRun: string; otherPath: string }> = [];
       for (const path of paths.map(normalizePath)) {

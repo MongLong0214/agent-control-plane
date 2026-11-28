@@ -76,6 +76,12 @@ export const RECEIPT_BYTES_SHA256 =
  *
  * `src/db/schema-v58.sql` is likewise `git show fab8b168:src/db/schema.sql` (v58 as released, frozen as the
  * prerequisite of v59's tasks.plan_key), and carries that file's git blob id.
+ *
+ * `src/db/schema-v59.sql` is likewise `git show 744e9bef:src/db/schema.sql` (v59 as released, frozen as the
+ * prerequisite of v60's review-completion trigger), and carries that file's git blob id.
+ *
+ * `src/db/schema-v60.sql` is likewise `git show d1e2b128:src/db/schema.sql` (v60 as released, frozen as the
+ * prerequisite of v61's repository rename), and carries that file's git blob id.
  */
 export const FROZEN_BLOBS: ReadonlyArray<{ path: string; sha256: string; gitBlob?: string }> = [
   {
@@ -83,9 +89,10 @@ export const FROZEN_BLOBS: ReadonlyArray<{ path: string; sha256: string; gitBlob
     // v53 appends verification history and freezes v52's released schema; #1189's v54 run-state exits
     // step freezes v53's, #1189 B5's v55 (the two state guards) freezes v54's, and #1234's v56 (the
     // manifest-pointer guard) freezes v55's, and v57 (the canonical entitlement transfer table) freezes v56's, and
-    // v58 (the canonical CTO switchover table) freezes v57's, and v59 (tasks.plan_key) freezes v58's.
+    // v58 (the canonical CTO switchover table) freezes v57's, and v59 (tasks.plan_key) freezes v58's, and v60 (the
+    // review-completion trigger) freezes v59's, and v61 (the repository rename table) freezes v60's.
     // Replayed lineage and compiled upgrades still bind the unchanged historical SQL, trace and receipt pins below.
-    sha256: "b00774c0b9f6ceb3e6d5fd780faf68195e3b27cf362edd776ff538cadf55cea2",
+    sha256: "017daebda71704ffa68ec739b469ea18d2716c78e6d7aa00adb8e7ac50bf8821",
   },
   {
     path: "src/db/schema-v37.sql",
@@ -163,6 +170,16 @@ export const FROZEN_BLOBS: ReadonlyArray<{ path: string; sha256: string; gitBlob
     path: "src/db/schema-v58.sql",
     sha256: "d865af6577a5ae60f1b1864f6a2def2a515479a69f65b9be4b2a7abf9d7f4d99",
     gitBlob: "439729122ed31be944b72c16d3d587a13114605f",
+  },
+  {
+    path: "src/db/schema-v59.sql",
+    sha256: "ebcc06641ab3ceadbcb2d2dcf81092593efff11d9353ea515ff884bdacd0d2a6",
+    gitBlob: "7c2c8a2a6381dcd862217020a3ed97c097531b55",
+  },
+  {
+    path: "src/db/schema-v60.sql",
+    sha256: "3fa78603e9a8d7d64a3b7122394f8b0e7d279d798a29f98c50203bbc871a7aed",
+    gitBlob: "e5f124254db4c87105b78afb792ebc275b1c3cca",
   },
   {
     path: "tests/fixtures/schema-v13.sql",

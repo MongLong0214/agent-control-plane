@@ -9,7 +9,7 @@ import { isAcpError } from "../../src/core/errors.ts";
 import { newAssignmentId, normalizeRemoteIdentity } from "../../src/core/ids.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { canTransition, isTerminal } from "../../src/domain/run-state.ts";
-import { RunState, SessionLifecycle } from "../../src/domain/types.ts";
+import { RunKind, RunState, SessionLifecycle } from "../../src/domain/types.ts";
 import { ManagedWriteGuard, ReadOperation, WriteOperation } from "../../src/guard/managed-write-guard.ts";
 import { fakeWorkspaceProbe, realWorkspaceProbe } from "../../src/guard/workspace-probe.ts";
 import { MessageKind } from "../../src/outbox/envelope.ts";
@@ -84,6 +84,13 @@ describe("run state machine (PRD §29.2)", () => {
     for (const target of Object.values(RunState)) {
       expect(canTransition(RunState.BLOCKED_POST_MERGE, target).allowed).toBe(target === RunState.POST_MERGE_VERIFYING);
     }
+  });
+
+  it("completes from CEO review only a PROJECT_BOOTSTRAP run", () => {
+    for (const kind of [RunKind.STANDARD_WORK, RunKind.CONTRACT_CHANGE]) {
+      expect(canTransition(RunState.READY_FOR_CEO_REVIEW, RunState.COMPLETED, kind).reasonCode).toBe(ReasonCode.RUN_TRANSITION_ILLEGAL);
+    }
+    expect(canTransition(RunState.READY_FOR_CEO_REVIEW, RunState.COMPLETED, RunKind.PROJECT_BOOTSTRAP).allowed).toBe(true);
   });
 });
 
@@ -505,7 +512,7 @@ describe("outbox fencing (PRD §15.7, §27.5)", () => {
   });
 
   it("expires overdue messages instead of delivering them late", () => {
-    const { outbox, clock } = enqueue(MessageKind.REVIEW_REQUEST);
+    const { outbox, clock } = enqueue(MessageKind.HANDOFF_PACKAGE);
     clock.advance(31 * 60 * 1000);
     expect(outbox.expireOverdue()).toBe(1);
     expect(outbox.claimDeliverable()).toHaveLength(0);

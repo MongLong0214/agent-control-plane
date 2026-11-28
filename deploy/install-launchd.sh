@@ -13,7 +13,7 @@ Usage:
   deploy/install-launchd.sh start | stop | restart | status | uninstall
   deploy/install-launchd.sh upgrade --app-root PATH [--node PATH] [--keychain-service NAME]
   deploy/install-launchd.sh rollback --pair-id UUID --expected-index-digest sha256:HEX \
-    --expect-schema-version N --expect-service-generation NAME --expect-node-version vX.Y.Z
+    --expect-schema-version N --expect-service-generation NAME --expect-node-version vX.Y.Z [--replacement-database IMAGE]
 
 rollback restores one sealed pair, named by its UUID under
 $HOME/.agent-control-plane/rollback-pairs/. It selects nothing implicitly: the pair holds the
@@ -70,6 +70,8 @@ expected_index_digest=""
 expect_schema_version=""
 expect_service_generation=""
 expect_node_version=""
+replacement_database=""
+replacement_database_given=0
 no_start=0
 
 while [[ $# -gt 0 ]]; do
@@ -90,6 +92,8 @@ while [[ $# -gt 0 ]]; do
       expect_service_generation="${2:-}"; shift 2 ;;
     --expect-node-version)
       expect_node_version="${2:-}"; shift 2 ;;
+    --replacement-database)
+      replacement_database_given=1; replacement_database="${2:-}"; shift 2 ;;
     --no-start)
       no_start=1; shift ;;
     --help|-h)
@@ -532,12 +536,8 @@ buzz_key_from_desktop_secrets() {
 # Clear the entire activation group before any credential lookup can inherit a partial group.
 #
 # The group is three variables: ACP_CANONICAL_SESSIONS_JSON, ACP_CANONICAL_CTO_PEER_PROTOCOL and
-# ACP_CANONICAL_CTO_BUZZ_PURPOSE. The three ACP_CANONICAL_*_EXECUTOR_* names cleared here and
-# exported in the loop below are the executor pins the claim used to require. The daemon no longer
-# reads them: they neither activate the group nor make it partial, and a Keychain that still holds
-# them is not refused (deploy/README.md). They are left in both lists because passing through a
-# value nothing reads is not a claim about it; removing them is a separate cleanup.
-unset ACP_CANONICAL_SESSIONS_JSON ACP_CANONICAL_REQUIRED_EXECUTOR_VERSION ACP_CANONICAL_EXPECTED_EXECUTOR_REALPATH ACP_CANONICAL_EXPECTED_EXECUTOR_SHA256 ACP_CANONICAL_CTO_PEER_PROTOCOL ACP_CANONICAL_CTO_BUZZ_PURPOSE
+# ACP_CANONICAL_CTO_BUZZ_PURPOSE.
+unset ACP_CANONICAL_SESSIONS_JSON ACP_CANONICAL_CTO_PEER_PROTOCOL ACP_CANONICAL_CTO_BUZZ_PURPOSE
 
 export ACP_MCP_TOKEN="$(required_keychain_value ACP_MCP_TOKEN)"
 export ACP_OPERATOR_TOKEN="$(required_keychain_value ACP_OPERATOR_TOKEN)"
@@ -553,9 +553,7 @@ for optional in ACP_OPERATOR_ACTOR BUZZ_PRIVATE_KEY ACP_BUZZ_INGRESS_SECRET ACP_
   ACP_TELEGRAM_POLL_TIMEOUT_SECONDS ACP_TELEGRAM_RETRY_DELAY_MS \
   ACP_TELEGRAM_DEFAULT_PROJECT_ID ACP_TELEGRAM_API_BASE_URL ACP_TELEGRAM_TRANSPORT_RETENTION_MS \
   ACP_TELEGRAM_EXTERNAL_CONSUMER ACP_TELEGRAM_EXTERNAL_SECRET ACP_DAEMON_NOTICE_ENABLED ACP_DAEMON_NOTICE_PROBE \
-  ACP_CANONICAL_SESSIONS_JSON ACP_CANONICAL_REQUIRED_EXECUTOR_VERSION \
-  ACP_CANONICAL_EXPECTED_EXECUTOR_REALPATH ACP_CANONICAL_EXPECTED_EXECUTOR_SHA256 \
-  ACP_CANONICAL_CTO_PEER_PROTOCOL ACP_CANONICAL_CTO_BUZZ_PURPOSE \
+  ACP_CANONICAL_SESSIONS_JSON ACP_CANONICAL_CTO_PEER_PROTOCOL ACP_CANONICAL_CTO_BUZZ_PURPOSE \
   ACP_HERMES_LINEAGE_ROOT_DIGEST ACP_HERMES_EXECUTABLE ACP_HERMES_PROFILE \
   ACP_HERMES_HOME ACP_HERMES_EXECUTOR_RUNTIME_IDENTITY ACP_HERMES_GATEWAY_API_KEY \
   ACP_REVIEWER_CODEX_HOME; do
@@ -965,9 +963,11 @@ case "$command_name" in
     coordinator="$DEFAULT_APP_ROOT/dist/deploy/rollback-pair.js"
     [[ -f "$coordinator" ]] || fail "rollback coordinator build missing from this installer's checkout: $coordinator"
     declared_high_water=""
+    declared_replacement=""
     if coordinator_guards="$("$node_path" "$coordinator" guards)"; then
       while IFS='=' read -r guard_key guard_value; do
         if [[ "$guard_key" == "ACP_ROLLBACK_DATABASE_HIGH_WATER" ]]; then declared_high_water="$guard_value"; fi
+        if [[ "$guard_key" == "ACP_ROLLBACK_REPLACEMENT_DATABASE" ]]; then declared_replacement="$guard_value"; fi
       done <<< "$coordinator_guards"
     fi
     [[ "$declared_high_water" =~ ^agent-control-plane\.database-content/v[0-9]+$ ]] ||
@@ -1000,6 +1000,20 @@ case "$command_name" in
       --expect-node-version "$expect_node_version"
       --stage-parent "$state_dir/rollback-stage"
     )
+    # Optional: a converted copy to install instead of the pair's own database image. Handed to the
+    # coordinator as given; it checks the image, its manifest and its source record. A coordinator
+    # that does not declare the flag would ignore it and run a plain rollback, so it is refused here.
+    # An empty value (an unset variable, say) is refused rather than dropped: dropping it would run a
+    # plain rollback when the operator asked for a replacement.
+    if [[ "$replacement_database_given" == "1" ]]; then
+      [[ -n "$replacement_database" ]] ||
+        fail "--replacement-database requires a path to the converted image"
+      [[ "$replacement_database" == /* ]] ||
+        fail "--replacement-database must be an absolute path: $replacement_database"
+      [[ -n "$declared_replacement" ]] ||
+        fail "the rollback coordinator in this installer's checkout does not declare --replacement-database; run deploy/install-launchd.sh from a checkout built with it and pass --app-root"
+      rollback_flags+=(--replacement-database "$replacement_database")
+    fi
 
     # Everything below this line is one generation being replaced. The command installs the sealed
     # runtime closure, plist, launcher and database together — restoring the database through the

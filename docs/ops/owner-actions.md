@@ -535,8 +535,17 @@ item 6 restores it as one operation.
     CLOSURE="$HOME/.agent-control-plane/closure-$(date -u +%Y%m%dT%H%M%SZ)"
     mkdir -p "$CLOSURE" && chmod 700 "$CLOSURE"
     cp -Rc "$APP_ROOT/dist/." "$CLOSURE/"
-    cp -RcL "$APP_ROOT/node_modules" "$CLOSURE/node_modules"
+    # Not `cp -RcL "$APP_ROOT/node_modules"`: that copy dereferences pnpm's symlinks into real
+    # directories at the top level, where a package's own dependencies (`@noble/hashes`, which
+    # `nostr-tools` needs) are not, so the sealed `state-admin.js` cannot start and the rollback
+    # fails at its database step. This installs the same lockfile's production dependencies as a
+    # hoisted, symlink-free tree that resolves on its own; it needs `pnpm` on PATH. It installs
+    # under the closure's own `bin/node` and loads better-sqlite3 and nostr-tools with it before
+    # it succeeds, so an addon built for a different Node is refused here, not at rollback. On a
+    # pnpm cache miss that addon is fetched by `prebuild-install` or built by `node-gyp`, and the
+    # lockfile's integrity hashes do not cover it.
     chmod 755 "$CLOSURE/bin/node"
+    "$APP_ROOT/deploy/closure-node-modules.sh" "$APP_ROOT" "$CLOSURE/node_modules" "$CLOSURE/bin/node"
     node "$APP_ROOT/dist/deploy/rollback-pair.js" seal \
       --pairs-root "$HOME/.agent-control-plane/rollback-pairs" \
       --database "$HOME/.agent-control-plane/state.sqlite" \
@@ -845,6 +854,7 @@ leaving *and*, later, the one you are moving to as its return leg. A producer th
 the generation it is running under would make a rollback a one-way door. Substitute your own
 checkout path for `$APP_ROOT`:
 
+    set -euo pipefail
     APP_ROOT=/absolute/path/to/agent-control-plane
     # The closure is what gets sealed, and it carries its own interpreter, native extension and
     # dependencies. A pair that named an external `node` (or an extension living outside `dist`)
@@ -858,8 +868,17 @@ checkout path for `$APP_ROOT`:
     CLOSURE="$HOME/.agent-control-plane/closure-$(date -u +%Y%m%dT%H%M%SZ)"
     mkdir -p "$CLOSURE" && chmod 700 "$CLOSURE"
     cp -Rc "$APP_ROOT/dist/." "$CLOSURE/"
-    cp -RcL "$APP_ROOT/node_modules" "$CLOSURE/node_modules"
+    # Not `cp -RcL "$APP_ROOT/node_modules"`: that copy dereferences pnpm's symlinks into real
+    # directories at the top level, where a package's own dependencies (`@noble/hashes`, which
+    # `nostr-tools` needs) are not, so the sealed `state-admin.js` cannot start and the rollback
+    # fails at its database step. This installs the same lockfile's production dependencies as a
+    # hoisted, symlink-free tree that resolves on its own; it needs `pnpm` on PATH. It installs
+    # under the closure's own `bin/node` and loads better-sqlite3 and nostr-tools with it before
+    # it succeeds, so an addon built for a different Node is refused here, not at rollback. On a
+    # pnpm cache miss that addon is fetched by `prebuild-install` or built by `node-gyp`, and the
+    # lockfile's integrity hashes do not cover it.
     chmod 755 "$CLOSURE/bin/node"
+    "$APP_ROOT/deploy/closure-node-modules.sh" "$APP_ROOT" "$CLOSURE/node_modules" "$CLOSURE/bin/node"
     node "$APP_ROOT/dist/deploy/rollback-pair.js" seal \
       --pairs-root "$HOME/.agent-control-plane/rollback-pairs" \
       --database "$HOME/.agent-control-plane/state.sqlite" \
@@ -935,6 +954,567 @@ build"` (thrown by `applySchema` in `src/db/database.ts`) — and with
 `KeepAlive.SuccessfulExit = false` and a 30 s
 `ThrottleInterval`, launchd retries that failure forever. Both restores must complete, in either
 order, while the job is stopped, before the next `start`.
+
+### Restore a stopped v60 database to v59 (single path, 60→59 only)
+
+This is the one way to turn a schema v60 (#1464) database into a v59 one that keeps the data written
+under v60. It produces and verifies a converted copy; installing that copy as the operational
+database uses the replacement-database path at the end of this section. It is written for one source and one target and it refuses everything else; there is no flag to widen
+it, and a second variant for another version pair is not a smaller version of this one — it is a
+different procedure that needs its own rehearsal. It exists because the sealed pair above restores
+the database image it sealed, and that image predates whatever the daemon wrote after it.
+
+It is a procedure, not a command: nothing in `src/` runs it, and `state-admin` has no verb for it.
+Every step is something an operator reads, runs and checks.
+
+**What it applies to.** The source is a database at `user_version` 60 whose `schema_migrations`
+holds the v60 row exactly — `version = 60`, `migration_id = 'v60-review-completion-bootstrap-only'`,
+`checksum = 'sha256:65511a8e156217490cf3b92da02b673e13832007425b438a8cc76cefb15e1a68'` — and whose
+triggers are exactly the v59 set plus `runs_review_completion_bootstrap_only` and
+`runs_kind_immutable`. The target is the v59 build: main at `47451b33`, or the v59 build pinned in the
+rollback pair, whichever the owner names. Nothing else — not v61, not a v60 database with a second
+change, not a v59 database. A database *created* at v60 rather than migrated to it carries the ledger
+row `bootstrap-v60`, not the one above, so the ledger guard refuses it; that is intended.
+
+**Preconditions.** All of these hold, and each of 1 to 4 is checked again immediately before and
+immediately after the copy is taken. If any differs at any of those points, the copy is discarded and
+the procedure stops.
+
+1. The daemon is stopped and `~/.agent-control-plane/agentcpd.lock` is free: the wait, with its
+   `exit 1` and not a warning, in step 3 ("Stop the job, then rebuild the candidate…") of the section
+   "4. Reconcile the deployed daemon with candidate main — blocks #512".
+2. `state.sqlite-journal` does not exist.
+3. `state.sqlite-wal` is absent or zero bytes.
+4. The source main file's SHA-256 is the one recorded at the start.
+5. Work only on a copy, in a directory made new for this run. The source is never opened for
+   writing, never renamed and never repaired.
+
+The copy is read through an immutable open, and an immutable open promises SQLite that nothing will
+change the file, so SQLite skips both journal recovery and the WAL. A `state.sqlite-journal` left by a
+stopped writer can leave pages in the main file from a transaction that never committed, which
+recovery would roll back and the copy would keep: the copy captures uncommitted data. A non-empty
+`state.sqlite-wal` holds committed pages that are not in the main file yet, and the copy would not
+see them: the copy misses committed data. Neither failure is an error; the copy opens cleanly. A lock
+that is not free, or a main file whose digest moves, says a writer is or was active, and either of
+the other two may be appearing as the copy is taken. A journal or non-empty WAL on a stopped daemon is
+a stop, not something to recover or checkpoint here.
+
+Run this as one block, in one `bash` that you keep for the conversion step below, so the function and
+the variables are the same ones:
+
+    set -euo pipefail
+    STATE="$HOME/.agent-control-plane"
+    SRC="$STATE/state.sqlite"
+    quiet() {
+      [ ! -e "$STATE/agentcpd.lock" ] || { echo "the agentcpd lock is not free" >&2; return 1; }
+      [ ! -e "$SRC-journal" ] || { echo "state.sqlite-journal exists" >&2; return 1; }
+      [ ! -s "$SRC-wal" ] || { echo "state.sqlite-wal is not empty" >&2; return 1; }
+      [ "$(stat -f %HT "$SRC")" = "Regular File" ] || { echo "the source is not a regular, non-symlink file" >&2; return 1; }
+      [ "$(shasum -a 256 < "$SRC")" = "$SOURCE_SHA" ] || { echo "the source main file changed" >&2; return 1; }
+    }
+    SOURCE_SHA="$(shasum -a 256 < "$SRC")"
+    # A new, unique path; mkdir without -p fails, and set -e stops, if anything already exists there.
+    WORK="$STATE/downgrade-60-59-$(date -u +%Y%m%dT%H%M%SZ)-$(uuidgen)"
+    mkdir -m 700 "$WORK"
+    echo "work directory: $WORK"
+    COPY="$WORK/state.sqlite"
+    printf '%s\n' "$SOURCE_SHA" > "$WORK/source.sha256.before"
+    quiet || { rm -f "$COPY"; exit 1; }
+    sqlite3 "file:$SRC?immutable=1" ".backup '$COPY'"
+    quiet || { rm -f "$COPY"; exit 1; }
+    chmod 600 "$COPY"   # .backup writes 644; the v59 build refuses a state file that is not 600
+    check_copy() {
+      [ "$(stat -f %HT "$COPY")" = "Regular File" ] || { echo "the copy is not a regular, non-symlink file" >&2; return 1; }
+      [ "$(dirname "$(realpath "$COPY")")" = "$(realpath "$WORK")" ] || { echo "the copy is not inside the work directory" >&2; return 1; }
+      [ "$(stat -f %d:%i "$COPY")" != "$(stat -f %d:%i "$SRC")" ] || { echo "the copy is the source" >&2; return 1; }
+    }
+    check_copy || { rm -f "$COPY"; exit 1; }
+    shasum -a 256 < "$COPY" > "$WORK/copy.sha256.before-convert"
+
+Verify the copy before using it: `PRAGMA integrity_check` returns `ok` on it, and its content
+digest (defined under the post-checks) equals the same digest taken from the source opened the
+same immutable way. A copy that cannot be proven equal to the source is not a starting point.
+
+**The reference for the schema comparisons.** The only valid reference for comparing full
+`(type, name, tbl_name, sql)` rows is the database image sealed in this database's own rollback pair,
+taken before the v59→v60 migration: the pair's `database/state.sqlite`, which carries v59's
+`sqlite_schema`. A migrated database keeps the whitespace each older release wrote for its own
+objects, and a database created fresh by the v59 build spells some of them differently, so a fresh
+image fails a valid source. If no such image exists, compare object `type`, `name` and `tbl_name`
+only, against a database created fresh by the pinned v59 build. That is weaker: a changed definition
+under an unchanged name is not caught. Say in the evidence which of the two was used.
+
+The two v60 triggers are compared against the text a v60 migration stores, not against
+`src/db/schema.sql` verbatim. SQLite drops `IF NOT EXISTS` from the stored text, so the literal
+statement never matches. The stored text is the statement in `src/db/schema.sql` from
+`CREATE TRIGGER IF NOT EXISTS <name>` through `END;`, with ` IF NOT EXISTS` removed and the final `;`
+dropped, and no comment above it. A v60 database produced by migrating the reference image holds
+exactly that.
+
+**Guards, checked on the copy, before anything is changed.** Any one of these failing stops the
+procedure. Nothing is repaired to make a guard pass.
+
+- `PRAGMA user_version` is not `60`, or the v60 ledger row is absent, appears more than once, or
+  carries a different `migration_id` or `checksum`, or `max(version)` in `schema_migrations` is not 60.
+- The trigger set is not exactly the reference's set plus `runs_review_completion_bootstrap_only` and
+  `runs_kind_immutable`. Compare `type`, `name` and `tbl_name` against the reference, and read the two
+  v60 triggers back as `type='trigger' AND tbl_name='runs'`. A missing, extra or renamed trigger is a
+  stop.
+- `sqlite_schema` differs from v60's expected schema: the reference's rows plus the two triggers in the
+  stored text above. With the sealed image as the reference, compare every `(type, name, tbl_name,
+  sql)` row, not a count. With a fresh v59 image as the reference, compare `type`, `name` and
+  `tbl_name` only, and compare the two triggers' `sql` to the stored text above.
+- `PRAGMA integrity_check` is anything but `ok`.
+
+**The steps.** One transaction, on the copy, in a `sqlite3` shell that supports `.dbconfig`. Write the
+SQL below to `$WORK/convert.sql` first — with an editor, or with `cat > "$WORK/convert.sql"`, pasting
+it and ending with Ctrl-D — and run it from that file. A shell heredoc needs a writable temporary
+directory, which a sandboxed shell or a read-only `TMPDIR` may not have.
+
+    .bail on
+    .dbconfig enable_trigger off
+    BEGIN IMMEDIATE;
+    -- Each guard raises "integer overflow" when its condition holds; .bail on then stops the shell and the
+    -- open transaction is rolled back when the connection closes.
+    SELECT CASE WHEN (SELECT user_version FROM pragma_user_version) <> 60 THEN abs(-9223372036854775807-1) END;
+    SELECT CASE WHEN (SELECT count(*) FROM sqlite_schema WHERE type='trigger' AND tbl_name='runs'
+      AND name IN ('runs_review_completion_bootstrap_only','runs_kind_immutable')) <> 2 THEN abs(-9223372036854775807-1) END;
+    SELECT CASE WHEN (SELECT count(*) FROM schema_migrations WHERE version=60
+      AND migration_id='v60-review-completion-bootstrap-only'
+      AND checksum='sha256:65511a8e156217490cf3b92da02b673e13832007425b438a8cc76cefb15e1a68') <> 1 THEN abs(-9223372036854775807-1) END;
+    SELECT CASE WHEN (SELECT max(version) FROM schema_migrations) <> 60 THEN abs(-9223372036854775807-1) END;
+    DROP TRIGGER runs_review_completion_bootstrap_only;
+    DROP TRIGGER runs_kind_immutable;
+    DELETE FROM schema_migrations WHERE version = 60 AND migration_id = 'v60-review-completion-bootstrap-only';
+    SELECT CASE WHEN changes() <> 1 THEN abs(-9223372036854775807-1) END;
+    PRAGMA user_version = 59;
+    SELECT CASE WHEN (SELECT max(version) FROM schema_migrations) <> 59 THEN abs(-9223372036854775807-1) END;
+    SELECT CASE WHEN (SELECT count(*) FROM sqlite_schema
+      WHERE name IN ('runs_review_completion_bootstrap_only','runs_kind_immutable')) <> 0 THEN abs(-9223372036854775807-1) END;
+    COMMIT;
+    PRAGMA wal_checkpoint(TRUNCATE);
+    SELECT 'user_version', user_version FROM pragma_user_version;
+
+Then, in the same `bash` that took the copy, run it. This begins by running `quiet` and `check_copy`
+again: the source's digest is re-checked before the conversion, not only at the end, and the SQL never
+runs against a path that is not the verified copy.
+
+    set -euo pipefail
+    quiet && check_copy || { echo "stop: the source or the copy changed since the copy was taken" >&2; exit 1; }
+    sqlite3 "$COPY" < "$WORK/convert.sql"
+
+`.dbconfig enable_trigger off` is what makes the `DELETE` possible, and it is the only thing that
+does. `schema_migrations_no_delete` refuses to delete a receipt row on purpose
+(`SCHEMA_MIGRATION_RECEIPT_IMMUTABLE`), and the ledger is the one table this procedure has to remove
+a row from. The setting is a property of this connection alone
+(`SQLITE_DBCONFIG_ENABLE_TRIGGER = 0`): no trigger is dropped or rewritten to get past it, so
+`sqlite_schema` keeps every other object byte for byte, and the next connection — the v59 build's —
+has every trigger back. Do not replace it with `DROP TRIGGER schema_migrations_no_delete`, and do
+not widen it into a general switch for other tables. The `DELETE` names the version and the id; a
+different row cannot match it, and the `changes()` guard stops anything but exactly one.
+
+**Post-checks on the copy.** All four must hold; none is optional.
+
+1. Every table except `schema_migrations` has the same content digest as before the transaction. The
+   digest is, per table, a SHA-256 over every row's column values, each typed (NULL, integer, real,
+   text with its length, blob), rows in `rowid` order — primary-key order for a `WITHOUT ROWID` table
+   — for every table in `sqlite_schema` that does not start with `sqlite_`, plus `sqlite_sequence`.
+   Take it from the copy before the transaction and after it. A count of rows is not a digest.
+2. `schema_migrations` differs from its pre-transaction state by the v60 row and nothing else: the
+   same digest over the rows where `version <> 60` is equal, and the v60 row is gone.
+3. `sqlite_schema` equals the reference, at the strength the reference allows: with the image sealed in
+   this database's own rollback pair, every `(type, name, tbl_name, sql)` row; with only a fresh v59
+   image, `type`, `name` and `tbl_name`, which is weaker and is reported as such.
+4. `PRAGMA integrity_check` is `ok`, and `PRAGMA user_version` is `59`.
+
+**Proving the converted copy in isolation.** Make a throwaway duplicate of the converted copy, record
+the converted copy's `sha256`, and start the v59 build against the duplicate, in a throwaway home of
+its own: no launchd job, no connection to the live socket, lock or `health.json`, and no network.
+
+**This command line does not isolate the network.** `env -i HOME=… node …` changes which directory
+the daemon uses and which variables it sees. It does not stop it opening a connection, and it does
+not stop it reaching a credential held outside `HOME`, such as the login Keychain. So the start proof
+runs with no network access at all: under a no-network sandbox profile, as below (on macOS,
+`sandbox-exec` with `(deny network*)` and a local unix-socket allow for the duplicate's directory),
+or on a host with networking disabled. Without one of those, do not run it.
+
+The duplicate's state directory, `<throwaway home>/.agent-control-plane`, holds exactly this and
+nothing else from the live one:
+
+- the duplicate database as `state.sqlite`, mode 0600;
+- a throwaway GitHub App credential in `credentials/`, which the start gate requires to exist. The
+  gate (`judgeStartBeforeOpening`, `src/daemon/start-gate.ts`) asks the credential store whether the
+  App env file and the private key it names are usable, before it opens any database. What it
+  checks (`TrustedCredentialStore`, `src/github/credential-store.ts`) is shape and presence: both
+  files are regular, non-symlink files owned by the daemon's user with mode 0600, the env file gives
+  a numeric `GITHUB_APP_ID`, a numeric `GITHUB_APP_INSTALLATION_ID` and a `GITHUB_APP_PRIVATE_KEY_PATH`,
+  and the key at that path parses as a private key. It makes no call to GitHub and does not check
+  that the App exists. So the proof does not need the deployment's credential and must not have it:
+  generate a key and made-up IDs for this run. Never copy the deployment's `github-app.env` or key,
+  and never one that works against GitHub. The env file the deployment holds names an absolute key
+  path in the live directory, which is one more reason not to copy it. A later start step that needs
+  a working installation token cannot succeed here, by design; report it as a finding about the
+  proof, not as a reason to use the real credential.
+
+Make the throwaway home, the duplicate, the credential and the throwaway temp directory, in the
+same shell as the copy block (it needs `$WORK` and `$COPY`). `mktemp` gives a fresh, short path: the
+operator socket is `$DUP_HOME/.agent-control-plane/agentcpd.operator.sock`, and macOS caps a unix
+socket path at 104 bytes, so a throwaway home inside `$WORK` is too long. The block saves the
+variables to `$WORK/env`, so that if a later block stops and the shell closes, a new shell can
+`. <work directory>/env` and carry on from the block that stopped:
+
+    set -euo pipefail
+    umask 077
+    DUP_HOME="$(realpath "$(mktemp -d /tmp/acp-v59.XXXXXX)")"
+    V59_ROOT=/absolute/path/to/the/v59/build
+    DUP="$DUP_HOME/.agent-control-plane"
+    mkdir -m 700 "$DUP"
+    cp "$COPY" "$DUP/state.sqlite"; chmod 600 "$DUP/state.sqlite"
+    cmp "$COPY" "$DUP/state.sqlite"
+    shasum -a 256 < "$COPY" > "$WORK/converted.sha256"
+    printf 'WORK=%q\nCOPY=%q\nDUP_HOME=%q\nV59_ROOT=%q\nDUP=%q\n' \
+      "$WORK" "$COPY" "$DUP_HOME" "$V59_ROOT" "$DUP" > "$WORK/env"
+    mkdir -p "$DUP/credentials" "$DUP_HOME/tmp"
+    openssl genrsa -out "$DUP/credentials/github-app.pem" 2048
+    printf '%s\n' 'GITHUB_APP_ID=1' 'GITHUB_APP_INSTALLATION_ID=1' \
+      "GITHUB_APP_PRIVATE_KEY_PATH=$DUP/credentials/github-app.pem" > "$DUP/credentials/github-app.env"
+    chmod 700 "$DUP" "$DUP/credentials" "$DUP_HOME/tmp"
+
+A start without that credential is refused by the gate with `TRUSTED_GATE_CREDENTIAL_MISSING`. The
+refusal happens before the database is opened and leaves a `crash-loop.json` backoff record in the
+duplicate's state directory. A refusal before the open is a defect in the duplicate's setup, not a
+data difference: the start block stops and closes the shell; in a new shell `. <work directory>/env`,
+discard that duplicate and its `crash-loop.json`, fix the setup, rerun the block above to make a new
+duplicate from the converted copy, and retry. It says nothing about the converted copy.
+
+**Pointing the daemon at the duplicate.** The daemon finds its state directory through `HOME` and
+nothing else: `agentcpd` takes `defaultConfig()`, and that is `homedir()/.agent-control-plane`
+(`src/app/control-plane.ts`, `src/daemon/agentcpd.ts`). `ACP_STATE_DIR` has **no effect on the
+daemon**; only `agentctl` reads it (`src/cli/agentctl.ts`). So the duplicate is started with
+`HOME=<throwaway home>`, where `<throwaway home>/.agent-control-plane` **is** the duplicate directory
+holding `state.sqlite` and `credentials/`. A daemon started without that `HOME` override opens the
+live state directory — its lock, `crash-loop.json` and `health.json` — whatever else was set.
+
+The start reads these, and `env -i` drops every one it is not given:
+
+- `ACP_OPERATOR_TOKEN`, and a separate `ACP_MCP_TOKEN` that must not equal it
+  (`src/daemon/agentcpd.ts`). Throwaway values generated for this run, kept in 0600 files in the work
+  directory and never printed, never the deployment's.
+- `ACP_OPERATOR_ACTOR`: the account name the daemon gives its operator peer (`cli:<name>`). It reads
+  `ACP_OPERATOR_ACTOR` and, only if that is empty, `USER`, and refuses to start with "ACP_OPERATOR_ACTOR
+  or USER is required to establish the operator peer identity" when neither is set — which is what
+  `env -i` leaves. Use the operator's own account name (`id -un`). The name does not have to match
+  anything else for this proof: `agentctl` presents only the token, and the daemon assigns the
+  identity bound to it, so `agentctl daemon status` needs no actor and no `USER`.
+- `TMPDIR`, as `<throwaway home>/tmp`, mode 0700, created beforehand. `env -i` drops it and
+  `os.tmpdir()` falls back to the shared `/tmp`. The start gate copies the database into a private
+  snapshot under the temp directory (`src/db/database-snapshot.ts`, `acp-db-snapshot-*`) before it
+  opens it, and the daemon creates its runtime scratch there too
+  (`src/continuity/continuity-kernel.ts`); both must stay inside the throwaway home, and a
+  sandbox that denies `/tmp` otherwise refuses the start as `START_GATE_DATABASE_UNREADABLE`.
+  `agentctl daemon status` does not use the temp directory and does not need it.
+- `HOME` and `PATH`.
+
+Everything else the daemon reads is optional or defaults to the duplicate's own state directory, and
+is left unset on purpose: `ACP_GITHUB_APP_ENV_FILE` and `ACP_GITHUB_APP_PRIVATE_KEY_PATH` default to
+`credentials/github-app.env` in the state directory (an inherited override would send the gate to
+the live credential); the Buzz, Telegram and Hermes variables leave those routes unconfigured,
+which the start reports and continues; `ACP_CLAUDE_BINARY` and `ACP_CODEX_BINARY` unset gives at
+most a provider finding that does not block the start; `LANG`, `LC_ALL`, `SHELL`, `DEVELOPER_DIR`,
+`GNUPGHOME`, `SSH_AUTH_SOCK` and the proxy variables are read only for optional behaviour or carry a
+default; `ACP_DAEMON_SUPERVISOR` only changes the exit code of a refused start; `ACP_STATE_DIR` is
+ignored by the daemon, as above. Nothing in `src/` reads an `XDG_*` variable.
+
+Before the start, check what it would touch, and refuse on anything outside the throwaway home.
+`V59_ROOT` is the v59 build, `DUP_HOME` the throwaway home, both set by the block above:
+
+    set -euo pipefail
+    LIVE="$HOME/.agent-control-plane"
+    stop() { echo "stop: $1; variables are in $WORK/env" >&2; exit 1; }
+    within() { case "$(realpath "$2")/" in "$(realpath "$1")"/*) return 0 ;; *) return 1 ;; esac; }
+    ! within "$DUP_HOME" "$LIVE" || stop "the throwaway home contains the live state directory"
+    ! within "$DUP_HOME" "$WORK" || stop "the throwaway home contains the work directory"
+    ! within "$LIVE" "$DUP_HOME" || stop "the throwaway home is inside the live state directory"
+    SOCK="$(realpath "$DUP")/agentcpd.operator.sock"
+    [ "${#SOCK}" -lt 104 ] || stop "the operator socket path is ${#SOCK} bytes; macOS allows at most 103"
+    cmp "$COPY" "$DUP/state.sqlite" || stop "the duplicate is not the converted copy"
+    RESOLVED="$(env -i HOME="$DUP_HOME" PATH="$PATH" node --input-type=module -e \
+      'const { defaultConfig } = await import(process.argv[1]); console.log(defaultConfig().databasePath)' \
+      "$V59_ROOT/dist/app/control-plane.js")"
+    echo "the daemon would open: $RESOLVED"
+    [ "$(realpath "$(dirname "$RESOLVED")")" = "$(realpath "$DUP")" ] || stop "that is not the duplicate"
+    [ "$(realpath "$(dirname "$RESOLVED")")" != "$(realpath "$LIVE")" ] || stop "that is the live state directory"
+    within "$DUP_HOME" "$DUP_HOME/tmp" || stop "TMPDIR is outside the throwaway home"
+    [ "$(stat -f %Lp "$DUP_HOME/tmp")" = 700 ] || stop "TMPDIR is not mode 700"
+    ENV_FILE="$DUP/credentials/github-app.env"
+    KEY_PATH="$(sed -n -E 's/^[[:space:]]*(export[[:space:]]+)?GITHUB_APP_PRIVATE_KEY_PATH=//p' "$ENV_FILE" \
+      | tail -n 1 | sed -E "s/^[\"']//; s/[\"']\$//")"
+    [ -n "$KEY_PATH" ] || stop "the env file names no private key path"
+    for f in "$ENV_FILE" "$KEY_PATH" "$DUP"/credentials/*; do
+      [ ! -L "$f" ] || stop "$f is a symbolic link"
+      within "$DUP" "$f" || stop "$f is outside $DUP"
+    done
+
+That check resolves the key path the env file names and every file in `credentials/` and refuses
+anything that lands outside the duplicate's own directory, which is what stops an env file copied
+from the deployment from pointing the gate at the live key.
+
+The no-network sandbox profile, for the duplicate's directory (macOS `sandbox-exec`; the profile also
+fences writes to the throwaway home). Write it with `printf`, not a heredoc:
+
+    DUP_HOME_REAL="$(realpath "$DUP_HOME")"
+    printf '%s\n' '(version 1)' '(allow default)' '(deny network*)' \
+      "(deny file-write* (require-not (require-any (subpath \"$DUP_HOME_REAL\") (literal \"/dev/null\") (literal \"/dev/tty\") (literal \"/dev/dtracehelper\") (subpath \"/dev/fd\"))))" \
+      "(allow network-bind network-inbound network-outbound (local unix-socket (subpath \"$DUP_HOME_REAL\")))" \
+      "(allow network-outbound (remote unix-socket (subpath \"$DUP_HOME_REAL\")))" > "$WORK/nonet.sb"
+
+Then start the daemon in the background from this same shell, so that its pid and the token files are
+at hand, and ask it with `agentctl` from the same shell. The tokens are read from the files and are
+never printed:
+
+    set -euo pipefail
+    umask 077
+    uuidgen > "$WORK/operator.token"; uuidgen > "$WORK/mcp.token"
+    : > "$WORK/daemon.out"; : > "$WORK/daemon.err"
+    sandbox-exec -f "$WORK/nonet.sb" env -i HOME="$DUP_HOME" PATH="$PATH" TMPDIR="$DUP_HOME/tmp" \
+      ACP_OPERATOR_ACTOR="$(id -un)" ACP_OPERATOR_TOKEN="$(cat "$WORK/operator.token")" \
+      ACP_MCP_TOKEN="$(cat "$WORK/mcp.token")" \
+      node "$V59_ROOT/dist/daemon/agentcpd.js" > "$WORK/daemon.out" 2> "$WORK/daemon.err" < /dev/null &
+    DAEMON_PID=$!
+    echo "$DAEMON_PID" > "$WORK/daemon.pid"
+    abort() { kill "$DAEMON_PID" 2>/dev/null || true; wait "$DAEMON_PID" 2>/dev/null || true
+      echo "stop: $1; see $WORK/daemon.err; variables are in $WORK/env" >&2; exit 1; }
+    for i in $(seq 1 120); do
+      kill -0 "$DAEMON_PID" 2>/dev/null || abort "the daemon exited"
+      grep -q '"started"' "$WORK/daemon.out" && break
+      sleep 1
+    done
+    grep -q '"started"' "$WORK/daemon.out" || abort "no started report after 120 seconds"
+    sandbox-exec -f "$WORK/nonet.sb" env -i HOME="$DUP_HOME" PATH="$PATH" \
+      ACP_STATE_DIR="$DUP_HOME/.agent-control-plane" ACP_OPERATOR_TOKEN="$(cat "$WORK/operator.token")" \
+      node "$V59_ROOT/dist/cli/agentctl.js" daemon status > "$WORK/daemon-status.json" \
+      || abort "agentctl daemon status failed"
+    node -e 'const fs = require("node:fs"); const [status, health] = process.argv.slice(1).map((p) => JSON.parse(fs.readFileSync(p, "utf8")));
+      if (status.mode !== "NORMAL" || health.mode !== "NORMAL") { console.error(`not ready: daemon status mode ${status.mode}, health.json mode ${health.mode}`); process.exit(1); }
+      console.log("ready: mode NORMAL")' "$WORK/daemon-status.json" "$DUP/health.json" || abort "not ready"
+    # Stop it cleanly, then run the post-start check below on the duplicate.
+    kill -TERM "$DAEMON_PID"; wait "$DAEMON_PID" || true
+
+For `agentctl`, `ACP_STATE_DIR` must name the duplicate and `ACP_OPERATOR_SOCKET` must be unset: when
+it is set it overrides `ACP_STATE_DIR` (`src/cli/agentctl.ts`) and the CLI would talk to whatever
+socket it names, which on a deployed host is the live one. `env -i` leaves it unset. The token has to
+be the daemon's: with a wrong or missing token `agentctl daemon status` does not fail. It falls back
+to an offline reading of the lock file, exits 0, and carries no `mode` at all. That is why the token
+comes from the file the daemon was started with, in the same shell, and why an offline reading is not
+ready.
+
+Ready is the product's own answer, all three of these together, and the block above requires them:
+
+- the daemon's stdout carries the `{ "started": … }` report, which it prints only after the last
+  startup step that can still refuse the start;
+- `health.json` in the duplicate's state directory says `"mode": "NORMAL"`, not `BOOTSTRAP`;
+- the operator socket answers `agentctl daemon status` and the answer reports `mode` `NORMAL`. An
+  offline reading — no `mode`, `daemonStatus` carrying a refusal reason — is NOT ready.
+
+A `health.json` with a new `pid` and `startedAt` is not enough on its own: the daemon writes both
+before it decides whether to run, park in `BOOTSTRAP` or refuse. A start that
+parks, refuses or exits is not ready, whatever `health.json` shows.
+
+The duplicate is the one that starts, so the converted copy stays exactly the bytes the post-checks
+were taken on. After the start, stop the duplicate cleanly and run the check below against it.
+
+**Known benign differences, and the post-start check.** A v59 start and stop is not a read-only
+act. It refreshes `repositories.last_observed_at` — normal observation, not a data change — and it
+appends rows to `audit_events`, `capacity_snapshots` and `telemetry_metrics`, and it moves the
+matching `sqlite_sequence` counters. The appended `audit_events` rows are whatever this start and
+stop writes — runtime observed, capacity and role probes, the doctor report, the notification
+attempt journal's start, started, stopped, drained, and others, which vary with the build and its
+configuration. Those kinds are examples, not a list to check against: the rule is appends to the
+table, not a set of event kinds. Compare the duplicate with the converted copy row by row, not by
+table digest, because a table that was appended to no longer has the same digest. The check holds
+only if all four of these do:
+
+1. No row that exists in the converted copy is missing from the duplicate.
+2. No row that exists in the converted copy has changed, except the `last_observed_at` column of
+   `repositories`.
+3. New rows appear only in `audit_events`, `capacity_snapshots` and `telemetry_metrics`, and the only
+   `sqlite_sequence` changes are those tables' counters rising.
+4. `sqlite_schema` is still equal, row for row, to the converted copy's, `user_version` is 59 and
+   `integrity_check` is `ok`.
+
+Anything else — a missing or changed row, a new row in any other table, another `repositories`
+column changing, a counter for any other table moving — is a stop.
+
+**Installing the converted copy.** After the conversion and the isolated start proof, the copy is
+installed with the supported replacement-database path; `deploy/README.md` ("replacement database")
+has the flags and the checks. In order:
+
+1. Keep the daemon stopped until the rollback returns. The coordinator cannot hold `agentcpd.lock`
+   across the restore, and a write to the live database after the conversion makes the rollback refuse.
+2. The P59 pair must have been sealed before the migration, and the retired approval for the
+   migration must still be kept; a missing approval refuses.
+3. `state-admin backup --database <converted copy> --output IMAGE`.
+4. `node dist/deploy/rollback-pair.js record-replacement <the validate identity flags, with
+   --pair-id <P59>> --source <live db> --image IMAGE`. It requires the source to be quiescent and writes
+   `IMAGE.source.json`.
+5. `deploy/install-launchd.sh rollback --pair-id <P59> … --replacement-database IMAGE`, from a checkout
+   built with the replacement check (`rollback-pair validate … --replacement-database IMAGE` first).
+
+A database-only `state-admin restore` must not be used: it leaves a v59 database under a v60 runtime.
+Record the source's `sha256` once more at the end; it must equal the value taken at the start. Keep
+the verified converted copy, its `source.sha256.before` and `copy.sha256.before-convert`, the digests,
+`IMAGE.source.json` and every output of the checks, and do not delete the evidence.
+
+**Stopping rules.**
+
+- Any unexpected schema or data difference — a guard, a post-check, or the start proof — means stop.
+  Keep the copy, the digests and every output exactly as they are, and report them.
+- Never delete or alter a row, a trigger or a ledger entry to make a check pass. A check that
+  passes after being edited around has stopped being a check.
+- Never run the SQL against the live file, and never against a copy that has been started or was not
+  made by the `.backup` above.
+- If any step fails midway, discard nothing: the source is untouched by construction, so the whole
+  procedure can be run again from a new copy, and the failed copy is the evidence.
+
+### Restore a stopped v61 database to v60 (single path, 61→60 only)
+
+This is the one way to turn a schema v61 (repository rename) database into a v60 one that keeps the data
+written under v61. It is the 60→59 procedure above applied to one other version pair, and it is its own
+procedure, rehearsed on its own (`tests/unit/rollback-pair.test.ts`, "a v61 database returns to v60"). It
+produces and verifies a converted copy; the copy is installed with the same replacement-database path, under
+a P60 pair. Nothing in `src/` runs it.
+
+**A recorded rename stops it.** v61 adds `repository_identity_renames`, and a row there is the only record
+that links the receipts, verification results and allocation written under a repository's old name to the
+name it holds now. Dropping the table would discard that record, so the conversion refuses, before it writes
+anything, when the table holds any row. Once a rename has been applied, recovery is forward-only on v61:
+
+1. Run the same `agentctl project rename-repository <project> <owner/name> --apply` again. It converges: the
+   ACP record is already written (`ALREADY_RENAMED`), and it sets any local clone's `origin` that still names
+   the old URL.
+2. If the v61 state itself has to go back, restore a v61 image taken before the rename, under the v61
+   build: a P61 pair sealed before the rename (`install-launchd.sh rollback --pair-id <P61> …`), or a
+   `state-admin backup` taken at v61 before the rename, restored with the daemon stopped. Either discards
+   everything written after it, and neither touches GitHub: the repository keeps its new name there, so the
+   restored ACP holds the old name again and its GitHub calls fail until the rename is applied again. There
+   is no combined GitHub-and-ACP rollback.
+
+Before applying a rename, seal a P61 pair, so that the second way exists.
+
+**What it applies to.** The source is a database at `user_version` 61 whose `schema_migrations` holds the v61
+row exactly — `version = 61`, `migration_id = 'v61-repository-identity-rename'`,
+`checksum = 'sha256:84bcf4d0932936943e591e35f7648a540112046afa5661ac3d07f9db545bde4c'` — with no rename
+recorded. The target is the v60 build pinned in the P60 pair sealed before the 60→61 migration. A database
+created at v61 rather than migrated to it carries `bootstrap-v61` and is refused; so is every other version
+pair.
+
+**Preconditions, and the copy.** Exactly as in the 60→59 section: the daemon stopped and the lock free, no
+`state.sqlite-journal`, an empty or absent `state.sqlite-wal`, the source digest recorded at the start and
+checked again around the copy, and an immutable `.backup` into a new work directory. Run that block as it
+stands, with `downgrade-61-60` in place of `downgrade-60-59` in the work directory's name, and keep the same
+`bash` for the steps below.
+
+**The reference.** The P60 pair's sealed image, `<pairs root>/<P60>/database/state.sqlite`, taken before the
+60→61 migration. It is also where the v60 manifest-pointer guard comes from: v61 replaced
+`projects_active_manifest_moves_by_grant`, and the v60 text a database holds depends on how it reached v60,
+so the conversion puts back the text the pair's own image holds and no other. Read it out, in the same `bash`:
+
+<!-- owner-actions:v61-to-v60-guard-text:start -->
+    set -euo pipefail
+    PAIR_IMAGE="${PAIR_IMAGE:?name the P60 pair image: <pairs root>/<P60>/database/state.sqlite}"
+    [ -f "$PAIR_IMAGE" ] && [ ! -L "$PAIR_IMAGE" ] || { echo "the pair image is not a regular, non-symlink file" >&2; exit 1; }
+    [ "$(sqlite3 "file:$PAIR_IMAGE?immutable=1" 'PRAGMA user_version')" = 60 ] || { echo "the pair image is not at v60" >&2; exit 1; }
+    sqlite3 "file:$PAIR_IMAGE?immutable=1" \
+      "SELECT sql || ';' FROM sqlite_schema WHERE type = 'trigger' AND name = 'projects_active_manifest_moves_by_grant'" \
+      > "$WORK/v60-pointer-guard.sql"
+    [ "$(head -n 1 "$WORK/v60-pointer-guard.sql")" = "CREATE TRIGGER projects_active_manifest_moves_by_grant" ] \
+      || { echo "the pair image holds no v60 manifest-pointer guard" >&2; exit 1; }
+    ! grep -q 'repository_identity_renames' "$WORK/v60-pointer-guard.sql" \
+      || { echo "the pair image's manifest-pointer guard is not v60's" >&2; exit 1; }
+<!-- owner-actions:v61-to-v60-guard-text:end -->
+
+**Guards, checked on the copy, before anything is changed.** Any one failing stops the procedure; nothing is
+repaired to make one pass. The SQL below checks each of them first, inside its transaction, and `.bail on`
+ends it there with the copy unchanged:
+
+- `PRAGMA user_version` is not `61`; the v61 ledger row is absent, repeated, or carries another id or checksum;
+  `max(version)` is not 61.
+- `repository_identity_renames` holds any row — the refusal above.
+- The v61 objects are not exactly the table and its four guards, or the manifest-pointer guard is not v61's.
+- `PRAGMA integrity_check` is anything but `ok` (run it first, as in the 60→59 section).
+
+**The steps.** One transaction, on the copy, from the work directory (the SQL reads `v60-pointer-guard.sql`
+from there). Write it to `$WORK/convert.sql` as in the 60→59 section, then run
+`quiet && check_copy && cd "$WORK" && sqlite3 "$COPY" < convert.sql`:
+
+<!-- owner-actions:v61-to-v60-convert:start -->
+    .bail on
+    .dbconfig enable_trigger off
+    BEGIN IMMEDIATE;
+    -- Each guard raises "integer overflow" when its condition holds; .bail on then stops the shell and the
+    -- open transaction is rolled back when the connection closes. Nothing is written before the last guard.
+    SELECT CASE WHEN (SELECT user_version FROM pragma_user_version) <> 61 THEN abs(-9223372036854775807-1) END;
+    SELECT CASE WHEN (SELECT count(*) FROM schema_migrations WHERE version = 61
+      AND migration_id = 'v61-repository-identity-rename'
+      AND checksum = 'sha256:84bcf4d0932936943e591e35f7648a540112046afa5661ac3d07f9db545bde4c') <> 1 THEN abs(-9223372036854775807-1) END;
+    SELECT CASE WHEN (SELECT max(version) FROM schema_migrations) <> 61 THEN abs(-9223372036854775807-1) END;
+    SELECT CASE WHEN (SELECT count(*) FROM sqlite_schema WHERE type = 'table' AND name = 'repository_identity_renames') <> 1
+      THEN abs(-9223372036854775807-1) END;
+    -- A recorded rename: dropping the table would discard it. Recovery is forward-only on v61.
+    SELECT CASE WHEN (SELECT count(*) FROM repository_identity_renames) <> 0 THEN abs(-9223372036854775807-1) END;
+    SELECT CASE WHEN (SELECT count(*) FROM sqlite_schema WHERE type = 'trigger' AND tbl_name = 'repository_identity_renames'
+      AND name IN ('repository_identity_renames_no_replace', 'repository_identity_renames_names_the_current_repository',
+                   'repository_identity_renames_immutable', 'repository_identity_renames_no_delete')) <> 4
+      OR (SELECT count(*) FROM sqlite_schema WHERE tbl_name = 'repository_identity_renames' AND name NOT LIKE 'sqlite_autoindex%') <> 5
+      THEN abs(-9223372036854775807-1) END;
+    SELECT CASE WHEN (SELECT count(*) FROM sqlite_schema WHERE type = 'trigger' AND name = 'projects_active_manifest_moves_by_grant'
+      AND tbl_name = 'projects' AND sql LIKE '%repository_identity_renames%') <> 1 THEN abs(-9223372036854775807-1) END;
+    DROP TRIGGER projects_active_manifest_moves_by_grant;
+    .read v60-pointer-guard.sql
+    SELECT CASE WHEN (SELECT count(*) FROM sqlite_schema WHERE type = 'trigger' AND name = 'projects_active_manifest_moves_by_grant'
+      AND tbl_name = 'projects' AND sql NOT LIKE '%repository_identity_renames%') <> 1 THEN abs(-9223372036854775807-1) END;
+    DROP TRIGGER repository_identity_renames_no_replace;
+    DROP TRIGGER repository_identity_renames_names_the_current_repository;
+    DROP TRIGGER repository_identity_renames_immutable;
+    DROP TRIGGER repository_identity_renames_no_delete;
+    DROP TABLE repository_identity_renames;
+    DELETE FROM schema_migrations WHERE version = 61 AND migration_id = 'v61-repository-identity-rename';
+    SELECT CASE WHEN changes() <> 1 THEN abs(-9223372036854775807-1) END;
+    PRAGMA user_version = 60;
+    SELECT CASE WHEN (SELECT max(version) FROM schema_migrations) <> 60 THEN abs(-9223372036854775807-1) END;
+    SELECT CASE WHEN (SELECT count(*) FROM sqlite_schema
+      WHERE tbl_name = 'repository_identity_renames' OR sql LIKE '%repository_identity_renames%') <> 0 THEN abs(-9223372036854775807-1) END;
+    COMMIT;
+    PRAGMA wal_checkpoint(TRUNCATE);
+    SELECT 'user_version', user_version FROM pragma_user_version;
+<!-- owner-actions:v61-to-v60-convert:end -->
+
+`.dbconfig enable_trigger off` is there for the one `DELETE` from `schema_migrations`, exactly as in the 60→59
+section, and is a property of this connection only. The rename table's guards go with the table.
+
+**Post-checks on the copy.** All must hold:
+
+1. Every table except `schema_migrations` and the dropped `repository_identity_renames` has the content digest
+   (defined in the 60→59 section) it had before the transaction.
+2. `schema_migrations` differs from its pre-transaction state by the v61 row and nothing else.
+3. `sqlite_schema` equals the P60 pair image's, every `(type, name, tbl_name, sql)` row. `record-replacement`
+   below checks this again and refuses a copy that differs.
+4. `PRAGMA integrity_check` is `ok`, and `PRAGMA user_version` is `60`.
+
+**Proving the converted copy in isolation, and installing it.** As in the 60→59 section, with the v60 build
+(`V60_ROOT`, the build pinned in the P60 pair) in place of the v59 build and a v60 duplicate in place of the v59
+one; the ready rule and the post-start check are the same. Then install it with the replacement-database path,
+the daemon kept stopped throughout:
+
+1. `state-admin backup --database <converted copy> --output IMAGE`.
+2. `node dist/deploy/rollback-pair.js record-replacement <the validate identity flags, with --pair-id <P60>>
+   --source <live db> --image IMAGE`, from the v61 build. It replays the retired 60→61 approval on IMAGE and
+   requires the result to equal the live v61 database: IMAGE must be exactly the live database minus v61.
+3. `deploy/install-launchd.sh rollback --pair-id <P60> … --replacement-database IMAGE`, after
+   `rollback-pair validate … --replacement-database IMAGE`.
+
+The P60 pair must have been sealed before the 60→61 migration and the retired approval kept. The stopping
+rules of the 60→59 section apply unchanged.
 
 ### What it creates
 

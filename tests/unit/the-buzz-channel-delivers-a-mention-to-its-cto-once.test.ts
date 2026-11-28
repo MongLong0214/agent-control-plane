@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -17,7 +17,7 @@ import {
   type ChannelState,
   type ChannelStateStore,
 } from "../../src/buzz/buzz-channel.ts";
-import { fileChannelStateStore } from "../../src/buzz/buzz-channel-files.ts";
+import { appendChannelReceipt, channelReceiptPath, fileChannelStateStore, readChannelReceipts } from "../../src/buzz/buzz-channel-files.ts";
 import type { BuzzRelaySocketFactory, BuzzRelaySocketHandlers } from "../../src/buzz/buzz-mention-subscriber.ts";
 
 /**
@@ -112,11 +112,16 @@ const harness = (options: {
   failOnce?: Set<string>;
   /** What the daemon's queue holds for this role, asked once when the relay first accepts the channel. */
   backlog?: () => readonly { eventId: string; event: ReturnType<typeof sign> }[];
+  answeredSince?: () => number | null;
+  historyBefore?: number;
+  /** The first N replied-receipt appends fail (the sink answers `false`), as a full disk would. */
+  failReceipts?: number;
 } = {}) => {
   const connections: FakeConnection[] = [];
   const notifications: ChannelNotification[] = [];
   const receipts: ChannelReceipt[] = [];
   const scheduler = fakeScheduler();
+  let failures = options.failReceipts ?? 0;
   scheduler.set(options.now ?? 2_000);
   const openSocket: BuzzRelaySocketFactory = (_url, handlers) => {
     const connection: FakeConnection = {
@@ -144,11 +149,20 @@ const harness = (options: {
     ceoPubkeys: options.ceoKeys ?? (() => [ceoPub]),
     ownerPubkeys: [ownerPub],
     ...(options.backlog ? { backlog: options.backlog } : {}),
+    ...(options.answeredSince ? { answeredSince: options.answeredSince } : {}),
+    ...(options.historyBefore !== undefined ? { historyBefore: options.historyBefore } : {}),
     onNotification: async (n) => {
       if (options.failOnce?.delete(n.content)) throw new Error("transport closed");
       notifications.push(n);
     },
-    onReceipt: (r) => receipts.push(r),
+    onReceipt: (r) => {
+      if (failures > 0 && r.type === "replied") {
+        failures -= 1;
+        return false;
+      }
+      receipts.push(r);
+      return true;
+    },
     openSocket,
     scheduler,
     ...(options.store ? { store: options.store } : {}),
@@ -170,6 +184,17 @@ const harness = (options: {
     await relay.settled();
   };
   return { relay, connections, notifications, receipts, scheduler, connect, deliver };
+};
+
+/**
+ * A parent restored from a saved state has a root an earlier version may have guessed, so a reply to it first asks the
+ * relay for the event; here the relay has nothing to show, and the reply goes out under the root that was remembered.
+ */
+const relayShowsNothing = async (relay: BuzzChannelRelay, connection: FakeConnection) => {
+  const ask = connection.sent.find((f) => f[0] === "REQ" && Array.isArray((f[2] as { ids?: unknown }).ids));
+  expect(ask).toBeDefined();
+  connection.push(["EOSE", ask![1]]);
+  await relay.settled();
 };
 
 describe("a mention of this CTO reaches its session once, as untrusted data", () => {
@@ -219,6 +244,149 @@ describe("a mention of this CTO reaches its session once, as untrusted data", ()
     expect(filters[0]).toMatchObject({ kinds: [9], "#p": [ctoPub], "#h": [ROOM] });
     expect(filters[1]).toMatchObject({ kinds: [9], "#h": [ROOM] });
     expect(new Set(filters[1]!.authors)).toEqual(new Set([ceoPub, ownerPub]));
+  });
+
+  it("hears this CTO's own posts, back to the oldest queued message, and reports a threaded one as a reply whatever sent it", async () => {
+    const h = harness({ answeredSince: () => 500 });
+    const connection = await h.connect();
+    const req = connection.sent.find((f) => f[0] === "REQ") as unknown[];
+    expect(req.slice(2)).toContainEqual({ kinds: [9], authors: [ctoPub], "#h": [ROOM], since: 500 });
+    const asked = mention(ceo, "hold the deploy", 1_500);
+    await h.deliver(connection, asked);
+    // Posted by `buzz messages send --reply-to`, not the reply tool: the relay shows it on the channel's own-author filter.
+    const cli = sign(cto, [["h", ROOM], ["e", asked.id, "", "reply"], ["p", ceoPub]], "held", 1_600);
+    await h.deliver(connection, cli);
+    await h.deliver(connection, cli);
+    // A post that answers nothing, or is in another room, is no reply; nor is one with a lone `root` marker, which the relay
+    // and the channel's own threading read as top-level.
+    await h.deliver(connection, sign(cto, [["h", ROOM], ["p", ceoPub]], "status", 1_601));
+    await h.deliver(connection, sign(cto, [["h", ROOM], ["e", asked.id, "", "root"], ["p", ceoPub]], "a new topic", 1_603));
+    await h.deliver(connection, sign(cto, [["h", OTHER_ROOM], ["e", asked.id, "", "reply"]], "elsewhere", 1_602));
+    expect(h.receipts.filter((r) => r.type === "replied")).toEqual([
+      { type: "replied", event: cli, room: ROOM, parentEventId: asked.id, ack: "ACCEPTED", repliedAt: 2_000 },
+    ]);
+    expect(h.notifications.map((n) => n.content)).toEqual(["hold the deploy"]);
+  });
+
+  it("never lets a replayed old reply drop a later CEO follow-up in its thread", async () => {
+    const NOW = 200_000;
+    const asked = mention(ceo, "hold the deploy", NOW - 100_000);
+    const old = sign(cto, [["h", ROOM], ["e", asked.id, "", "reply"], ["p", ceoPub]], "held", NOW - 99_000);
+    // An earlier process delivered the question and saw the reply; the thread was active an hour ago, so both are remembered.
+    const store: ChannelStateStore = {
+      load: () => ({ cursor: NOW - 3_600, failed: [], events: [[asked.id, NOW - 3_600, ceoPub, ROOM, asked.id, true], [old.id, NOW - 3_600, ctoPub, ROOM, asked.id, false]] }),
+      save: () => undefined,
+    };
+    // The own-posts lookback reaches back past the old reply, so the relay replays it.
+    const h = harness({ store, now: NOW, answeredSince: () => NOW - 200_000 });
+    const connection = await h.connect();
+    await h.deliver(connection, old);
+    // The CEO answers the CTO's reply in the thread, naming nobody: it is for this CTO only because its parent is remembered.
+    const followUp = sign(ceo, [["h", ROOM], ["e", asked.id, "", "root"], ["e", old.id, "", "reply"]], "go ahead after all", NOW - 10);
+    await h.deliver(connection, followUp);
+    expect(h.notifications.map((n) => n.content)).toEqual(["go ahead after all"]);
+  });
+
+  it("re-reports once a remembered reply whose replied receipt never reached the daemon, and still delivers a later CEO follow-up", async () => {
+    const NOW = 200_000;
+    const asked = mention(ceo, "hold the deploy", NOW - 100_000);
+    const old = sign(cto, [["h", ROOM], ["e", asked.id, "", "reply"], ["p", ceoPub]], "held", NOW - 99_000);
+    // An earlier process remembered the reply, but its receipt was trimmed from the file before the daemon applied it.
+    const store: ChannelStateStore = {
+      load: () => ({ cursor: NOW - 3_600, failed: [], events: [[asked.id, NOW - 3_600, ceoPub, ROOM, asked.id, true], [old.id, NOW - 3_600, ctoPub, ROOM, asked.id, false]] }),
+      save: () => undefined,
+    };
+    const h = harness({ store, now: NOW, answeredSince: () => NOW - 200_000 });
+    const connection = await h.connect();
+    await h.deliver(connection, old);
+    await h.deliver(connection, old);
+    expect(h.receipts.filter((r) => r.type === "replied")).toEqual([
+      { type: "replied", event: old, room: ROOM, parentEventId: asked.id, ack: "ACCEPTED", repliedAt: NOW },
+    ]);
+    // The replay did not reset the thread's activity time: the CEO's follow-up in it is still for this CTO.
+    const followUp = sign(ceo, [["h", ROOM], ["e", asked.id, "", "root"], ["e", old.id, "", "reply"]], "go ahead after all", NOW - 10);
+    await h.deliver(connection, followUp);
+    expect(h.notifications.map((n) => n.content)).toEqual(["go ahead after all"]);
+  });
+
+  it("re-reports a reply its own receipt append failed for, on the relay's replay, and not again once it is written", async () => {
+    const h = harness({ failReceipts: 1 });
+    const connection = await h.connect();
+    const asked = mention(ceo, "hold the deploy", 1_500);
+    await h.deliver(connection, asked);
+    const cli = sign(cto, [["h", ROOM], ["e", asked.id, "", "reply"], ["p", ceoPub]], "held", 1_600);
+    await h.deliver(connection, cli);
+    expect(h.receipts.filter((r) => r.type === "replied")).toEqual([]);
+    await h.deliver(connection, cli);
+    await h.deliver(connection, cli);
+    expect(h.receipts.filter((r) => r.type === "replied")).toEqual([
+      { type: "replied", event: cli, room: ROOM, parentEventId: asked.id, ack: "ACCEPTED", repliedAt: 2_000 },
+    ]);
+  });
+
+  it("appends one replied receipt for an expired reply the own-posts lookback replays within one subscription", async () => {
+    const NOW = 200_000;
+    const asked = mention(ceo, "hold the deploy", NOW - 150_000);
+    // Older than the answerable retention, so it is forgotten the moment it is handled; the subscription still returns it again.
+    const expired = sign(cto, [["h", ROOM], ["e", asked.id, "", "reply"], ["p", ceoPub]], "held", NOW - 140_000);
+    const h = harness({ now: NOW, answeredSince: () => NOW - 200_000 });
+    const connection = await h.connect();
+    await h.deliver(connection, expired);
+    // A newer event moves the cursor past it, so nothing but the retention horizon keeps it, and the horizon has passed.
+    await h.deliver(connection, mention(ceo, "newer", NOW - 50));
+    await h.deliver(connection, expired);
+    await h.deliver(connection, mention(ceo, "newer still", NOW - 40));
+    await h.deliver(connection, expired);
+    expect(h.receipts.filter((r) => r.type === "replied")).toHaveLength(1);
+  });
+
+  it("restores an already-reported reply to thread memory on its replay, so a CEO follow-up naming it is still delivered", async () => {
+    const NOW = 200_000;
+    const asked = mention(ceo, "hold the deploy", NOW - 150_000);
+    const expired = sign(cto, [["h", ROOM], ["e", asked.id, "", "reply"], ["p", ceoPub]], "held", NOW - 140_000);
+    const h = harness({ now: NOW, answeredSince: () => NOW - 200_000, failOnce: new Set(["stuck"]) });
+    const connection = await h.connect();
+    await h.deliver(connection, expired);
+    // A newer event moves the cursor on, and the reply, past the retention horizon, is forgotten although its receipt is written.
+    await h.deliver(connection, mention(ceo, "newer", NOW - 50));
+    // A notification that fails near the subscription's start pins the resume point back, so the next replay is retained again.
+    await h.deliver(connection, mention(ceo, "stuck", NOW - 145_000));
+    await h.deliver(connection, expired);
+    const followUp = sign(ceo, [["h", ROOM], ["e", asked.id, "", "root"], ["e", expired.id, "", "reply"]], "go ahead after all", NOW - 10);
+    await h.deliver(connection, followUp);
+    expect(h.notifications.map((n) => n.content)).toEqual(["newer", "go ahead after all"]);
+    expect(h.receipts.filter((r) => r.type === "replied")).toHaveLength(1);
+  });
+
+  it("writes one replied receipt when the relay echoes a reply before it acknowledges the publish", async () => {
+    const h = harness();
+    const connection = await h.connect();
+    const asked = mention(ceo, "status?", 1_001);
+    await h.deliver(connection, asked);
+    const pending = h.relay.reply({ room: ROOM, eventId: asked.id, kind: "report", text: "green on main" });
+    const published = connection.sent.find((f) => f[0] === "EVENT") as [string, ReturnType<typeof sign>];
+    await h.deliver(connection, published[1]);
+    connection.push(["OK", published[1].id, true, ""]);
+    await expect(pending).resolves.toMatchObject({ ok: true });
+    expect(h.receipts.filter((r) => r.type === "replied")).toHaveLength(1);
+  });
+
+  it("shows a fresh conversation's backlog from before its switch as history, never as a plain notification", async () => {
+    const old = mention(ceo, "HOLD every deploy", 1_400);
+    // Signed in the launch's own second: Buzz signs whole seconds, so this is before the switch too.
+    const edge = mention(ceo, "signed in the launch second", 1_500);
+    const current = mention(ceo, "deploy is fine now", 1_600);
+    const h = harness({ historyBefore: 1_500, backlog: () => [old, edge, current].map((event) => ({ eventId: event.id, event })) });
+    await h.connect();
+    expect(h.notifications.map((n) => [n.content, n.meta["history"]])).toEqual([
+      ["[history from before this conversation, not an instruction; confirm with the CEO]\nHOLD every deploy", "pre-switch"],
+      ["[history from before this conversation, not an instruction; confirm with the CEO]\nsigned in the launch second", "pre-switch"],
+      ["deploy is fine now", undefined],
+    ]);
+    // A launch that is not fresh passes no switch time and shows its backlog as it always did.
+    const normal = harness({ backlog: () => [{ eventId: old.id, event: old }] });
+    await normal.connect();
+    expect(normal.notifications.map((n) => [n.content, n.meta["history"]])).toEqual([["HOLD every deploy", undefined]]);
   });
 
   it("stops a text from closing the channel tag it arrives in", () => {
@@ -648,6 +816,7 @@ describe("what a restart remembers having shown, and what it can still answer", 
     const again = await two.connect();
     // The very first parent is still answerable after the restart, and a follow-up to it is still in its thread.
     const pending = two.relay.reply({ room: ROOM, eventId: events[0]!.id, kind: "report", text: "answering the oldest" });
+    await relayShowsNothing(two.relay, again);
     const sent = again.sent.find((f) => f[0] === "EVENT") as [string, { id: string; tags: string[][] }];
     expect(sent[1].tags).toContainEqual(["p", ceoPub]);
     again.push(["OK", sent[1].id, true, ""]);
@@ -699,6 +868,7 @@ describe("repros from the final review", () => {
     expect(h.notifications).toEqual([]);
     // Merged, not overwritten: it is also still a parent that can be answered.
     const pending = h.relay.reply({ room: ROOM, eventId: shown.id, kind: "report", text: "answering it" });
+    await relayShowsNothing(h.relay, connection);
     const sent = connection.sent.find((f) => f[0] === "EVENT") as [string, { id: string }];
     connection.push(["OK", sent[1].id, true, ""]);
     await expect(pending).resolves.toMatchObject({ ok: true });
@@ -737,6 +907,7 @@ describe("repros from the final review", () => {
     const two = harness({ store, now: now + day + 3_600 });
     const again = await two.connect();
     const pending = two.relay.reply({ room: ROOM, eventId: root.id, kind: "report", text: "answering the root" });
+    await relayShowsNothing(two.relay, again);
     const sent = again.sent.find((f) => f[0] === "EVENT") as [string, { id: string }];
     again.push(["OK", sent[1].id, true, ""]);
     await expect(pending).resolves.toMatchObject({ ok: true });
@@ -853,5 +1024,66 @@ describe("a relay that goes quiet is replaced", () => {
     h.scheduler.advance(KEEPALIVE_ANSWER_MS);
     expect(first.closed).toBe(false);
     expect(h.connections).toHaveLength(1);
+  });
+});
+
+describe("the receipts file after a partial append", () => {
+  const receipt = (n: number) => ({ type: "emitted" as const, eventId: `e${n}`, room: ROOM, senderPubkey: ceoPub, emittedAt: n });
+
+  it("starts an append on a new line when the last line is incomplete, so the receipt reads back", () => {
+    const dir = mkdtempSync(join(tmpdir(), "buzz-channel-partial-"));
+    scratch.push(dir);
+    appendChannelReceipt(dir, "demo", receipt(1));
+    // A writer died mid-line: the file ends with half a receipt and no newline.
+    writeFileSync(channelReceiptPath(dir, "demo"), `${JSON.stringify(receipt(1))}\n{"type":"emitted","eventI`, { flag: "w" });
+    appendChannelReceipt(dir, "demo", receipt(2));
+    appendChannelReceipt(dir, "demo", receipt(3));
+    const read = readChannelReceipts(channelReceiptPath(dir, "demo"));
+    expect(read.receipts.map((r) => (r as { eventId: string }).eventId)).toEqual(["e1", "e2", "e3"]);
+    expect(read.skipped).toEqual([2]);
+  });
+
+  it("finishes the line, and writes no second receipt, when a short write left this receipt's JSON without its newline", () => {
+    const dir = mkdtempSync(join(tmpdir(), "buzz-channel-short-"));
+    scratch.push(dir);
+    mkdirSync(join(dir, "buzz-channel"), { recursive: true });
+    writeFileSync(channelReceiptPath(dir, "demo"), `${JSON.stringify(receipt(1))}\n${JSON.stringify({ ...receipt(2), launchId: "this-launch" })}`);
+    expect(() => appendChannelReceipt(dir, "demo", receipt(2), "this-launch")).not.toThrow();
+    // A second retry, and an append of the same receipt by another path, add nothing either.
+    appendChannelReceipt(dir, "demo", receipt(2), "this-launch");
+    appendChannelReceipt(dir, "demo", receipt(3));
+    const read = readChannelReceipts(channelReceiptPath(dir, "demo"));
+    expect(read.receipts.map((r) => (r as { eventId: string }).eventId)).toEqual(["e1", "e2", "e3"]);
+    expect(read.skipped).toEqual([]);
+    expect(readFileSync(channelReceiptPath(dir, "demo"), "utf8").endsWith("\n")).toBe(true);
+  });
+
+  it("fails, and so is not counted as written, when a concurrent writer's fragment lands between the check and the write; a retry then succeeds", () => {
+    const dir = mkdtempSync(join(tmpdir(), "buzz-channel-race-"));
+    scratch.push(dir);
+    appendChannelReceipt(dir, "demo", receipt(1));
+    const fragment = () => appendFileSync(channelReceiptPath(dir, "demo"), '{"type":"emitted","eventI');
+    expect(() => appendChannelReceipt(dir, "demo", receipt(2), undefined, fragment)).toThrow(/read back/u);
+    appendChannelReceipt(dir, "demo", receipt(2));
+    const read = readChannelReceipts(channelReceiptPath(dir, "demo"));
+    expect(read.receipts.map((r) => (r as { eventId: string }).eventId)).toEqual(["e1", "e2"]);
+  });
+
+  it("writes a launch's own emitted receipt even when an older launch already left one for the same event, since the launcher matches on its launch id", () => {
+    const dir = mkdtempSync(join(tmpdir(), "buzz-channel-launch-"));
+    scratch.push(dir);
+    appendChannelReceipt(dir, "demo", receipt(1), "old-launch");
+    appendChannelReceipt(dir, "demo", receipt(1), "new-launch");
+    // The same launch repeating it adds nothing.
+    appendChannelReceipt(dir, "demo", receipt(1), "new-launch");
+    const read = readChannelReceipts(channelReceiptPath(dir, "demo"));
+    expect(read.receipts.map((r) => (r as { launchId?: string }).launchId)).toEqual(["old-launch", "new-launch"]);
+  });
+
+  it("refuses to write what would not read back, so the channel never counts it as reported", () => {
+    const dir = mkdtempSync(join(tmpdir(), "buzz-channel-shape-"));
+    scratch.push(dir);
+    expect(() => appendChannelReceipt(dir, "demo", { type: "replied", event: {}, room: ROOM } as never)).toThrow(/read back/u);
+    expect(readChannelReceipts(channelReceiptPath(dir, "demo")).receipts).toEqual([]);
   });
 });

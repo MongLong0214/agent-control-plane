@@ -149,7 +149,7 @@ node dist/daemon/agentcpd.js
 - CEO 서버(`hermes.mcp.sock`): `run_create`, `run_dispatch`, `run_get`, `run_cancel`, `ceo_decision_submit`, `escalation_resolve`, `owner_decision_submit`, `doctor_run` 등
 - CTO 서버(`cto.mcp.sock`): `session_attest`, `contract_get`, `plan_submit`, `resource_claim`, `task_worker_provision`, `task_worker_run`, `task_receipt_submit`, `result_submit`, `escalation_open`, `handoff_submit`, `handoff_ack`, `run_ack`, `role_dispatch_pending`, `role_dispatch_ack`, `capacity_get`, `doctor_run` 등
 
-CTO 서버의 `blind_review_request`는 거부하기 위해서만 존재합니다. 블라인드 리뷰는 컨트롤 플레인이 시작합니다. wake를 받아야 하는 클라이언트는 `--messaging-socket-path`를 상태 디렉터리 바로 안의 소켓으로 지정해 실행합니다. 자세한 내용은 [운영 문서](docs/OPERATIONS.md#starting-a-client-that-can-receive-wakes)를 참고하세요.
+wake를 받아야 하는 클라이언트는 `--messaging-socket-path`를 상태 디렉터리 바로 안의 소켓으로 지정해 실행합니다. 자세한 내용은 [운영 문서](docs/OPERATIONS.md#starting-a-client-that-can-receive-wakes)를 참고하세요.
 
 ## 설정과 상태
 

@@ -95,8 +95,9 @@ describe("role attachment over real daemon sockets", () => {
     socket.write(`${JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" })}\n`);
     return {
       socket,
+      request,
       register: async (extra = {}) => (await request("tools/call", {
-        name: "role_wake_endpoint_register", arguments: { endpoint, ...extra },
+        name: "role_owner_message_claim", arguments: { roleKey, ...extra },
       })).result!.structuredContent!,
     };
   };
@@ -133,6 +134,15 @@ describe("role attachment over real daemon sockets", () => {
     const peer = await open(credential);
     expect((await peer.register({ sessionId: "forged", bindingGeneration: 999, connection: "other" })).ok).toBe(true);
     expect(h.cp.sessions.verifySecret(subject.sessionId, subject.sessionSecret).allowed).toBe(true);
+  });
+
+  it("no longer lists or answers role_wake_endpoint_register", async () => {
+    const peer = await open(await grant());
+    const listed = (await peer.request("tools/list", {})).result as { tools: { name: string }[] };
+    expect(listed.tools.map((tool) => tool.name)).not.toContain("role_wake_endpoint_register");
+    const called = await peer.request("tools/call", { name: "role_wake_endpoint_register", arguments: { endpoint } })
+      .then((message) => message.result as { isError?: boolean }, () => ({ isError: true }));
+    expect(called.isError).toBe(true);
   });
 
   it("an ordinary holder reconnect takes over an attachment and the former connection cannot register", async () => {

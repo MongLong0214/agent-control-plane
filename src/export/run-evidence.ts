@@ -744,12 +744,15 @@ export class RunEvidenceExporter {
         ])
       : undefined;
     const manifest = pinned ? safeJson(pinned.content_json) : null;
+    // v61: a receipt keeps the name it was written under; the repository may hold another one since.
     const roleOf = (identity: string): string | null =>
       this.db.get<{ repository_role: string }>(
         `SELECT rr.repository_role FROM run_repositories rr
            JOIN repositories r ON r.repository_id = rr.repository_id
-          WHERE rr.run_id = ? AND r.identity = ?`,
-        [run.run_id, identity],
+          WHERE rr.run_id = ?
+            AND (r.identity = ? OR EXISTS (SELECT 1 FROM repository_identity_renames n
+                                            WHERE n.repository_id = r.repository_id AND n.from_identity = ?))`,
+        [run.run_id, identity, identity],
       )?.repository_role ?? null;
     const identities = new Set(receipts
       .filter((receipt) => receipt.operation === "merge_execute" || receipt.operation === "post_merge_verify")

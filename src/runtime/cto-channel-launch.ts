@@ -28,6 +28,13 @@ export interface ChannelLaunchInput {
   readonly keyFile: string;
   readonly roomId: string;
   readonly stateDir: string;
+  /**
+   * This launch's own id. The channel server writes it into every receipt (`--launch-id`), and only a receipt carrying
+   * it proves this launch's channel registered (`channelEmittedBy`).
+   */
+  readonly launchId?: string;
+  /** A fresh conversation's switch time in whole seconds (`--history-before`): what was signed at or before it is shown as history. */
+  readonly historyBefore?: number;
 }
 
 export const channelMcpConfig = (input: ChannelLaunchInput): string =>
@@ -41,6 +48,8 @@ export const channelMcpConfig = (input: ChannelLaunchInput): string =>
           "--key-file", input.keyFile,
           "--room", input.roomId,
           "--state-dir", input.stateDir,
+          ...(input.launchId === undefined ? [] : ["--launch-id", input.launchId]),
+          ...(input.historyBefore === undefined ? [] : ["--history-before", String(input.historyBefore)]),
         ],
       },
     },
@@ -181,7 +190,7 @@ export const classifyScreen = (screen: string): ScreenVerdict => {
   return "OTHER";
 };
 
-export type ChannelStartupFailure = "UNRECOGNIZED_SCREEN" | "WARNING_DIFFERS" | "NOT_REGISTERED";
+export type ChannelStartupFailure = "UNRECOGNIZED_SCREEN" | "WARNING_DIFFERS" | "NOT_REGISTERED" | "ABORTED";
 
 export type ChannelStartupResult =
   | { readonly ok: true; readonly confirmed: boolean }
@@ -192,6 +201,13 @@ export interface ChannelScreenDriver {
   capture(): string | Promise<string>;
   /** The one confirming keystroke (`Enter`). */
   press(): void | Promise<void>;
+  /**
+   * A durable sign that the channel is up and delivering into the session (`channelEmittedSince`), for when the screen
+   * cannot show it: a backlog flood scrolls the one registered line away. Never a reason to press anything.
+   */
+  registered?(): boolean | Promise<boolean>;
+  /** Asked once, immediately before the keystroke and after the last screen read; false presses nothing (ABORTED). */
+  proceed?(): boolean | Promise<boolean>;
   now(): number;
   sleep(ms: number): Promise<void>;
 }
@@ -242,6 +258,7 @@ export const confirmChannelStartup = async (
     return { verdict, settled, raw: text };
   };
   let verdict: ScreenVerdict = "OTHER";
+  const durable = async (): Promise<boolean> => (driver.registered ? (await driver.registered()) === true : false);
   // The one keystroke is authorized by agreement, never by one snapshot: two reads of the same pane in a row, byte for
   // byte the same, each exactly the warning. A screen is redrawn between any two reads, so a single exact read can be
   // followed by something else before the key lands; this narrows that to the one read taken immediately before it.
@@ -250,7 +267,7 @@ export const confirmChannelStartup = async (
   while (true) {
     const read = await look();
     verdict = read.verdict;
-    if (verdict === "REGISTERED") return { ok: true, confirmed: false };
+    if (verdict === "REGISTERED" || (verdict !== "EXACT_WARNING" && await durable())) return { ok: true, confirmed: false };
     if (verdict === "EXACT_WARNING") {
       if (exactBefore !== null && exactBefore === read.raw) break;
       exactBefore = read.raw;
@@ -271,6 +288,16 @@ export const confirmChannelStartup = async (
   if (last.raw !== exactBefore) {
     return { ok: false, failure: last.verdict === "OTHER_DIALOG" ? "UNRECOGNIZED_SCREEN" : "WARNING_DIFFERS", screen: last.verdict, confirmed: false };
   }
+  if (driver.proceed) {
+    if (!(await driver.proceed())) return { ok: false, failure: "ABORTED", screen: last.verdict, confirmed: false };
+    // The wait above took turns of the event loop, in which the pane may have changed: one more read, the same bytes or nothing is pressed.
+    const after = await look();
+    if (after.verdict === "REGISTERED") return { ok: true, confirmed: false };
+    if (after.raw === null) return { ok: false, failure: "UNRECOGNIZED_SCREEN", screen: after.verdict, confirmed: false };
+    if (after.raw !== exactBefore) {
+      return { ok: false, failure: after.verdict === "OTHER_DIALOG" ? "UNRECOGNIZED_SCREEN" : "WARNING_DIFFERS", screen: after.verdict, confirmed: false };
+    }
+  }
   await driver.press();
   lastRefusable = null;
   const pressed = driver.now();
@@ -278,7 +305,8 @@ export const confirmChannelStartup = async (
     await driver.sleep(bounds.pollMs);
     const read = await look();
     verdict = read.verdict;
-    if (verdict === "REGISTERED") return { ok: true, confirmed: true };
+    // The registered line, or the channel's own receipt when its backlog has scrolled that line off the screen.
+    if (verdict === "REGISTERED" || await durable()) return { ok: true, confirmed: true };
     if (driver.now() - pressed >= bounds.registerWaitMs) break;
     // The warning may take a moment to be redrawn away, so it is waited out; a different dialog is not.
     if (read.settled && (verdict === "OTHER_DIALOG" || verdict === "WARNING_ALTERED" || verdict === "WARNING_OTHER_CHANNELS")) break;
@@ -298,6 +326,8 @@ export const tmuxChannelDriver = (input: {
   /** What `#{pane_start_command}` must be: the launcher script this launch started. */
   readonly startCommand: string;
   readonly run: (bin: string, args: string[]) => string;
+  /** The launch's durable registration signal, usually `channelEmittedSince`. */
+  readonly registered?: () => boolean | Promise<boolean>;
 }): ChannelScreenDriver => {
   let pane: string | null = null;
   const own = (): string => {
@@ -316,5 +346,37 @@ export const tmuxChannelDriver = (input: {
     },
     now: () => Date.now(),
     sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+    ...(input.registered ? { registered: input.registered } : {}),
   };
+};
+
+/**
+ * Whether this launch's channel server is up in the session: a `registered` receipt (written when Claude Code completes
+ * the MCP handshake, so a CTO with nothing queued has one) or an `emitted` receipt (a message taken into the session),
+ * carrying this launch's id (`ChannelLaunchInput.launchId`). Either proves the channel registered whatever the screen
+ * shows, because a backlog scrolls the startup line away. Time never counts: an
+ * older channel process still appending while this one starts writes no id, or another launch's. The file is
+ * `channelReceiptPath`'s (`src/buzz/buzz-channel-files.ts`), named here because that module cannot load under the type
+ * stripping the host provisioner runs with. An unreadable file or line is no proof.
+ */
+export const channelEmittedBy = (
+  stateDir: string,
+  projectId: string,
+  launchId: string,
+  read: (path: string) => string = (path) => readFileSync(path, "utf8"),
+): (() => boolean) => () => {
+  let text: string;
+  try {
+    text = read(join(stateDir, "buzz-channel", `${projectId}.receipts.jsonl`));
+  } catch {
+    return false;
+  }
+  return text.split("\n").some((line) => {
+    try {
+      const receipt = JSON.parse(line) as { type?: unknown; launchId?: unknown };
+      return (receipt.type === "emitted" || receipt.type === "registered") && receipt.launchId === launchId;
+    } catch {
+      return false;
+    }
+  });
 };

@@ -75,6 +75,7 @@ import {
   readSync,
   readdirSync,
   realpathSync,
+  renameSync,
   rmSync,
   statSync,
   writeFileSync,
@@ -87,7 +88,16 @@ import Database from "better-sqlite3";
 
 import { acpError, isAcpError } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
+import { holderProvenGone, SingleInstanceLock } from "../daemon/single-instance.ts";
 import { backupDatabase, captureRollbackPointSync, restoreDatabase, validateBackup } from "../db/backup.ts";
+import { Db } from "../db/database.ts";
+import {
+  approveMigration,
+  migrationPlanFrom,
+  readRetiredMigrationApprovals,
+  type MigrationApproval,
+} from "../db/migration-approval.ts";
+import { SCHEMA_VERSION } from "../db/migrations.ts";
 import { RollbackFilesystem, type RollbackEntry, type RollbackParent } from "../db/fd-vfs.ts";
 import { PRIVATE_FILE_MODE } from "../db/state-preflight.ts";
 
@@ -703,6 +713,20 @@ const DATABASE_CONTENT_FORMAT = "agent-control-plane.database-content/v2";
  */
 const DATABASE_HIGH_WATER_GUARD = "ACP_ROLLBACK_DATABASE_HIGH_WATER";
 
+/**
+ * What `guards` declares about `--replacement-database`. A coordinator that predates the flag ignores
+ * an argument it does not know and would run a plain rollback, so the installer asks before it passes
+ * the flag.
+ */
+const REPLACEMENT_DATABASE_GUARD = "ACP_ROLLBACK_REPLACEMENT_DATABASE";
+/**
+ * How long the sealed state-admin restore may run before the install gives up on it. The restore
+ * copies one database image into place and renames it, so it is seconds for any real image; ten
+ * minutes is a bound on a stuck child, not an expected duration.
+ */
+const RESTORE_TIMEOUT_MS = 600_000;
+const REPLACEMENT_SOURCE_FORMAT = "agent-control-plane.rollback-replacement/v1";
+
 const quoteIdentifier = (name: string): string => `"${name.replaceAll('"', '""')}"`;
 
 /** The names SQLite answers with a rowid table's hidden rowid, each unless a declared column takes it. */
@@ -731,6 +755,27 @@ const hiddenRowidName = (raw: Database.Database, table: string): string => {
 };
 
 /**
+ * The only fields a migration replay cannot reproduce, named so nothing else is ever excluded.
+ *
+ * Each migration step appends one `schema_migrations` row stamped with the clock (`applied_at`),
+ * and the first step also records the pre-migration backup it took (`backup_file`, a path, and
+ * `backup_checksum`, the digest of that file). A replay in a temporary directory takes its own
+ * backup at its own time, so these three differ from the live database's on every run, whatever
+ * else is true. The ledger is immutable by trigger, so the replay cannot be made to carry the
+ * live values; the comparison reads them as NULL on both sides instead.
+ *
+ * Only for ledger rows above the sealed version, so every row the seal already held, and every
+ * row of every other table, is compared exactly. The row's own `version`, `migration_id` and
+ * `checksum` stay in the comparison, which is what says the live ledger names the approved chain.
+ */
+const MIGRATION_BOOKKEEPING_COLUMNS = ["applied_at", "backup_file", "backup_checksum"] as const;
+
+interface MigrationBookkeepingMask {
+  /** Ledger rows with `version` above this are the migration's own, and read their bookkeeping as NULL. */
+  aboveVersion: number;
+}
+
+/**
  * One digest over everything a write can change: `user_version`, `application_id`, the schema
  * without its root pages (layout, not content), and every row of every table in key order. Each
  * value is tagged with its storage class and length-prefixed, so `'1'`, `1` and `1.0` differ and no
@@ -743,7 +788,7 @@ const hiddenRowidName = (raw: Database.Database, table: string): string => {
  * Where an `INTEGER PRIMARY KEY` already aliases it, the value appears twice, which costs nothing.
  * A `WITHOUT ROWID` table has no hidden identity: its declared primary key is all of it.
  */
-const digestDatabaseContent = (raw: Database.Database): string => {
+const digestDatabaseContent = (raw: Database.Database, mask?: MigrationBookkeepingMask): string => {
   const hash = createHash("sha256");
   const length = Buffer.alloc(8);
   const field = (tag: string, bytes: Uint8Array): void => {
@@ -774,7 +819,24 @@ const digestDatabaseContent = (raw: Database.Database): string => {
     }
   };
 
+  // What `SELECT` reads for a table: every column, except that under a mask the migration
+  // bookkeeping of the ledger rows the mask names reads as NULL. Nothing else is ever masked.
+  const selection = (table: string): string => {
+    if (mask === undefined || table !== "schema_migrations") return "*";
+    return (raw.prepare("SELECT name FROM pragma_table_info(?)").pluck().all(table) as string[])
+      .map((column) =>
+        (MIGRATION_BOOKKEEPING_COLUMNS as readonly string[]).includes(column)
+          ? `CASE WHEN version > ${mask.aboveVersion} THEN NULL ELSE ${quoteIdentifier(column)} END`
+          : quoteIdentifier(column),
+      )
+      .join(", ");
+  };
+
   field("F", Buffer.from(DATABASE_CONTENT_FORMAT, "utf8"));
+  // A masked digest is a different measurement and must never equal an unmasked one.
+  if (mask !== undefined) {
+    field("M", Buffer.from(`schema_migrations(${MIGRATION_BOOKKEEPING_COLUMNS.join(",")}) above ${mask.aboveVersion}`, "utf8"));
+  }
   field("V", Buffer.from(String(raw.pragma("user_version", { simple: true })), "utf8"));
   field("A", Buffer.from(String(raw.pragma("application_id", { simple: true })), "utf8"));
   rows("SELECT type, name, tbl_name, sql FROM sqlite_schema ORDER BY type, name");
@@ -790,7 +852,7 @@ const digestDatabaseContent = (raw: Database.Database): string => {
     field("T", Buffer.from(table.name, "utf8"));
     if (table.wr === 0) {
       const rowid = hiddenRowidName(raw, table.name);
-      rows(`SELECT ${rowid}, * FROM ${quoteIdentifier(table.name)} ORDER BY ${rowid}`);
+      rows(`SELECT ${rowid}, ${selection(table.name)} FROM ${quoteIdentifier(table.name)} ORDER BY ${rowid}`);
       continue;
     }
     const key = (
@@ -798,7 +860,7 @@ const digestDatabaseContent = (raw: Database.Database): string => {
     )
       .map(quoteIdentifier)
       .join(", ");
-    rows(`SELECT * FROM ${quoteIdentifier(table.name)} ORDER BY ${key}`);
+    rows(`SELECT ${selection(table.name)} FROM ${quoteIdentifier(table.name)} ORDER BY ${key}`);
   }
   return `sha256:${hash.digest("hex")}`;
 };
@@ -813,7 +875,10 @@ const digestDatabaseContent = (raw: Database.Database): string => {
  * the main file alone is older than the last commit until something checkpoints it. A database
  * that changes while it is being copied has a writer, and is refused rather than measured.
  */
-const measureDatabaseAt = (databasePath: string): RollbackPairDatabaseHighWater | null => {
+const measureDatabaseAt = (
+  databasePath: string,
+  mask?: MigrationBookkeepingMask,
+): (RollbackPairDatabaseHighWater & { migrationMaskedSha256?: string }) | null => {
   if (lstatSync(databasePath, { throwIfNoEntry: false }) === undefined) return null;
   const files = ["", "-wal", "-journal"];
   for (const suffix of files) {
@@ -858,6 +923,7 @@ const measureDatabaseAt = (databasePath: string): RollbackPairDatabaseHighWater 
       return {
         contentFormat: DATABASE_CONTENT_FORMAT,
         contentSha256: digestDatabaseContent(raw),
+        ...(mask === undefined ? {} : { migrationMaskedSha256: digestDatabaseContent(raw, mask) }),
         userVersion: Number(raw.pragma("user_version", { simple: true })),
         auditEventId:
           audited === 0 ? null : (raw.prepare("SELECT max(event_id) FROM audit_events").pluck().get() as number | null),
@@ -925,6 +991,521 @@ const assertLiveDatabaseAtSeal = (manifest: RollbackPairManifest, root: string):
       `the live database has changed since this pair was sealed, and restoring the sealed image would discard every write made since; ${remedy}`,
       { root, databasePath, sealedAt: manifest.createdAt, sealed, live },
     );
+  }
+};
+
+/**
+ * `assertLiveDatabaseAtSeal`, except that a live database whose content differs from the seal by
+ * exactly the migration the owner approved is accepted, and the migration is returned (#1492).
+ *
+ * A pair is sealed from the stopped database right before an approved schema migration, to be the
+ * way back from it. The migration alone changes the content digest and moves no audit row, so the
+ * seal check would refuse the one rollback the pair exists for, with nothing written since. Only
+ * a content difference is eligible, and only the replay below can excuse it; every other refusal
+ * from the check above, and every content difference the replay does not reproduce, stands as it
+ * was, with the replay's outcome added to the evidence.
+ */
+const assertLiveDatabaseAtSealOrApprovedMigration = (
+  manifest: RollbackPairManifest,
+  root: string,
+  sealedImage: string,
+): ApprovedMigrationSinceSeal | null => {
+  try {
+    assertLiveDatabaseAtSeal(manifest, root);
+    return null;
+  } catch (error) {
+    if (
+      !isAcpError(error) ||
+      error.reasonCode !== ReasonCode.ROLLBACK_PAIR_STALE_DATABASE ||
+      error.evidence["live"] === undefined
+    ) {
+      throw error;
+    }
+    const replay = replayApprovedMigration(
+      manifest.database.highWater!,
+      manifest.identity.database.targetPath,
+      sealedImage,
+    );
+    if ("approved" in replay) return replay.approved;
+    if (replay.evidence === undefined) throw error;
+    throw acpError(error.reasonCode, error.message, { ...error.evidence, migrationReplay: replay.evidence });
+  }
+};
+
+/** What explained the live database's difference from the seal, for the operator and the audit trail. */
+export interface ApprovedMigrationSinceSeal {
+  fromVersion: number;
+  toVersion: number;
+  migrations: readonly string[];
+  approvedBy: string;
+  approvedAt: string;
+  /** The digest, with the migration's own ledger bookkeeping masked, both the replay and the live database produced. */
+  replayedContentSha256: string;
+}
+
+/**
+ * Whether the live database is exactly the sealed image plus the migration the owner approved.
+ *
+ * The audit high-water mark cannot say so: a migration moves no audit row, and neither does a write
+ * to any other table. The content can. So when an applied approval on file names a chain that
+ * starts at the sealed version, the sealed image is copied aside, that chain is applied to the copy
+ * through the product's own approval and open path, and the copy is compared with the live database
+ * under one digest. Equal means the live database holds the seal and the migration and nothing
+ * else, so putting the seal back discards nothing. Anything else — no approval, another chain, a
+ * replay that fails, a digest that differs by one row — is not explained, and is refused as before.
+ *
+ * `evidence` is present only when a replay was attempted and did not match.
+ */
+const replayApprovedMigration = (
+  sealed: RollbackPairDatabaseHighWater,
+  databasePath: string,
+  sealedImage: string,
+): { approved: ApprovedMigrationSinceSeal } | { evidence?: Record<string, unknown> } => {
+  if (sealed.userVersion >= SCHEMA_VERSION) return {};
+  let plan: ReturnType<typeof migrationPlanFrom>;
+  try {
+    plan = migrationPlanFrom(sealed.userVersion);
+  } catch {
+    return {};
+  }
+  const livePath = realpathSync(databasePath);
+  const approvals = readRetiredMigrationApprovals(databasePath, sealed.userVersion).filter(
+    (approval: MigrationApproval) =>
+      approval.toVersion === plan.toVersion &&
+      approval.migrations.length === plan.migrations.length &&
+      approval.migrations.every((id, index) => id === plan.migrations[index]) &&
+      approval.target.path === livePath,
+  );
+  const approval = approvals.at(-1);
+  if (approval === undefined) return {};
+
+  const evidence = (outcome: string, extra: Record<string, unknown> = {}): { evidence: Record<string, unknown> } => ({
+    evidence: {
+      outcome,
+      fromVersion: approval.fromVersion,
+      toVersion: approval.toVersion,
+      migrations: approval.migrations,
+      ...extra,
+    },
+  });
+  const live = measureDatabaseAt(databasePath, { aboveVersion: sealed.userVersion });
+  if (live === null || live.userVersion !== approval.toVersion) {
+    return evidence("live-database-not-at-the-approved-version", { liveVersion: live?.userVersion ?? null });
+  }
+
+  let replayed: string;
+  const scratch = mkdtempSync(join(tmpdir(), "acp-rollback-replay-"));
+  try {
+    const copy = join(scratch, "state.sqlite");
+    copyFileSync(sealedImage, copy);
+    chmodSync(copy, 0o600);
+    approveMigration(copy, "rollback-pair-replay");
+    new Db(copy).close();
+    const raw = new Database(copy, { fileMustExist: true });
+    try {
+      replayed = digestDatabaseContent(raw, { aboveVersion: sealed.userVersion });
+    } finally {
+      raw.close();
+    }
+  } catch (error) {
+    return evidence("replay-failed", { error: error instanceof Error ? error.message : String(error) });
+  } finally {
+    rmSync(scratch, { recursive: true, force: true });
+  }
+  if (replayed !== live.migrationMaskedSha256) {
+    return evidence("replay-did-not-match-the-live-database", {
+      replayedContentSha256: replayed,
+      liveContentSha256: live.migrationMaskedSha256,
+    });
+  }
+  return {
+    approved: {
+      fromVersion: approval.fromVersion,
+      toVersion: approval.toVersion,
+      migrations: approval.migrations,
+      approvedBy: approval.approvedBy,
+      approvedAt: approval.approvedAt,
+      replayedContentSha256: replayed,
+    },
+  };
+};
+
+/**
+ * A replacement database image: the converted copy that stands in for the pair's sealed image when
+ * the live database is past the pair's schema and the pair's own image cannot be the one installed.
+ *
+ * The identity chain, each link checked where it is used:
+ *  - the image is a `state-admin backup` image with its own manifest (checksum, integrity, version);
+ *  - `IMAGE.source.json` records the SHA-256 of the stopped source main file it was converted from
+ *    and the image's own SHA-256. The backup manifest is written by code outside this module, so the
+ *    record is a sidecar rather than a manifest field;
+ *  - the live database must still hash to that source and be quiescent (no lock holder, no
+ *    `-journal`, an empty or absent `-wal`), so no write lies between the source and now;
+ *  - the unchanged replay shows the image is the live database minus the approved migration;
+ *  - the bytes installed are the staged bytes that were validated.
+ */
+export interface ReplacementDatabaseBinding {
+  /** SHA-256 of the private copy that passed validation. Everything later is compared with it. */
+  imageSha256: string;
+  /** SHA-256 of the stopped source main file the image was converted from, as the sidecar records it. */
+  sourceMainSha256: string;
+  /** The mark of the image itself, standing in for the pair's sealed mark. */
+  highWater: RollbackPairDatabaseHighWater;
+}
+
+export const replacementSourcePath = (image: string): string => `${image}.source.json`;
+
+const readReplacementSource = (sidecar: string): { sourceMainSha256: string; imageSha256: string } => {
+  const stat = lstatSync(sidecar, { throwIfNoEntry: false });
+  if (stat === undefined || !stat.isFile() || stat.isSymbolicLink()) {
+    throw acpError(
+      ReasonCode.INTERNAL_ERROR,
+      "the replacement database has no regular source record beside it, so what it was converted from cannot be shown",
+      { sidecar },
+    );
+  }
+  let parsed: Record<string, unknown>;
+  try {
+    parsed = JSON.parse(readFileSync(sidecar, "utf8")) as Record<string, unknown>;
+  } catch {
+    throw acpError(ReasonCode.INTERNAL_ERROR, "the replacement database's source record is unreadable", { sidecar });
+  }
+  if (
+    parsed["format"] !== REPLACEMENT_SOURCE_FORMAT ||
+    typeof parsed["sourceMainSha256"] !== "string" ||
+    !DIGEST.test(parsed["sourceMainSha256"]) ||
+    typeof parsed["imageSha256"] !== "string" ||
+    !DIGEST.test(parsed["imageSha256"])
+  ) {
+    throw acpError(ReasonCode.INTERNAL_ERROR, "the replacement database's source record has an invalid shape", { sidecar });
+  }
+  return { sourceMainSha256: parsed["sourceMainSha256"], imageSha256: parsed["imageSha256"] };
+};
+
+/** Copies the image, its backup manifest and its source record into `into`, keeping the image's name. */
+const copyReplacementImage = (
+  image: string,
+  into: string,
+  databaseTargetPath: string,
+  withSourceRecord = true,
+): string => {
+  assertAbsolute(image, "the replacement database");
+  if (canonical(image) === databaseTargetPath) {
+    throw acpError(ReasonCode.INVALID_ARGUMENT, "the replacement database is the live database", { image });
+  }
+  const copy = join(into, basename(image));
+  mkdirSync(into, { recursive: true, mode: 0o700 });
+  for (const [what, from, to] of [
+    ["image", image, copy],
+    ["backup manifest", `${image}.manifest.json`, `${copy}.manifest.json`],
+    ...(withSourceRecord
+      ? ([["source record", replacementSourcePath(image), replacementSourcePath(copy)]] as const)
+      : []),
+  ] as const) {
+    if (lstatSync(from, { throwIfNoEntry: false }) === undefined) {
+      throw acpError(
+        what === "image" ? ReasonCode.NOT_FOUND : ReasonCode.INTERNAL_ERROR,
+        `the replacement database's ${what} does not exist`,
+        { path: from },
+      );
+    }
+    copyPrivateFile(from, to);
+  }
+  return copy;
+};
+
+/** Reads one database's identity-bearing schema and ledger through a private copy. */
+const generationShapeOf = (path: string): { applicationId: number; schema: unknown[]; ledger: unknown[] } => {
+  const scratch = mkdtempSync(join(tmpdir(), "acp-rollback-generation-"));
+  try {
+    const copy = join(scratch, "image.sqlite");
+    copyFileSync(path, copy);
+    const raw = new Database(copy, { fileMustExist: true });
+    try {
+      const hasLedger =
+        (raw.prepare("SELECT count(*) FROM sqlite_schema WHERE type = 'table' AND name = 'schema_migrations'").pluck().get() as number) > 0;
+      return {
+        applicationId: Number(raw.pragma("application_id", { simple: true })),
+        schema: raw.prepare("SELECT type, name, tbl_name, sql FROM sqlite_schema ORDER BY type, name, tbl_name").all(),
+        ledger: hasLedger ? raw.prepare("SELECT * FROM schema_migrations ORDER BY version, migration_id").all() : [],
+      };
+    } finally {
+      raw.close();
+    }
+  } finally {
+    rmSync(scratch, { recursive: true, force: true });
+  }
+};
+
+/**
+ * The replacement is the pair's own v-N generation, not any database that happens to be at N: its
+ * schema version is the pair's, and its `application_id`, every `sqlite_schema` row and every
+ * `schema_migrations` row equal the pair's sealed image. A converted copy that still carries a newer
+ * generation's trigger, or a fresh database at the same version (its ledger timestamps differ), is
+ * not the way back to the generation the pair names.
+ */
+const assertReplacementAtSealedGeneration = (
+  pairImage: string,
+  replacementImage: string,
+  replacementSchemaVersion: number,
+  identity: RollbackPairIdentity,
+  expectedSchemaVersion: number,
+): void => {
+  if (replacementSchemaVersion !== identity.schemaVersion || replacementSchemaVersion !== expectedSchemaVersion) {
+    throw acpError(ReasonCode.INTERNAL_ERROR, "the replacement database is not at the schema version the pair is sealed at", {
+      sealed: identity.schemaVersion,
+      expected: expectedSchemaVersion,
+      found: replacementSchemaVersion,
+    });
+  }
+  const sealed = generationShapeOf(pairImage);
+  const replacement = generationShapeOf(replacementImage);
+  for (const [what, same] of [
+    ["application_id", sealed.applicationId === replacement.applicationId],
+    ["sqlite_schema rows", JSON.stringify(sealed.schema) === JSON.stringify(replacement.schema)],
+    ["schema_migrations rows", JSON.stringify(sealed.ledger) === JSON.stringify(replacement.ledger)],
+  ] as const) {
+    if (!same) {
+      throw acpError(
+        ReasonCode.INTERNAL_ERROR,
+        `the replacement database's ${what} are not the sealed generation's, so it is not the way back to the pair's generation`,
+        { differs: what },
+      );
+    }
+  }
+};
+
+/**
+ * Whether nothing can be writing the live database: no holder of the state lock that is not proven
+ * gone, no hot `-journal`, and a `-wal` that is absent or empty. Fails closed on a lock it cannot read.
+ */
+const assertLiveDatabaseQuiescent = (databasePath: string): void => {
+  const refuse = (why: string, evidence: Record<string, unknown> = {}): never => {
+    throw acpError(
+      ReasonCode.ROLLBACK_PAIR_STALE_DATABASE,
+      `the live database is not quiescent (${why}), so it cannot be shown to be the replacement's source; stop the service and try again`,
+      { databasePath, ...evidence },
+    );
+  };
+  const lockPath = join(dirname(databasePath), "agentcpd.lock");
+  const standing = lstatSync(lockPath, { throwIfNoEntry: false });
+  if (standing !== undefined) {
+    const holder = standing.isDirectory() || standing.isFile() ? new SingleInstanceLock(lockPath).read() : null;
+    if (holder === null) refuse("the state lock cannot be read", { lockPath });
+    else if (!holderProvenGone(holder)) refuse("a daemon holds the state lock", { lockPath, pid: holder.pid });
+  }
+  if (lstatSync(`${databasePath}-journal`, { throwIfNoEntry: false }) !== undefined) {
+    refuse("a -journal is present");
+  }
+  const wal = lstatSync(`${databasePath}-wal`, { throwIfNoEntry: false });
+  if (wal !== undefined && (!wal.isFile() || wal.size !== 0)) refuse("the -wal is not empty");
+};
+
+/** The live main file is, byte for byte, the stopped source the replacement was converted from. */
+const assertLiveDatabaseIsReplacementSource = (databasePath: string, sourceMainSha256: string): void => {
+  assertLiveDatabaseQuiescent(databasePath);
+  const stat = lstatSync(databasePath, { bigint: true, throwIfNoEntry: false });
+  if (stat === undefined || !stat.isFile()) {
+    throw acpError(
+      ReasonCode.ROLLBACK_PAIR_STALE_DATABASE,
+      "there is no live database file to show is the replacement's source",
+      { databasePath },
+    );
+  }
+  const actual = hashFile(databasePath);
+  const after = lstatSync(databasePath, { bigint: true, throwIfNoEntry: false });
+  if (after === undefined || `${after.ino}:${after.size}:${after.mtimeNs}` !== `${stat.ino}:${stat.size}:${stat.mtimeNs}`) {
+    throw acpError(
+      ReasonCode.ROLLBACK_PAIR_STALE_DATABASE,
+      "the live database changed while it was being hashed, so something is still writing it",
+      { databasePath },
+    );
+  }
+  if (actual !== sourceMainSha256) {
+    throw acpError(
+      ReasonCode.ROLLBACK_PAIR_STALE_DATABASE,
+      "the live database is not the source file the replacement was converted from, so installing the replacement would discard what the live database holds",
+      { databasePath, expected: sourceMainSha256, actual },
+    );
+  }
+};
+
+/** What the image itself shows, with no source record involved: it is sound, and it is the pair's generation. */
+const inspectReplacementCopy = (
+  validated: ValidatedRollbackPair,
+  expectation: RollbackPairExpectation,
+  copy: string,
+): { imageSha256: string; highWater: RollbackPairDatabaseHighWater } => {
+  const backup = validateBackup(copy, { assertSchemaInvariants: false });
+  assertReplacementAtSealedGeneration(
+    validated.databasePath,
+    copy,
+    backup.schemaVersion,
+    validated.manifest.identity,
+    expectation.schemaVersion,
+  );
+  const measured = measureDatabaseAt(copy)!;
+  return {
+    imageSha256: hashFile(copy),
+    highWater: {
+      contentFormat: measured.contentFormat,
+      contentSha256: measured.contentSha256,
+      userVersion: measured.userVersion,
+      auditEventId: measured.auditEventId,
+    },
+  };
+};
+
+/** Checks one private copy of a replacement image and binds it to its source record. */
+const bindReplacementCopy = (
+  validated: ValidatedRollbackPair,
+  expectation: RollbackPairExpectation,
+  copy: string,
+): ReplacementDatabaseBinding => {
+  const record = readReplacementSource(replacementSourcePath(copy));
+  const inspected = inspectReplacementCopy(validated, expectation, copy);
+  if (inspected.imageSha256 !== record.imageSha256) {
+    throw acpError(ReasonCode.INTERNAL_ERROR, "the replacement database is not the image its source record names", {
+      expected: record.imageSha256,
+      actual: inspected.imageSha256,
+    });
+  }
+  return { imageSha256: inspected.imageSha256, sourceMainSha256: record.sourceMainSha256, highWater: inspected.highWater };
+};
+
+const withReplacementHighWater = (
+  manifest: RollbackPairManifest,
+  binding: ReplacementDatabaseBinding,
+): RollbackPairManifest => ({ ...manifest, database: { ...manifest.database, highWater: binding.highWater } });
+
+/**
+ * The pair's OWN high-water mark, checked as it is without the flag, before the replacement's mark
+ * stands in for it: a pair that records none, or one recorded under another content definition, is
+ * refused here exactly as it is refused without `--replacement-database`. A content difference from
+ * the live database is the expected case for a replacement and is not an error here.
+ */
+const assertPairMarkAllowsReplacement = (manifest: RollbackPairManifest, root: string): void => {
+  try {
+    assertLiveDatabaseAtSeal(manifest, root);
+  } catch (error) {
+    if (
+      isAcpError(error) &&
+      error.reasonCode === ReasonCode.ROLLBACK_PAIR_STALE_DATABASE &&
+      error.evidence["live"] !== undefined
+    ) {
+      return;
+    }
+    throw error;
+  }
+};
+
+/**
+ * `assertLiveDatabaseAtSealOrApprovedMigration`, unchanged, run against the replacement image — and
+ * then the source link. The replay refusal keeps its evidence; the source check only adds to it.
+ *
+ * The flag is for exactly one case: a live database past the pair's generation by an approved
+ * migration. So it never loosens what STALE refuses without it. The pair's own mark is checked first,
+ * and the check must have gone through the approved-migration replay; a replacement that merely
+ * equals the live database (a same-version write with no migration) is refused as it is without the
+ * flag.
+ */
+const assertLiveDatabaseAtReplacement = (
+  manifest: RollbackPairManifest,
+  root: string,
+  replacementImage: string,
+  binding: ReplacementDatabaseBinding,
+): ApprovedMigrationSinceSeal => {
+  assertPairMarkAllowsReplacement(manifest, root);
+  const approved = assertLiveDatabaseAtSealOrApprovedMigration(
+    withReplacementHighWater(manifest, binding),
+    root,
+    replacementImage,
+  );
+  if (approved === null) {
+    throw acpError(
+      ReasonCode.ROLLBACK_PAIR_STALE_DATABASE,
+      "a replacement database is accepted only for a live database that is past the pair's generation by an " +
+        "approved migration, and this one is not; restore the pair without --replacement-database, or seal a fresh " +
+        "pair from the stopped current database",
+      { databasePath: manifest.identity.database.targetPath, root },
+    );
+  }
+  assertLiveDatabaseIsReplacementSource(manifest.identity.database.targetPath, binding.sourceMainSha256);
+  return approved;
+};
+
+/**
+ * Writes `IMAGE.source.json`, the record `--replacement-database` requires, after showing what it
+ * says. The source is the stopped live database; the image is the converted copy made from it.
+ *
+ *  1. the source is quiescent (no lock holder, no `-journal`, an empty or absent `-wal`);
+ *  2. the image is sound and is the pair's generation, as validate requires;
+ *  3. the unchanged replay, run with this pair and its approved migration, shows the image is
+ *     exactly the source minus that migration — so the image does derive from this source;
+ *  4. the source main file is hashed, and it is the same file before and after the replay.
+ *
+ * Only then are both hashes written (mode 0600, never over an existing record). A record is thus a
+ * statement the coordinator checked, not whatever its writer chose to hash.
+ */
+export const recordReplacementSource = (
+  pairRoot: string,
+  expectation: RollbackPairExpectation,
+  source: string,
+  image: string,
+): { sidecar: string; sourceMainSha256: string; imageSha256: string } => {
+  const validated = validateSealedPair(pairRoot, expectation);
+  const target = validated.manifest.identity.database.targetPath;
+  assertAbsolute(source, "the replacement source database");
+  if (canonical(source) !== target) {
+    throw acpError(
+      ReasonCode.INVALID_ARGUMENT,
+      "the replacement source must be the live database the pair is for: the approved migration is recorded against it",
+      { source, expected: target },
+    );
+  }
+  const sidecar = replacementSourcePath(image);
+  assertAbsolute(image, "the replacement database");
+  if (lstatSync(sidecar, { throwIfNoEntry: false }) !== undefined) {
+    throw acpError(ReasonCode.INVALID_ARGUMENT, "a source record already exists beside this image; remove it to record again", {
+      sidecar,
+    });
+  }
+  const scratch = mkdtempSync(join(tmpdir(), "acp-rollback-record-"));
+  try {
+    const copy = copyReplacementImage(image, scratch, target, false);
+    assertLiveDatabaseQuiescent(target);
+    const before = hashFile(target);
+    const inspected = inspectReplacementCopy(validated, expectation, copy);
+    const binding: ReplacementDatabaseBinding = {
+      imageSha256: inspected.imageSha256,
+      sourceMainSha256: before,
+      highWater: inspected.highWater,
+    };
+    assertPairMarkAllowsReplacement(validated.manifest, validated.root);
+    const approved = assertLiveDatabaseAtSealOrApprovedMigration(
+      withReplacementHighWater(validated.manifest, binding),
+      validated.root,
+      copy,
+    );
+    if (approved === null) {
+      throw acpError(
+        ReasonCode.ROLLBACK_PAIR_STALE_DATABASE,
+        "the image is not the source minus an approved migration, so no record of it is written",
+        { databasePath: target },
+      );
+    }
+    assertLiveDatabaseIsReplacementSource(target, before);
+    const temporary = `${sidecar}.tmp-${process.pid}-${randomUUID()}`;
+    writeFileSync(
+      temporary,
+      `${JSON.stringify({ format: REPLACEMENT_SOURCE_FORMAT, sourceMainSha256: before, imageSha256: inspected.imageSha256 }, null, 2)}\n`,
+      { encoding: "utf8", mode: 0o600, flag: "wx" },
+    );
+    chmodSync(temporary, 0o600);
+    renameSync(temporary, sidecar);
+    return { sidecar, sourceMainSha256: before, imageSha256: inspected.imageSha256 };
+  } finally {
+    rmSync(scratch, { recursive: true, force: true });
   }
 };
 
@@ -1237,6 +1818,10 @@ export interface ValidatedRollbackPair {
   runtimeRoot: string;
   entrypointPath: string;
   stateAdminPath: string;
+  /** Present when the live database differs from the seal only by the approved migration it was sealed for. */
+  approvedMigration?: ApprovedMigrationSinceSeal;
+  /** Present when a replacement database stood in for the pair's image in the live-database checks. */
+  replacement?: ReplacementDatabaseBinding;
 }
 
 /**
@@ -1694,10 +2279,32 @@ const validateSealedPair = (
 export const validateRollbackPair = (
   pairRoot: string,
   expectation: RollbackPairExpectation,
+  options: { replacementDatabase?: string } = {},
 ): ValidatedRollbackPair => {
   const validated = validateSealedPair(pairRoot, expectation);
-  assertLiveDatabaseAtSeal(validated.manifest, validated.root);
-  return validated;
+  if (options.replacementDatabase === undefined) {
+    const approvedMigration = assertLiveDatabaseAtSealOrApprovedMigration(
+      validated.manifest,
+      validated.root,
+      validated.databasePath,
+    );
+    return approvedMigration === null ? validated : { ...validated, approvedMigration };
+  }
+  // Private copies in the system temporary directory, removed before this returns: a refusal here
+  // must leave the deployment and the caller's directories exactly as found.
+  const scratch = mkdtempSync(join(tmpdir(), "acp-rollback-replacement-"));
+  try {
+    const copy = copyReplacementImage(
+      options.replacementDatabase,
+      scratch,
+      validated.manifest.identity.database.targetPath,
+    );
+    const replacement = bindReplacementCopy(validated, expectation, copy);
+    const approvedMigration = assertLiveDatabaseAtReplacement(validated.manifest, validated.root, copy, replacement);
+    return { ...validated, approvedMigration, replacement };
+  } finally {
+    rmSync(scratch, { recursive: true, force: true });
+  }
 };
 
 export interface StagedRollbackPair {
@@ -1709,9 +2316,14 @@ export interface StagedRollbackPair {
   launcherPath: string;
   runtimeRoot: string;
   stateAdminPath: string;
+  approvedMigration?: ApprovedMigrationSinceSeal;
+  /** Present when `databasePath` is a staged replacement image rather than the pair's own. */
+  replacement?: ReplacementDatabaseBinding;
 }
 
 export interface StageOptions {
+  /** A converted copy to install instead of the pair's sealed database image. See `ReplacementDatabaseBinding`. */
+  replacementDatabase?: string;
   /**
    * Test-only seam, fired immediately before each member is copied into the stage.
    *
@@ -1744,7 +2356,11 @@ export const stageRollbackPair = (
   options: StageOptions = {},
 ): StagedRollbackPair => {
   assertAbsolute(stageParent, "the stage parent");
-  const validated = validateRollbackPair(pairRoot, expectation);
+  const validated = validateRollbackPair(
+    pairRoot,
+    expectation,
+    options.replacementDatabase === undefined ? {} : { replacementDatabase: options.replacementDatabase },
+  );
   mkdirSync(stageParent, { recursive: true, mode: 0o700 });
   const stageRoot = join(stageParent, `.rollback-stage-${validated.pairId}-${process.pid}-${randomUUID()}`);
   mkdirSync(stageRoot, { mode: 0o700 });
@@ -1843,15 +2459,45 @@ export const stageRollbackPair = (
     // The staged image has to satisfy the backup contract in its own right, not by inheritance.
     validateBackup(join(pairMembers, validated.manifest.database.member), { assertSchemaInvariants: false });
 
+    // The replacement image, as a copy this stage owns. What validation measured was a private copy
+    // made earlier; the copy that is installed has to be those same bytes, with the same source record.
+    let stagedReplacement: string | undefined;
+    if (options.replacementDatabase !== undefined && validated.replacement !== undefined) {
+      stagedReplacement = copyReplacementImage(
+        options.replacementDatabase,
+        join(stageRoot, "replacement"),
+        identity.database.targetPath,
+      );
+      validateBackup(stagedReplacement, { assertSchemaInvariants: false });
+      const stagedSha256 = hashFile(stagedReplacement);
+      const stagedRecord = readReplacementSource(replacementSourcePath(stagedReplacement));
+      if (
+        stagedSha256 !== validated.replacement.imageSha256 ||
+        stagedRecord.imageSha256 !== validated.replacement.imageSha256 ||
+        stagedRecord.sourceMainSha256 !== validated.replacement.sourceMainSha256
+      ) {
+        throw acpError(ReasonCode.INTERNAL_ERROR, "the replacement database changed between validation and staging", {
+          stageRoot,
+          expected: validated.replacement.imageSha256,
+          actual: stagedSha256,
+        });
+      }
+    }
+
     return {
       pairId: validated.pairId,
       stageRoot,
-      manifest: validated.manifest,
-      databasePath: join(pairMembers, validated.manifest.database.member),
+      manifest:
+        validated.replacement === undefined
+          ? validated.manifest
+          : withReplacementHighWater(validated.manifest, validated.replacement),
+      ...(validated.replacement === undefined ? {} : { replacement: validated.replacement }),
+      databasePath: stagedReplacement ?? join(pairMembers, validated.manifest.database.member),
       plistPath: join(pairMembers, identity.service.plist),
       launcherPath: join(pairMembers, identity.service.launcher),
       runtimeRoot: join(pairMembers, "runtime"),
       stateAdminPath: join(pairMembers, "runtime", identity.runtime.stateAdmin),
+      ...(validated.approvedMigration === undefined ? {} : { approvedMigration: validated.approvedMigration }),
     };
   } catch (error) {
     rmSync(stageRoot, { recursive: true, force: true });
@@ -1949,6 +2595,10 @@ export interface AppliedRollbackPair {
   plistPath: string;
   launcherPath: string;
   databasePath: string;
+  /** Present when the database put back differed from the live one only by the approved migration. */
+  approvedMigration?: ApprovedMigrationSinceSeal;
+  /** SHA-256 of the replacement image that was installed, when one was. */
+  replacementImageSha256?: string;
   /**
    * `null` on every successful return: the previous generation this copy held is deliberately
    * gone, and the sealed pair for it still exists under `pair_root` — that is what the sealed-pair
@@ -2032,10 +2682,28 @@ export const applyRollbackPair = (
       void what;
     };
     intact("before securing recovery");
+    /**
+     * The live-database check, the same one at every call. With a replacement image it also holds
+     * the staged copy to the bytes that passed validation, and the live file to the source the image
+     * was converted from.
+     */
+    const checkLiveDatabase = (): ApprovedMigrationSinceSeal | null => {
+      if (staged.replacement === undefined) {
+        return assertLiveDatabaseAtSealOrApprovedMigration(staged.manifest, staged.stageRoot, staged.databasePath);
+      }
+      const stagedSha256 = hashFile(staged.databasePath);
+      if (stagedSha256 !== staged.replacement.imageSha256) {
+        throw acpError(ReasonCode.INTERNAL_ERROR, "the staged replacement database is not the image that was validated", {
+          expected: staged.replacement.imageSha256,
+          actual: stagedSha256,
+        });
+      }
+      return assertLiveDatabaseAtReplacement(staged.manifest, staged.stageRoot, staged.databasePath, staged.replacement);
+    };
     // Again, immediately before the first mutation. The validation staging ran is not enough on its
     // own: staging copies the whole closure, and a write that lands in that window is still a write
     // this rollback would discard. A refusal here has changed nothing.
-    assertLiveDatabaseAtSeal(staged.manifest, staged.stageRoot);
+    const approvedMigration = checkLiveDatabase();
 
     // A sibling of the stage parent, deliberately not nested under `staged.stageRoot`: the stage is
     // exactly what `rollbackToSealedPair`'s own `finally` removes once this call returns *or*
@@ -2155,17 +2823,43 @@ export const applyRollbackPair = (
       if (options.failAfter === "restoreHelper") {
         throw acpError(ReasonCode.INTERNAL_ERROR, "injected failure after restoreHelper", {});
       }
+      // A write during the runtime, plist and launcher copies is a write this database step would
+      // discard. Only a replacement install repeats the check here: it is what has to show that no
+      // write lies between the last comparison and the replacement. Nothing is replaced yet, so a
+      // refusal compensates the three steps above and leaves the database as it is.
+      //
+      // Limit, stated rather than hidden: nothing is held from here to the rename inside the restore
+      // child, so a write in that interval is not excluded by this process. The state lock cannot be
+      // held across it, because the sealed state-admin restore refuses while any live process holds
+      // `agentcpd.lock` (this one included), and that code is the sealed generation's, not ours to
+      // change. What narrows the interval is outside this process: the installer has stopped the job,
+      // and the restore re-checks the lock itself before it validates, copies and renames. The check
+      // below includes a non-empty `-wal`, which the main-file hash alone cannot see.
+      if (staged.replacement !== undefined) checkLiveDatabase();
       databaseReplaced = true;
-      execFileSync(
-        installedNode,
-        [installedStateAdmin, "restore", staged.databasePath, "--database", databaseDestination, "--confirm-restore"],
-        { encoding: "utf8", stdio: "pipe" },
-      );
+      try {
+        execFileSync(
+          installedNode,
+          [installedStateAdmin, "restore", staged.databasePath, "--database", databaseDestination, "--confirm-restore"],
+          { encoding: "utf8", stdio: "pipe", timeout: RESTORE_TIMEOUT_MS, killSignal: "SIGKILL" },
+        );
+      } catch (restoreError) {
+        // A restore that outlives its bound is a refusal, not a wait: the install ends here and the
+        // handler below puts the previous generation back, the database from the recovery point.
+        if ((restoreError as { code?: string }).code === "ETIMEDOUT") {
+          throw acpError(
+            ReasonCode.INTERNAL_ERROR,
+            `the sealed state-admin restore did not finish within ${RESTORE_TIMEOUT_MS / 1000} seconds`,
+            { databaseDestination, timeoutMs: RESTORE_TIMEOUT_MS },
+          );
+        }
+        throw restoreError;
+      }
       // Exit zero is a claim, not a result. Whatever the sealed state-admin did, the destination
       // now has to be the image that was staged, byte for byte, or this rollback did not happen.
       const restoredDigest = hashFile(databaseDestination);
       const stagedDigest = hashFile(staged.databasePath);
-      if (restoredDigest !== stagedDigest) {
+      if (restoredDigest !== stagedDigest || (staged.replacement !== undefined && restoredDigest !== staged.replacement.imageSha256)) {
         throw acpError(ReasonCode.INTERNAL_ERROR, "the restore reported success without installing the sealed image", {
           databaseDestination,
           expected: stagedDigest,
@@ -2194,6 +2888,8 @@ export const applyRollbackPair = (
         plistPath: plistDestination,
         launcherPath: launcherDestination,
         databasePath: databaseDestination,
+        ...(approvedMigration === null ? {} : { approvedMigration }),
+        ...(staged.replacement === undefined ? {} : { replacementImageSha256: staged.replacement.imageSha256 }),
         recoveryRoot: null,
       };
     } catch (error) {
@@ -2248,11 +2944,17 @@ export const rollbackToSealedPair = (
   pairRoot: string,
   expectation: RollbackPairExpectation,
   stageParent: string,
-  options: ApplyOptions = {},
+  options: ApplyOptions & { replacementDatabase?: string } = {},
 ): AppliedRollbackPair => {
-  const staged = stageRollbackPair(pairRoot, expectation, stageParent);
+  const { replacementDatabase, ...applyOptions } = options;
+  const staged = stageRollbackPair(
+    pairRoot,
+    expectation,
+    stageParent,
+    replacementDatabase === undefined ? {} : { replacementDatabase },
+  );
   try {
-    return applyRollbackPair(staged, options);
+    return applyRollbackPair(staged, applyOptions);
   } finally {
     rmSync(staged.stageRoot, { recursive: true, force: true });
   }
@@ -2282,7 +2984,14 @@ const USAGE = `rollback-pair — seal, validate and roll back one exact sealed p
     --expect-service-label LABEL --expect-working-directory DIR \\
     --expect-runtime-root DIR --expect-schema-version N \\
     --expect-service-generation NAME --expect-node-version vX.Y.Z \\
-    [--stage-parent DIR, required by rollback]
+    [--stage-parent DIR, required by rollback] [--replacement-database IMAGE]
+
+  rollback-pair record-replacement --pair-root DIR --pair-id UUID \\
+    --expected-index-digest sha256:HEX --expect-database FILE \\
+    --expect-service-label LABEL --expect-working-directory DIR \\
+    --expect-runtime-root DIR --expect-schema-version N \\
+    --expect-service-generation NAME --expect-node-version vX.Y.Z \\
+    --source FILE --image IMAGE
 
   rollback-pair guards
 
@@ -2302,6 +3011,25 @@ made since. A pair sealed before seals recorded that mark is refused the same wa
 mark was recorded under a different database content definition than this build measures. The remedy
 is always the same: stop the service, seal a fresh pair from the stopped current database and the
 target generation's runtime closure, and roll back with that pair.
+
+--replacement-database IMAGE installs IMAGE instead of the pair's own database image, for a pair whose
+generation the live database has been converted past by an approved migration. IMAGE is a
+state-admin backup image (with IMAGE.manifest.json) of the converted copy, plus IMAGE.source.json,
+written by record-replacement and never by hand:
+
+  { "format": "agent-control-plane.rollback-replacement/v1",
+    "sourceMainSha256": "sha256:<hex of the stopped source main file>",
+    "imageSha256": "sha256:<hex of IMAGE>" }
+
+record-replacement takes the pair's identity flags, --source (the stopped live database, which must be
+the pair's database), and --image. It requires the source to be quiescent (state lock free, no -journal,
+an empty or absent -wal), shows the image is the pair's generation and exactly the source minus the
+approved migration (the same replay validate runs), hashes the source main file, and only then writes
+the record, mode 0600, never over an existing one. With the flag, validate and rollback run the same
+live-database checks against IMAGE, refuse unless the approved-migration replay explains the live
+database (the pair's own mark is checked first, as without the flag), and require the live main file
+to still be that source and quiescent, again just before the database is replaced. The pair's runtime
+closure, plist and launcher install as usual. Without the flag nothing changes.
 
 guards prints ACP_ROLLBACK_DATABASE_HIGH_WATER=<definition> and changes nothing. A coordinator built
 before the check prints no such line, so a caller holding one can refuse it before any rollback.
@@ -2375,6 +3103,7 @@ const main = async (argv: readonly string[]): Promise<number> => {
     // Asked before a rollback is handed to this coordinator, by a caller that may hold an older
     // one (deploy/install-launchd.sh). Reads nothing and changes nothing.
     process.stdout.write(`${DATABASE_HIGH_WATER_GUARD}=${DATABASE_CONTENT_FORMAT}\n`);
+    process.stdout.write(`${REPLACEMENT_DATABASE_GUARD}=${REPLACEMENT_SOURCE_FORMAT}\n`);
     return 0;
   }
 
@@ -2421,6 +3150,29 @@ const main = async (argv: readonly string[]): Promise<number> => {
     return 0;
   }
 
+  if (command === "record-replacement") {
+    const supplied = collect(argv, [...REQUIRED_USE_FLAGS, "--source", "--image"]);
+    if (!supplied) {
+      process.stderr.write(USAGE);
+      return 2;
+    }
+    const recorded = recordReplacementSource(
+      supplied.get("--pair-root")!,
+      expectationFrom(supplied),
+      supplied.get("--source")!,
+      supplied.get("--image")!,
+    );
+    process.stdout.write(
+      [
+        `ACP_REPLACEMENT_SOURCE_RECORD=${recorded.sidecar}`,
+        `ACP_REPLACEMENT_SOURCE_MAIN_SHA256=${recorded.sourceMainSha256}`,
+        `ACP_REPLACEMENT_IMAGE_SHA256=${recorded.imageSha256}`,
+        "",
+      ].join("\n"),
+    );
+    return 0;
+  }
+
   if (command === "validate" || command === "rollback") {
     const supplied = collect(argv, REQUIRED_USE_FLAGS);
     if (!supplied) {
@@ -2428,14 +3180,29 @@ const main = async (argv: readonly string[]): Promise<number> => {
       return 2;
     }
     const expectation = expectationFrom(supplied);
+    const replacementDatabase = argumentValue(argv, "--replacement-database");
+    if (argv.includes("--replacement-database") && !replacementDatabase) {
+      process.stderr.write(USAGE);
+      return 2;
+    }
     if (command === "validate") {
-      const validated = validateRollbackPair(supplied.get("--pair-root")!, expectation);
+      const validated = validateRollbackPair(
+        supplied.get("--pair-root")!,
+        expectation,
+        replacementDatabase === undefined ? {} : { replacementDatabase },
+      );
       process.stdout.write(
         [
           `ACP_PAIR_ROOT=${validated.root}`,
           `ACP_PAIR_SCHEMA_VERSION=${validated.manifest.identity.schemaVersion}`,
           `ACP_PAIR_SERVICE_LABEL=${validated.manifest.identity.service.label}`,
           `ACP_PAIR_SERVICE_GENERATION=${validated.manifest.identity.service.generation}`,
+          ...(validated.approvedMigration === undefined
+            ? []
+            : [`ACP_PAIR_APPROVED_MIGRATION=v${validated.approvedMigration.fromVersion}-v${validated.approvedMigration.toVersion}`]),
+          ...(validated.replacement === undefined
+            ? []
+            : [`ACP_PAIR_REPLACEMENT_IMAGE_SHA256=${validated.replacement.imageSha256}`]),
           "",
         ].join("\n"),
       );
@@ -2446,13 +3213,24 @@ const main = async (argv: readonly string[]): Promise<number> => {
       process.stderr.write(USAGE);
       return 2;
     }
-    const applied = rollbackToSealedPair(supplied.get("--pair-root")!, expectation, stageParent);
+    const applied = rollbackToSealedPair(
+      supplied.get("--pair-root")!,
+      expectation,
+      stageParent,
+      replacementDatabase === undefined ? {} : { replacementDatabase },
+    );
     process.stdout.write(
       [
         `ACP_APPLIED_PAIR_ID=${applied.pairId}`,
         `ACP_APPLIED_GENERATION=${applied.generation}`,
         `ACP_APPLIED_RUNTIME_ROOT=${applied.runtimeRoot}`,
         `ACP_APPLIED_DATABASE=${applied.databasePath}`,
+        ...(applied.approvedMigration === undefined
+          ? []
+          : [`ACP_APPLIED_APPROVED_MIGRATION=v${applied.approvedMigration.fromVersion}-v${applied.approvedMigration.toVersion}`]),
+        ...(applied.replacementImageSha256 === undefined
+          ? []
+          : [`ACP_APPLIED_REPLACEMENT_IMAGE_SHA256=${applied.replacementImageSha256}`]),
         "",
       ].join("\n"),
     );

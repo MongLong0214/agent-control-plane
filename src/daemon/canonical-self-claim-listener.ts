@@ -235,6 +235,24 @@ const boundedClose = (server: Server, boundMs = 5_000): Promise<void> =>
     }
   });
 
+/**
+ * Ends a connection with one last line, only when the peer is still there to read it. A peer that gave up
+ * and closed (a caller timing out while the daemon was busy) leaves a socket whose writes fail with EPIPE;
+ * writing to it is skipped, and a write that fails anyway is swallowed by the error handler every accepted
+ * socket carries (`listenPeerCredentialSocket`), because nobody is left to tell.
+ */
+const endOpenSocket = (socket: Socket, line: string): void => {
+  if (socket.destroyed || socket.writableEnded || !socket.writable) return;
+  socket.end(line);
+};
+
+/** `endOpenSocket` for a refusal: the request the peer may already have sent is drained and discarded first. */
+const refuseOpenSocket = (socket: Socket, line: string): void => {
+  if (socket.destroyed) return;
+  socket.resume();
+  endOpenSocket(socket, line);
+};
+
 const serveCanonicalSelfClaimConnection = (
   socket: Socket,
   daemon: { lock: { held(): boolean } },
@@ -256,8 +274,7 @@ const serveCanonicalSelfClaimConnection = (
     // daemon's own graceful-shutdown path) then waits on it forever. `.resume()` drains and
     // discards whatever the peer already sent or still sends; nothing here was ever going to read
     // it for its content.
-    socket.resume();
-    socket.end(`${JSON.stringify(publicClaimResponse(authenticated))}\n`);
+    refuseOpenSocket(socket, `${JSON.stringify(publicClaimResponse(authenticated))}\n`);
     return;
   }
 
@@ -268,7 +285,7 @@ const serveCanonicalSelfClaimConnection = (
     settled = true;
     if (timeout) clearTimeout(timeout);
     frame.dispose();
-    if (!socket.destroyed) socket.end(`${JSON.stringify(publicClaimResponse(decision))}\n`);
+    endOpenSocket(socket, `${JSON.stringify(publicClaimResponse(decision))}\n`);
   };
   const frame = readOneJsonLineRequest(
     socket,
@@ -356,18 +373,20 @@ const publicToolRefusal = (decision: Decision<unknown>): string =>
   `${JSON.stringify({ ok: false, reasonCode: decision.reasonCode })}\n`;
 
 /**
- * The closed set of kernel-peer MCP doors. `acknowledge` is the one difference: the canonical CTO's
- * relay must know it was admitted before it hands over a byte of the client's, because a refusal
- * there sends it to the claim instead, with the client's `initialize` still unsent. The adopted
- * CEO's relay has nowhere else to go, so its first line is either a refusal or traffic (`null`).
+ * The closed set of kernel-peer MCP doors. Both answer an admitted peer with one `{ok:true,admitted}`
+ * line before MCP begins, naming the binding and runtime that connection was admitted under, so a
+ * relay that comes back after a restart can refuse a reconnect admitted under any other. The
+ * canonical CTO's relay also reads it before it hands over a byte of the client's, because a refusal
+ * there sends it to the claim instead; the adopted CEO's relay, which has nowhere else to go, reads
+ * it as the first line of a connection its client is already writing to.
  */
 interface PeerAdmittedDoor<T> {
   socketFilename: typeof ADOPTED_CEO_TOOL_SOCKET_FILENAME | typeof CANONICAL_CTO_TOOL_SOCKET_FILENAME;
-  acknowledge: ((admitted: T) => string) | null;
+  acknowledge: (admitted: T) => string;
 }
 
 /**
- * What the canonical CTO door's acknowledgement names: the binding and the runtime this connection
+ * What either door's acknowledgement names: the binding and the runtime this connection
  * was admitted under (review PR1051-R1). A relay that comes back after a restart compares it with
  * what its first admission named and refuses any other, so a reconnect can never adopt a binding or
  * session that replaced its own while it was away. None of the five is a credential.
@@ -417,11 +436,7 @@ const servePeerAdmittedConnection = <T>(
   door: PeerAdmittedDoor<T>,
 ): void => {
   let settled = false;
-  const refuse = (decision: Decision<unknown>): void => {
-    if (socket.destroyed) return;
-    socket.resume();
-    socket.end(publicToolRefusal(decision));
-  };
+  const refuse = (decision: Decision<unknown>): void => refuseOpenSocket(socket, publicToolRefusal(decision));
   const authenticated = authenticateClaimPeer(socket);
   if (!authenticated.allowed) return refuse(authenticated);
   if (!daemon.lock.held()) {
@@ -447,16 +462,17 @@ const servePeerAdmittedConnection = <T>(
       clearTimeout(timer);
       if (!admitted.allowed) return refuse(admitted);
       if (socket.destroyed) return;
-      if (door.acknowledge !== null) socket.write(door.acknowledge(admitted.value));
+      socket.write(door.acknowledge(admitted.value));
       serve(admitted.value, socket);
     });
 };
 
 /**
  * Starts the adopted CEO's tool socket (#1037). Token-less like the claim socket: its only
- * authority is the kernel's record of who connected and what `admit` decides about that peer.
+ * authority is the kernel's record of who connected and what `admit` decides about that peer. An
+ * admitted peer is answered with the same `{ok:true,admitted}` line the canonical CTO door writes.
  */
-export const startAdoptedCeoToolListener = <T>(
+export const startAdoptedCeoToolListener = <T extends CanonicalCtoAdmittedTuple>(
   daemon: { lock: { held(): boolean } },
   stateDir: string,
   admit: AdoptedCeoToolAdmit<T>,
@@ -465,7 +481,7 @@ export const startAdoptedCeoToolListener = <T>(
 ): Promise<CanonicalSelfClaimListener> =>
   startPeerAdmittedListener(daemon, stateDir, admit, serve, options, {
     socketFilename: ADOPTED_CEO_TOOL_SOCKET_FILENAME,
-    acknowledge: null,
+    acknowledge: admittedLine,
   });
 
 /**
@@ -534,6 +550,8 @@ const listenPeerCredentialSocket = async (
       socket.destroy();
       return;
     }
+    // First, before anything can write: an error on a connection (EPIPE, ECONNRESET) is that peer's, never the daemon's.
+    socket.on("error", () => undefined);
     connections.add(socket);
     socket.once("close", () => connections.delete(socket));
     onConnection(socket);

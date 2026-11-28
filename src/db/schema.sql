@@ -652,18 +652,10 @@ CREATE TABLE IF NOT EXISTS finalization_attempts (
 CREATE INDEX IF NOT EXISTS finalization_attempts_running_deadline
   ON finalization_attempts(state, deadline_at);
 
--- CP-HI-02 — §29's state machine is enforced in the database, not only in the service that usually writes it.
--- §29 is a persisted state machine. The service owns authority/evidence/outbox work,
--- while this guard rejects topology bypasses even from a raw SQLite caller.
--- #1189 (schema v54) — CANCELLED is reachable from READY_FOR_CEO_REVIEW (B14), and from CEO_APPROVED,
--- MERGING and POST_MERGE_VERIFYING only for a CONTRACT_CHANGE holding no activation grant (B15,
--- `runs_cancel_after_approval_requires_no_grant` below). Like every edge it needs the authority marker.
--- That nothing merged is RunEngine.cancel's check, not a guard's: a guard reading github_receipts
--- would tie these triggers to every rebuild of that table (v49 refuses such a trigger).
--- #1189 B5 (schema v55) — CEO_APPROVED and MERGING may go back to REVISION_REQUIRED: an approved candidate
--- refused before anything merged. Like every edge it needs the authority marker (below); that no merge_execute
--- receipt exists is RunEngine.returnApprovedCandidate's check, not this guard's, because a guard reading
--- github_receipts would tie these triggers to every rebuild of that table (v49 refuses such a trigger).
+-- CP-HI-02 — §29's state machine is enforced in the database, even against a raw SQLite caller.
+-- The two state guards list every edge some kind may take. The kind triggers
+-- (`runs_cancel_after_approval_requires_no_grant`, `runs_review_completion_bootstrap_only`) narrow edges by kind,
+-- and the authority guard also requires the connection marker.
 CREATE TRIGGER IF NOT EXISTS runs_state_transition_guard
 BEFORE UPDATE OF state ON runs
 WHEN NEW.state <> OLD.state
@@ -1692,6 +1684,10 @@ END;
 -- it reached (the first, the record's), in event order, the last reaching the pin's session. This is the
 -- chain's shape only; that each link is the adopted conversation's restart is the control plane's proof
 -- (carriedByTakeovers), asked before the first GitHub write. A takeover row alone moves nothing.
+-- v61: or by the project's latest repository rename, recorded for exactly this move, while the renamed repository
+-- still holds the name it is leaving (the rename's own transaction, which renames it right after). An earlier rename
+-- of the project never moves it again: after A→B and B→A, the first row is not the latest. A row is bound to its place
+-- in the project's renames rather than marked consumed, so the rename table stays append-only.
 CREATE TRIGGER IF NOT EXISTS projects_active_manifest_moves_by_grant
 BEFORE UPDATE OF active_manifest_digest ON projects
 WHEN NEW.active_manifest_digest IS NOT OLD.active_manifest_digest
@@ -1781,6 +1777,14 @@ WHEN NEW.active_manifest_digest IS NOT OLD.active_manifest_digest
            AND json_extract(e.evidence_json, '$.adoptCanonicalCto.buzzActorId') IS c.buzz_actor_id
          ELSE 0 END
 ))
+ AND NOT EXISTS (
+  SELECT 1 FROM repository_identity_renames n
+    JOIN repositories r ON r.repository_id = n.repository_id AND r.identity = n.from_identity
+   WHERE n.project_id = NEW.project_id
+     AND n.from_manifest_digest IS OLD.active_manifest_digest
+     AND n.to_manifest_digest IS NEW.active_manifest_digest
+     AND n.sequence = (SELECT MAX(m.sequence) FROM repository_identity_renames m WHERE m.project_id = NEW.project_id)
+)
 BEGIN
   SELECT RAISE(ABORT, 'MANIFEST_ACTIVATION_AUTHORITY_DENIED');
 END;
@@ -1823,6 +1827,28 @@ WHEN NEW.state = 'CANCELLED' AND OLD.state IN ('CEO_APPROVED','MERGING','POST_ME
   OR EXISTS (SELECT 1 FROM manifest_first_activation_grants f WHERE f.run_id = OLD.run_id))
 BEGIN
   SELECT RAISE(ABORT, 'RUN_STATE_TRANSITION_ILLEGAL');
+END;
+
+-- CP-HI-02 — only a PROJECT_BOOTSTRAP run completes from CEO review; every other kind completes through
+-- merge and post-merge verification. The two state guards list the edge for every kind, as they do the cancel above.
+-- It refuses unless the run is PROJECT_BOOTSTRAP both before and after the UPDATE: `OLD.kind` alone lets a bootstrap run
+-- be reclassified and completed in one statement, and `NEW.kind` alone lets a run be reclassified into bootstrap.
+CREATE TRIGGER IF NOT EXISTS runs_review_completion_bootstrap_only
+BEFORE UPDATE OF state ON runs
+WHEN NEW.state = 'COMPLETED' AND OLD.state = 'READY_FOR_CEO_REVIEW'
+ AND (OLD.kind IS NOT 'PROJECT_BOOTSTRAP' OR NEW.kind IS NOT 'PROJECT_BOOTSTRAP')
+BEGIN
+  SELECT RAISE(ABORT, 'RUN_STATE_TRANSITION_ILLEGAL');
+END;
+
+-- CP-HI-02 — a run's kind decides which edges it may take, so it is born with the run and never rewritten. Without this,
+-- three statements in one transaction (kind → PROJECT_BOOTSTRAP, state → COMPLETED, kind restored) complete any run
+-- straight from CEO review.
+CREATE TRIGGER IF NOT EXISTS runs_kind_immutable
+BEFORE UPDATE OF kind ON runs
+WHEN NEW.kind IS NOT OLD.kind
+BEGIN
+  SELECT RAISE(ABORT, 'RUN_KIND_IMMUTABLE');
 END;
 
 -- ---------------------------------------------------------------------------
@@ -4567,4 +4593,70 @@ CREATE TRIGGER IF NOT EXISTS canonical_cto_rotations_no_delete
 BEFORE DELETE ON canonical_cto_rotations
 BEGIN
   SELECT RAISE(ABORT, 'CANONICAL_ENTITLEMENT_TRANSFER_IMMUTABLE');
+END;
+
+-- v61 — the same GitHub repository under a new name. GitHub keeps a repository's node id across a rename, and
+-- ACP keys a repository by its `github:owner/name` text, written once into rows that cannot change (receipts,
+-- verification results, bootstrap applications, the resident allocation). One row per rename: the repository, the
+-- name it had and the one it took, the node id GitHub answered for the new name (equal to the one the allocation
+-- recorded), the active manifest the rename replaced and the one it activated (the same manifest with that one
+-- remote changed), and its place in the project's renames (1, 2, ...). Readers of a write-once identity resolve it
+-- through this table; nothing else moves the name.
+CREATE TABLE IF NOT EXISTS repository_identity_renames (
+  rename_id            TEXT PRIMARY KEY,
+  repository_id        TEXT NOT NULL REFERENCES repositories(repository_id),
+  project_id           TEXT NOT NULL REFERENCES projects(project_id),
+  sequence             INTEGER NOT NULL CHECK (sequence > 0),
+  from_identity        TEXT NOT NULL,
+  to_identity          TEXT NOT NULL,
+  repository_node_id   TEXT NOT NULL,
+  from_manifest_digest TEXT NOT NULL REFERENCES manifests(digest),
+  to_manifest_digest   TEXT NOT NULL REFERENCES manifests(digest),
+  renamed_at           TEXT NOT NULL,
+  CHECK (from_identity <> to_identity),
+  CHECK (from_manifest_digest <> to_manifest_digest)
+) WITHOUT ROWID;
+-- CP-HI-06 — v61: a rename is recorded once and never rewritten by its key.
+CREATE TRIGGER IF NOT EXISTS repository_identity_renames_no_replace
+BEFORE INSERT ON repository_identity_renames
+WHEN EXISTS (SELECT 1 FROM repository_identity_renames WHERE rename_id = NEW.rename_id)
+BEGIN
+  SELECT RAISE(ABORT, 'REPOSITORY_RENAME_IMMUTABLE');
+END;
+-- CP-HI-03 — v61: a rename names the repository as it stands, under the project's active manifest, and changes that
+-- manifest by exactly the one remote: the repository holds from_identity in that project, unretired; the project's
+-- active manifest is from_manifest_digest and names from_identity in exactly one repositories[] entry; the stored
+-- to_manifest_digest is that manifest with that entry's remote set to to_identity and nothing else changed; and the
+-- row is the project's next rename. So a row cannot describe a move that is not the next one, and the manifest-
+-- pointer guard's rename branch can only move the pointer to the same contract under the new name.
+CREATE TRIGGER IF NOT EXISTS repository_identity_renames_names_the_current_repository
+BEFORE INSERT ON repository_identity_renames
+WHEN NOT EXISTS (SELECT 1 FROM repositories r
+                  WHERE r.repository_id = NEW.repository_id AND r.identity = NEW.from_identity
+                    AND r.project_id IS NEW.project_id AND r.retired_at IS NULL)
+  OR NOT EXISTS (SELECT 1 FROM projects p
+                  WHERE p.project_id = NEW.project_id AND p.active_manifest_digest IS NEW.from_manifest_digest)
+  OR NEW.sequence IS NOT (SELECT COALESCE(MAX(m.sequence), 0) + 1 FROM repository_identity_renames m WHERE m.project_id = NEW.project_id)
+  OR NOT EXISTS (
+    SELECT 1 FROM manifests f
+      JOIN manifests t ON t.digest = NEW.to_manifest_digest
+      JOIN json_each(f.content_json, '$.repositories') e ON json_extract(e.value, '$.remote') IS NEW.from_identity
+     WHERE f.digest = NEW.from_manifest_digest
+       AND (SELECT COUNT(*) FROM json_each(f.content_json, '$.repositories') o
+             WHERE json_extract(o.value, '$.remote') IS NEW.from_identity) = 1
+       AND json(t.content_json) = json(json_set(f.content_json, '$.repositories[' || e.key || '].remote', NEW.to_identity)))
+BEGIN
+  SELECT RAISE(ABORT, 'REPOSITORY_RENAME_IMMUTABLE');
+END;
+-- CP-HI-02 — v61: a recorded rename never changes.
+CREATE TRIGGER IF NOT EXISTS repository_identity_renames_immutable
+BEFORE UPDATE ON repository_identity_renames
+BEGIN
+  SELECT RAISE(ABORT, 'REPOSITORY_RENAME_IMMUTABLE');
+END;
+-- CP-HI-02 — v61: a recorded rename is never erased; old receipts and results are read through it.
+CREATE TRIGGER IF NOT EXISTS repository_identity_renames_no_delete
+BEFORE DELETE ON repository_identity_renames
+BEGIN
+  SELECT RAISE(ABORT, 'REPOSITORY_RENAME_IMMUTABLE');
 END;

@@ -20,6 +20,7 @@ import { allow, deny, fail } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import { ArtifactStore, type EvidenceWriterSet } from "../db/artifacts.ts";
 import { Db } from "../db/database.ts";
+import type { SingleInstanceLock } from "../daemon/single-instance.ts";
 import { databaseSidecarPaths, ensurePrivateDirectory } from "../db/state-preflight.ts";
 import { ArtifactKind, Role, SessionLifecycle, roleKeyFor } from "../domain/types.ts";
 import {
@@ -83,6 +84,7 @@ import { type CommitLorePort, createCommitLoreCliPort } from "../bootstrap/commi
 import { mergeCommitCheck } from "../github/merge-commit-check.ts";
 import { releaseCancelledBootstrapReservation } from "../bootstrap/cancelled-reservation-release.ts";
 import { RepoFactoryBootstrapRunner } from "../bootstrap/repo-factory-bootstrap-run.ts";
+import { RepositoryRenames } from "../registry/repository-rename.ts";
 import { BootstrapApplications } from "../bootstrap/bootstrap-applications.ts";
 import { Daemon, type DaemonOptions } from "../daemon/daemon.ts";
 import type { DaemonFinalizationAuthorities } from "../daemon/finalizer.ts";
@@ -91,6 +93,13 @@ export interface ControlPlaneConfig {
   databasePath: string;
   /** Optional connection policy for callers that may not inherit native temporary-file paths. */
   databaseTemporaryStorage?: "MEMORY";
+  /**
+   * `agentcpd.lock`, already held by the caller when it opens the database (migrate-before-start). The
+   * entry point takes the lock before it judges the start or opens anything, so a second start never
+   * writes before it learns another process holds it; a migration this open applies then runs under that
+   * lease rather than contending with it. Absent, `Db` takes the lock itself for a migration, as before.
+   */
+  databaseMigrationLock?: SingleInstanceLock;
   /**
    * Identities that may act as the owner (§21). Empty means this deployment has no owner
    * identity, so no human gate can be satisfied — an explicit absence, never an implicit
@@ -199,6 +208,12 @@ export interface ControlPlaneConfig {
    */
   commitlore?: CommitLorePort;
 }
+
+/** The blind reviewer a deployment gets without naming one: gpt-6.2-sol at xhigh, with Claude Opus behind it (§18.1). */
+const DEFAULT_REVIEWER: { preferred: ReviewerPreference; fallbacks: ReviewerPreference[] } = {
+  preferred: { provider: "gpt", model: "gpt-6.2-sol", effort: "xhigh" },
+  fallbacks: [{ provider: "claude", model: "opus", effort: null }],
+};
 
 export const defaultConfig = (root = join(homedir(), ".agent-control-plane")): ControlPlaneConfig => ({
   databasePath: join(root, "state.sqlite"),
@@ -363,6 +378,8 @@ export class ControlPlane {
   readonly residentProjects: ResidentProjectProvisioning;
   /** #1227 — moves each resident project's worker turns off the resident's clone, into their own checkout. */
   readonly workerCheckouts: WorkerCheckouts;
+  /** v61 — adopts GitHub's new name for the same repository (operator only). */
+  readonly repositoryRenames: RepositoryRenames;
   /** The explicit canonical-CTO adoption of a PROJECT_BOOTSTRAP run: one validator for every door. */
   readonly bootstrapAdoptions: CanonicalCtoBootstrapAdoptions;
   readonly bootstrap: BootstrapActivation;
@@ -490,12 +507,10 @@ export class ControlPlane {
     });
     const runtimeRoot = config.runtimeRoot ?? join(dirname(config.databasePath), "runtime");
     ensurePrivateDirectory(runtimeRoot);
-    this.db = new Db(
-      config.databasePath,
-      config.databaseTemporaryStorage === undefined
-        ? {}
-        : { temporaryStorage: config.databaseTemporaryStorage },
-    );
+    this.db = new Db(config.databasePath, {
+      ...(config.databaseTemporaryStorage === undefined ? {} : { temporaryStorage: config.databaseTemporaryStorage }),
+      ...(config.databaseMigrationLock === undefined ? {} : { migrationLock: config.databaseMigrationLock }),
+    });
     // Everything after the database handle exists, wrapped because the coordinator below claims
     // the materialization capability and this constructor can still throw afterwards — rejecting
     // a non-production adapter, for one. A throw leaves no value for the caller to close, so the
@@ -650,14 +665,21 @@ export class ControlPlane {
           evidence,
         });
       }
+      // An entry naming a reviewer other than gpt-6.2-sol is ignored, not refused: its project reviews on
+      // the global preferred reviewer. Recorded, so the file that still names it can be fixed.
+      const globalReviewer = (config.reviewer ?? DEFAULT_REVIEWER).preferred;
+      for (const [projectId, ignored] of projectReviewers.ignored ?? []) {
+        this.audit.record({
+          kind: "REVIEWER_PREFERENCES_REFUSED",
+          reasonCode: ReasonCode.REVIEWER_PREFERENCES_INVALID,
+          evidence: { path: reviewerFile.path, projectId, ...ignored, reviewerModel: globalReviewer.model },
+        });
+      }
       this.review = new BlindReviewGate(
         this.clock, this.db, this.audit, this.artifacts, this.#evidenceWriters.BLIND_REVIEW,
         this.sessions, this.bindings, this.providers, this.repositories, this.telemetry,
         {
-          ...(config.reviewer ?? {
-            preferred: { provider: "gpt", model: "gpt-6.1-sol", effort: "xhigh" },
-            fallbacks: [{ provider: "claude", model: "opus", effort: null }],
-          }),
+          ...(config.reviewer ?? DEFAULT_REVIEWER),
           // Absent unless an entry applies, so the default preferences are exactly what they were.
           ...(projectReviewers.byProject.size === 0 ? {} : { projects: projectReviewers.byProject }),
           ...(projectReviewers.refusedProjects.size === 0 ? {} : { refusedProjects: projectReviewers.refusedProjects }),
@@ -889,6 +911,7 @@ export class ControlPlane {
       // write request starts, after any read the port method makes first. #1240 — a Repo Factory
       // project's STANDARD_WORK issues go through the same port, under their own write guard.
       const repoFactoryGitHub = config.repoFactory?.githubPort ?? createBootstrapGitHubWritePort();
+      this.repositoryRenames = new RepositoryRenames({ db: this.db, clock: this.clock, audit: this.audit, github: repoFactoryGitHub });
       this.tasks.attach({
         workScope: new WorkScopeTracking({ db: this.db, audit: this.audit, artifacts: this.artifacts, runs: this.runs, tasks: this.tasks, github: repoFactoryGitHub }),
       });

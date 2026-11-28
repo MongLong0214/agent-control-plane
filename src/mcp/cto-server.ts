@@ -19,10 +19,12 @@ import { allow, deny, type Decision } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import { parseVerificationCommand } from "../contracts/verification-command.ts";
 import type { CtoLifecycle, HandoffAcknowledgement } from "../cto/cto-lifecycle.ts";
+import { CTO_HANDOFF_MAX_BYTES, hostStoreFiles, writeHandoff } from "../cto/cto-conversation.ts";
 import type { ArtifactStore } from "../db/artifacts.ts";
 import type { AuditLog } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
 import type { Doctor } from "../doctor/doctor.ts";
+import { retiredSessionOf } from "../domain/fixed-role-runtime.ts";
 import { ArtifactKind, Role, RunKind, roleKeyFor } from "../domain/types.ts";
 import type { Outbox } from "../outbox/outbox.ts";
 import { ContractChangeRefusal, contractChangePlanForSubmission, isContractChangeRun } from "../registry/contract-change-plan.ts";
@@ -107,6 +109,10 @@ const standardWorkTasks = (source: CtoMcpSource, runId: string) => {
   const executions = source.tasks.executions(runId);
   return source.tasks.list(runId).map((task) => {
     const worker = source.bindings.history(roleKeyFor(Role.WORKER, { taskId: task.taskId })).at(-1) ?? null;
+    // #1477 — an ACTIVE worker on a retired model is not reused: its replacement is provisioned, on the provider it ran.
+    // Judged from the active binding's current session, as staffing judges it, not from the history row's recorded one.
+    const active = worker?.status === "ACTIVE" ? source.bindings.active(roleKeyFor(Role.WORKER, { taskId: task.taskId })) : null;
+    const retired = active === null ? null : retiredSessionOf(active, source.sessions);
     return {
       taskId: task.taskId,
       title: task.title,
@@ -123,6 +129,7 @@ const standardWorkTasks = (source: CtoMcpSource, runId: string) => {
             generation: worker.bindingGeneration,
             state: worker.status,
             sessionLifecycle: source.sessions.get(worker.sessionId)?.lifecycle ?? null,
+            ...(retired === null ? {} : { model: retired.model, replacementRequired: true, replacementProvider: retired.provider }),
           },
       executions: executions
         .filter((execution) => execution.taskId === task.taskId)
@@ -453,6 +460,26 @@ export const createCtoMcpPort = (source: CtoMcpSource) => {
       source.pipeline.replaySubmission(runId, idempotencyKey, requestFingerprint),
     openEscalation: (input: Parameters<ProductionGate["openEscalation"]>[0]) => source.ceo.openEscalation(input),
     activePrimaryCto: (projectId: string) => source.bindings.activePrimaryCto(projectId),
+    // The handoff a long conversation's CTO leaves for the fresh one that replaces it, stored by project under the state root.
+    writeCtoHandoff: (peer: AuthenticatedMcpPeer, text: string): Decision<{ projectId: string; bytes: number; maxBytes: number }> => {
+      if (!peer.sessionId || !peer.sessionIncarnation) return deny(ReasonCode.MCP_PEER_UNAUTHENTICATED, "CTO MCP peer is missing a session incarnation");
+      const held = source.bindings.bySession(peer.sessionId)
+        .filter((binding) => binding.status === "ACTIVE" && binding.roleKey.startsWith("PRIMARY_CTO:") &&
+          (peer.binding === undefined || (binding.roleKey === peer.binding.roleKey && binding.bindingGeneration === peer.binding.bindingGeneration)));
+      if (held.length !== 1) return deny(ReasonCode.MCP_PEER_UNAUTHENTICATED, "authenticated peer holds no single PRIMARY_CTO binding");
+      const binding = held[0]!;
+      const projectId = binding.roleKey.slice("PRIMARY_CTO:".length);
+      const current = source.bindings.activePrimaryCto(projectId);
+      if (!current || current.sessionId !== peer.sessionId || current.sessionIncarnation !== peer.sessionIncarnation || current.bindingGeneration !== binding.bindingGeneration) {
+        return deny(ReasonCode.MCP_PEER_UNAUTHENTICATED, "authenticated peer is not this project's primary CTO", { projectId });
+      }
+      const conversation = source.db.get<{ target_locator: string }>(
+        `SELECT tb.target_locator FROM actor_target_bindings tb JOIN assignments a ON a.actor_id = tb.target_actor_id
+          WHERE a.role_key = ? AND a.status = 'ACTIVE' AND a.binding_generation = ?`, [binding.roleKey, binding.bindingGeneration])?.target_locator ?? binding.boundSessionId;
+      const written = writeHandoff(hostStoreFiles, dirname(source.config.databasePath), { projectId, conversation, source: "cto", text, now: source.clock.nowIso() });
+      if (!written.ok) return deny(ReasonCode.INVALID_ARGUMENT, written.reason, { maxBytes: CTO_HANDOFF_MAX_BYTES });
+      return allow(ReasonCode.OK, { projectId, bytes: Buffer.byteLength(written.handoff.text, "utf8"), maxBytes: CTO_HANDOFF_MAX_BYTES });
+    },
     prepareSwitchover: (...args: Parameters<CtoLifecycle["prepareSwitchover"]>) => source.cto.prepareSwitchover(...args),
     handoffAuthority: (messageId: string) => {
       const message = source.outbox.get(messageId);
@@ -477,7 +504,6 @@ export const createCtoMcpPort = (source: CtoMcpSource) => {
     capacity: () => source.capacity.all(),
     continuityMode: () => source.continuity.mode(),
     doctorRun: (...args: Parameters<Doctor["run"]>) => source.doctor.run(...args),
-    manualReview: (sessionId: string, runId: string) => source.review.manualInvocation(sessionId, runId),
   });
   CTO_MCP_PORTS.add(port);
   return port;
@@ -1038,6 +1064,16 @@ const createCtoServerFromPort = (
     }),
   );
   server.registerTool(
+    "cto_handoff_write",
+    {
+      description:
+        `Write the handoff for the fresh conversation that will replace this long one. At most ${CTO_HANDOFF_MAX_BYTES} bytes of plain text: what is in flight, ` +
+        `what you decided and why, what to do first, what to watch for. It is stored for this project and becomes the new conversation's first prompt; calling it again replaces it. Current PRIMARY_CTO only.`,
+      inputSchema: { text: z.string().min(1) },
+    },
+    async (args) => read("cto_handoff_write", (peer) => respond(port.writeCtoHandoff(peer, args.text))),
+  );
+  server.registerTool(
     "capacity_get",
     { description: "Normalized provider capacity.", inputSchema: { ...mutation, refresh: z.boolean().default(false) } },
     async (args) => write("capacity_get", args, async () => {
@@ -1051,14 +1087,6 @@ const createCtoServerFromPort = (
     "doctor_run",
     { description: "Read-only doctor pass.", inputSchema: { scope: z.enum(["system", "project", "cto", "run", "session", "capacity", "github", "worktree"]).default("run"), target: z.string().optional() } },
     async (args) => read("doctor_run", async () => ok(await port.doctorRun(args.scope, args.target))),
-  );
-  server.registerTool(
-    "blind_review_request",
-    { description: "Not available: blind review is invoked by the control plane.", inputSchema: runIdentity },
-    async (args) => read("blind_review_request", (peer) => {
-      const fenced = owner(peer, args.runId);
-      return fenced.allowed ? respond(port.manualReview(fenced.value.sessionId, args.runId)) : respond(fenced);
-    }),
   );
   return server;
 };

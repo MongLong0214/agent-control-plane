@@ -27,7 +27,7 @@
  * who claimed it so the refusal report and the audit trail have an author to name.
  */
 import Database from "better-sqlite3";
-import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 
 import { acpError } from "../core/errors.ts";
@@ -102,6 +102,10 @@ const sameOrderedIds = (left: readonly string[], right: readonly string[]): bool
 export const readMigrationApproval = (databasePath: string): MigrationApproval | null => {
   const path = migrationApprovalPath(databasePath);
   if (!existsSync(path)) return null;
+  return parseMigrationApprovalFile(path);
+};
+
+const parseMigrationApprovalFile = (path: string): MigrationApproval => {
   assertPrivatePath(path, "file");
   let parsed: Partial<MigrationApproval>;
   try {
@@ -130,6 +134,39 @@ export const readMigrationApproval = (databasePath: string): MigrationApproval |
     });
   }
   return parsed as MigrationApproval;
+};
+
+const RETIRED_APPROVAL_NAME = /^migration-approval\.applied-v(\d+)-v(\d+)-\d+\.json$/;
+
+/**
+ * The approvals this database has already spent that started at `fromVersion`, oldest name first.
+ *
+ * `retireMigrationApproval` files a spent approval beside the database under a name that carries
+ * both versions, and that file is the only record of *which chain the owner approved*. A file that
+ * is not a well-formed, private approval whose content agrees with its name is skipped rather than
+ * thrown on: the caller is asking whether an approved chain explains a database, and a file it
+ * cannot read explains nothing.
+ */
+export const readRetiredMigrationApprovals = (
+  databasePath: string,
+  fromVersion: number,
+): MigrationApproval[] => {
+  const directory = dirname(databasePath);
+  if (!existsSync(directory)) return [];
+  const approvals: MigrationApproval[] = [];
+  for (const name of readdirSync(directory).sort()) {
+    const match = RETIRED_APPROVAL_NAME.exec(name);
+    if (match === null || Number(match[1]) !== fromVersion) continue;
+    try {
+      const approval = parseMigrationApprovalFile(join(directory, name));
+      if (approval.fromVersion === fromVersion && approval.toVersion === Number(match[2])) {
+        approvals.push(approval);
+      }
+    } catch {
+      /* not a readable approval, so not evidence of one */
+    }
+  }
+  return approvals;
 };
 
 /**

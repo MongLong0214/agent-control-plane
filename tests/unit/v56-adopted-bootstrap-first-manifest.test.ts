@@ -10,6 +10,7 @@ import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 import { releasedChainImage } from "../helpers/released-chain-image.ts";
 import { privateStatePath, schemaRowsOf } from "../helpers/released-v44-schema.ts";
 import { contentDigests } from "../helpers/released-v45-schema.ts";
+import { takeBackV61 } from "../helpers/released-v50-schema.ts";
 
 afterAll(cleanupTempDirs);
 
@@ -108,7 +109,7 @@ const world = () => {
 
 describe("#1234 v56 — an adopting bootstrap's first manifest, and nothing else", () => {
   it("v55 → v56 replaces exactly the manifest-pointer guard, keeps every row, and matches a fresh v56 database", () => {
-    expect(SCHEMA_VERSION).toBe(59);
+    expect(SCHEMA_VERSION).toBe(61);
     expect(MIGRATIONS.find((step) => step.toVersion === 56)).toMatchObject({ id: "v56-adopted-bootstrap-first-manifest", fromVersion: 55, toVersion: 56 });
     const path = releasedChainImage(privateStatePath("acp-v56-from-v55-"), 55);
     const v55Rows = schemaRowsOf(path);
@@ -133,13 +134,17 @@ describe("#1234 v56 — an adopting bootstrap's first manifest, and nothing else
     expect(upgraded.map((row) => row.name).sort()).toEqual(v55Rows.map((row) => row.name).sort());
     const freshPath = join(tempDir("acp-v56-fresh-"), "state.sqlite");
     new Db(freshPath).close();
+    // v61 replaces this guard again; a fresh database taken back below v61 holds v60's, which is v56's unchanged.
+    const fresh = new Database(freshPath);
+    try { takeBackV61(fresh); } finally { fresh.close(); }
     expect(upgraded.filter((row) => row.name === GUARD)).toEqual(schemaRowsOf(freshPath).filter((row) => row.name === GUARD));
   });
 
   it("is v55's guard with one more clause, which applies only when the old value is NULL", () => {
     const strip = (ddl: string) => ddl.split("\n").filter((line) => !line.startsWith("--")).join("\n");
     const v55 = strip(guardIn("schema-v55.sql"));
-    const v56 = strip(guardIn("schema.sql"));
+    // v56's guard as released, unchanged through v60; v61's own clause is v61's test's to account for.
+    const v56 = strip(guardIn("schema-v60.sql"));
     const [v55When, v55Body] = v55.split("\nBEGIN\n");
     const [v56When, v56Body] = v56.split("\nBEGIN\n");
     expect(v56Body).toBe(v55Body);

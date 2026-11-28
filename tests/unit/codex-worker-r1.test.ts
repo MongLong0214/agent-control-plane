@@ -38,7 +38,7 @@ const reconcileCodexLaunch = async (
 ): Promise<{ outcome: string; killed: number; argv: string[]; sandbox: string | undefined; codexHome: string | undefined }> => {
   const core = makeCore();
   const world = seedWorkerWorld(core);
-  world.db.run("UPDATE sessions SET provider = 'gpt', model = 'gpt-6.1-sol' WHERE session_id = ?", [world.worker.sessionId]);
+  world.db.run("UPDATE sessions SET provider = 'gpt', model = 'gpt-6.2-sol' WHERE session_id = ?", [world.worker.sessionId]);
   const account = join(tempDir("codex-r1-account-"), "home");
   mkdirSync(account);
   let live = true;
@@ -159,10 +159,10 @@ it("pins the configured Codex home on the login probe and keeps the outer profil
     codexHome: account,
     managedWriteBroker: { authorize: async (_write, effect) => allow(ReasonCode.OK, await effect()) },
   });
-  const handle = await adapter.startSession({ model: "gpt-6.1-sol", workdir: root, purpose: "worker:review" });
+  const handle = await adapter.startSession({ model: "gpt-6.2-sol", workdir: root, purpose: "worker:review" });
   expect(await adapter.probeSession(handle)).toBe("HEALTHY");
   await adapter.invoke({
-    model: "gpt-6.1-sol",
+    model: "gpt-6.2-sol",
     workdir: root,
     prompt: "offline witness",
     timeoutMs: 1000,
@@ -185,7 +185,7 @@ it("pins the configured Codex home on the login probe and keeps the outer profil
     return ok;
   });
   await adapter.invoke({
-    model: "gpt-6.1-sol",
+    model: "gpt-6.2-sol",
     workdir: root,
     prompt: "worker turn",
     timeoutMs: 1000,
@@ -245,8 +245,8 @@ it("overlapping account probes leave process.env.CODEX_HOME unchanged", async ()
       capacityFile: join(root, "capacity.json"),
       codexHome: account,
     });
-    const one = await adapter.startSession({ model: "gpt-6.1-sol", workdir: root, purpose: "worker:one" });
-    const two = await adapter.startSession({ model: "gpt-6.1-sol", workdir: root, purpose: "worker:two" });
+    const one = await adapter.startSession({ model: "gpt-6.2-sol", workdir: root, purpose: "worker:one" });
+    const two = await adapter.startSession({ model: "gpt-6.2-sol", workdir: root, purpose: "worker:two" });
     const first = adapter.probeSession(one);
     const second = adapter.probeSession(two);
     expect(release).toHaveLength(2);

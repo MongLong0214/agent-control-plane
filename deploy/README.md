@@ -110,19 +110,7 @@ be expressed and the project a claimant asked for was compared against nothing (
 `ACP_CANONICAL_SESSIONS_JSON` replaces both, and a deployment that still provisions either of the
 old two is not refused — they are simply ignored.
 
-`ACP_CANONICAL_REQUIRED_EXECUTOR_VERSION`, `ACP_CANONICAL_EXPECTED_EXECUTOR_REALPATH` and
-`ACP_CANONICAL_EXPECTED_EXECUTOR_SHA256` used to be three of the six. They pinned one CLI build —
-its version, its resolved path and the sha256 of its bytes — that every claimant's executing image
-had to equal, while each project's session runs whichever build it was started with; a session on
-an earlier build was refused, and one whose build the updater had since deleted from disk could
-never be admitted at all. The claim now records the executing image and requires nothing of it.
-That also withdraws what the realpath and sha256 comparison defended against: a same-user process
-exec'd from a binary renamed `claude` is no longer told apart by its bytes, and what bounds a claim
-is the kernel peer credential on the claim socket, the session UUID derived from the claimant's
-ancestor, and the project that UUID's entry names. A deployment that still provisions any of the three is not
-refused — they are simply ignored.
-
-The generated launcher clears all six inherited variables together before its first Keychain
+The generated launcher clears all three inherited variables together before its first Keychain
 lookup, then reads each through the existing optional-account loop. These values are not written
 to the plist. Installation does not create `buzz-nostr-subscriber.json`; that separately provisioned
 subscriber config retains its existing authentication contract. Without it, an otherwise configured
@@ -344,6 +332,39 @@ Seal a pair with `node dist/deploy/rollback-pair.js seal …` — run
 line rather than reading any of it from the host, so the same command seals the generation being
 left and, later, the one being moved to; it prints the pair id and the index digest to retain.
 `docs/ops/owner-actions.md` carries the full procedure.
+
+When the live database has been converted past the pair's generation by an approved migration, the
+pair's own image is not the database to put back: it lacks every write made after it was sealed. Roll
+back with a **replacement database** instead, a converted copy of the stopped live database made with
+`state-admin backup --database <copy> --output IMAGE`. Record where it came from while the daemon is
+still stopped:
+
+```bash
+node dist/deploy/rollback-pair.js record-replacement <the same identity flags as validate> \
+  --source ~/.agent-control-plane/state.sqlite --image IMAGE
+deploy/install-launchd.sh rollback --pair-id <uuid> --expected-index-digest sha256:<hex> \
+  --expect-schema-version N --expect-service-generation NAME --expect-node-version vX.Y.Z \
+  --replacement-database IMAGE
+```
+
+`record-replacement` requires the source to be quiescent (no lock holder, no `-journal`, an empty or
+absent `-wal`), shows that IMAGE is the pair's generation and exactly the source minus the approved
+migration, hashes the source main file, and writes `IMAGE.source.json` (mode 0600, never over an
+existing one):
+
+```json
+{ "format": "agent-control-plane.rollback-replacement/v1",
+  "sourceMainSha256": "sha256:<hex of the stopped source main file>",
+  "imageSha256": "sha256:<hex of IMAGE>" }
+```
+
+`validate` and `rollback` then run every live-database check against IMAGE, refuse with
+`ROLLBACK_PAIR_STALE_DATABASE` unless the approved-migration replay explains the live database, and
+require the live main file to still be that source, quiescent, immediately before the database is
+replaced. A write after the conversion, a missing retired approval, or no flag at all still refuses.
+The pair's runtime closure, plist and launcher install as usual. The coordinator cannot hold
+`agentcpd.lock` across the restore (the sealed restore refuses while it is held), so keep the daemon
+stopped until the rollback returns.
 
 `uninstall` removes only the LaunchAgent plist and launcher. It intentionally leaves the
 database and backups intact.

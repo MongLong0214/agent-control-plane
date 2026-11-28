@@ -12,6 +12,7 @@ import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { dispositionForStartupError } from "../../src/daemon/agentcpd.ts";
 import { openDb } from "../../src/db/database.ts";
 import { approveMigration } from "../../src/db/migration-approval.ts";
+import { installGitHubAppCredential } from "../helpers/github-app-credential.ts";
 import { releasedChainImage } from "../helpers/released-chain-image.ts";
 import { V47_CANDIDATE_CHECKSUM, asCandidateV47 } from "../helpers/released-v47-schema.ts";
 
@@ -52,6 +53,9 @@ const stateAtV46 = (contaminate: (path: string) => void): { home: string; path: 
   const root = join(home, ".agent-control-plane");
   mkdirSync(root, { recursive: true, mode: 0o700 });
   chmodSync(root, 0o700);
+  // This start is about the refusal the database open makes; one without the trusted gate's credential
+  // is refused earlier, before the database is opened (migrate-before-start).
+  installGitHubAppCredential(root);
   const path = releasedChainImage(join(root, "state.sqlite"), 46);
   contaminate(path);
   chmodSync(path, 0o600);
