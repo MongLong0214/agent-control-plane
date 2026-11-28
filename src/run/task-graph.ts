@@ -15,7 +15,7 @@ import type { AuditLog } from "../db/audit.ts";
 import { isRetiredModel } from "../domain/fixed-role-runtime.ts";
 import type { Db } from "../db/database.ts";
 import type { SupersessionBinding } from "./candidate-integration.ts";
-import { recordedWriteTarget } from "./task-write-target.ts";
+import { isNormalRelativePath, recordedWriteTarget } from "./task-write-target.ts";
 import type { WorkScopeTracking } from "./work-scope-tracking.ts";
 import {
   type FailureClass,
@@ -377,7 +377,8 @@ export class TaskGraph {
       }
     }
 
-    const existingByTitle = new Map(this.list(runId).map((t) => [t.title, t.taskId]));
+    const existing = this.list(runId);
+    const existingByTitle = new Map(existing.map((t) => [t.title, t.taskId]));
     const resolve = (key: string): string | null =>
       keys.has(key) ? null : (existingByTitle.get(key) ?? null);
 
@@ -401,6 +402,18 @@ export class TaskGraph {
       });
     }
 
+    // #1458 — advisory only: the edges across which nothing reaches the dependent, never a refusal (PRD §11.3).
+    const runRepositories = this.db.all<{ identity: string }>(
+      `SELECT r.identity FROM run_repositories rr JOIN repositories r ON r.repository_id = rr.repository_id WHERE rr.run_id = ?`,
+      [runId],
+    ).map((row) => row.identity);
+    const judged = suspectEdges(specs, existing, runRepositories);
+    const suspect = {
+      edges: judged.edges.slice(0, SUSPECT_EDGES_LISTED),
+      omitted: Math.max(0, judged.edges.length - SUSPECT_EDGES_LISTED),
+      unjudged: judged.unjudged,
+    };
+
     return this.db.tx(() => {
       const now = this.clock.nowIso();
       // CEO msg_2b439e5a — a STANDARD_WORK PLAN's supersedesTaskIds is judged and applied here, under the
@@ -408,7 +421,7 @@ export class TaskGraph {
       // and any named task that may not be cancelled refuses the whole submission before anything is written.
       if (supersede) {
         const replayed = this.#supersessionReplay(runId, supersede, specs);
-        if (replayed) return allow(ReasonCode.OK, replayed);
+        if (replayed) return allow(ReasonCode.OK, replayed, { suspectEdges: suspect });
         const refused = this.#supersessionRefusal(runId, supersede);
         if (refused) return refused;
       }
@@ -512,8 +525,16 @@ export class TaskGraph {
         runId,
         value: created.reduce((n, t) => n + t.dependsOn.length, 0),
       });
+      const crossRepository = judged.edges.filter((edge) => edge.kind === "CROSS_REPOSITORY").length;
+      this.telemetry.record({
+        scope: "graph",
+        name: "suspect_edge_count",
+        runId,
+        value: judged.edges.length,
+        dims: { crossRepository, disjointPaths: judged.edges.length - crossRepository, unjudged: judged.unjudged },
+      });
 
-      return allow(ReasonCode.OK, created);
+      return allow(ReasonCode.OK, created, { suspectEdges: suspect });
     });
   }
 
@@ -1940,6 +1961,62 @@ const findCycle = (specs: readonly TaskSpec[]): string[] | null => {
     if (cycle) return cycle;
   }
   return null;
+};
+
+/** #1458 — how many suspect edges a plan_submit answer lists; the rest are counted in `omitted`. */
+const SUSPECT_EDGES_LISTED = 50;
+
+export interface SuspectEdge {
+  task: string;
+  dependsOn: string;
+  kind: "CROSS_REPOSITORY" | "DISJOINT_PATHS";
+}
+
+/**
+ * #1458 — the submitted dependsOn edges across which nothing reaches the dependent through its checkout.
+ * An end's repository is its writeTarget's, or the run's only one, and its paths are its writeTarget's,
+ * under `TaskWriteTargets.derive`'s rules; a dependency named by an existing task's title is that task's
+ * stored spec. CROSS_REPOSITORY is sound. DISJOINT_PATHS (no path equal to, or a directory of, one of the
+ * other end's) is a heuristic: the dependent may still read what its predecessor added. An edge whose ends
+ * lack what its judgment needs is counted in `unjudged`.
+ */
+export const suspectEdges = (
+  specs: readonly TaskSpec[],
+  existing: ReadonlyArray<{ title: string; spec: Record<string, unknown> }>,
+  runRepositories: readonly string[],
+): { edges: SuspectEdge[]; unjudged: number } => {
+  const specOf = new Map<string, Record<string, unknown> | undefined>(existing.map((task) => [task.title, task.spec]));
+  for (const spec of specs) specOf.set(spec.key, spec.spec);
+  const endOf = (spec: Record<string, unknown> | undefined): { repository: string | null; paths: readonly string[] | null } => {
+    const target = spec?.["writeTarget"];
+    if (target !== undefined && (typeof target !== "object" || target === null || Array.isArray(target))) return { repository: null, paths: null };
+    const declared = target as Record<string, unknown> | undefined;
+    const named = declared?.["repositoryIdentity"];
+    const paths = declared?.["paths"];
+    return {
+      repository: named === undefined
+        ? (runRepositories.length === 1 ? runRepositories[0]! : null)
+        : (typeof named === "string" && runRepositories.includes(named) ? named : null),
+      paths: Array.isArray(paths) && paths.length > 0 && paths.every((path) => typeof path === "string" && isNormalRelativePath(path))
+        ? (paths as string[])
+        : null,
+    };
+  };
+  const overlap = (a: string, b: string): boolean => a === b || b.startsWith(`${a}/`) || a.startsWith(`${b}/`);
+
+  const edges: SuspectEdge[] = [];
+  let unjudged = 0;
+  for (const spec of specs) {
+    const dependent = endOf(spec.spec);
+    for (const dependsOn of spec.dependsOn ?? []) {
+      const dependency = specOf.has(dependsOn) ? endOf(specOf.get(dependsOn)) : { repository: null, paths: null };
+      if (dependent.repository === null || dependency.repository === null) unjudged++;
+      else if (dependent.repository !== dependency.repository) edges.push({ task: spec.key, dependsOn, kind: "CROSS_REPOSITORY" });
+      else if (dependent.paths === null || dependency.paths === null) unjudged++;
+      else if (!dependent.paths.some((a) => dependency.paths!.some((b) => overlap(a, b)))) edges.push({ task: spec.key, dependsOn, kind: "DISJOINT_PATHS" });
+    }
+  }
+  return { edges, unjudged };
 };
 
 interface RawTask {
