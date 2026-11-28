@@ -1137,7 +1137,7 @@ const STANDARD_WORK_STEPS =
   "First, if the task has executions, read its newest execution with mcp__acp-cto__task_execution_get by that executionId; while that execution is RUNNING, read it again until it is not; " +
   "an execution that SUCCEEDED leaves its task done; an execution that did not succeed, or one you cannot read, is reported for that run with mcp__acp-cto__escalation_open, its task is never run again, and no result is submitted. " +
   "Only a READY task with no execution gets a first execution: reuse its worker if it has one and never provision another (a worker whose state is not ACTIVE is reported with mcp__acp-cto__escalation_open), " +
-  "except that a worker contract_get marks replacementRequired runs a retired model and is not reused: staff its task with mcp__acp-cto__task_worker_provision, using a new idempotencyKey, no model, and the provider contract_get names as its replacementProvider rather than the one below (the replacement stays on the provider the retired worker ran), which replaces it; " +
+  "except that a worker contract_get marks replacementRequired runs a retired model and is not reused: staff its task with mcp__acp-cto__task_worker_provision, using a new idempotencyKey, no model, and the provider contract_get names as its replacementProvider rather than the one below (the replacement stays on the provider the retired worker ran), which replaces it whether that worker is ACTIVE or not; " +
   `otherwise staff it with mcp__acp-cto__task_worker_provision, using a new idempotencyKey and provider "${STANDARD_WORK_WORKER_PROVIDER}" with no model (the control plane fixes it); ` +
   "then claim its write target with mcp__acp-cto__resource_claim exactly as its spec's writeTarget names it: repositoryIdentity, branch and paths as declaredPaths, with that repository's checkoutPath from contract_get's repositories as the worktreeId (the control plane records a task's writeTarget when it provisions the task's worker and answers task_worker_provision with it, so after provisioning take it from that answer or read contract_get again); " +
   "task_worker_run then creates that branch at the run's pinned base and checks it out, or continues on it, and refuses a checkout that is not clean, so never choose, derive, create or change a branch yourself; when the spec names no writeTarget, report it with mcp__acp-cto__escalation_open (task_worker_provision answers writeTargetRefused when the control plane cannot record one); " +
@@ -1192,8 +1192,14 @@ export const STANDARD_WORK_CONTINUATION_STALLED = "STANDARD_WORK_CONTINUATION_ST
 export const STANDARD_CONTINUATION_STATE = Object.freeze({
   /** READY, no WORKER ever bound, no execution: the unprogressed state `taskState: "READY"` named before. */
   UNSTAFFED: "READY",
-  /** READY, its WORKER bound and ACTIVE, no execution: provisioned, never run. */
+  /** READY, its WORKER bound and ACTIVE on a model that is not retired, no execution: provisioned, never run. */
   STAFFED: "READY_WORKER_PROVISIONED",
+  /**
+   * #1486 — READY, no execution, and its newest WORKER, ACTIVE or revoked, runs a retired model: owed the
+   * replacement its owner provisions. A state of its own, so a wake spent on the task while it was STAFFED does
+   * not stand for this one.
+   */
+  RETIRED: "READY_WORKER_RETIRED",
 });
 
 const STANDARD_CONTINUATION_KIND_PREFIX = "standard work continuation: run ";
@@ -1201,7 +1207,9 @@ const STANDARD_CONTINUATION_KIND_PREFIX = "standard work continuation: run ";
 /** The wake kind that tells a run's owner why it was woken: its accepted PLAN left this task READY and unstarted. */
 export const standardWorkContinuationTriggerKind = (runId: string, taskId: string, taskState: string = STANDARD_CONTINUATION_STATE.UNSTAFFED): string =>
   `${STANDARD_CONTINUATION_KIND_PREFIX}${runId} has READY task ${taskId} ${
-    taskState === STANDARD_CONTINUATION_STATE.STAFFED ? "with a provisioned worker and no execution" : "with no worker"
+    taskState === STANDARD_CONTINUATION_STATE.STAFFED
+      ? "with a provisioned worker and no execution"
+      : taskState === STANDARD_CONTINUATION_STATE.RETIRED ? "with a worker on a retired model and no execution" : "with no worker"
   }`;
 
 /**
@@ -1246,7 +1254,7 @@ export const workPrompt = (
       : []),
     ...(triggers.some((trigger) => trigger.kind.startsWith(STANDARD_CONTINUATION_KIND_PREFIX))
       ? [
-          `A wake for "${STANDARD_CONTINUATION_KIND_PREFIX}<runId> has READY task <taskId> with no worker" or "... with a provisioned worker and no execution" means that run's PLAN was accepted and its RUN_DISPATCH acknowledged, and that task is still READY with no execution started for it: for that run, starting with that task, ${STANDARD_WORK_STEPS}. No message is left to acknowledge for it.`,
+          `A wake for "${STANDARD_CONTINUATION_KIND_PREFIX}<runId> has READY task <taskId> with no worker", "... with a provisioned worker and no execution" or "... with a worker on a retired model and no execution" means that run's PLAN was accepted and its RUN_DISPATCH acknowledged, and that task is still READY with no execution started for it: for that run, starting with that task, ${STANDARD_WORK_STEPS}. No message is left to acknowledge for it.`,
         ]
       : []),
     `A REVISION_REQUEST for a run whose contract_get returned a bootstrapPlanGuide carries why its PLAN was sent back (the CEO's rationale, or the blind review's findings): for that run, ${PLAN_STEPS}, writing the new PLAN so that it addresses that reason; then acknowledge the REVISION_REQUEST with mcp__acp-cto__run_ack. If the run is ACTIVE, submit the new PLAN's result first, as above; a run the CEO sent back is ACTIVE again with its next RUN_DISPATCH.`,

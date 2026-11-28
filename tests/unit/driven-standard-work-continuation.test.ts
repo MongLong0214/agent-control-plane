@@ -61,6 +61,8 @@ afterEach(() => vi.restoreAllMocks());
  */
 const UNSTAFFED = "READY";
 const STAFFED = "READY_WORKER_PROVISIONED";
+/** #1486 — its worker, ACTIVE or revoked, runs a retired model: owed a replacement, a state of its own. */
+const RETIRED = "READY_WORKER_RETIRED";
 
 /** The work branch a run's contract names: a PLAN declares it as its tasks' write target (CEO e64aa10b). */
 const WORK_BRANCH = "task/readme";
@@ -84,7 +86,8 @@ const STANDARD_DIRECTIVE = "For a STANDARD_WORK run (contract_get's run.kind), a
  */
 const GENERIC_DIRECTIVE = "For a run whose contract_get returned no bootstrapPlanGuide";
 const CONTINUATION_LINE = 'A wake for "standard work continuation: run <runId> has READY task <taskId> with no worker"';
-const CONTINUATION_KIND = /standard work continuation: run (\S+) has READY task (\S+) with (?:no worker|a provisioned worker and no execution)/;
+const CONTINUATION_KIND =
+  /standard work continuation: run (\S+) has READY task (\S+) with (?:no worker|a provisioned worker and no execution|a worker on a retired model and no execution)/;
 
 /**
  * The directive's clauses, word for word as the prompt states them. The stand-in model acts on a
@@ -111,6 +114,8 @@ const CLAUSE = {
   replaceRetired: "a worker contract_get marks replacementRequired runs a retired model and is not reused: staff its task with mcp__acp-cto__task_worker_provision",
   /** #1477 — the replacement is staffed on the provider the retired worker ran, as contract_get names it, never on the prompt's usual one. */
   replacementProvider: "the provider contract_get names as its replacementProvider",
+  /** #1486 — a retired worker already revoked is replaced the same way, not escalated as one no longer ACTIVE. */
+  replaceInactiveRetired: "which replaces it whether that worker is ACTIVE or not",
   provision: "otherwise staff it with mcp__acp-cto__task_worker_provision",
   claim: "exactly as its spec's writeTarget names it",
   missingTarget: "when the spec names no writeTarget, report it with mcp__acp-cto__escalation_open",
@@ -266,7 +271,7 @@ const scriptStandardOwner = (
         }
         if (!says(CLAUSE.firstExecution)) return;
         if (task.worker !== null) {
-          if (task.worker.state !== "ACTIVE") {
+          if (task.worker.state !== "ACTIVE" && !(task.worker.replacementRequired === true && says(CLAUSE.replaceInactiveRetired))) {
             if (says(CLAUSE.inactiveWorker)) await escalate(runId, task.taskId, "the task's worker is no longer ACTIVE");
             return;
           }
@@ -978,7 +983,7 @@ describe("#1477 — a READY task whose ACTIVE worker runs a retired model is rep
     await withBootstrapRuntime(async (f) => {
       const cp = f.harness.cp;
       const { runId, sessionId, taskId } = await stalledAfterPlan(f, "std-moved", "ignore");
-      const original = bindRunWorker(f, runId, taskId, { provider: "gpt", model: "gpt-6.1-sol" });
+      bindRunWorker(f, runId, taskId, { provider: "gpt", model: "gpt-6.1-sol" });
       const workerRole = roleKeyFor(Role.WORKER, { taskId });
       // The same generation's runtime moves to a gpt-6.2-sol session: the assignment row still records the first.
       const moved = cp.sessions.create({ provider: "gpt", model: "gpt-6.2-sol" });
@@ -992,7 +997,8 @@ describe("#1477 — a READY task whose ACTIVE worker runs a retired model is rep
 
       const record = await f.cto(sessionId, "contract_get", { runId });
       const worker = (record["value"] as { tasks: Array<{ worker: Record<string, unknown> }> }).tasks[0]!.worker;
-      expect(worker).toMatchObject({ sessionId: original.sessionId, generation: 1, state: "ACTIVE" });
+      // #1486 — and it names that current session, with its lifecycle, not the one the row first recorded.
+      expect(worker).toMatchObject({ sessionId: moved.sessionId, generation: 1, state: "ACTIVE", sessionLifecycle: "READY" });
       expect(worker).not.toHaveProperty("replacementRequired");
       expect(worker).not.toHaveProperty("model");
       // Staffing reads the same binding the same way, so it refuses the replacement the record does not ask for.
@@ -1001,6 +1007,120 @@ describe("#1477 — a READY task whose ACTIVE worker runs a retired model is rep
         fence: () => allow(ReasonCode.OK, { sessionId, bindingGeneration: 1 }),
       });
       expect(refused).toMatchObject({ allowed: false, reasonCode: ReasonCode.BINDING_ALREADY_ACTIVE });
+    });
+  });
+});
+
+describe("#1486 — a retired-model worker is replaced however it got there: moved onto one in its generation, revoked first, or behind a spent wake", () => {
+  /** The task's WORKER moved by `switchTo`, in the same generation, onto a fresh READY session on `runtime`. */
+  const moveWorker = (f: BootstrapRuntimeFixture, runId: string, taskId: string, runtime: { provider: string; model: string }): string => {
+    const cp = f.harness.cp;
+    const session = cp.sessions.create(runtime);
+    expect(cp.sessions.transition(session.sessionId, SessionLifecycle.READY, "test: moved worker runtime").allowed).toBe(true);
+    const moved = cp.bindings.switchTo({
+      role: Role.WORKER, taskId, runId, projectId: cp.runs.require(runId).projectId,
+      sessionId: session.sessionId, reason: "test: worker runtime moved", conversation: "SURVIVED",
+    });
+    if (!moved.allowed) throw new Error(`${moved.reasonCode}: ${moved.message}`);
+    expect(moved.value).toMatchObject({ sessionId: session.sessionId, bindingGeneration: 1 });
+    return session.sessionId;
+  };
+
+  /** Claude admission refused and GPT allowed, so only a replacement on the retired worker's own provider is staffed. */
+  const gptWorkersOnly = (f: BootstrapRuntimeFixture) => {
+    const cp = f.harness.cp;
+    const real = realWorkerRuntime(f);
+    cp.providers.registerForRole(new TestProductionAdapter(f.harness.clock, "gpt"), Role.WORKER);
+    vi.spyOn(cp.tasks, "admitWorkerFanout").mockImplementation(async (provider) =>
+      provider === "claude" ? deny(ReasonCode.CAPACITY_UNKNOWN_NOT_ROUTABLE, "claude worker admission refused") : allow(ReasonCode.OK, undefined));
+    return real;
+  };
+
+  const workerOf = async (f: BootstrapRuntimeFixture, sessionId: string, runId: string) =>
+    ((await f.cto(sessionId, "contract_get", { runId }))["value"] as { tasks: Array<{ worker: unknown }> }).tasks[0]!.worker;
+
+  it("a generation-1 Opus worker moved onto gpt-6.1-sol: contract_get names the session it runs, and the woken owner's provision replaces it on gpt", async () => {
+    await withBootstrapRuntime(async (f) => {
+      const cp = f.harness.cp;
+      const real = gptWorkersOnly(f);
+      const { owner, runId, sessionId, taskId } = await stalledAfterPlan(f, "std-moved-retired", "follow-prompt");
+      bindRunWorker(f, runId, taskId);
+      const movedSessionId = moveWorker(f, runId, taskId, { provider: "gpt", model: "gpt-6.1-sol" });
+      const workerRole = roleKeyFor(Role.WORKER, { taskId });
+
+      expect(await workerOf(f, sessionId, runId)).toEqual({
+        sessionId: movedSessionId, generation: 1, state: "ACTIVE", sessionLifecycle: "READY",
+        model: "gpt-6.1-sol", replacementRequired: true, replacementProvider: "gpt",
+      });
+
+      const calls = owner.calls.length;
+      const turns = f.finishedTurns(sessionId);
+      expect(f.daemon.wakeStandardWorkContinuation().woken).toEqual([expect.objectContaining({ taskId, taskState: RETIRED })]);
+      await f.awaitFinishedTurns(sessionId, turns + 1);
+      await idle(f, sessionId);
+      expect(owner.calls.slice(calls).slice(0, 2).map((call) => [call.tool, call.ok])).toEqual([
+        ["contract_get", true],
+        ["task_worker_provision", true],
+      ]);
+      expect(real.provision.mock.calls[0]![0]).toMatchObject({ provider: "gpt" });
+      const replacement = cp.bindings.active(workerRole)!;
+      expect(replacement).toMatchObject({ bindingGeneration: 2 });
+      expect(cp.sessions.get(replacement.sessionId)).toMatchObject({ provider: "gpt", model: "gpt-6.2-sol", lifecycle: "READY" });
+      // The session the generation ran on is the one released.
+      expect(cp.sessions.get(movedSessionId)?.lifecycle).toBe(SessionLifecycle.DRAINING);
+    });
+  });
+
+  it("a gpt-6.1-sol worker revoked before its replacement: contract_get still flags it, its owner is woken once, and it replaces the worker instead of escalating", async () => {
+    await withBootstrapRuntime(async (f) => {
+      const cp = f.harness.cp;
+      gptWorkersOnly(f);
+      const { owner, runId, sessionId, taskId } = await stalledAfterPlan(f, "std-revoked-retired", "follow-prompt");
+      const retired = bindRunWorker(f, runId, taskId, { provider: "gpt", model: "gpt-6.1-sol" });
+      const workerRole = roleKeyFor(Role.WORKER, { taskId });
+      expect(cp.bindings.revoke(workerRole, "test: revoked before its replacement").allowed).toBe(true);
+
+      expect(await workerOf(f, sessionId, runId)).toMatchObject({
+        sessionId: retired.sessionId, generation: 1, state: "REVOKED",
+        model: "gpt-6.1-sol", replacementRequired: true, replacementProvider: "gpt",
+      });
+
+      const calls = owner.calls.length;
+      const turns = f.finishedTurns(sessionId);
+      expect(f.daemon.wakeStandardWorkContinuation()).toEqual({ woken: [expect.objectContaining({ taskId, taskState: RETIRED })], stalled: [] });
+      await f.awaitFinishedTurns(sessionId, turns + 1);
+      await idle(f, sessionId);
+      expect(owner.calls.slice(calls).slice(0, 2).map((call) => [call.tool, call.ok])).toEqual([
+        ["contract_get", true],
+        ["task_worker_provision", true],
+      ]);
+      expect(cp.bindings.history(workerRole).map((binding) => [binding.bindingGeneration, binding.status])).toEqual([[1, "REVOKED"], [2, "ACTIVE"]]);
+      expect(cp.sessions.get(cp.bindings.active(workerRole)!.sessionId)).toMatchObject({ provider: "gpt", model: "gpt-6.2-sol" });
+    });
+  });
+
+  it("a wake spent while the worker was staffed does not hide it once it runs a retired model: that state is woken once, then stalls once", async () => {
+    await withBootstrapRuntime(async (f) => {
+      const { owner, runId, sessionId, roleKey, taskId } = await stalledAfterPlan(f, "std-spent-retired", "ignore");
+      const at = (taskState: string) => ({ runId, roleKey, bindingGeneration: 1, taskId, taskState });
+      bindRunWorker(f, runId, taskId);
+      let turns = f.finishedTurns(sessionId);
+      expect(f.daemon.wakeStandardWorkContinuation()).toEqual({ woken: [at(STAFFED)], stalled: [] });
+      await f.awaitFinishedTurns(sessionId, turns + 1);
+      await idle(f, sessionId);
+      // Before the next pass, the same generation's worker moves onto a retired model.
+      moveWorker(f, runId, taskId, { provider: "gpt", model: "gpt-6.1-sol" });
+      turns = f.finishedTurns(sessionId);
+      expect(f.daemon.wakeStandardWorkContinuation()).toEqual({ woken: [at(RETIRED)], stalled: [] });
+      await f.awaitFinishedTurns(sessionId, turns + 1);
+      await idle(f, sessionId);
+      expect(owner.prompts.at(-1)).toContain(
+        `The control plane woke you for: ${standardWorkContinuationTriggerKind(runId, taskId, RETIRED)}.`,
+      );
+      expect(f.daemon.wakeStandardWorkContinuation()).toEqual({ woken: [], stalled: [at(RETIRED)] });
+      expect(f.daemon.wakeStandardWorkContinuation()).toEqual(nothing);
+      expect(markers(f, STANDARD_WORK_CONTINUATION_WAKE, runId).map((evidence) => evidence["taskState"])).toEqual([STAFFED, RETIRED]);
+      expect(markers(f, STANDARD_WORK_CONTINUATION_STALLED, runId).map((evidence) => evidence["taskState"])).toEqual([RETIRED]);
     });
   });
 });
@@ -1110,7 +1230,7 @@ describe("R1-01 (b), CEO e64aa10b — re-entry goes by the run's record, and a p
       expect(markers(f, STANDARD_WORK_CONTINUATION_STALLED, runId).map((evidence) => evidence["taskState"]))
         .toEqual([UNSTAFFED, STAFFED]);
       expect(cp.tasks.executions(runId)).toEqual([]);
-      expect(STANDARD_CONTINUATION_STATE).toEqual({ UNSTAFFED, STAFFED });
+      expect(STANDARD_CONTINUATION_STATE).toEqual({ UNSTAFFED, STAFFED, RETIRED });
     });
   });
 });

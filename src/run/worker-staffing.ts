@@ -4,7 +4,7 @@ import { ReasonCode } from "../core/reason-codes.ts";
 import { containedWorkdir, probeSessionHealth } from "../cto/cto-lifecycle.ts";
 import type { AuditLog } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
-import { fixedRuntimes, retiredSessionOf } from "../domain/fixed-role-runtime.ts";
+import { currentBindingOf, fixedRuntimes } from "../domain/fixed-role-runtime.ts";
 import { Role, type RoleBinding, RunState, SessionLifecycle, TaskState, roleKeyFor } from "../domain/types.ts";
 import type { ProcessGroupReap } from "../runtime/cli-adapters.ts";
 import type { ProviderAdapter, ProviderRegistry, SessionHandle } from "../runtime/provider.ts";
@@ -288,25 +288,21 @@ export class WorkerStaffing {
         state: task.state,
       });
     }
-    const active = this.ports.bindings.active(roleKey);
-    const activeModel = active === null ? null : this.#retiredModelOf(active);
-    if (active !== null && activeModel === null) {
-      return deny(ReasonCode.BINDING_ALREADY_ACTIVE, "the task already has an active worker binding", { roleKey });
+    // #1486 — the newest binding as it runs, the reading contract_get and the continuation make: an ACTIVE one
+    // on its live session, so a same-generation move onto a retired model is replaced, not refused as held before.
+    const worker = currentBindingOf(roleKey, this.ports.bindings, this.ports.sessions);
+    if (worker !== null && worker.retired === null) {
+      return worker.binding.status === "ACTIVE"
+        ? deny(ReasonCode.BINDING_ALREADY_ACTIVE, "the task already has an active worker binding", { roleKey })
+        : deny(
+            ReasonCode.BINDING_REVOKED,
+            "the task's worker role was held before; its replacement belongs to continuity or a claim",
+            { roleKey, generation: worker.binding.bindingGeneration },
+          );
     }
-    const history = this.ports.bindings.history(roleKey);
-    if (history.length > 0 && this.#retiredModelOf(history[history.length - 1]!) === null) {
-      return deny(
-        ReasonCode.BINDING_REVOKED,
-        "the task's worker role was held before; its replacement belongs to continuity or a claim",
-        { roleKey, generation: history[history.length - 1]!.bindingGeneration },
-      );
-    }
-    return allow(ReasonCode.OK, { projectId: run.projectId, retired: active, retiredModel: activeModel });
-  }
-
-  /** The retired model a binding's session runs, or null: not retired, or no such session. */
-  #retiredModelOf(binding: RoleBinding): string | null {
-    return retiredSessionOf(binding, this.ports.sessions)?.model ?? null;
+    // Only an ACTIVE retired binding is released by the bind; a revoked one already is.
+    const releasing = worker?.binding.status === "ACTIVE" ? worker : null;
+    return allow(ReasonCode.OK, { projectId: run.projectId, retired: releasing?.binding ?? null, retiredModel: releasing?.retired?.model ?? null });
   }
 
   /** Stops a session this path constituted and did not bind, through the provider's own handle. */
