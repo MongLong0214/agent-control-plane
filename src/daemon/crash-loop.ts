@@ -1,3 +1,4 @@
+import Database from "better-sqlite3";
 import { randomBytes } from "node:crypto";
 import { closeSync, constants, lstatSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync, writeSync } from "node:fs";
 import { join } from "node:path";
@@ -94,10 +95,6 @@ const replaceRecord = (stateDir: string, contents: string): void => {
 };
 
 const LOCK_WAIT_MS = 3_000;
-const LOCK_STALE_MS = 10_000;
-const sleepSync = (ms: number): void => {
-  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
-};
 
 /**
  * Runs one read-modify-write of the record while no other start is doing the same. Starts that refuse run
@@ -106,34 +103,49 @@ const sleepSync = (ms: number): void => {
  * wrote last erased what the others wrote, a `lastRefusal` and its notice outcome among it, and the next
  * start inside the backoff told the CEO again.
  *
- * The lock is a file created exclusively beside the record and never through a link, held only for the
- * read-modify-write (never for a notice's delivery), and given up on as stale after `LOCK_STALE_MS`. A start
- * that cannot take it within `LOCK_WAIT_MS` throws, and its caller keeps the refusal without the record, as
- * it always has when the record could not be written.
+ * The lock is an open `BEGIN EXCLUSIVE` transaction on `.crash-loop.lock`, an empty SQLite file beside the
+ * record, held by one connection for the read-modify-write only (never for a notice's delivery). The
+ * operating system ends it when that connection closes or its process exits, SIGKILL included: an owner
+ * that exited leaves it to the next start at once, and one that stalls keeps it for as long as it stalls.
+ * Nothing judges it by age and the file is never removed, so no owner, however late it resumes, can take
+ * away a lock another start holds. A start that cannot take it within `LOCK_WAIT_MS` throws, and its caller
+ * keeps the refusal without the record, as it always has when the record could not be written. It is the
+ * primitive `agentcpd.lock.db` uses (`single-instance.ts`), in the normal locking mode with a busy wait,
+ * for the reason given there.
+ *
+ * Rejected: a file created exclusively, reclaimed once older than ten seconds and removed by its owner on
+ * release. A stalled owner lost it to the next start and, resuming, removed that start's lock, so two starts
+ * rewrote the record at once. Rejected: that file naming its owner's pid and start token, reclaimed only once
+ * the owner is proven gone. Two starts that read the same dead owner each remove what is at the path, and
+ * the later one removes the lock the first has just taken.
  */
-const withRecordLock = <T>(stateDir: string, action: () => T): T => {
+export const withRecordLock = <T>(stateDir: string, action: () => T): T => {
   const lock = join(stateDir, ".crash-loop.lock");
-  const deadline = Date.now() + LOCK_WAIT_MS;
-  for (;;) {
-    try {
-      const fd = openSync(lock, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
-      closeSync(fd);
-      break;
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-      try {
-        if (Date.now() - lstatSync(lock).mtimeMs > LOCK_STALE_MS) unlinkSync(lock);
-        else if (Date.now() >= deadline) throw new Error("crash-loop.json is being written by another start");
-        else sleepSync(15);
-      } catch (inner) {
-        if ((inner as NodeJS.ErrnoException).code !== "ENOENT") throw inner;
-      }
-    }
-  }
   try {
+    closeSync(openSync(lock, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600));
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+  }
+  // SQLite opens a path through a link: a lock that is not this regular file (a link to `state.sqlite`)
+  // is never opened as the lock, since locking it would be a write to whatever it names.
+  const created = lstatSync(lock);
+  if (!created.isFile()) throw new Error("the crash-loop.json lock is not a regular file");
+  const db = new Database(lock, { timeout: LOCK_WAIT_MS });
+  try {
+    const opened = lstatSync(lock);
+    if (!opened.isFile() || opened.dev !== created.dev || opened.ino !== created.ino) {
+      throw new Error("the crash-loop.json lock changed while it was opened");
+    }
+    try {
+      db.exec("BEGIN EXCLUSIVE");
+    } catch (error) {
+      const code = (error as { code?: string }).code;
+      if (code === "SQLITE_BUSY" || code === "SQLITE_LOCKED") throw new Error("crash-loop.json is being written by another start");
+      throw error;
+    }
     return action();
   } finally {
-    try { unlinkSync(lock); } catch { /* already gone */ }
+    try { db.close(); } catch { /* the lock ends with the process if not before */ }
   }
 };
 
