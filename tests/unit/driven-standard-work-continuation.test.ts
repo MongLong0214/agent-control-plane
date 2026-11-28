@@ -1099,6 +1099,35 @@ describe("#1486 — a retired-model worker is replaced however it got there: mov
     });
   });
 
+  it("an Opus worker moved onto gpt-6.1-sol in its generation, then revoked: judged by the session it last ran, flagged, woken for and replaced", async () => {
+    await withBootstrapRuntime(async (f) => {
+      const cp = f.harness.cp;
+      gptWorkersOnly(f);
+      const { owner, runId, sessionId, taskId } = await stalledAfterPlan(f, "std-moved-revoked", "follow-prompt");
+      bindRunWorker(f, runId, taskId);
+      const movedSessionId = moveWorker(f, runId, taskId, { provider: "gpt", model: "gpt-6.1-sol" });
+      const workerRole = roleKeyFor(Role.WORKER, { taskId });
+      expect(cp.bindings.revoke(workerRole, "test: revoked before its replacement").allowed).toBe(true);
+
+      expect(await workerOf(f, sessionId, runId)).toMatchObject({
+        sessionId: movedSessionId, generation: 1, state: "REVOKED",
+        model: "gpt-6.1-sol", replacementRequired: true, replacementProvider: "gpt",
+      });
+
+      const calls = owner.calls.length;
+      const turns = f.finishedTurns(sessionId);
+      expect(f.daemon.wakeStandardWorkContinuation()).toEqual({ woken: [expect.objectContaining({ taskId, taskState: RETIRED })], stalled: [] });
+      await f.awaitFinishedTurns(sessionId, turns + 1);
+      await idle(f, sessionId);
+      expect(owner.calls.slice(calls).slice(0, 2).map((call) => [call.tool, call.ok])).toEqual([
+        ["contract_get", true],
+        ["task_worker_provision", true],
+      ]);
+      expect(cp.bindings.history(workerRole).map((binding) => [binding.bindingGeneration, binding.status])).toEqual([[1, "REVOKED"], [2, "ACTIVE"]]);
+      expect(cp.sessions.get(cp.bindings.active(workerRole)!.sessionId)).toMatchObject({ provider: "gpt", model: "gpt-6.2-sol" });
+    });
+  });
+
   it("a wake spent while the worker was staffed does not hide it once it runs a retired model: that state is woken once, then stalls once", async () => {
     await withBootstrapRuntime(async (f) => {
       const { owner, runId, sessionId, roleKey, taskId } = await stalledAfterPlan(f, "std-spent-retired", "ignore");

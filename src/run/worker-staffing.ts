@@ -53,7 +53,7 @@ export interface WorkerProvisioned {
 export interface WorkerStaffingPorts {
   readonly runs: Pick<RunEngine, "get">;
   readonly tasks: Pick<TaskGraph, "get" | "admitWorkerFanout">;
-  readonly bindings: Pick<BindingRegistry, "active" | "history" | "bind" | "revoke">;
+  readonly bindings: Pick<BindingRegistry, "latest" | "bind" | "revoke">;
   readonly sessions: Pick<SessionRegistry, "createWithPinnedStart" | "transition" | "get">;
   readonly providers: Pick<ProviderRegistry, "requireForRole">;
   /** §9.5 step 3 — the doctor's readiness gate, the same one a fresh CTO passes. */

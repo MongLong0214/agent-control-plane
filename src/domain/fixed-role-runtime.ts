@@ -48,20 +48,18 @@ export const retiredSessionOf = (
 
 /**
  * #1486 — a role's newest binding as it runs, with the retired runtime it runs on (`retiredSessionOf`), or null
- * when the role was never held. An ACTIVE binding is read through `active`, on its live session: `history`
- * keeps the session its row first recorded, which a same-generation move leaves behind. A revoked one is read
- * as recorded. Staffing, `contract_get` and the standard work continuation read a task's worker through this
- * alone, so none of them judges a session the others do not.
+ * when the role was never held. Read through `latest`, on the session the binding last ran, ACTIVE or revoked:
+ * `history` keeps the session its row first recorded, which a same-generation move leaves behind. Staffing,
+ * `contract_get` and the standard work continuation read a task's worker through this alone, so none of them
+ * judges a session the others do not.
  */
 export const currentBindingOf = (
   roleKey: string,
-  bindings: { active(roleKey: string): RoleBinding | null; history(roleKey: string): readonly RoleBinding[] },
+  bindings: { latest(roleKey: string): RoleBinding | null },
   sessions: Parameters<typeof retiredSessionOf>[1],
 ): { binding: RoleBinding; retired: { provider: string; model: string } | null } | null => {
-  const newest = bindings.history(roleKey).at(-1);
-  if (newest === undefined) return null;
-  const binding = newest.status === "ACTIVE" ? bindings.active(roleKey) ?? newest : newest;
-  return { binding, retired: retiredSessionOf(binding, sessions) };
+  const binding = bindings.latest(roleKey);
+  return binding === null ? null : { binding, retired: retiredSessionOf(binding, sessions) };
 };
 
 /** The fixed provider/model pairs for a role. Empty when the role is not fixed. */
