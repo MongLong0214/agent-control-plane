@@ -523,6 +523,17 @@ describe("the canonical CTO attach relay", () => {
     expect(relay.err()).toBe(`attach: claim refused ${ReasonCode.CONFLICT} GENERATION_MISMATCH\n`);
   });
 
+  it("a session launched without its Buzz channel is refused once, and the line names the flag to launch it with (#1427)", async () => {
+    const asked = await scriptedClaims([refusal(ReasonCode.CONFLICT, "BUZZ_CHANNEL_NOT_LOADED"), receipt()]);
+    const relay = drive(mcpPath, TOKEN, quick);
+    expect(await settles(relay.exit)).toBe(ATTACH_EXIT.CLAIM_REFUSED);
+    expect(asked).toHaveLength(1);
+    expect(relay.err()).toBe(
+      `attach: claim refused ${ReasonCode.CONFLICT} BUZZ_CHANNEL_NOT_LOADED: ` +
+        "relaunch claude with --dangerously-load-development-channels server:acp-buzz-channel\n",
+    );
+  });
+
   it.each([
     ["another conversation holds the role", ReasonCode.BINDING_ALREADY_ACTIVE, "BIND_REFUSED"],
     ["the session is not entitled", ReasonCode.CONFLICT, "SESSION_NOT_ENTITLED"],

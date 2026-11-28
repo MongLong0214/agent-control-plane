@@ -14,7 +14,7 @@ import { fallbackHandoff, firstPromptOf, handoffPackageOf, markHandoff, readHand
 import { residentWorkerCheckoutPath } from "../core/resident-allocation-paths.ts";
 import { daemonBuzzSigner } from "../outbox/ceo-buzz-signer.ts";
 import { readOperatorToken } from "./operator-token.ts";
-import { BUZZ_CHANNEL_SERVER, CHANNEL_DEV_FLAG, channelEmittedBy, channelLaunchArgs, confirmChannelStartup, launchFolderTrust, tmuxChannelDriver } from "../runtime/cto-channel-launch.ts";
+import { argvCarriesChannel, channelEmittedBy, channelLaunchArgs, confirmChannelStartup, launchFolderTrust, tmuxChannelDriver } from "../runtime/cto-channel-launch.ts";
 import { readHostProvisionerReason, recordedResidentExitStatus } from "../runtime/host-provisioner-reason.ts";
 
 /**
@@ -214,19 +214,6 @@ const cloneOf = (record: CtoRecord): string | null =>
   allocationString(record, "clonePath") ?? record.repositories.find((r) => !r.checkoutPath.includes("/.acp-worker-checkouts/"))?.checkoutPath ?? null;
 
 const cwdOf = (record: CtoRecord | null): string | null => (record ? record.session?.workdir ?? cloneOf(record) : null);
-
-/** Whether a claude argv, element by element, loads the acp-buzz-channel development channel. */
-const argvCarriesChannel = (argv: readonly string[] | null | undefined): boolean => {
-  if (!argv) return false;
-  const wanted = `server:${BUZZ_CHANNEL_SERVER}`;
-  for (let at = 0; at < argv.length; at++) {
-    const element = argv[at]!;
-    if (element.startsWith(`${CHANNEL_DEV_FLAG}=`) && element.slice(CHANNEL_DEV_FLAG.length + 1).split(/[ ,]/).includes(wanted)) return true;
-    if (element !== CHANNEL_DEV_FLAG) continue;
-    for (let value = at + 1; value < argv.length && (value === at + 1 || !argv[value]!.startsWith("-")); value++) if (argv[value] === wanted) return true;
-  }
-  return false;
-};
 
 /** The role's scope by the shared rule: the database's, plus the bound conversation and folder this run knows. */
 const roleScopeOf = (ports: CtoPorts, projectId: string): CtoRoleScope => {

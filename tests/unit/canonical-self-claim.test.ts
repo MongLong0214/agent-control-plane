@@ -53,6 +53,7 @@ import {
   type HostSessionRegistryReader,
   type SubscribedBuzzRooms,
   SELF_CLAIM_EXECUTOR_KIND,
+  SelfClaimRefusal,
 } from "../../src/registry/canonical-self-claim.ts";
 import type { CtoProcess, CtoProcessReader } from "../../src/cto/one-cto-per-project.ts";
 import { cleanupTempDirs, makeCore, tempDir, type CoreHarness } from "../helpers/fixtures.ts";
@@ -372,6 +373,7 @@ const makeSubject = (
     processSignal?: (pid: number) => void;
     subscribedBuzzRooms?: SubscribedBuzzRooms;
     ctoProcessReader?: CtoProcessReader;
+    requireBuzzChannel?: boolean;
   } = {},
 ): CanonicalSelfClaim =>
   new CanonicalSelfClaim(
@@ -391,6 +393,7 @@ const makeSubject = (
       processSignal: options.processSignal ?? signalFromChain(options.chain ?? standardChain()),
       ...(options.subscribedBuzzRooms === undefined ? {} : { subscribedBuzzRooms: options.subscribedBuzzRooms }),
       ctoProcessReader: options.ctoProcessReader ?? hostProcesses(),
+      ...(options.requireBuzzChannel === undefined ? {} : { requireBuzzChannel: options.requireBuzzChannel }),
     },
   );
 
@@ -3713,4 +3716,57 @@ it('refuses canonical admission when DB entitlement is revoked during the awaite
   expect(result.allowed).toBe(false);
   for (const table of FIVE_TABLES) expect(core.db.get<{n:number}>(`SELECT count(*) AS n FROM ${table}`)?.n).toBe(0);
   core.db.close();
+});
+
+describe("a canonical CTO that cannot hear its Buzz channel is refused at claim, not admitted to wait unread (#1427)", () => {
+  const FLAG = "--dangerously-load-development-channels server:acp-buzz-channel";
+  const launchedWith = (...flags: string[]): ProcessSnapshot[] =>
+    standardChain({ argv: ["/opt/claude/claude", ...flags, "--session-id", CANON] });
+
+  it("refuses a claude launched without the channel, names the launch flag, and writes only its refusal row", async () => {
+    const core = makeCore();
+    const projectId = "prj_no_channel";
+    insertProject(core, projectId);
+    const subject = makeSubject(core, projectId, { requireBuzzChannel: true });
+    const before = rowCounts(core);
+    const result = await subject.claim(baseRequest(core, projectId));
+
+    expect(result).toMatchObject({ allowed: false, reasonCode: ReasonCode.CONFLICT, evidence: { reason: SelfClaimRefusal.BUZZ_CHANNEL_NOT_LOADED } });
+    if (result.allowed) return;
+    expect(result.message).toContain(FLAG);
+    expectRolledBack(core, before, result);
+    const row = core.db.get<{ evidence: string }>(`SELECT evidence_json AS evidence FROM audit_events WHERE kind = 'CANONICAL_SELF_CLAIM_REFUSED' ORDER BY event_id DESC LIMIT 1`);
+    expect(JSON.parse(row!.evidence)).toMatchObject({ reason: SelfClaimRefusal.BUZZ_CHANNEL_NOT_LOADED });
+    core.db.close();
+  });
+
+  it.each([
+    ["the bare flag", ["--dangerously-load-development-channels", "server:acp-buzz-channel"]],
+    ["the attached flag", ["--dangerously-load-development-channels=server:acp-buzz-channel"]],
+    ["a list that names it second", ["--dangerously-load-development-channels", "server:other", "server:acp-buzz-channel"]],
+  ])("admits a claude launched with %s", async (_label, flags) => {
+    const core = makeCore();
+    const projectId = "prj_channel";
+    insertProject(core, projectId);
+    const subject = makeSubject(core, projectId, { requireBuzzChannel: true, chain: launchedWith(...flags) });
+    const result = await subject.claim(baseRequest(core, projectId));
+
+    expect(result.allowed, JSON.stringify(result)).toBe(true);
+    core.db.close();
+  });
+
+  it.each([
+    ["another server only", launchedWith("--dangerously-load-development-channels", "server:other")],
+    ["the flag only after the options boundary, where it is a positional",
+      standardChain({ argv: ["/opt/claude/claude", "--session-id", CANON, "--", "--dangerously-load-development-channels", "server:acp-buzz-channel"] })],
+  ])("refuses a claude whose argv carries %s", async (_label, chain) => {
+    const core = makeCore();
+    const projectId = "prj_wrong_channel";
+    insertProject(core, projectId);
+    const subject = makeSubject(core, projectId, { requireBuzzChannel: true, chain });
+    const result = await subject.claim(baseRequest(core, projectId));
+
+    expect(result).toMatchObject({ allowed: false, evidence: { reason: SelfClaimRefusal.BUZZ_CHANNEL_NOT_LOADED } });
+    core.db.close();
+  });
 });

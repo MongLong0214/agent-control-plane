@@ -7028,6 +7028,8 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
             buzzPurpose: canonicalActivationValues["ACP_CANONICAL_CTO_BUZZ_PURPOSE"],
           },
           subscribedBuzzRooms,
+          // #1427 — a canonical CTO is reached only through its Buzz channel, so a claude launched without it is refused.
+          claimDeps: { requireBuzzChannel: true },
         });
       });
       process.stdout.write("canonical self-claim listener started\n");

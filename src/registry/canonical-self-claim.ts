@@ -14,6 +14,7 @@ import type { AuditLog, AuditRecord } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
 import { Role, SessionLifecycle, roleKeyFor, type RoleBinding } from "../domain/types.ts";
 import type { AuthenticatedTargetBinding, BindingRegistry, VerifiedTargetBinding } from "../session/binding-registry.ts";
+import { BUZZ_CHANNEL_SERVER, CHANNEL_DEV_FLAG, argvCarriesChannel } from "../runtime/cto-channel-launch.ts";
 import type { BuzzActorAuthenticator, SessionRegistry } from "../session/session-registry.ts";
 import {
   type CanonicalCtoCarried,
@@ -104,6 +105,8 @@ export const SelfClaimRefusal = {
   CTO_PROCESS_TABLE_UNREADABLE: CTO_PROCESS_TABLE_UNREADABLE,
   ANCESTOR_START_UNKNOWN: "ANCESTOR_START_UNKNOWN",
   ANCESTOR_NOT_INTERACTIVE: "ANCESTOR_NOT_INTERACTIVE",
+  /** The claude was launched without its Buzz channel, so it could hold the role and never hear a message (#1427). */
+  BUZZ_CHANNEL_NOT_LOADED: "BUZZ_CHANNEL_NOT_LOADED",
   ANCESTOR_CWD_UNREADABLE: "ANCESTOR_CWD_UNREADABLE",
   PEER_PROTOCOL_MISMATCH: "PEER_PROTOCOL_MISMATCH",
   TRANSCRIPT_NOT_FOUND: "TRANSCRIPT_NOT_FOUND",
@@ -1680,6 +1683,11 @@ export interface CanonicalSelfClaimDeps {
   subscribedBuzzRooms?: SubscribedBuzzRooms;
   /** The host's process-table reader for the one-CTO check, defaulting to ps and lsof. Injectable for the same reason `processInspector` is. */
   ctoProcessReader?: CtoProcessReader;
+  /**
+   * Whether the claimant's claude must have been launched with its Buzz channel (`argvCarriesChannel`). Absent or false,
+   * no argv is checked for it, which is a deployment that delivers nothing to a CTO in real time; the daemon sets it.
+   */
+  requireBuzzChannel?: boolean;
 }
 
 /** Read-only evidence only: no owner authority, session creation or binding writes.
@@ -2054,6 +2062,7 @@ export class CanonicalSelfClaim {
   readonly #canonicalBuzzChannelId: string;
   readonly #subscribedBuzzRooms: SubscribedBuzzRooms | null;
   readonly #ctoProcessReader: CtoProcessReader;
+  readonly #requireBuzzChannel: boolean;
   readonly #canonicalSessions: readonly CanonicalAdoptableSession[];
 
   constructor(
@@ -2103,6 +2112,7 @@ export class CanonicalSelfClaim {
     this.#canonicalBuzzChannelId = config.canonicalBuzzChannelId;
     this.#subscribedBuzzRooms = deps.subscribedBuzzRooms ?? null;
     this.#ctoProcessReader = deps.ctoProcessReader ?? systemCtoProcessReader();
+    this.#requireBuzzChannel = deps.requireBuzzChannel === true;
     // Frozen at construction, like every other deployment fact here: a later mutation of the array
     // the composition root passed must not change which sessions this instance will adopt.
     this.#canonicalSessions = validatedSessions.map((entry) => Object.freeze({ ...entry }));
@@ -2224,6 +2234,20 @@ export class CanonicalSelfClaim {
         ReasonCode.CONFLICT,
         "this session is not the canonical CTO for the requested project",
         { observed: request.projectId, entitled: entry.projectId },
+      );
+    }
+    // A canonical CTO hears its CEO and owner only through its Buzz channel, and Claude Code delivers a channel's
+    // messages only to a session launched with that channel opted in. Admitted without it, the session would hold the
+    // role while every message for it waited unread in the outbox, and nothing at attach would say so (#1427). Nothing
+    // ACP can do to a running session adds the channel, so this is refused rather than repaired. Read before the `--`
+    // boundary, where an element is a positional and not a flag. The launch flag is read rather than a running channel
+    // server: Claude Code starts its MCP servers together, so the channel's may not be up yet when this claim arrives.
+    // A reattach (`canonical-cto-reattach.ts`) is not checked: refusing there would end a live CTO's relay on a restart.
+    if (this.#requireBuzzChannel && !argvCarriesChannel(argvBeforeOptionsBoundary(identity.argv))) {
+      return refuse(SelfClaimRefusal.BUZZ_CHANNEL_NOT_LOADED,
+        ReasonCode.CONFLICT,
+        `the claude ancestor was launched without its Buzz channel, so it would never hear a message; relaunch it with ${CHANNEL_DEV_FLAG} server:${BUZZ_CHANNEL_SERVER} (agentctl cto relaunch <project> --apply)`,
+        { pid: identity.pid },
       );
     }
     // One CTO per project: a second distinct live process for this role is refused, whatever started it and
