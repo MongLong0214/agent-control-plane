@@ -1,6 +1,8 @@
 import { closeSync, constants as fsConstants, existsSync, mkdirSync, openSync, readFileSync, renameSync, statSync, writeFileSync, writeSync } from "node:fs";
 import { join } from "node:path";
 
+import { verifyEvent } from "nostr-tools/pure";
+
 import { isChannelReceipt, type ChannelEventEntry, type ChannelReceipt, type ChannelState, type ChannelStateStore } from "./buzz-channel.ts";
 
 /**
@@ -38,17 +40,50 @@ const identityOf = (receipt: ChannelReceipt, stampedLaunchId: unknown): string =
 };
 
 /**
+ * What the daemon checks of a `replied` receipt on its own, before it looks for the message it answers: a kind-9 event in
+ * exactly the receipt's room, acknowledged by the relay, whose id and signature verify. The daemon also needs the signer to
+ * be the session's bound actor, which only it knows; a stored copy that passes this with the same event id carries that same
+ * signer, because the id is the hash of every signed field.
+ */
+export const replyReceiptVerifies = (receipt: Extract<ChannelReceipt, { type: "replied" }>): boolean => {
+  const event = receipt.event;
+  const rooms = event.tags.filter((tag) => tag[0] === "h").map((tag) => tag[1]);
+  return (
+    event.kind === 9 &&
+    rooms.length === 1 &&
+    rooms[0] === receipt.room &&
+    (receipt.ack === "ACCEPTED" || receipt.ack === "DUPLICATE") &&
+    // A fresh seven-field copy: `verifyEvent` caches its verdict on the object it is given, and a
+    // spread of an already-verified event carries that verdict over a body that was changed after.
+    verifyEvent({
+      id: event.id,
+      pubkey: event.pubkey,
+      created_at: event.created_at,
+      kind: event.kind,
+      tags: event.tags.map((tag) => [...tag]),
+      content: event.content,
+      sig: event.sig,
+    })
+  );
+};
+
+/**
  * One receipt as one line, stamped with the launch the server was started by; `O_APPEND` makes concurrent writers' lines whole.
  *
  * It returns only when this receipt reads back from the file through `readChannelReceipts`, the daemon's own reader, and
- * throws otherwise, so a caller that records "written" on a return records something the daemon will see:
+ * throws otherwise, so a caller that records "written" on a return records something the daemon will see. A receipt counts
+ * as there only when it is the same one by `identityOf` and, for a reply, passes `replyReceiptVerifies`: a stored copy the
+ * daemon would refuse does not stop a valid one being written.
  *   - a receipt already there for the same event (and launch, for the kinds the launcher reads by launch) is success and writes nothing, so a retry never doubles it;
  *   - a last line with no newline is a writer that died mid-line: this receipt starts on a new line, so the fragment stays one
  *     skipped line. When that fragment is this very receipt, whole but for its newline (a short write), only the newline is
- *     written;
- *   - a writer that appends a fragment between that check and this write joins it to this line, which then does not read back:
+ *     written. Both the check and the tail come from one read, so another writer's line that completes the fragment after
+ *     it is read never makes this receipt look absent and get appended a second time. No lock is held, so two processes
+ *     appending the same receipt at once can still both write it; the daemon settles per row, so that repeat is harmless;
+ *   - a writer that appends a fragment between that read and this write joins it to this line, which then does not read back:
  *     the read-back after the write throws, and a retry appends on a clean line;
- *   - a receipt that would not read back (not the shape the reader accepts) or that was only partly written throws.
+ *   - a receipt that would not read back (not the shape the reader accepts, or a reply the daemon would refuse) or that was
+ *     only partly written throws.
  *
  * The whole file is read for the check and the read-back, as the daemon reads it on every pass; `trimChannelReceipts`
  * bounds it when a server starts. `beforeWrite` is a test seam: it runs between the check and the write.
@@ -61,15 +96,18 @@ export const appendChannelReceipt = (
   beforeWrite?: () => void,
 ): void => {
   const line = JSON.stringify(launchId === undefined ? receipt : { ...receipt, launchId });
-  if (!isChannelReceipt(JSON.parse(line) as unknown)) throw new Error("the receipt would not read back");
   const want = identityOf(receipt, launchId);
-  const matches = (value: unknown): boolean => isChannelReceipt(value) && identityOf(value, (value as { launchId?: unknown }).launchId) === want;
+  const matches = (value: unknown): boolean =>
+    isChannelReceipt(value) &&
+    identityOf(value, (value as { launchId?: unknown }).launchId) === want &&
+    (value.type !== "replied" || replyReceiptVerifies(value));
+  if (!matches(JSON.parse(line) as unknown)) throw new Error("the receipt would not read back");
   ensureDir(stateDir);
   const path = channelReceiptPath(stateDir, projectId);
   const fd = openSync(path, fsConstants.O_RDWR | fsConstants.O_APPEND | fsConstants.O_CREAT | fsConstants.O_NOFOLLOW, 0o600);
   try {
-    if (readChannelReceipts(path).receipts.some(matches)) return;
     const text = readFileSync(path, "utf8");
+    if (receiptsIn(text).receipts.some(matches)) return;
     const tail = text === "" || text.endsWith("\n") ? "" : text.slice(text.lastIndexOf("\n") + 1);
     let finishesThis = false;
     try {
@@ -109,6 +147,11 @@ export const readChannelReceipts = (path: string): { receipts: ChannelReceipt[];
   } catch {
     return { receipts: [], skipped: [] };
   }
+  return receiptsIn(text);
+};
+
+/** `readChannelReceipts` over text already read. */
+const receiptsIn = (text: string): { receipts: ChannelReceipt[]; skipped: number[] } => {
   const receipts: ChannelReceipt[] = [];
   const skipped: number[] = [];
   const lines = text.split("\n");
