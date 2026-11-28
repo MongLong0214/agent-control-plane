@@ -147,6 +147,7 @@ interface Page {
     pull: { state: string; merged: boolean | null; mergeability: string } | null;
     gaps: { count: number; kinds: Record<string, number>; first: string[] };
     compareGapsChanged: boolean;
+    compareGapsNotToldApart: Array<{ kind: string; detail: string; before: number; now: number }>;
   };
   compared: { baseSha: string; headSha: string };
   diff: { offset: number; chars: number; nextCursor: string | null; done: boolean; totalChars: number; sha256: string; text: string };
@@ -825,6 +826,48 @@ describe("pr_evidence_get", () => {
       expect(second.incompleteNotListed).toBe(0);
       expect(second.brief.gaps.first.some((quote) => quote.includes("src/f290.ts"))).toBe(true);
       expect(second.incomplete[0]!.detail).toContain("276 gap(s), 275 before this page and 1 on it");
+    });
+
+    /** A 300-file PR whose first 275 files lack line counts, read once; `reshape` then rewrites the compare's files. */
+    const lineCountsFirstPage = async (number: number, reshape: (files: Row[]) => void): Promise<Page> => {
+      const rows = Array.from({ length: 300 }, (_, i) => fileRow(i));
+      for (const row of rows.slice(0, 275)) delete row["additions"];
+      gh.pulls.push(pullRow(number, HEAD_A, 300));
+      gh.filesByHead.set(HEAD_A, rows);
+      gh.checkRuns.push({ id: 8, name: "ci", head_sha: HEAD_A, status: "completed", conclusion: "success" });
+      const first = evidenceOf(await ceoCall({ projectId, prNumber: number, expectedHead: HEAD_A }));
+      gh.reshape = { compare: (body) => {
+        const files = structuredClone(body["files"] as Row[]);
+        reshape(files);
+        return { ...body, files };
+      } };
+      return first;
+    };
+
+    it("names both files that lose their line counts on one page among 275 that lacked them, ahead of those (#1512)", async () => {
+      const first = await lineCountsFirstPage(52, (files) => { delete files[290]!["additions"]; delete files[295]!["additions"]; });
+      const second = evidenceOf(await ceoCall({ projectId, prNumber: 52, expectedHead: HEAD_A, cursor: first.diff.nextCursor }));
+      expect(second.brief.compareGapsChanged).toBe(true);
+      // Before the fix a class that grew by two was listed whole, the 275 recurring entries first.
+      expect(second.incomplete.slice(1).map((entry) => entry.file)).toEqual(["src/f290.ts", "src/f295.ts"]);
+      expect(second.incompleteNotListed).toBe(0);
+      expect(second.brief.compareGapsNotToldApart).toEqual([]);
+      for (const file of ["src/f290.ts", "src/f295.ts"]) expect(second.brief.gaps.first.some((quote) => quote.includes(file))).toBe(true);
+      expect(second.brief.ok).toBe(false);
+      expect(second.brief.reasonCode).toBe(ReasonCode.COVERAGE_INCOMPLETE);
+    });
+
+    it("says in the brief which class changed in a way it cannot narrow to the gaps it added, and lists that class (#1512)", async () => {
+      // One file regains its line counts and another loses them: the count is the same, the class is not.
+      const first = await lineCountsFirstPage(53, (files) => { files[0]!["additions"] = 2; delete files[290]!["additions"]; });
+      const second = evidenceOf(await ceoCall({ projectId, prNumber: 53, expectedHead: HEAD_A, cursor: first.diff.nextCursor }));
+      expect(second.brief.compareGapsChanged).toBe(true);
+      expect(second.brief.compareGapsNotToldApart).toEqual([
+        { kind: "MALFORMED_RESPONSE", detail: expect.stringContaining("line counts"), before: 275, now: 275 },
+      ]);
+      expect(second.incomplete[1]).toMatchObject({ kind: "MALFORMED_RESPONSE", detail: expect.stringContaining("line counts") });
+      expect(second.incomplete.length - 1 + second.incompleteNotListed).toBe(275);
+      expect(second.brief.reasonCode).toBe(ReasonCode.COVERAGE_INCOMPLETE);
     });
 
     it("lists a merge-base lost on page 2 ahead of 40 recurring entries with no filename (#1490)", async () => {
