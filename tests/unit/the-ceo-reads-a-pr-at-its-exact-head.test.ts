@@ -756,11 +756,11 @@ describe("pr_evidence_get", () => {
       expect(first.brief.compareGapsChanged).toBe(false);
       gh.reshape = dropMergeBase;
       const second = evidenceOf(await ceoCall({ projectId, prNumber: 43, expectedHead: HEAD_A, cursor: first.diff.nextCursor }));
-      // The compare is not the one page 1 saw: all of its gaps are listed, a gap naming no file first.
+      // The compare is not the one page 1 saw: the gap it adds is listed, and the forty recurring omissions are not.
       expect(second.brief.compareGapsChanged).toBe(true);
       expect(second.incomplete[0]).toMatchObject({ kind: "SNAPSHOT_INCOMPLETE" });
       expect(second.incomplete[1]).toMatchObject({ kind: "MALFORMED_RESPONSE", detail: expect.stringContaining("merge-base") });
-      expect(second.incomplete[2]).toMatchObject({ kind: "PATCH_OMITTED" });
+      expect(second.incomplete).toHaveLength(2);
       expect(second.brief.gaps.first.some((quote) => quote.includes("merge-base"))).toBe(true);
       // The next page's compare is the second page's: nothing in it is new.
       const third = evidenceOf(await ceoCall({ projectId, prNumber: 43, expectedHead: HEAD_A, cursor: second.diff.nextCursor }));
@@ -782,7 +782,8 @@ describe("pr_evidence_get", () => {
       expect(second.incomplete[1]).toMatchObject({ kind: "MALFORMED_RESPONSE", file: "src/f1015.ts",
         detail: expect.stringContaining("line counts") });
       expect(second.brief.gaps.first.some((quote) => quote.includes("line counts"))).toBe(true);
-      expect(second.incomplete.length + second.incompleteNotListed).toBe(1 + 276);
+      // The 275 recurring omissions are neither listed nor counted again.
+      expect(second.incomplete.length + second.incompleteNotListed).toBe(1 + 1);
     });
 
     it("shows a second identical failure on page 2 against one on page 1 as a change", async () => {
@@ -798,7 +799,64 @@ describe("pr_evidence_get", () => {
       gh.reshape = withEntries(2);
       const second = evidenceOf(await ceoCall({ projectId, prNumber: 48, expectedHead: HEAD_A, pageChars: 2_000, cursor: first.diff.nextCursor }));
       expect(second.brief.compareGapsChanged).toBe(true);
-      expect(second.incomplete.filter((entry) => entry.detail.includes("no filename"))).toHaveLength(2);
+      // The second one is listed; the one page 1 counted is not counted again.
+      expect(second.incomplete.filter((entry) => entry.detail.includes("no filename"))).toHaveLength(1);
+      expect(second.incomplete[0]!.detail).toContain("5 gap(s), 4 before this page and 1 on it");
+    });
+
+    it("names the one file that loses its line counts on page 2 among 275 that lacked them on page 1 (#1490)", async () => {
+      const rows = Array.from({ length: 300 }, (_, i) => fileRow(i));
+      for (const row of rows.slice(0, 275)) delete row["additions"];
+      gh.pulls.push(pullRow(49, HEAD_A, 300));
+      gh.filesByHead.set(HEAD_A, rows);
+      gh.checkRuns.push({ id: 8, name: "ci", head_sha: HEAD_A, status: "completed", conclusion: "success" });
+      const first = evidenceOf(await ceoCall({ projectId, prNumber: 49, expectedHead: HEAD_A }));
+      expect(first.brief.gaps.count).toBe(275);
+      gh.reshape = { compare: (body) => {
+        const files = structuredClone(body["files"] as Row[]);
+        delete files[290]!["additions"];
+        return { ...body, files };
+      } };
+      const second = evidenceOf(await ceoCall({ projectId, prNumber: 49, expectedHead: HEAD_A, cursor: first.diff.nextCursor }));
+      expect(second.brief.compareGapsChanged).toBe(true);
+      // Before the fix the 275 recurring entries filled the gap budget and this file was in neither the list nor the brief.
+      expect(second.incomplete).toHaveLength(2);
+      expect(second.incomplete[1]).toMatchObject({ kind: "MALFORMED_RESPONSE", file: "src/f290.ts", detail: expect.stringContaining("line counts") });
+      expect(second.incompleteNotListed).toBe(0);
+      expect(second.brief.gaps.first.some((quote) => quote.includes("src/f290.ts"))).toBe(true);
+      expect(second.incomplete[0]!.detail).toContain("276 gap(s), 275 before this page and 1 on it");
+    });
+
+    it("lists a merge-base lost on page 2 ahead of 40 recurring entries with no filename (#1490)", async () => {
+      seedBinaries(50, 0, 30);
+      const unnamed = (body: Row): Row => ({ ...body, files: [...(body["files"] as Row[]), ...Array.from({ length: 40 }, () => ({}))] });
+      gh.reshape = { compare: unnamed };
+      const first = evidenceOf(await ceoCall({ projectId, prNumber: 50, expectedHead: HEAD_A, pageChars: 2_000 }));
+      expect(first.brief.gaps.count).toBe(40);
+      gh.reshape = { compare: (body) => dropMergeBase.compare(unnamed(body)) };
+      const second = evidenceOf(await ceoCall({ projectId, prNumber: 50, expectedHead: HEAD_A, pageChars: 2_000, cursor: first.diff.nextCursor }));
+      expect(second.brief.compareGapsChanged).toBe(true);
+      expect(second.incomplete).toHaveLength(2);
+      expect(second.incomplete[1]).toMatchObject({ kind: "MALFORMED_RESPONSE", detail: expect.stringContaining("merge-base") });
+      expect(second.brief.gaps.first.some((quote) => quote.includes("merge-base"))).toBe(true);
+    });
+
+    it("reads a compare that drops its merge-base on every other read in about as many pages as a stable one (#1490)", async () => {
+      seedBinaries(51);
+      const comparesOf = (): number => gh.calls.filter((call) => call.path.includes("/compare/")).length;
+      const stable = await pagesOf(51);
+      const stableCompares = comparesOf();
+      gh.calls.length = 0;
+      let reads = 0;
+      gh.reshape = { compare: (body) => (reads += 1) % 2 === 0 ? dropMergeBase.compare(body) : body };
+      const flapping = await pagesOf(51);
+      // Before the fix: 18 pages and 18 compare reads against 12, the forty omissions re-listed on every flip.
+      expect(flapping.length).toBeLessThanOrEqual(stable.length + 1);
+      expect(comparesOf()).toBeLessThanOrEqual(stableCompares + 1);
+      for (const { page } of flapping.slice(1)) expect(page.incomplete.some((entry) => entry.kind === "PATCH_OMITTED")).toBe(false);
+      // The forty are counted once; each page that loses the merge-base adds one.
+      const named = Number(/named (\d+) gap\(s\)/.exec(flapping.at(-1)!.page.incomplete[0]!.detail)?.[1]);
+      expect(named).toBeLessThanOrEqual(40 + flapping.length);
     });
 
     it("never gives the gap list more than a small share of an answer, first page included", async () => {
