@@ -7,6 +7,7 @@ import {
   deferIncidentNotice,
   deliverIncident,
   enqueueAdHocNotice,
+  enqueueCeoNotice,
   runEndedSince,
 } from "./ceo-incident-notices.ts";
 import { deriveHumanGate } from "./human-gate.ts";
@@ -591,17 +592,13 @@ export class ProductionGate {
         // U6 B1 — the owner's `/acp` turn the run was dispatched in, signed with the notice so the CEO's
         // answer can reply to that message; the outbox drops it if the CEO changes before it is sent.
         const origin = dispatchOriginOf(this.audit, input.runId);
-        const notice = this.outbox.enqueue({
+        const notice = enqueueCeoNotice(this.outbox, ceo, {
           idempotencyKey: `notify:${NotificationKind.READY_FOR_CEO_REVIEW}:${input.runId}:${digestOf({
             goal: run.goal,
             candidateSnapshotDigest: input.candidateSnapshotDigest,
             humanGate,
           })}`,
-          roleKey: ceo.roleKey,
-          bindingGeneration: ceo.bindingGeneration,
-          targetSessionId: ceo.sessionId,
           runId: input.runId,
-          kind: MessageKind.CEO_NOTIFICATION,
           payload: {
             notification: NotificationKind.READY_FOR_CEO_REVIEW,
             runId: input.runId,
