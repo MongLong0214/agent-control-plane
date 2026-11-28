@@ -117,7 +117,6 @@ import {
   BuzzActorIngress,
   IngressGuard,
   ingressSignature,
-  isTransportRetentionUnknown,
   type IngressPolicy,
 } from "../ingress/ingress-guard.ts";
 import {
@@ -139,21 +138,13 @@ import {
   type PeerProofCto,
 } from "../ingress/buzz-message.ts";
 import {
-  configuredTelegramExternalConsumerConfig,
-  configuredTelegramLongPollConfig,
-  startTelegramLongPollListener,
-  type TelegramBotTransport,
-  type TelegramExternalConsumerConfig,
-  type TelegramLongPollStartOptions,
-  type TelegramLongPollListener,
-} from "../ingress/telegram-polling.ts";
-import {
   TELEGRAM_EXTERNAL_MAX_REQUEST_BYTES,
   TELEGRAM_EXTERNAL_SOCKET_NAME,
   TelegramExternalUpdateLane,
+  configuredTelegramExternalConsumerConfig,
   type TelegramExternalAnswer,
+  type TelegramExternalConsumerConfig,
 } from "../ingress/telegram-external.ts";
-import type { TelegramDirectAnswer } from "../ingress/telegram-router.ts";
 import { Role, SessionLifecycle, roleKeyFor, type RoleBinding } from "../domain/types.ts";
 import type { HandoffPackage, SessionLaunchCredential, SessionLaunchPin } from "../cto/cto-lifecycle.ts";
 import type { SessionRegistry } from "../session/session-registry.ts";
@@ -2037,7 +2028,7 @@ export const createBuzzMessageIngress = (
   // (`msg_b4177e7ec603...`, 2026-09-13) carries `deliveryStatus`, three digests and no
   // `canonicalTarget`, and `canonicalTargetForClaim("buzz", nonce)` can only answer null for it.
   // Without this line the bridge below is a call that always refuses, which is the shape
-  // `telegram-polling.ts` already met once and named: a writer that cannot write.
+  // the Telegram long-poll lane (deleted in #1444) met once and named: a writer that cannot write.
   const guard = new IngressGuard(cp.db, cp.clock, cp.audit, { buzz: policy }, {
     canonicalTargetForClaim: (identity) => {
       const target = canonicalTurnTarget(cp);
@@ -5666,156 +5657,7 @@ export const configuredBuzzMessageOwnerActors = (
 ];
 
 /**
- * The daemon's Telegram composition root. Tests may replace only the external transport; the
- * guard, sealed Hermes port, CEO receipt callback, durable response reader and poll service are
- * still assembled by the same factory `main` uses.
- */
-export type DaemonTelegramStartOptions = Omit<TelegramLongPollStartOptions, "onCeoApproved"> & {
-  transport?: TelegramBotTransport;
-};
-
-type DaemonTelegramComposition = {
-  finalizeApprovedRun(runId: string): void | Promise<unknown>;
-  setTelegramIngressStatus?(status: {
-    configured: boolean;
-    running: boolean;
-    disabledReason: string | null;
-    recoveryNonce?: string | null;
-  }): void;
-  attachTelegramIngressController?(controller: TelegramLongPollListener["service"]): void;
-  detachTelegramIngressController?(controller: TelegramLongPollListener["service"]): void;
-};
-
-export const startDaemonTelegramListener = async (
-  cp: ControlPlane,
-  config: Parameters<typeof startTelegramLongPollListener>[1],
-  daemon: DaemonTelegramComposition,
-  options: DaemonTelegramStartOptions = {},
-): Promise<TelegramLongPollListener> => {
-  const listener = await startTelegramLongPollListener(cp, config, {
-    ...options,
-    // The daemon attaches the recovery controller before the first poll can possibly stop.
-    start: false,
-    onCeoApproved: (runId) => daemon.finalizeApprovedRun(runId),
-    onRuntimeStatus: (status) => {
-      try {
-        daemon.setTelegramIngressStatus?.({
-          configured: true,
-          running: status.running,
-          disabledReason: status.running
-            ? null
-            : status.stopReason === "UNKNOWN_DELIVERY"
-              ? `listener stopped after an UNKNOWN reply delivery for nonce '${status.recoveryNonce}'; acknowledge this exact nonce to resume`
-              : status.stopReason === "NOT_STARTED"
-                ? "listener has not been started"
-                : "listener closed",
-          recoveryNonce: status.recoveryNonce,
-        });
-      } catch (error) {
-        // Health I/O is an observer of the loop. Report its failure without turning a running
-        // listener into a half-started one that the composition root no longer has a handle on.
-        options.onError?.(error);
-      }
-      options.onRuntimeStatus?.(status);
-    },
-  });
-  daemon.attachTelegramIngressController?.(listener.service);
-  if (options.start === false) {
-    const status = { running: false, stopReason: "NOT_STARTED", recoveryNonce: null } as const;
-    daemon.setTelegramIngressStatus?.({
-      configured: true,
-      running: false,
-      disabledReason: "listener has not been started",
-      recoveryNonce: null,
-    });
-    options.onRuntimeStatus?.(status);
-  } else {
-    listener.service.start();
-  }
-  return {
-    service: listener.service,
-    close: async () => {
-      try {
-        await listener.close();
-      } finally {
-        daemon.detachTelegramIngressController?.(listener.service);
-      }
-    },
-  };
-};
-
-/**
- * `startDaemonTelegramListener`, but a transport whose redelivery retention `IngressGuard`
- * cannot bound (#682, round 8) is refused as `null` rather than thrown.
- *
- * A supported, deliberately-configured transport — most commonly a self-hosted Bot API server
- * behind `ACP_TELEGRAM_API_BASE_URL` — can have a retention nobody here has measured, and the
- * guard now refuses to build a nonce floor it cannot bound. That refusal must not take the rest
- * of the daemon down with it: this operator configured Telegram on purpose, and MCP listeners,
- * Buzz and the operator door still have to come up. Any other failure is still a real bug and is
- * rethrown unchanged, so `main`'s own startup teardown still runs for it exactly as before.
- *
- * A separate top-level function rather than a nested `try`/`catch` inline in `main`: a nested
- * `try` that reassigns an outer `let` and conditionally rethrows is a real TypeScript control-flow
- * analysis gap (confirmed with a minimal reproduction against this repo's compiler) — the outer
- * variable narrows to `never` at the enclosing `catch` even though the value is reachable there.
- * One `await` of a plain function does not exhibit it.
- */
-const startDaemonTelegramListenerOrRefuse = async (
-  cp: ControlPlane,
-  config: Parameters<typeof startTelegramLongPollListener>[1],
-  daemon: DaemonTelegramComposition,
-  options: DaemonTelegramStartOptions,
-): Promise<{ listener: TelegramLongPollListener | null; disabledReason: string | null }> => {
-  try {
-    const listener = await startDaemonTelegramListener(cp, config, daemon, options);
-    process.stdout.write("Telegram ingress started\n");
-    return { listener, disabledReason: null };
-  } catch (error) {
-    if (!isTransportRetentionUnknown(error)) throw error;
-    // The reason travels with the outcome rather than being re-derived at the call site, so
-    // `health.json` (via `Daemon.setTelegramIngressStatus`, #682 round 8's second follow-up)
-    // says the same thing this stderr line does — a daemon that comes up healthy while a
-    // configured feature silently never started is exactly the gap that review found.
-    const disabledReason =
-      `transport's redelivery retention is not known for channel '${error.channel}'`;
-    process.stderr.write(
-      `Telegram ingress refused: its ${disabledReason}, so a safe nonce floor cannot be ` +
-        "established; continuing without Telegram ingress\n",
-    );
-    return { listener: null, disabledReason };
-  }
-};
-
-/**
- * `directHandler` returns a string, so a refusal has to be readable rather than thrown: the
- * owner is a person waiting in a chat, and an exception here would surface as a dropped
- * message. The reason code travels with the sentence so a refusal in the transcript can still
- * be traced to the branch that produced it.
- *
- * The return carries `answered` beside the text, and that is the whole of #639's residual fix.
- * Both branches produce a sentence the owner must see — silence after a timeout is worse than an
- * apology — but only one of them is the CEO answering. A bare string could not tell the ingress
- * layer which, so the reply's acceptance by Telegram resolved the turn either way, and a
- * `CEO_CONVERSATION_TIMEOUT` apology was indistinguishable from an answer in the row. Delivering
- * it and counting it as answered are now two separate things.
- */
-export const answerAsCeo = async (
-  port: CeoConversationPort,
-  text: string,
-): Promise<TelegramDirectAnswer> => {
-  const answered = await port.ask(text);
-  if (answered.allowed) return { answered: true, text: answered.value };
-  return {
-    answered: false,
-    reasonCode: answered.reasonCode,
-    text: `${ceoUnavailableSentence(answered.reasonCode)} (${answered.reasonCode})`,
-  };
-};
-
-/**
- * `answerAsCeo` with the contact boundary kept, which the Buzz path needs and Telegram's
- * `directHandler` signature cannot carry.
+ * One CEO turn for a Buzz message, with the contact boundary kept.
  *
  * Whether the request crossed to the CEO peer is not derivable from the reason code — that is
  * the whole of #652 — and it decides whether the ingress claim closes or stays outstanding. A
@@ -6356,8 +6198,6 @@ export const ceoUnavailableSentence = (reasonCode: string): string => {
 export interface AgentcpdMainOptions {
   /** Test-only composition override; production calls `main()` without options. */
   config?: ControlPlaneConfig;
-  /** Test-only transport/lifecycle seam; production uses the real Bot API and stays alive. */
-  telegramStartOptions?: DaemonTelegramStartOptions;
   /** Allows a composition test to inspect the lock-held composition before shutting down. */
   waitForShutdown?: (
     shutdown: (signal: string) => Promise<void>,
@@ -6368,11 +6208,9 @@ export interface AgentcpdMainOptions {
 export interface AgentcpdMainContext {
   cp: ControlPlane;
   daemon: Daemon;
-  telegram: TelegramLongPollListener | null;
   /**
-   * The live CEO conversation port, exposed for the same reason `telegram` is: a composition
-   * test has to be able to stand a peer in front of the surface `main` actually wired, rather
-   * than assert against one it built itself.
+   * The live CEO conversation port: a composition test has to be able to stand a peer in front of
+   * the surface `main` actually wired, rather than assert against one it built itself.
    */
   ceoConversation: CeoConversationPort | null;
 }
@@ -6518,10 +6356,9 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
   const hermesAdoptionConfiguration = Object.fromEntries(
     [...HERMES_ADOPTION_VARS, HERMES_GATEWAY_ENDPOINT_VAR].map((key) => [key, process.env[key]]),
   ) as Record<(typeof HERMES_ADOPTION_VARS)[number] | typeof HERMES_GATEWAY_ENDPOINT_VAR, string | undefined>;
-  // Both parsers refuse `ACP_TELEGRAM_EXTERNAL_CONSUMER=hermes` beside a bot token, here, before the
-  // control plane or any listener exists. In that mode the long-poll parser answers null.
+  // Read here, before the control plane or any listener exists, so a malformed lane refuses startup
+  // with nothing opened. Hermes's lane is ACP's only Telegram consumer (#1444).
   const telegramExternalConfig = configuredTelegramExternalConsumerConfig(config.ownerIdentities ?? []);
-  const telegramConfig = configuredTelegramLongPollConfig(config.ownerIdentities ?? []);
   // migrate-before-start — the lock first, then everything the doctor can already judge from files,
   // credentials and the registered checkouts, all before the control plane opens the database. Opening it
   // creates a missing file, switches a rollback-journal file to WAL, applies an approved migration and
@@ -6768,7 +6605,6 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
   let adoptedCeoTools: CanonicalSelfClaimListener | null = null;
   let hermesAutoAdoptionTimer: NodeJS.Timeout | null = null;
   let hermesBootstrap: HermesBootstrapAuthority | null = null;
-  let telegram: TelegramLongPollListener | null = null;
   let telegramExternal: LocalTelegramExternalIngress | null = null;
   // The in-flight `daemon.start()`, seen from every exit after the database is open. A stop (a signal after
   // the handlers exist, one recorded before they did, a start that failed, or one that threw) must not take
@@ -6791,7 +6627,6 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
         begin: () => daemon.beginStop(),
         closeListeners: async () => {
           if (hermesAutoAdoptionTimer) clearInterval(hermesAutoAdoptionTimer);
-          await telegram?.close();
           ownerReplies?.close();
           peerMessageNotices?.close();
           await telegramExternal?.close();
@@ -7237,32 +7072,6 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
         "Telegram external consumer lane not started: ACP_TELEGRAM_EXTERNAL_SECRET is not configured\n",
       );
     }
-    if (telegramConfig) {
-      const telegramStartOptions = options.telegramStartOptions ?? {};
-      const ceoConversation = listeners.ceoConversation;
-      const outcome = await startDaemonTelegramListenerOrRefuse(cp, telegramConfig, daemon, {
-        // §6.1 — ordinary conversation goes to the CEO. A test that supplies its own handler
-        // keeps it; production has none, which is how this route stayed unreachable.
-        onDirect: (input) => answerAsCeo(ceoConversation, input.text),
-        ...telegramStartOptions,
-        onError: (error) => {
-          process.stderr.write(`telegram ingress error: ${error instanceof Error ? error.message : String(error)}\n`);
-          telegramStartOptions.onError?.(error);
-        },
-      });
-      telegram = outcome.listener;
-      if (!outcome.listener) {
-        daemon.setTelegramIngressStatus({
-          configured: true,
-          running: false,
-          disabledReason: outcome.disabledReason,
-          recoveryNonce: null,
-        });
-      }
-    } else {
-      process.stderr.write("Telegram ingress not configured; continuing without Telegram ingress\n");
-      daemon.setTelegramIngressStatus({ configured: false, running: false, disabledReason: null });
-    }
     // The last statement of startup, after every step that can still refuse it (PR1060-FU-01): the
     // subscriber is decided, its rooms are checked, and only now may a claim or correction open a room.
     settleCanonicalRooms();
@@ -7279,7 +7088,6 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
   const context: AgentcpdMainContext = {
     cp,
     daemon,
-    telegram,
     ceoConversation: listeners?.ceoConversation ?? null,
   };
 

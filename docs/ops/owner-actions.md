@@ -66,29 +66,28 @@ check.
 
 ---
 
-## 2. Telegram bot token — #392
+## 2. Telegram owner lane — #392
 
 ### Why
 
-The production ingress server exists as of `8461d82` — long-poll owner channel, allowlist,
-replay defence, prompt-bound receipts. What #392 requires and does not have is a real Telegram
-message creating a run and leaving Buzz dispatch evidence. Every path that touches
-`getUpdates`/`sendMessage` currently injects a test transport.
+Hermes polls the bot and hands each owner update to the daemon's lane socket
+(`src/ingress/telegram-external.ts`); ACP holds no bot token and polls nothing (#1444).
 
 ### Command
 
-    security add-generic-password -U -s acp -a ACP_TELEGRAM_BOT_TOKEN -w '<token from @BotFather>'
-    security add-generic-password -U -s acp -a ACP_TELEGRAM_OWNER_ID   -w '<numeric telegram user id>'
-    security add-generic-password -U -s acp -a ACP_TELEGRAM_CHAT_ID    -w '<numeric chat id, may be negative>'
-    security add-generic-password -U -s acp -a ACP_TELEGRAM_WEBHOOK_SECRET -w "$(openssl rand -hex 32)"
+    security add-generic-password -U -s acp -a ACP_TELEGRAM_EXTERNAL_CONSUMER -w hermes
+    security add-generic-password -U -s acp -a ACP_TELEGRAM_EXTERNAL_SECRET -w "$(openssl rand -hex 32)"
+    security add-generic-password -U -s acp -a ACP_TELEGRAM_OWNER_ID -w '<numeric telegram user id>'
+    security add-generic-password -U -s acp -a ACP_TELEGRAM_CHAT_ID  -w '<numeric chat id, may be negative>'
 
-`-s acp` must match the `--keychain-service` the launcher was installed with.
+`-s acp` must match the `--keychain-service` the launcher was installed with. Hermes presents the
+same `ACP_TELEGRAM_EXTERNAL_SECRET` value with every update.
 
 ### What it creates
 
-Four Keychain items the launcher reads at start — the `required_keychain_value` /
-`optional_keychain_value` block in `deploy/install-launchd.sh`. Telegram stays disabled when none
-are present and **refuses a partial set**, so all four are needed together.
+Four Keychain items the launcher reads at start — the `optional_keychain_value` block in
+`deploy/install-launchd.sh`. The lane opens only when the flag and the secret are both present,
+and then refuses a missing owner or chat id.
 
 ### Which identity
 
@@ -102,9 +101,9 @@ The Keychain, under the launcher's service name. Restart the daemon afterwards.
 
 ### Verification — exits 0 when done
 
-    security find-generic-password -s acp -a ACP_TELEGRAM_BOT_TOKEN -w >/dev/null \
+    security find-generic-password -s acp -a ACP_TELEGRAM_EXTERNAL_SECRET >/dev/null \
       && grep -q '^telegram:' "$HOME/.agent-control-plane/owner-identities" \
-      && echo "telegram ingress configured"
+      && echo "telegram lane configured"
 
 ---
 
