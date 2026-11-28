@@ -43,13 +43,27 @@ const APPROVED_SYSTEM_ALIASES: ReadonlyMap<string, string> = new Map([
   ["/var", "/private/var"],
 ]);
 
+/**
+ * Whether anything stands at `path`, read without following a link. `existsSync` follows it, so a dangling
+ * link read as a path that does not exist yet, and whatever then created the path wrote through the link or
+ * failed on it after the database was already open (#1497).
+ */
+const presentAt = (path: string): boolean => {
+  try {
+    lstatSync(path);
+    return true;
+  } catch {
+    return false;
+  }
+};
+
 const unsafeSymlinkAncestor = (path: string): string | null => {
   const normalized = resolve(path);
   const parts = normalized.split("/").filter(Boolean);
   let cursor = "/";
   for (const part of parts) {
     cursor = join(cursor, part);
-    if (!existsSync(cursor)) break;
+    if (!presentAt(cursor)) break;
     const stat = lstatSync(cursor);
     if (!stat.isSymbolicLink()) continue;
     const approvedTarget = APPROVED_SYSTEM_ALIASES.get(cursor);
@@ -94,7 +108,7 @@ export const inspectPrivatePath = (path: string, kind: StatePathKind): StatePath
         reason: `path traverses symbolic link ${symlinkAncestor}`,
       };
     }
-    if (!existsSync(path)) {
+    if (!presentAt(path)) {
       return {
         path,
         kind,
@@ -227,7 +241,7 @@ export const databaseSidecarPaths = (databasePath: string): string[] => [
 export const assertPrivateDatabaseFiles = (databasePath: string): void => {
   assertPrivatePath(databasePath, "file");
   for (const sidecar of databaseSidecarPaths(databasePath)) {
-    if (existsSync(sidecar)) assertPrivatePath(sidecar, "file");
+    if (presentAt(sidecar)) assertPrivatePath(sidecar, "file");
   }
 };
 
@@ -253,7 +267,7 @@ export const finalizeNewPrivateDatabaseFiles = (databasePath: string, databaseEx
 export const inspectDatabaseStatePaths = (databasePath: string): StatePathInspection[] => {
   const paths: Array<[string, StatePathKind]> = [[dirname(databasePath), "directory"], [databasePath, "file"]];
   for (const sidecar of databaseSidecarPaths(databasePath)) {
-    if (existsSync(sidecar)) paths.push([sidecar, "file"]);
+    if (presentAt(sidecar)) paths.push([sidecar, "file"]);
   }
   return paths.map(([path, kind]) => inspectPrivatePath(path, kind));
 };

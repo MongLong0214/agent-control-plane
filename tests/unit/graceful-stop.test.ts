@@ -1,5 +1,7 @@
-import { existsSync } from "node:fs";
-import { join } from "node:path";
+import { spawn } from "node:child_process";
+import { chmodSync, existsSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import Database from "better-sqlite3";
 import { afterAll, describe, expect, it, vi } from "vitest";
@@ -272,6 +274,64 @@ describe("the lock is let go only when it is safe to", () => {
     handle.close();
     lock.release();
   });
+
+  // #1498: the fence beside the lock could not be written (EACCES), the error was swallowed, and the holder's
+  // directory was all that was left. A successor read it as a dead holder and reclaimed it.
+  it.skipIf(process.getuid?.() === 0)(
+    "a fence the state directory refuses is written inside the holder's directory, and refuses a successor after the holder exits",
+    async () => {
+      const dir = tempDir("acp-graceful-stop-unwritable-");
+      const lockPath = join(dir, "agentcpd.lock");
+      const module = (path: string): string => JSON.stringify(new URL(path, import.meta.url).href);
+      const source = [
+        `import Database from "better-sqlite3";`,
+        `import { chmodSync } from "node:fs";`,
+        `const { StartTracker, StopFailure, gracefulStop } = await import(${module("../../src/daemon/graceful-stop.ts")});`,
+        `const { SingleInstanceLock } = await import(${module("../../src/daemon/single-instance.ts")});`,
+        `const lock = new SingleInstanceLock(${JSON.stringify(lockPath)});`,
+        `if (!lock.acquire(new Date().toISOString()).allowed) process.exit(3);`,
+        `const handle = new Database(${JSON.stringify(join(dir, "live.sqlite"))});`,
+        `handle.exec("CREATE TABLE t (n INTEGER); INSERT INTO t VALUES (1), (2), (3)");`,
+        `const rows = handle.prepare("SELECT n FROM t").iterate();`,
+        `rows.next();`,
+        `const tracker = new StartTracker();`,
+        `tracker.track(Promise.resolve());`,
+        `await gracefulStop(tracker, {`,
+        `  begin: () => undefined,`,
+        `  closeListeners: async () => undefined,`,
+        // The drain confirmed its workers gone; only the stop's own row could not be written.
+        `  stopDaemon: async () => { throw new StopFailure(new Error("the stop row is refused"), true); },`,
+        `  closeDatabase: () => { chmodSync(${JSON.stringify(dir)}, 0o500); handle.close(); },`,
+        `  fenceUnconfirmed: () => lock.fence(null, new Date().toISOString()),`,
+        `  releaseLock: () => lock.release(),`,
+        `}).catch(() => undefined);`,
+        // Leaves as agentcpd does after a close that failed: non-zero, the lock released only by the exit.
+        `process.exit(1);`,
+      ].join("\n");
+      const child = spawn(process.execPath, ["--experimental-transform-types", "--input-type=module", "-e", source], {
+        cwd: fileURLToPath(new URL("../..", import.meta.url)),
+        env: { ...process.env, NODE_DISABLE_COMPILE_CACHE: "1" },
+        stdio: ["ignore", "ignore", "pipe"],
+      });
+      let stderr = "";
+      child.stderr!.on("data", (chunk: Buffer) => (stderr += chunk.toString()));
+      const status = await new Promise<number | null>((resolveExit) => child.once("exit", resolveExit));
+      chmodSync(dir, 0o700);
+      expect(status, stderr).toBe(1);
+
+      // The state directory refused the fence beside the lock, as in the report; the holder's record stays.
+      const lock = new SingleInstanceLock(lockPath);
+      expect(existsSync(lock.fencePath)).toBe(false);
+      expect(lock.read()?.pid).toBe(child.pid);
+      const successor = lock.acquire(new Date().toISOString());
+
+      expect(successor.allowed, "the dead holder's lock was reclaimed with no fence standing").toBe(false);
+      expect(successor.reasonCode).toBe("DAEMON_ALREADY_RUNNING");
+      const files = (successor.evidence as { files?: string[] } | undefined)?.files ?? [];
+      expect(files.map((file) => dirname(file)), "the fence that refused it").toEqual([lockPath]);
+    },
+    60_000,
+  );
 
   it("an incomplete worker drain followed by a failing DAEMON_STOPPED insert keeps the lock, and the fence says why", async () => {
     const harness = makeHarness();

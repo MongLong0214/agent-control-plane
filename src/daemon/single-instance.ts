@@ -108,6 +108,7 @@ export class SingleInstanceLock {
    * linked into place without replacing anything, so a name is written once and a replacement fence is
    * always another name. `fencePath` (`<lock>.git-fence.json`) is only a second link to the newest of
    * them, where operators and tooling look; a file an earlier build wrote there is read as a fence too.
+   * A holder the state directory refuses writes its fence inside `<lock>` instead (`writeHolderFence`).
    */
   get fencePath(): string {
     return `${this.path}.git-fence.json`;
@@ -124,7 +125,18 @@ export class SingleInstanceLock {
    */
   fence(groups: readonly FencedGroup[] | null, recordedAt: string): void {
     if (this.#db !== null) {
-      writeFence(this.path, groups, recordedAt);
+      try {
+        writeFence(this.path, groups, recordedAt);
+      } catch (error) {
+        // #1498: the state directory refused the fence (EACCES on a read-only directory). Left at that, the
+        // holder's directory was all that stood once the process exited, and a successor reclaimed it as a
+        // dead holder's. The directory is this holder's own, so the fence goes there instead.
+        try {
+          writeHolderFence(this.path, groups, recordedAt);
+        } catch {
+          throw error;
+        }
+      }
       return;
     }
     mkdirSync(dirname(this.path), { recursive: true });
@@ -163,7 +175,7 @@ export class SingleInstanceLock {
       return deny(
         ReasonCode.DAEMON_ALREADY_RUNNING,
         "a stopped agentcpd could not confirm a worker git process group finished; authority is not taken while it may still run",
-        { fence: this.fencePath, groups: fenced.groups, alive: fenced.alive },
+        { fence: this.fencePath, groups: fenced.groups, alive: fenced.alive, files: fenced.files },
       );
     }
 
@@ -440,6 +452,43 @@ const writeFence = (lockPath: string, groups: readonly FencedGroup[] | null, rec
   }
 };
 
+/**
+ * #1498 — a fence written inside the holder's directory, `<lock>/git-fence.<pid>.<start token>.<random>.json`,
+ * when the state directory refused the one beside the lock. `<lock>` is where a successor looks before it
+ * reclaims a dead holder, and the holder can still write there. Written once under its own name and never
+ * replaced; a write cut short leaves a file that cannot be read, which stands as an unknown fence. Read and
+ * removed with the fences beside the lock (`assessFences`).
+ */
+const HOLDER_FENCE_PREFIX = "git-fence.";
+
+const writeHolderFence = (lockPath: string, groups: readonly FencedGroup[] | null, recordedAt: string): void => {
+  if (!lstatSync(lockPath).isDirectory()) throw new Error("the lock path is not the holder's directory");
+  const token = (readProcessStartToken(process.pid) ?? "unknown").replace(/[^A-Za-z0-9_-]/gu, "-");
+  const fd = openSync(join(lockPath, `${HOLDER_FENCE_PREFIX}${process.pid}.${token}.${randomUUID()}.json`), "wx", 0o600);
+  try {
+    writeSync(fd, JSON.stringify({ pid: process.pid, recordedAt, groups }));
+    fsyncSync(fd);
+  } finally {
+    closeSync(fd);
+  }
+};
+
+/** Every fence inside the holder's directory; none when `<lock>` is absent or is not a directory. */
+const holderFencePaths = (lockPath: string): string[] => {
+  let stat;
+  try {
+    stat = lstatSync(lockPath);
+  } catch (error) {
+    if ((error as { code?: string }).code === "ENOENT") return [];
+    throw error;
+  }
+  if (!stat.isDirectory()) return [];
+  return readdirSync(lockPath)
+    .filter((name) => name.startsWith(HOLDER_FENCE_PREFIX) && name.endsWith(".json"))
+    .sort()
+    .map((name) => join(lockPath, name));
+};
+
 const legacyFencePath = (lockPath: string): string => `${lockPath}.git-fence.json`;
 
 /** Every fence name beside `lockPath`: unique, adopted, and the legacy name. */
@@ -506,9 +555,9 @@ const assessFences = (lockPath: string, underLock: boolean): { standing: LiveFen
   if (underLock && !adoptLegacy(lockPath)) {
     return { standing: { groups: null, alive: [], files: [legacy] }, stale: [] };
   }
-  let names: string[];
+  let paths: string[];
   try {
-    names = fenceNames(lockPath);
+    paths = [...fenceNames(lockPath).map((name) => join(directory, name)), ...holderFencePaths(lockPath)];
   } catch {
     return { standing: { groups: null, alive: [], files: [directory] }, stale: [] };
   }
@@ -516,8 +565,7 @@ const assessFences = (lockPath: string, underLock: boolean): { standing: LiveFen
   const standingFiles: { path: string; ino: number | null; fence: LiveFence }[] = [];
   const staleUnique = new Map<number, StaleFence[]>();
   let staleLegacy: StaleFence | null = null;
-  for (const name of names) {
-    const path = join(directory, name);
+  for (const path of paths) {
     const read = readFence(path);
     if (read === null) continue;
     let verdict: LiveFence | null;
@@ -696,6 +744,11 @@ const takeExclusive = (path: string): Taken => {
   } catch {
     /* it exists; it is never opened here otherwise */
   }
+  // #1497: what the path names is judged before SQLite opens it, not after. SQLite follows a link, and opening
+  // and closing a WAL database checkpoints it and removes its sidecars, so a lock file linked to `state.sqlite`
+  // wrote the database before the identity check below could refuse it.
+  const before = identityOf(path);
+  if (before === null) return { ok: false, busy: false, code: "LOCK_FILE_NOT_REGULAR" };
   try {
     db = new Database(path, { timeout: LOCK_WAIT_MS });
     db.exec("BEGIN EXCLUSIVE");
@@ -709,7 +762,7 @@ const takeExclusive = (path: string): Taken => {
     return { ok: false, busy: false, code: "NOT_EXCLUSIVE" };
   }
   const identity = identityOf(path);
-  if (identity === null || !processHasOpen(identity)) {
+  if (identity === null || identity.dev !== before.dev || identity.ino !== before.ino || !processHasOpen(identity)) {
     close();
     return { ok: false, busy: false, code: "LOCK_FILE_CHANGED" };
   }

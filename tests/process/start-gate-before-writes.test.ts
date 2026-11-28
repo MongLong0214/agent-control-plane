@@ -274,6 +274,25 @@ describe("a start the doctor will refuse leaves the database as it found it (mig
     expect(loop.lastRefusal?.blockingFindings.map((finding) => finding.code)).toContain("STATE_PATH_INSECURE");
   }, 120_000);
 
+  // #1497: a dangling link read as a path that does not exist yet, so the gate let the start open the database,
+  // and only the worktree manager's mkdir failed on it (EEXIST), with no crash-loop record.
+  it("#1497: a dangling worktrees link is refused and recorded, and creates no database", async () => {
+    const { home, root, database } = newHome();
+    // The gate passes on everything else, so the link is the one thing that can refuse this start.
+    installGitHubAppCredential(root);
+    symlinkSync(join(root, "no-such-worktrees"), join(root, "worktrees"));
+
+    const result = await runToExit(home);
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain("STATE_PATH_INSECURE");
+    expect(imageOf(database)).toMatchObject({ exists: false, wal: false, shm: false, journal: false });
+    expect(existsSync(join(root, "no-such-worktrees"))).toBe(false);
+    const loop = crashLoopOf(root);
+    expect(loop.lastRefusal).toMatchObject({ stage: "before-open", databaseWritten: false });
+    expect(loop.lastRefusal?.blockingFindings.map((finding) => finding.code)).toContain("STATE_PATH_INSECURE");
+  }, 120_000);
+
   it("item 2: a malformed reviewer-preferences file is not refused into the audit log by a refused start", async () => {
     const { home, root, database } = newHome();
     currentDatabase(database);
@@ -957,6 +976,25 @@ describe("the gate before the database is opened (judgeStartBeforeOpening)", () 
       else process.env["TMPDIR"] = previous;
     }
   });
+
+  it.each(["state.sqlite", "state.sqlite-wal", "secrets", "capacity"])(
+    "#1497: a dangling link at %s is an insecure state path, not one that does not exist yet",
+    async (name) => {
+      const { root, database } = newHome();
+      if (name.startsWith("state.sqlite-")) currentDatabase(database);
+      installGitHubAppCredential(root);
+      symlinkSync(join(root, `${name}.missing`), join(root, name));
+
+      const { judgeStartBeforeOpening } = await import("../../src/daemon/start-gate.ts");
+      const judged = await judgeStartBeforeOpening(gateConfig(root, database));
+
+      // STATE_PATH_INSECURE is CRITICAL, so the gate's verdict is ERROR, which refuses the start.
+      expect(judged.status).toBe("ERROR");
+      expect(judged.findings.filter((finding) => finding.code === "STATE_PATH_INSECURE").map((finding) => finding.observedEvidence))
+        .toEqual([expect.objectContaining({ path: join(root, name) })]);
+      expect(existsSync(join(root, `${name}.missing`))).toBe(false);
+    },
+  );
 
   it("lets a start with a readable credential and sound paths go on, writing nothing", async () => {
     const { root, database } = newHome();
